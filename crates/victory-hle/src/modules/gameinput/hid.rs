@@ -580,10 +580,11 @@ mod host {
             ..Default::default()
         };
         let mut raw: PHIDP_PREPARSED_DATA = 0;
-        // SAFETY: a valid handle and out pointers.
-        if !unsafe { HidD_GetAttributes(read.0, &mut attributes) }
-            || !unsafe { HidD_GetPreparsedData(read.0, &mut raw) }
-        {
+        // SAFETY: the HID handle is open and both out pointers are valid.
+        if !unsafe {
+            HidD_GetAttributes(read.0, &mut attributes)
+                && HidD_GetPreparsedData(read.0, &mut raw)
+        } {
             return None;
         }
         let preparsed = Preparsed(raw);
