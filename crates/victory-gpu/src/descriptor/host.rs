@@ -161,11 +161,23 @@ impl HostHeap {
                     // shortcut: descriptors past the host's limit are left
                     // out; a title that reaches them needs remapping.
                     tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+                    let (heap, total) = [PORTABLE_VIEWS, 500_000, 250_000, MIN_DYNAMIC]
+                        .into_iter()
+                        .find_map(|cap| make(cap).ok().map(|h| (h, cap)))?;
+                    let extra = if total >= PORTABLE_VIEWS {
+                        (1 << 17).min(total / 4)
+                    } else {
+                        MIN_DYNAMIC.min(total / 2)
+                    };
+                    (heap, total - extra, extra)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                    return None;
+                    let (heap, total) = [PORTABLE_VIEWS, 500_000, 250_000, MIN_DYNAMIC]
+                        .into_iter()
+                        .find_map(|cap| make(cap).ok().map(|h| (h, cap)))?;
+                    let extra = MIN_DYNAMIC.min(total / 2);
+                    (heap, total - extra, extra)
                 }
             }
         };
@@ -378,6 +390,32 @@ impl HostHeap {
         } else {
             self.release(index, 2);
         }
+    }
+
+    /// Recycles `n` dynamic slots in ring-buffer fashion when the dynamic pool
+    /// is otherwise exhausted, preventing draw/dispatch drops.
+    pub(crate) fn recycle_dynamic(&self, n: u32) -> Option<u32> {
+        if self.sampler || n == 0 || n > self.dynamic {
+            return None;
+        }
+        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let (next, taken) = &mut *guard;
+        let n = n as usize;
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                n,
+                dynamic = self.dynamic,
+                "dynamic descriptor pool exhausted: recycling slots in ring-buffer fashion"
+            );
+        });
+        let mut candidate = *next as usize;
+        if candidate + n > self.dynamic as usize {
+            candidate = 0;
+        }
+        taken[candidate..candidate + n].fill(true);
+        *next = ((candidate + n) % self.dynamic as usize) as u32;
+        Some(self.count + candidate as u32)
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -732,7 +770,11 @@ impl HostHeap {
                     "title slot past the host heap"
                 );
             }
-            return None;
+            // Graceful degradation: return the title's view so callers (e.g. table_entry)
+            // can still transition and prepare resources rather than dropping state.
+            // SAFETY: the handle is a descriptor slot in title memory.
+            let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+            return (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         }
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
@@ -2461,5 +2503,56 @@ mod tests {
         // SAFETY: plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
         assert_eq!(host.log_messages(), None);
+    }
+
+    /// When dynamic slots are exhausted, recycling provides a ring-buffer fallback
+    /// instead of dropping the draw.
+    #[test]
+    fn dynamic_descriptor_recycling_survives_pool_exhaustion() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let full = heap.dynamic(heap.dynamic).unwrap();
+        assert_eq!(full, 4);
+        // Standard allocation fails because the pool is full.
+        assert_eq!(heap.dynamic(10), None);
+        // Recycling succeeds and wraps cleanly within dynamic bounds.
+        let recycled = heap.recycle_dynamic(10).unwrap();
+        assert_eq!(recycled, 4);
+        let recycled2 = heap.recycle_dynamic(10).unwrap();
+        assert_eq!(recycled2, 14);
+    }
+
+    /// Contiguous spans that cross the search cursor are found.
+    #[test]
+    fn dynamic_cursor_wraparound_finds_contiguous_span() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        // Fill the heap in two parts: first dynamic - 10 slots, then 10 slots.
+        let a = heap.dynamic(heap.dynamic - 10).unwrap();
+        let b = heap.dynamic(10).unwrap();
+        assert_eq!(a, 4);
+        assert_eq!(b, 4 + heap.dynamic - 10);
+        // Release the first part.
+        heap.release(a, heap.dynamic - 10);
+        // Request 10 slots: finds them in the freed range at the start.
+        let c = heap.dynamic(10).unwrap();
+        assert_eq!(c, 4);
+    }
+
+    /// Requesting more than the host limit (> 1,000,000) caps gracefully without panicking.
+    #[test]
+    fn heap_request_over_one_million_caps_gracefully() {
+        let Some(heap) = HostHeap::new(false, 1_245_184) else {
+            return; // no host GPU or device failed
+        };
+        assert!(heap.count + heap.dynamic <= PORTABLE_VIEWS);
+        assert!(heap.count > 0);
+        assert!(heap.dynamic > 0);
+        // Mirroring a slot past the capped host count handles it gracefully without panic.
+        let mut dummy_handle: [u32; 3] = [0, 0, 0];
+        let handle_ptr = (&raw mut dummy_handle) as u64;
+        assert!(heap.mirror(1_245_000, handle_ptr, false).is_none());
     }
 }
