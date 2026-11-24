@@ -1,5 +1,7 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
-//! (host slots 0-3); while none is connected, the keyboard drives one
+//! (host slots 0-3) and, in the slots XInput leaves empty, from HID
+//! ([`hid`]: DualShock 4, DualSense and generic HID gamepads); while none is
+//! connected, the keyboard drives one
 //! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
 //! too. A poll thread turns host state into readings (a new one per change)
 //! and runs device callbacks on connect and disconnect.
@@ -20,6 +22,8 @@ use std::time::{Duration, Instant};
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
+
+mod hid;
 
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
@@ -1202,6 +1206,10 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        /// Pads XInput does not list, and which of them sits in each slot
+        /// XInput leaves empty.
+        hid: super::hid::Pads,
+        hid_slots: [Option<u64>; PADS],
     }
 
     fn key_state(vk: u8) -> KeyState {
@@ -1215,8 +1223,8 @@ mod host {
         }
     }
 
-    impl Source for Host {
-        fn pad(&mut self, slot: usize) -> Option<PadState> {
+    impl Host {
+        fn xinput(&mut self, slot: usize) -> Option<PadState> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
             }
@@ -1228,6 +1236,33 @@ mod host {
             }
             self.empty_until[slot] = None;
             Some(convert(&state.Gamepad))
+        }
+
+        /// The HID pad in this slot: the one it had while that one is still
+        /// connected, else the oldest one in no slot yet.
+        fn hid(&mut self, slot: usize) -> Option<PadState> {
+            let connected = self.hid.connected();
+            let kept = self.hid_slots[slot].filter(|id| connected.iter().any(|(c, _)| c == id));
+            let id = kept.or_else(|| {
+                connected
+                    .iter()
+                    .map(|&(id, _)| id)
+                    .find(|id| !self.hid_slots.contains(&Some(*id)))
+            });
+            self.hid_slots[slot] = id;
+            connected.into_iter().find(|&(c, _)| Some(c) == id).map(|(_, pad)| pad)
+        }
+    }
+
+    impl Source for Host {
+        fn pad(&mut self, slot: usize) -> Option<PadState> {
+            if let Some(pad) = self.xinput(slot) {
+                // An XInput pad takes the slot; a HID pad there moves
+                // to a free one.
+                self.hid_slots[slot] = None;
+                return Some(pad);
+            }
+            self.hid(slot)
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
@@ -1267,6 +1302,9 @@ mod host {
             };
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
+            if let Some(id) = self.hid_slots[slot] {
+                self.hid.rumble(id, low, high);
+            }
         }
     }
 

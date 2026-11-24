@@ -131,8 +131,12 @@ limits them. This scales the displayed image; it does not change the
 console render resolution or the swap-chain buffers. With the variable
 unset, window sizing is unchanged.
 
-Input: XInput pads. With none connected the keyboard is a pad while the
-title's window has focus:
+Input supports XInput and HID gamepads, including DualShock 4 and DualSense.
+HID pads fill slots left free by XInput. With no pad connected, the keyboard
+acts as a pad while the title's window has focus.
+
+For generic HID pads, `VICTORY_PAD_BUTTONS` accepts comma-separated HID button
+numbers in A, B, X, Y, LB, RB, LT, RT, View, Menu, LS, RS order.
 
 | Keys | Pad |
 |------|-----|
