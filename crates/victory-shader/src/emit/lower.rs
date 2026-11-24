@@ -14,7 +14,7 @@ use super::container::SigElement;
 use super::shader::{Shader, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
-use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
+use crate::io::{Attribute, Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
 use crate::ir::{Block, EXEC, Exit, Inst, Phi, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER_DATA};
@@ -23,6 +23,20 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 mod bvh;
 
 type Why = &'static str;
+
+/// How an interpolation evaluates an input channel.
+#[derive(Debug, Clone, Copy)]
+enum Eval {
+    /// Loaded with this DXIL interpolation mode (1: constant, P0).
+    Mode(u8),
+    /// From the vertex values of a constant element: P0 when `p0`, plus
+    /// i (P1 - P0), plus j (P2 - P0), weights as floats.
+    Weights {
+        p0: bool,
+        i: Option<V>,
+        j: Option<V>,
+    },
+}
 
 #[derive(Debug, Clone, Copy)]
 enum Val {
@@ -8147,49 +8161,122 @@ impl<'a> Lower<'a> {
     }
 
     fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
-        let Some(&interp) = self.interps.get(&site) else {
+        let interp = self.interps.get(&site).copied();
+        // A first half whose pair's registers may be overwritten where it
+        // runs is a computed interpolation too (see `computed_first`).
+        let computed_first = if interp.is_none() {
+            self.computed_first(site)
+        } else {
+            None
+        };
+        if interp.is_none() && computed_first.is_none() {
             return Err("the first half of an interpolation");
-        };
-        let (attribute, mode) = match interp {
-            Interp::Interpolated { unless, .. } if !self.avoids(site, unless) => {
-                return Err("an interpolation with computed barycentrics");
+        }
+        let name = inst.name();
+        let (dst, src) = match &inst.fields {
+            Fields::Vintrp { dst, src, .. } => (*dst, Some(*src)),
+            Fields::Valu(v) => {
+                if v.abs != 0 || v.neg != 0 {
+                    return Err("interpolation operand modifiers");
+                }
+                (v.dst.ok_or("an interpolation")?, v.src.get(1).copied())
             }
-            Interp::Interpolated {
-                attribute,
-                barycentric,
-                ..
-            } => (
-                attribute,
-                interp_mode(*barycentric).ok_or("pull-model interpolation")?,
-            ),
-            // P0, the provoking vertex: a flat (nointerpolation) input.
-            Interp::Vertex {
-                attribute,
-                vertex: 2,
-            } => (attribute, 1),
-            Interp::Vertex { .. } => return Err("a non-provoking vertex value"),
-        };
-        let dst = match &inst.fields {
-            Fields::Vintrp { dst, .. } => *dst,
-            Fields::Valu(v) => v.dst.ok_or("an interpolation")?,
             _ => unreachable!(),
         };
         let Operand::Vector { reg, .. } = dst else {
             return Err("an interpolation");
         };
-        // A channel of an input element, interpolated as `mode` says.
-        let channel = |l: &mut Self, row: u8, ch: u8| -> Result<V, Why> {
-            let (id, col) = l
-                .find_input(row, ch)
-                .ok_or("an input the signature lacks")?;
-            let e = &mut l.s.inputs[id];
-            if e.interp != mode && e.usage != 0 {
-                return Err("one input interpolated two ways");
-            }
-            e.interp = mode;
-            match l.load_any_input(id, col) {
-                Val::I32(x) => Ok(x),
-                _ => Err("an input"),
+        // A float operand of the instruction.
+        let float = |l: &mut Self, op: Option<Operand>| -> Result<V, Why> {
+            let x = l.operand(inst, &op.ok_or("an interpolation operand")?)?;
+            Ok(l.as_float(x))
+        };
+        // What the result adds to the evaluated channel (a second half's
+        // first half, when the halves evaluate on their own).
+        let mut add = None;
+        let weighted_first = |l: &mut Self| -> Result<Eval, Why> {
+            let i = Some(float(l, src)?);
+            Ok(Eval::Weights {
+                p0: true,
+                i,
+                j: None,
+            })
+        };
+        let weighted_second = |l: &mut Self, add: &mut Option<V>| -> Result<Eval, Why> {
+            let old = match &inst.fields {
+                Fields::Valu(v) => v.src.get(2).copied(),
+                _ => Some(dst),
+            };
+            *add = Some(float(l, old)?);
+            let j = Some(float(l, src)?);
+            Ok(Eval::Weights {
+                p0: false,
+                i: None,
+                j,
+            })
+        };
+        let (attribute, eval) = if let Some(attribute) = computed_first {
+            (attribute, weighted_first(self)?)
+        } else {
+            match interp.expect("an interpolation") {
+                Interp::Interpolated {
+                    attribute,
+                    barycentric,
+                    unless,
+                    ..
+                } => {
+                    let (attribute, barycentric) = (*attribute, *barycentric);
+                    if !self.avoids(site, unless) {
+                        // The register the instruction reads holds the
+                        // overwritten value in the lanes that run it: use it
+                        // as the weight, as the hardware does.
+                        (attribute, weighted_second(self, &mut add)?)
+                    } else {
+                        let mode = interp_mode(barycentric).ok_or("pull-model interpolation")?;
+                        let eval = if self.per_vertex(attribute.row) {
+                            // The element is read per vertex elsewhere, so it is
+                            // constant: weigh its vertices with SV_Barycentrics.
+                            let mut ij = [None; 2];
+                            for (index, w) in ij.iter_mut().enumerate() {
+                                let x = match self.barycentric(barycentric, index as u8) {
+                                    Val::I32(x) => x,
+                                    Val::Missing(w) => return Err(w),
+                                    Val::Bit(_) => unreachable!(),
+                                };
+                                *w = Some(self.as_float(x));
+                            }
+                            Eval::Weights {
+                                p0: true,
+                                i: ij[0],
+                                j: ij[1],
+                            }
+                        } else {
+                            Eval::Mode(mode)
+                        };
+                        (attribute, eval)
+                    }
+                }
+                // P0, the provoking vertex: a flat (nointerpolation) input.
+                Interp::Vertex { attribute, vertex } if *vertex == 2 => {
+                    (*attribute, Eval::Mode(1))
+                }
+                // P10 and P20: what the first and second halves weigh, P1 - P0
+                // and P2 - P0, which is what the hardware holds for an
+                // attribute the program also interpolates.
+                Interp::Vertex { attribute, vertex } if self.interpolated(attribute.row) => {
+                    let one = Some(self.s.m.f32(1f32.to_bits()));
+                    let (i, j) = if *vertex == 0 { (one, None) } else { (None, one) };
+                    (*attribute, Eval::Weights { p0: false, i, j })
+                }
+                Interp::Vertex { .. } => return Err("a non-provoking vertex value"),
+                // A half of an interpolation with computed i or j: P0 + i P10,
+                // or the old dst (f16: the third operand) + j P20.
+                Interp::Weighted { attribute } if name.starts_with("v_interp_p1") => {
+                    (*attribute, weighted_first(self)?)
+                }
+                Interp::Weighted { attribute } => {
+                    (*attribute, weighted_second(self, &mut add)?)
+                }
             }
         };
         let packing = match &self.x.native.io {
@@ -8199,10 +8286,22 @@ impl<'a> Lower<'a> {
                 .map(|i| i.pack2),
             _ => None,
         };
-        let f16 = inst.name().ends_with("_f16");
+        let f16 = name.ends_with("_f16");
+        // The evaluated channel plus `add`, as a float.
+        let total = |l: &mut Self, row: u8, ch: u8| -> Result<V, Why> {
+            let x = l.eval_channel(row, ch, eval)?;
+            let x = l.as_float(x);
+            Ok(match add {
+                Some(a) => l.s.m.bin(l.cur, Bin::Add, a, x),
+                None => x,
+            })
+        };
         let x = match packing {
             None if f16 || attribute.high => return Err("a 16-bit read of a 32-bit input"),
-            None => channel(self, attribute.row, attribute.channel)?,
+            None => {
+                let x = total(self, attribute.row, attribute.channel)?;
+                self.as_int(x)
+            }
             Some(pack2) => {
                 // 16-bit values: one in the low half of each dword, or two
                 // per dword (`packed_half`); the host's are 32-bit floats.
@@ -8212,27 +8311,36 @@ impl<'a> Lower<'a> {
                     } else {
                         h.is_multiple_of(2).then_some((attribute.row, h / 2))
                     };
-                    let Some((row, ch)) = src else {
-                        return Ok(None);
-                    };
-                    let x = channel(l, row, ch)?;
-                    let f = l.as_float(x);
-                    Ok(Some(l.narrow16(f)))
+                    match src {
+                        Some((row, ch)) => total(l, row, ch).map(Some),
+                        None => Ok(None),
+                    }
                 };
-                let h = 2 * attribute.channel;
+                let h = 2 * attribute.channel + u8::from(attribute.high);
                 let c = self.cur;
-                if f16 {
-                    let lo = half(self, h + u8::from(attribute.high))?
-                        .ok_or("a packed input half no element holds")?;
+                if name == "v_interp_p1ll_f16" {
+                    // An f32 result from 16-bit vertex values.
+                    let f = half(self, h)?.ok_or("a packed input half no element holds")?;
+                    self.as_int(f)
+                } else if f16 {
+                    let f = half(self, h)?.ok_or("a packed input half no element holds")?;
+                    let lo = self.narrow16(f);
                     // omod and clamp are part of the f16 instruction; op_sel[3]
                     // picks the destination half.
                     let lo = self.half_modifiers(inst, lo);
                     return self.write_half(inst, lo, None);
-                } else if mode == 1 {
+                } else if matches!(eval, Eval::Mode(1)) {
                     // The whole dword of a flat input: both halves.
+                    let h = 2 * attribute.channel;
                     let z = self.s.m.i32(0);
-                    let lo = half(self, h)?.unwrap_or(z);
-                    let hi = half(self, h + 1)?.unwrap_or(z);
+                    let lo = match half(self, h)? {
+                        Some(f) => self.narrow16(f),
+                        None => z,
+                    };
+                    let hi = match half(self, h + 1)? {
+                        Some(f) => self.narrow16(f),
+                        None => z,
+                    };
                     let k16 = self.s.m.i32(16);
                     let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
                     self.s.m.bin(c, Bin::Or, lo, hi)
@@ -8244,6 +8352,21 @@ impl<'a> Lower<'a> {
         // A pixel interpolates in every lane; guards only hide inactive ones.
         self.write(inst, Reg::V(reg), x, None);
         Ok(())
+    }
+
+    /// The attribute of a first interpolation half at `site` whose pair's
+    /// barycentric register is overwritten in lanes that reach the second
+    /// half (so both halves evaluate with the values they read).
+    fn computed_first(&self, site: Site) -> Option<Attribute> {
+        self.x.io.interps.iter().find_map(|(second, interp)| match interp {
+            Interp::Interpolated {
+                attribute,
+                first,
+                unless,
+                ..
+            } if first.contains(&site) && !self.avoids(*second, unless) => Some(*attribute),
+            _ => None,
+        })
     }
 
     /// Whether no lane that runs the instruction at `site` has been where
@@ -8295,6 +8418,102 @@ impl<'a> Lower<'a> {
             });
             !self.on_cycle(at) && !some_lane
         })
+    }
+
+    /// Whether the program reads attribute row `row` per vertex (an
+    /// interpolation with computed barycentrics, or P10 or P20): then its
+    /// element is declared constant and read with `attributeAtVertex`.
+    fn per_vertex(&self, row: u8) -> bool {
+        self.x.io.interps.iter().any(|(site, i)| match i {
+            Interp::Weighted { attribute } => attribute.row == row,
+            Interp::Vertex { attribute, vertex } => {
+                attribute.row == row && *vertex != 2 && self.interpolated(row)
+            }
+            Interp::Interpolated {
+                attribute, unless, ..
+            } => attribute.row == row && !self.avoids(*site, unless),
+        })
+    }
+
+    /// Whether the program interpolates attribute row `row` (so the
+    /// hardware holds P1 - P0 and P2 - P0 for it).
+    fn interpolated(&self, row: u8) -> bool {
+        self.x.io.interps.iter().any(|(_, i)| match i {
+            Interp::Interpolated { attribute, .. } | Interp::Weighted { attribute } => {
+                attribute.row == row
+            }
+            Interp::Vertex { .. } => false,
+        })
+    }
+
+    /// Channel `ch` of input row `row` evaluated as `eval` says, as raw bits.
+    fn eval_channel(&mut self, row: u8, ch: u8, eval: Eval) -> Result<V, Why> {
+        let (id, col) = self
+            .find_input(row, ch)
+            .ok_or("an input the signature lacks")?;
+        let mode = match eval {
+            Eval::Mode(mode) => mode,
+            Eval::Weights { .. } => 1,
+        };
+        let e = &mut self.s.inputs[id];
+        if e.interp != mode && e.usage != 0 {
+            return Err("one input interpolated two ways");
+        }
+        e.interp = mode;
+        let Eval::Weights { p0, i, j } = eval else {
+            return match self.load_any_input(id, col) {
+                Val::I32(x) => Ok(x),
+                _ => Err("an input"),
+            };
+        };
+        let v0 = self.vertex_input(id, col, 0);
+        let c = self.cur;
+        let mut acc = p0.then_some(v0);
+        for (k, w) in [(1, i), (2, j)] {
+            let Some(w) = w else { continue };
+            let vk = self.vertex_input(id, col, k);
+            let d = self.s.m.bin(c, Bin::Sub, vk, v0);
+            acc = Some(match acc {
+                Some(a) => self.fmad(w, d, a),
+                None => self.s.m.bin(c, Bin::Mul, w, d),
+            });
+        }
+        let acc = acc.ok_or("an interpolation")?;
+        Ok(self.as_int(acc))
+    }
+
+    /// Vertex `k` (0 the provoking vertex, as `barycentric` orders them)
+    /// of a constant input element's channel, as a float.
+    fn vertex_input(&mut self, id: usize, col: u8, k: u8) -> V {
+        let e = &mut self.s.inputs[id];
+        e.usage |= 1 << col;
+        let int = e.comp != 9;
+        let (ty, suffix) = if int {
+            (self.s.t.i32, ".i32")
+        } else {
+            (self.s.t.f32, ".f32")
+        };
+        self.s.flags |= flags::BARYCENTRICS;
+        let entry = self.s.entry;
+        let args = [
+            self.s.m.i32(id as u32),
+            self.s.m.i32(0),
+            self.s.m.i8(col),
+            self.s.m.i8(k),
+        ];
+        let v = self.s.op(
+            entry,
+            &format!("attributeAtVertex{suffix}"),
+            Attr::ReadNone,
+            ty,
+            137,
+            &args,
+        );
+        if int {
+            self.s.m.cast(entry, Cast::Bitcast, v, self.s.t.f32)
+        } else {
+            v
+        }
     }
 
     /// What holds in a lane that goes from IR block `q` to `b`.
