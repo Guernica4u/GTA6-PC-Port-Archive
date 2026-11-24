@@ -98,22 +98,21 @@ fn last(kind: u32) -> &'static AtomicU64 {
     &LAST[(kind as usize).min(LAST.len() - 1)]
 }
 
-/// The scheduled tick and delay, in nanoseconds. A zero offset can take
-/// the latest tick that has already passed.
+/// The scheduled tick and delay, in nanoseconds. Whole intervals in the
+/// offset advance the tick. Wait for its remaining offset if the event is
+/// still pending; otherwise take it at once, unless a wait already took it.
 fn event_after(elapsed: u128, interval: u128, first: u64, last: u64, offset: u128) -> (u64, u128) {
     let interval = interval.max(1);
-    let next = elapsed / interval + u128::from(offset != 0);
-    let tick = (first + (next + offset / interval) as u64).max(last + 1);
+    let tick = (first + (elapsed / interval + offset / interval) as u64).max(last + 1);
     let at = u128::from(tick - first) * interval + offset % interval;
     (tick, at.saturating_sub(elapsed))
 }
 
 /// The tick a wait for `kind` ends on, and how long until it: the first
 /// one after the last a wait for `kind` took (an event happens once per
-/// tick: a wait woken a little early must not let the next one end on the
-/// same tick), the latest one passed if that is later. A wait begun after
-/// its tick passed (a frame slower than the interval) so ends at once, as
-/// an event signalled at the tick and left signalled until a wait takes it
+/// tick), or the current scheduled tick if that is later. A wait begun
+/// after that tick's event passed ends at once, as an event left signalled
+/// until a wait takes it
 /// would (assumed: nothing we have says what a late wait does); waiting for
 /// the next tick instead cost the cutscene's frames 0-33 ms each (4 % of
 /// the frame thread, run perf3). A wait that
@@ -242,8 +241,14 @@ mod tests {
         // A quarter into the first millisecond after now.
         assert_eq!(event_after(250_000, MS, 0, 0, 0), (1, 750_000));
         assert_eq!(event_after(250_000, MS, 0, 0, 300_000), (1, 1_050_000));
-        // An offset past a tick moves the event into the next one.
-        assert_eq!(event_after(250_000, MS, 0, 0, MS + 200_000), (2, 1_950_000));
+        // An offset past a tick moves the event into the next one; that
+        // event is still ahead and must not be skipped.
+        assert_eq!(event_after(250_000, MS, 0, 0, MS + 200_000), (1, 950_000));
+        // Review note on #321: between a tick and its offset, that tick's
+        // event is still pending.
+        assert_eq!(event_after(1_100_000, MS, 0, 0, 300_000), (1, 200_000));
+        // A late wait takes the latest tick without waiting again.
+        assert_eq!(event_after(2_400_000, MS, 0, 0, 300_000), (2, 0));
         // A kind already woken on a tick cannot wake on it again, offset or
         // no offset.
         assert_eq!(event_after(250_000, MS, 0, 1, 0), (2, 1_750_000));
