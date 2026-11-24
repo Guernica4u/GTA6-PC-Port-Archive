@@ -876,6 +876,7 @@ mod tests {
             offset: 0,
             encoding,
             opcode,
+            name: crate::gfx10::name(encoding, opcode),
             words: words.to_vec(),
         }
     }
