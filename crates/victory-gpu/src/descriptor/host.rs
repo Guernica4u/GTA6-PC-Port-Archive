@@ -392,32 +392,6 @@ impl HostHeap {
         }
     }
 
-    /// Recycles `n` dynamic slots in ring-buffer fashion when the dynamic pool
-    /// is otherwise exhausted, preventing draw/dispatch drops.
-    pub(crate) fn recycle_dynamic(&self, n: u32) -> Option<u32> {
-        if self.sampler || n == 0 || n > self.dynamic {
-            return None;
-        }
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
-        let n = n as usize;
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            tracing::warn!(
-                n,
-                dynamic = self.dynamic,
-                "dynamic descriptor pool exhausted: recycling slots in ring-buffer fashion"
-            );
-        });
-        let mut candidate = *next as usize;
-        if candidate + n > self.dynamic as usize {
-            candidate = 0;
-        }
-        taken[candidate..candidate + n].fill(true);
-        *next = ((candidate + n) % self.dynamic as usize) as u32;
-        Some(self.count + candidate as u32)
-    }
-
     /// The title slots this heap has host slots for; fewer than the title's
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
