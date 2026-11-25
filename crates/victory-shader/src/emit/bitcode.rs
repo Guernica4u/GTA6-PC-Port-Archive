@@ -319,6 +319,72 @@ impl Module {
         self.consts.iter().any(|(_, c)| *c == want)
     }
 
+    /// The value of a 32-bit integer that any optimiser can work out before
+    /// the program runs: a constant, or integer arithmetic, casts and selects
+    /// over such values (the builder itself folds nothing, a driver does).
+    /// `None` when it depends on anything else.
+    pub fn known_i32(&self, v: V) -> Option<u32> {
+        self.known_int(v, 32)
+    }
+
+    fn known_int(&self, v: V, depth: u32) -> Option<u32> {
+        let depth = depth.checked_sub(1)?;
+        let (bits, int) = match self.types[self.type_of(v).0 as usize] {
+            TypeDef::Int(bits) if bits <= 32 => (bits, true),
+            TypeDef::Float => (32, false),
+            _ => return None,
+        };
+        let mask = u32::MAX >> (32 - bits);
+        let x = match v {
+            V::Const(i) => match self.consts[i as usize].1 {
+                Const::Int(x) => x as u32,
+                Const::Float(x) => x,
+                _ => return None,
+            },
+            V::Inst(i) => match self.insts[i as usize].op {
+                Op::Bin(op, a, b) if int => {
+                    let (a, b) = (self.known_int(a, depth)?, self.known_int(b, depth)?);
+                    let signed = |x: u32| ((x << (32 - bits)) as i32) >> (32 - bits);
+                    match op {
+                        Bin::Add => a.wrapping_add(b),
+                        Bin::Sub => a.wrapping_sub(b),
+                        Bin::Mul => a.wrapping_mul(b),
+                        Bin::Shl if b < bits => a << b,
+                        Bin::LShr if b < bits => (a & mask) >> b,
+                        Bin::AShr if b < bits => (signed(a) >> b) as u32,
+                        Bin::And => a & b,
+                        Bin::Or => a | b,
+                        Bin::Xor => a ^ b,
+                        _ => return None,
+                    }
+                }
+                Op::Cast(op, x) => {
+                    let from = match self.types[self.type_of(x).0 as usize] {
+                        TypeDef::Int(bits) if bits <= 32 => bits,
+                        TypeDef::Float if op == Cast::Bitcast => 32,
+                        _ => return None,
+                    };
+                    let y = self.known_int(x, depth)?;
+                    match op {
+                        Cast::Trunc | Cast::ZExt | Cast::Bitcast => y & u32::MAX >> (32 - from),
+                        Cast::SExt => (((y << (32 - from)) as i32) >> (32 - from)) as u32,
+                        _ => return None,
+                    }
+                }
+                Op::Select(cond, t, f) => match self.known_int(cond, depth) {
+                    Some(c) => self.known_int(if c & 1 != 0 { t } else { f }, depth)?,
+                    None => {
+                        let t = self.known_int(t, depth)?;
+                        (Some(t) == self.known_int(f, depth)).then_some(t)?
+                    }
+                },
+                _ => return None,
+            },
+            _ => return None,
+        };
+        Some(x & mask)
+    }
+
     /// Gives constant `old` the content of `new` (both stay valid).
     pub fn replace_const(&mut self, old: V, new: V) {
         if let (V::Const(o), V::Const(n)) = (old, new) {
@@ -1231,6 +1297,44 @@ mod tests {
         assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 1);
         assert_eq!(signed(-3), 7);
         assert_eq!(signed(2), 4);
+    }
+
+    /// `known_i32` sees through the integer arithmetic over constants that
+    /// an `op_sel` half selection is made of, and stops at run-time values
+    /// and float arithmetic.
+    #[test]
+    fn known_i32_folds_constant_integer_arithmetic() {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let fty = m.func_ty(i32t, vec![i32t]);
+        let f = m.function("dx.op.input", fty, Some(Attr::ReadNone), false);
+        let b = m.new_block();
+        let two = m.i32(0x4000_0000);
+        let (k16, low) = (m.i32(16), m.i32(0xFFFF));
+        let top = m.bin(b, Bin::LShr, two, k16);
+        let bottom = m.bin(b, Bin::And, two, low);
+        let hi = m.bin(b, Bin::Shl, bottom, k16);
+        let swapped = m.bin(b, Bin::Or, top, hi);
+        assert_eq!(m.known_i32(swapped), Some(0x4000));
+        let minus16 = m.i32(0xFFFF_FFF0);
+        assert_eq!(m.known_i32(minus16), Some(0xFFFF_FFF0));
+        let float = m.f32(2.0f32.to_bits());
+        let bits = m.cast(b, Cast::Bitcast, float, i32t);
+        assert_eq!(m.known_i32(bits), Some(0x4000_0000));
+        let shifted = m.bin(b, Bin::AShr, minus16, k16);
+        assert_eq!(m.known_i32(shifted), Some(u32::MAX));
+
+        let input = m.call(b, f, vec![two]);
+        assert_eq!(m.known_i32(input), None);
+        let mixed = m.bin(b, Bin::And, input, low);
+        assert_eq!(m.known_i32(mixed), None);
+        let yes = m.cmp(b, pred::EQ, input, two);
+        let same = m.select(b, yes, swapped, top);
+        assert_eq!(m.known_i32(same), Some(0x4000));
+        let either = m.select(b, yes, swapped, two);
+        assert_eq!(m.known_i32(either), None);
+        let sum = m.bin(b, Bin::Add, float, float);
+        assert_eq!(m.known_i32(sum), None);
     }
 
     /// A structured shader's shape: `stages` if/else diamonds in a row, each
