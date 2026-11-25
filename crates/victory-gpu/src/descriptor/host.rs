@@ -98,6 +98,11 @@ const DYNAMIC: u32 = 1 << 18;
 /// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
+/// Slots kept free at the top of a heap capped at [`PORTABLE_VIEWS`] for the
+/// null buffer views `victory_shader::emit::NULL_BUFFER_VIEW` names and the
+/// pairs beside them: with the clamp at the heap's size, the top of the heap
+/// is the only place they can be.
+const NULL_RESERVE: u32 = 1024;
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -153,15 +158,23 @@ impl HostHeap {
         } else if let Ok(heap) = make((count + DYNAMIC).max(views)) {
             (heap, count, DYNAMIC)
         } else {
-            // shortcut: a host that caps its heaps below `HEAP_VIEWS` (NVIDIA)
-            // faults on an index past them, as before the clamp.
+            // A host that caps its heaps at `PORTABLE_VIEWS` (every host:
+            // that is the tier-2 limit) gets the largest heap it will make.
             match make(count + MIN_DYNAMIC) {
                 Ok(heap) => (heap, count, MIN_DYNAMIC),
                 Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
                     // shortcut: descriptors past the host's limit are left
                     // out; a title that reaches them needs remapping.
                     tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+                    // `HEAP_VIEWS` - what translated shaders clamp their
+                    // indices below - is this heap's whole size, so the top
+                    // of it is not dynamic slots: the null buffer views live
+                    // there, and so does room for the pairs below them.
+                    (
+                        make(PORTABLE_VIEWS).ok()?,
+                        PORTABLE_VIEWS - MIN_DYNAMIC,
+                        MIN_DYNAMIC - NULL_RESERVE,
+                    )
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
