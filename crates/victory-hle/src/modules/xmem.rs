@@ -821,6 +821,11 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
+    // No pages: nothing changes, wherever `to` is (a count of 0 next to a
+    // reservation shown whole would otherwise be refused as inside it).
+    if len == 0 {
+        return true;
+    }
     let mut physical = physical();
     if in_whole(&physical, to, len) {
         tracing::warn!(to = format_args!("{to:#x}"), len, "page mappings into a reservation shown whole");
