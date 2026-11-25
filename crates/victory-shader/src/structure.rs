@@ -474,6 +474,11 @@ pub struct Structured {
     /// What a program run as the console runs it, every lane through every
     /// block, guards its vector instructions with ([`structure_console`]).
     pub execs: Vec<Vec<Option<Bool>>>,
+    /// The high dword read with each low dword of a wave64 mask in
+    /// [`Self::masks`] or [`Self::other`], where the two are different
+    /// values: the halves of a mask held as a number need not come from
+    /// one instruction.
+    pub pairs: HashMap<Value, Value>,
     /// `v_readlane_b32` results of a constant lane: the SGPR value that
     /// `v_writelane_b32` spilled to that lane, the same along every path.
     pub restored: HashMap<Value, Value>,
@@ -526,6 +531,9 @@ fn structure_as(
     }
     loop {
         let execs = l.masks_in_order();
+        while let Some(key) = l.console_pending.pop() {
+            l.mask(key);
+        }
         let cond = l.paths()?;
         let wrong = l.wrong_joins(&cond);
         if wrong.is_empty() {
@@ -544,6 +552,7 @@ struct Lanes<'a> {
     p: &'a Program,
     /// See [`structure_console`].
     console: bool,
+    console_pending: Vec<Key>,
     order: Vec<usize>,
     /// Reverse-postorder index per block.
     index: Vec<usize>,
@@ -626,6 +635,7 @@ impl<'a> Lanes<'a> {
         let mut l = Lanes {
             p,
             console,
+            console_pending: Vec::new(),
             order,
             index,
             incoming,
@@ -905,7 +915,6 @@ impl<'a> Lanes<'a> {
                 .filter(|(lo, hi)| lo != hi)
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
-            paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
             active: self.active,
             restored: self.restored.into_iter().collect(),
             discards: self
@@ -917,6 +926,14 @@ impl<'a> Lanes<'a> {
             exits,
             guards,
             execs: execs.to_vec(),
+            pairs: self
+                .masks
+                .keys()
+                .chain(self.other.keys())
+                .filter(|(lo, hi)| lo != hi)
+                .copied()
+                .collect(),
+            paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
             reach: cond.to_vec(),
         })
     }
@@ -1052,6 +1069,9 @@ impl<'a> Lanes<'a> {
                     return Some((m, derived));
                 }
             }
+        }
+        if self.console {
+            self.console_pending.extend(args);
         }
         let born = self.index[block];
         Some((self.b.atom(Atom::Phi(id), born), derived))

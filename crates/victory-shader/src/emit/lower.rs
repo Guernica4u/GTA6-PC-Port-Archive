@@ -132,10 +132,22 @@ enum Stop {
     Fail(ShaderError),
 }
 
+const UNTRACKED_SELECT: Why = "a select on an untracked mask";
+
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    match lower_program(parts, false) {
+        Err(ShaderError::Unsupported {
+            what: UNTRACKED_SELECT,
+            ..
+        }) if parts.native.stage == HwStage::Cs => lower_program(parts, true),
+        result => result,
+    }
+}
+
+fn lower_program(parts: &Parts, numeric_selects: bool) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run() {
+        match Lower::new(parts, &bad, numeric_selects).run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -282,10 +294,11 @@ struct Lower<'a> {
     split: bool,
     /// Split, and run as the console runs it ([`CONSOLE_FLOW`]).
     console_cf: bool,
-    /// Masks held as numbers whose number is being read (see `atom`).
-    opaque_open: HashSet<Value>,
     /// Split without [`Self::console_cf`] cannot run it, the console flow can.
     wants_console_flow: bool,
+    /// Why a wave64 program that needs its whole wave cannot take the
+    /// console flow on a host without 64-lane waves.
+    no_console_flow: Option<Why>,
     /// The console thread's flat id in the group (relabelled; see
     /// [`Self::thread_id`]).
     console_flat: Option<V>,
@@ -311,6 +324,8 @@ struct Lower<'a> {
     mask_ok: bool,
     /// Ballots of masks read as data, by low dword: (low, high).
     ballots: HashMap<Value, (V, V)>,
+    /// Masks held as numbers whose number is being read (see `atom`).
+    opaque_open: HashSet<Value>,
     /// Masks whose ballot is being built: a mask whose lane bit needs its
     /// own value as a number (an opaque mask keyed by a dword it shares
     /// with another) would otherwise recurse until the stack overflows.
@@ -636,6 +651,16 @@ fn scalar_constant(operand: Operand) -> Option<u32> {
     }
 }
 
+/// Whether a lane mask is held as a number: a constant lane set or a value
+/// no instruction derives from EXEC or a compare, of which a lane tests its
+/// console lane's bit.
+fn numeric(bools: &crate::structure::Bools, mask: Bool) -> bool {
+    bools
+        .support(mask)
+        .iter()
+        .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
+}
+
 /// The dwords an `s_load_dword*` reads.
 fn smem_dwords(name: &str) -> Option<u32> {
     match name.strip_prefix("s_load_dword")? {
@@ -666,7 +691,7 @@ fn code_table_start(p: &crate::ir::Program, addresses: &[&crate::resource::Addre
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, numeric_selects: bool) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -687,6 +712,7 @@ impl<'a> Lower<'a> {
         let mut console_lanes = false;
         let mut split = false;
         let mut wants_console_flow = false;
+        let mut no_console_flow = None;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -697,6 +723,7 @@ impl<'a> Lower<'a> {
             // of 8, 32 or 4): the rest may read the other half of a wave64.
             let in_half = |i: &Inst| {
                 i.name().starts_with("ds_swizzle")
+                    || i.name() == "ds_bpermute_b32"
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
             };
             let spills = spill_writes(p, x.st, &phi_at);
@@ -706,7 +733,9 @@ impl<'a> Lower<'a> {
                 if is_named_lane(i) {
                     return named_lane(i);
                 }
-                n.contains("permute") || n.starts_with("v_mbcnt") || reads_mask_as_data(x.st, i)
+                (n.contains("permute") && n != "ds_bpermute_b32")
+                    || n.starts_with("v_mbcnt")
+                    || reads_mask_as_data(x.st, i)
             };
             let reads_whole = insts().any(whole);
             let masks_held = {
@@ -716,6 +745,32 @@ impl<'a> Lower<'a> {
                     LaneExit::Branch { when, .. } => Some(when),
                     _ => None,
                 });
+                // Numeric selects need fixed lane numbering only if the
+                // first lowering attempt needs an otherwise untracked result.
+                let selectors =
+                    insts()
+                        .filter(|_| numeric_selects)
+                        .filter_map(|i| match &i.fields {
+                            Fields::Valu(v) if i.name() == "v_cndmask_b32" => match v.src.get(2) {
+                                Some(&Operand::Scalar { code, .. }) => i.read(Reg::S(code)),
+                                _ => None,
+                            },
+                            _ => None,
+                        });
+                let selectors = selectors
+                    .filter(|m| !x.st.masks.contains_key(m))
+                    .filter_map(|m| x.st.other.get(&m).copied());
+                // (An inline constant other than no lane or every lane is a
+                // lane set too.)
+                let constant = numeric_selects
+                    && insts().any(|i| match &i.fields {
+                        Fields::Valu(v) if i.name() == "v_cndmask_b32" => match v.src.get(2) {
+                            Some(&Operand::Const(k)) => crate::resource::inline(k)
+                                .is_some_and(|x| x != 0 && x != u32::MAX),
+                            _ => false,
+                        },
+                        _ => false,
+                    });
                 let mut all: Vec<Bool> =
                     x.st.guards
                         .iter()
@@ -723,15 +778,11 @@ impl<'a> Lower<'a> {
                         .flatten()
                         .copied()
                         .chain(whens)
+                        .chain(selectors)
                         .collect();
                 all.sort_unstable();
                 all.dedup();
-                all.into_iter().any(|g| {
-                    x.st.bools
-                        .support(g)
-                        .iter()
-                        .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
-                })
+                constant || all.into_iter().any(|g| numeric(&x.st.bools, g))
             };
             // SGPR spills keep main's per-lane form: on a host that runs the
             // console's wave size, with that wave size and the lane writes
@@ -762,17 +813,30 @@ impl<'a> Lower<'a> {
                 && x.target.runs(32)
                 && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
             // The rest of such programs need the halves to exchange values
-            // (masks read whole, lanes of the other half): the console flow,
-            // for a group of one console wave without LDS.
-            wants_console_flow = console_lanes
-                && !split
-                && x.native.wave64
-                && !x.target.runs(64)
-                && x.target.runs(32)
-                && s.lds_dwords == 0
-                && cs.threads.iter().product::<u32>() <= 64
-                && !insts().any(|i| i.name().contains("permute"))
-                && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
+            // (masks read whole, lanes of the other half) or to share LDS in
+            // the console's instruction order: the console flow, for a group
+            // of one console wave. What keeps a program out of it is the
+            // reason it stops with.
+            let needs_wave64 =
+                (console_lanes || one_wave && s.lds_dwords > 0) && !split && x.native.wave64;
+            if needs_wave64 && !x.target.runs(64) {
+                no_console_flow = if cs.threads.iter().product::<u32>() > 64 {
+                    Some(
+                        "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
+                    )
+                } else if insts()
+                    .any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32")
+                {
+                    Some("ds_permute across the halves of a wave64 on a host without 64-lane waves")
+                } else if s.threads.map(|t| t.iter().product::<u32>()) != Some(64)
+                    && !(0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty())
+                {
+                    Some("a whole-wave section of a wave64 on a host without 64-lane waves")
+                } else {
+                    None
+                };
+                wants_console_flow = no_console_flow.is_none() && x.target.runs(32);
+            }
             // On a host that runs the console's wave size: lane reads and
             // writes other than SGPR spills in a divergent program (see
             // [`CONSOLE_FLOW`]).
@@ -782,14 +846,25 @@ impl<'a> Lower<'a> {
                     .iter()
                     .all(|a| matches!(a, Atom::Uniform(_)))
             };
+            // (The lane reads a whole-wave section makes are its own: the
+            // section is lowered as wave operations in either form. One
+            // outside a section is what needs the console flow.)
+            let lane_access_outside_sections = p.blocks.iter().enumerate().any(|(b, block)| {
+                let sections = super::wave::sections(p, b);
+                block.insts.iter().enumerate().any(|(i, inst)| {
+                    named_lane(inst)
+                        && !sections
+                            .iter()
+                            .any(|(&start, s)| (start..=s.end).contains(&i))
+                })
+            });
             wants_console_flow |= x.target.runs(wave)
-                && insts().any(named_lane)
+                && lane_access_outside_sections
                 && x.st
                     .exits
                     .iter()
                     .any(|e| matches!(*e, LaneExit::Branch { when, .. } if !uniform(when)))
-                && !insts().any(|i| i.name().contains("permute"))
-                && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
+                && !insts().any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32");
             if x.console_cf {
                 console_lanes = true;
                 // In halves only where the host cannot run the console wave.
@@ -890,8 +965,8 @@ impl<'a> Lower<'a> {
             console_lanes,
             split,
             console_cf: x.console_cf,
-            opaque_open: HashSet::new(),
             wants_console_flow,
+            no_console_flow,
             console_flat: None,
             xchg: None,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
@@ -907,6 +982,7 @@ impl<'a> Lower<'a> {
             },
             mask_ok: false,
             ballots: HashMap::new(),
+            opaque_open: HashSet::new(),
             balloting: HashSet::new(),
             def_block: p
                 .blocks
@@ -1432,7 +1508,7 @@ impl<'a> Lower<'a> {
         {
             return Err("a wave reduction in a mesh shader");
         }
-        if self.split {
+        if self.split && !self.console_cf {
             return Err("a wave reduction in a wave64 program split in halves");
         }
         let c = self.cur;
@@ -1499,6 +1575,69 @@ impl<'a> Lower<'a> {
                 )
             }
         };
+        if self.console_cf && self.split {
+            // The halves exchange dwords: a float goes as its bits. (The
+            // console adds a wave's floats in its own order, the host's
+            // wave operations in theirs, and the halves' sums are added
+            // last: sums may differ in the last bits, as they already do
+            // in one host wave.)
+            let bits = |l: &mut Self, v: V| if float { l.as_int(v) } else { v };
+            let value = |l: &mut Self, v: V| if float { l.as_float(v) } else { v };
+            // The console-flow path keeps both halves converged. The exclusive
+            // prefix for the upper half includes the complete lower half's sum.
+            if prefix.is_some() {
+                let add = self.s.m.i8(0);
+                let unsigned = self.s.m.i8(if float { 0 } else { 1 });
+                let total = self.s.op(
+                    c,
+                    &format!("waveActiveOp.{sfx}"),
+                    Attr::NoUnwind,
+                    ty,
+                    119,
+                    &[arg, add, unsigned],
+                );
+                let total = bits(self, total);
+                let (lo, _) = self.exchange(c, total);
+                let lo = value(self, lo);
+                let (_, half) = self.console_lane();
+                let zero = self.s.m.i32(0);
+                let upper = self.s.m.cmp(c, pred::NE, half, zero);
+                // (A select of the sums, not of the carry: adding 0.0 would
+                // turn a lower half's -0.0 into 0.0.)
+                let carried = self.s.m.bin(c, Bin::Add, r, lo);
+                let r = self.s.m.select(c, upper, carried, r);
+                return Ok(bits(self, r));
+            }
+            let r = bits(self, r);
+            let (lo, hi) = self.exchange(c, r);
+            if float {
+                let (lo, hi) = (self.as_float(lo), self.as_float(hi));
+                let r = match op {
+                    Op::AddF => self.s.m.bin(c, Bin::Add, lo, hi),
+                    // FMin and FMax, as the per-lane `v_min_f32` / `v_max_f32`.
+                    Op::MinF => self.binary(36, lo, hi),
+                    _ => self.binary(35, lo, hi),
+                };
+                return Ok(self.as_int(r));
+            }
+            return Ok(match op {
+                Op::AddU => self.s.m.bin(c, Bin::Add, lo, hi),
+                Op::And => self.s.m.bin(c, Bin::And, lo, hi),
+                Op::Or => self.s.m.bin(c, Bin::Or, lo, hi),
+                Op::Xor => self.s.m.bin(c, Bin::Xor, lo, hi),
+                Op::MinU | Op::MaxU | Op::MinI | Op::MaxI => {
+                    let pred = match op {
+                        Op::MinU => pred::IULT,
+                        Op::MaxU => pred::IUGT,
+                        Op::MinI => pred::SLT,
+                        _ => pred::SGT,
+                    };
+                    let choose = self.s.m.cmp(c, pred, lo, hi);
+                    self.s.m.select(c, choose, lo, hi)
+                }
+                _ => return Err("a whole-wave reduction across 32-lane halves"),
+            });
+        }
         Ok(if float { self.as_int(r) } else { r })
     }
 
@@ -1515,6 +1654,9 @@ impl<'a> Lower<'a> {
             return Err(unsupported(
                 0,
                 match (n, self.console_lanes) {
+                    (64, _) if self.no_console_flow.is_some() => {
+                        self.no_console_flow.expect("checked")
+                    }
                     (64, true) => "console wave64 lanes on a host without 64-lane waves",
                     (64, false) => {
                         "a wave64 group sharing LDS without barriers on a host without 64-lane waves"
@@ -2978,13 +3120,18 @@ impl<'a> Lower<'a> {
                 .find(|q| q.reg == h)
                 .map(|q| q.value);
         }
-        let b = *self.def_block.get(&lo)?;
-        let inst = p.blocks[b]
-            .insts
-            .iter()
-            .find(|i| i.writes.iter().any(|w| w.1 == lo))?;
-        let &(reg, _) = inst.writes.iter().find(|w| w.1 == lo)?;
-        inst.write(pick(reg)?)
+        // Written with it by one instruction; else (two instructions, one
+        // for each dword) the dword the mask's reader takes with it.
+        let together = || {
+            let b = *self.def_block.get(&lo)?;
+            let inst = p.blocks[b]
+                .insts
+                .iter()
+                .find(|i| i.writes.iter().any(|w| w.1 == lo))?;
+            let &(reg, _) = inst.writes.iter().find(|w| w.1 == lo)?;
+            inst.write(pick(reg)?)
+        };
+        together().or_else(|| self.x.st.pairs.get(&lo).copied())
     }
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
@@ -3580,6 +3727,21 @@ impl<'a> Lower<'a> {
         }
         if self.s.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
+        }
+        if self.console_cf
+            && self.split
+            && self
+                .s
+                .threads
+                .is_some_and(|t| t.iter().product::<u32>() > 32)
+        {
+            // The console runs an instruction in all 64 lanes before the
+            // next one. The halves are two host waves, both here (console
+            // flow): a group barrier before each LDS access puts it after
+            // every earlier one, whichever half made it.
+            let (mode, void) = (self.s.m.i32(1 | 8), self.s.t.void);
+            self.s
+                .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
         // shortcut: LDS addresses are taken as aligned to what they access.
@@ -6846,37 +7008,49 @@ impl<'a> Lower<'a> {
                 int(self, r)
             }
             "v_cndmask_b32" => {
+                // A selector that derives from neither EXEC nor a compare
+                // and is not uniform (a constant, a number built from
+                // scalars) is a mask held as a number: the lane tests its
+                // console lane's bit. A compute program needs console lanes
+                // for that, and the in-half form cannot test the high word:
+                // the select is deferred there, and `lower` tries again
+                // with console lanes only if its result is used.
+                let numeric_mask = self.console_lanes && (!self.split || self.console_cf);
+                let deferred = self.mask_data == MaskData::Console && !numeric_mask;
                 let cond = match v.src.get(2) {
                     Some(&Operand::Scalar { code, .. }) => {
-                        let m = inst
-                            .read(Reg::S(code))
-                            .and_then(|m| {
-                                self.x
-                                    .st
-                                    .masks
-                                    .get(&m)
-                                    .or_else(|| self.x.st.other.get(&m))
-                                    .copied()
-                            })
-                            .ok_or("a select on an untracked mask")?;
+                        let read = inst.read(Reg::S(code));
+                        let m = match read.and_then(|m| self.x.st.masks.get(&m).copied()) {
+                            Some(m) => m,
+                            None => {
+                                let m = read
+                                    .and_then(|m| self.x.st.other.get(&m).copied())
+                                    .ok_or(UNTRACKED_SELECT)?;
+                                if deferred && numeric(&self.x.st.bools, m) {
+                                    return Err(UNTRACKED_SELECT);
+                                }
+                                m
+                            }
+                        };
                         self.boolean(m, c)?
                     }
                     Some(&Operand::Const(k)) => {
-                        let x =
-                            crate::resource::inline(k).ok_or("a select on an untracked mask")?;
+                        let x = crate::resource::inline(k).ok_or(UNTRACKED_SELECT)?;
                         if x == 0 {
                             self.s.m.bool(false)
                         } else if x == u32::MAX {
                             self.s.m.bool(true)
-                        } else if self.console_lanes {
+                        } else if numeric_mask {
                             let lo = self.s.m.i32(x);
                             let hi = self.s.m.i32(if (x as i32) < 0 { u32::MAX } else { 0 });
                             self.lane_bit(c, lo, Some(hi))?
+                        } else if deferred {
+                            return Err(UNTRACKED_SELECT);
                         } else {
                             return Err("a constant lane mask");
                         }
                     }
-                    _ => return Err("a select on an untracked mask"),
+                    _ => return Err(UNTRACKED_SELECT),
                 };
                 if v.abs != 0 || v.neg != 0 {
                     // Sign-bit moves on the bits a select passes through
@@ -11503,3 +11677,7 @@ impl<'a> Lower<'a> {
 #[cfg(test)]
 #[path = "lower_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "lower_select_tests.rs"]
+mod select_tests;

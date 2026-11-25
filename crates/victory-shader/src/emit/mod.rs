@@ -413,6 +413,13 @@ impl Default for Target {
     }
 }
 
+/// A diagnostic: what the module this thread emitted last declares and
+/// calls (thread-group size, wave size, `dx.op` operations), for reports of
+/// a module the validator refuses. Nothing of the console program is in it.
+pub fn last_module_summary() -> String {
+    shader::last_summary()
+}
+
 /// How a translation is made.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Options {
@@ -1909,9 +1916,10 @@ mod tests {
             parts: vec![],
         };
         let p = crate::ir::build(&native.code, native.wave64, native.vgprs)?;
-        let st = crate::structure::structure(&p)?;
-        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let st = crate::structure::structure(&p);
+        let res = crate::resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
         let io = crate::io::raise(&p, native)?;
+        let st = st?;
         super::emit(&c, native, &p, &st, &io, &res, target)
     }
 
@@ -2037,7 +2045,7 @@ mod tests {
             emit_for(&two, NVIDIA),
             Err(crate::ShaderError::Unsupported {
                 offset: 0,
-                what: "console wave64 lanes on a host without 64-lane waves",
+                what: "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
             })
         );
         // The same code in waves of 32 runs on either.
