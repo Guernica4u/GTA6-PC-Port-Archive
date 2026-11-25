@@ -36,8 +36,26 @@ fn the_code_table_starts_after_the_instructions() {
     assert_eq!(code_table_start(&p, &[&fixed_after], 12), 12);
 }
 
-/// Whether a synthetic compute program translates with these input registers.
+/// Whether a synthetic compute program translates with these input registers:
+/// as `emit` lowers it, in the console flow where the per-lane form asks for
+/// it ([`super::CONSOLE_FLOW`]), else per lane.
 fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
+    match lowers_as(words, rsrc2, false, false) {
+        Err(crate::ShaderError::Unsupported { what, .. }) if what == super::CONSOLE_FLOW => {
+            lowers_as(words, rsrc2, true, false)
+                .or_else(|e| lowers_as(words, rsrc2, false, true).map_err(|_| e))
+        }
+        result => result,
+    }
+}
+
+/// [`lowers`] in one form: the console flow, or the per-lane form only.
+fn lowers_as(
+    words: &[u32],
+    rsrc2: u32,
+    console_cf: bool,
+    per_lane_only: bool,
+) -> Result<(), crate::ShaderError> {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -55,10 +73,15 @@ fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
     let st = structure::structure(&p).unwrap();
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
     let io = io::raise(&p, &native).unwrap();
+    let console = if console_cf {
+        Some(structure::structure_console(&p)?)
+    } else {
+        None
+    };
     lower(&Parts {
         native: &native,
         p: &p,
-        st: &st,
+        st: console.as_ref().unwrap_or(&st),
         io: &io,
         res: &res,
         inputs: vec![],
@@ -66,8 +89,8 @@ fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
         prims: vec![],
         mesh_stride: 0,
         target: super::super::Target::ANY,
-        console_cf: false,
-        per_lane_only: false,
+        console_cf,
+        per_lane_only,
         view_marks: false,
     })
     .map(|_| ())
@@ -926,6 +949,9 @@ fn a_scalar_result_needs_no_exec() {
         S_ENDPGM,
     ];
     lowers(&words, 1 << 7).expect("a lane read under an EXEC with no mask");
+    // The lane read in a branch lanes take differently asks for the console
+    // flow (#320); the per-lane form, its fallback, lowers it too.
+    lowers_as(&words, 1 << 7, false, true).expect("the per-lane form");
 }
 
 #[test]
