@@ -99,6 +99,9 @@ const DYNAMIC: u32 = 1 << 18;
 /// below [`PORTABLE_VIEWS`].
 const MIN_DYNAMIC: u32 = 1 << 16;
 
+/// Slot pairs kept on a capped heap for unified title memory copies.
+const CAPPED_PAIRS: u32 = 24_576;
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -154,23 +157,33 @@ impl HostHeap {
             && let Ok(heap) = make(total.max(views))
         {
             (heap, count, DYNAMIC)
-        } else if let Some(total) = count.checked_add(MIN_DYNAMIC)
-            && let Ok(heap) = make(total.max(views))
-        {
-            (heap, count, MIN_DYNAMIC)
-        } else if count.saturating_add(MIN_DYNAMIC) > PORTABLE_VIEWS
+        } else if let Some(total) = count.checked_add(DYNAMIC)
+            && total <= PORTABLE_VIEWS - CAPPED_PAIRS
             && let Ok(heap) = make(PORTABLE_VIEWS)
         {
-            // shortcut: descriptors past `PORTABLE_VIEWS - DYNAMIC` are
-            // remapped to dynamic slots; keeping the full `DYNAMIC` range
-            // prevents world draws from dropping on 1M-capped hosts (#1496).
+            (heap, count, DYNAMIC)
+        } else if let Some(total) = count.checked_add(MIN_DYNAMIC)
+            && total <= PORTABLE_VIEWS - CAPPED_PAIRS
+            && let Ok(heap) = make(PORTABLE_VIEWS)
+        {
+            (heap, count, MIN_DYNAMIC)
+        } else if count.saturating_add(MIN_DYNAMIC) > PORTABLE_VIEWS - CAPPED_PAIRS
+            && let Ok(heap) = make(PORTABLE_VIEWS)
+        {
+            // shortcut: descriptors past `PORTABLE_VIEWS - DYNAMIC - CAPPED_PAIRS`
+            // are left out (`HostHeap::mirror` returns `None` for
+            // `index >= self.count`); keeping the full `DYNAMIC` range and
+            // `CAPPED_PAIRS` prevents world draws from dropping on 1M-capped
+            // hosts (#1496).
+            let kept = PORTABLE_VIEWS - DYNAMIC - CAPPED_PAIRS;
             tracing::warn!(
                 count,
-                capped = PORTABLE_VIEWS - DYNAMIC,
+                capped = kept,
                 dynamic = DYNAMIC,
+                pairs = CAPPED_PAIRS,
                 "host view heap capped at {PORTABLE_VIEWS}"
             );
-            (heap, PORTABLE_VIEWS - DYNAMIC, DYNAMIC)
+            (heap, kept, DYNAMIC)
         } else {
             match count.checked_add(MIN_DYNAMIC).map(make) {
                 Some(Ok(heap)) => (heap, count, MIN_DYNAMIC),
@@ -2333,9 +2346,9 @@ mod tests {
             return; // no host GPU
         };
         assert_eq!(heap.dynamic, DYNAMIC);
-        assert!(heap.count + heap.dynamic >= PORTABLE_VIEWS);
+        assert!(heap.count + heap.dynamic + CAPPED_PAIRS >= PORTABLE_VIEWS);
 
-        let mid = PORTABLE_VIEWS - MIN_DYNAMIC;
+        let mid = PORTABLE_VIEWS - MIN_DYNAMIC - CAPPED_PAIRS;
         let Some(mid_heap) = HostHeap::new(false, mid) else {
             return; // no host GPU
         };
