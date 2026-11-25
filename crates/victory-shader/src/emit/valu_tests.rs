@@ -1669,6 +1669,22 @@ fn bfe_signed_and_unsigned_match_rdna2() {
 /// tables at s4 and s6 (slots 1 and 2); `used` lists (table user SGPR,
 /// kind, table offset in dwords, descriptor dwords).
 fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: bool) -> HostShader {
+    let shader = try_lower_cs32(words, used).expect("lower");
+    if let (true, Ok(mut v)) = (
+        validate,
+        validator::Validator::load(validator::Validator::default_path().as_deref()),
+    ) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    shader
+}
+
+/// [`lower_cs32`] without validation, returning what the lowering refuses.
+fn try_lower_cs32(
+    words: &[u32],
+    used: &[(u8, ResourceType, u32, u8)],
+) -> Result<HostShader, crate::ShaderError> {
     let param = |root, user_data, slot| RootParam {
         root,
         table_offset_dwords: 0,
@@ -1722,9 +1738,8 @@ fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: boo
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
-    })
-    .expect("lower");
-    let shader = HostShader {
+    })?;
+    Ok(HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
@@ -1739,15 +1754,7 @@ fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: boo
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
-    };
-    if let (true, Ok(mut v)) = (
-        validate,
-        validator::Validator::load(validator::Validator::default_path().as_deref()),
-    ) {
-        v.validate(&mut shader.dxil.clone())
-            .expect("DXIL validation failed");
-    }
-    shader
+    })
 }
 
 /// User data for [`lower_cs32`]'s programs: the root constant `k`, both
@@ -1906,6 +1913,163 @@ fn image_addresses_of_16_bits_and_clamps() {
             assert_eq!(got, want, "{label}: {k:#x}");
         }
     }
+}
+
+/// MIMG `op v[vdata], v[vaddr:...], s[8:15], s[16:19] dmask:0x1` of this
+/// dimension (0 1D, 1 2D, 2 3D), opcode bit 7 in bit 0.
+const fn mimg_sample(op: u32, vdata: u8, vaddr: u8, dim: u32, a16: bool) -> [u32; 2] {
+    [
+        0xF000_0000 | (op & 0x7F) << 18 | 1 << 8 | dim << 3 | op >> 7,
+        vaddr as u32 | (vdata as u32) << 8 | 2 << 16 | 4 << 21 | (a16 as u32) << 30,
+    ]
+}
+
+/// Gradient samples with 16-bit (`image_sample_d_g16`, `_d_cl_g16`) and
+/// 32-bit derivatives, each with 32-bit and 16-bit (`a16`) coordinates:
+/// the two are independent on RDNA2, `a16` packing the coordinates and
+/// clamp, `_g16` the derivatives, a direction per VGPR (LLVM's
+/// `gfx10_asm_mimg.s`: 2D `image_sample_d` with a16 takes 5 VGPRs,
+/// `image_sample_d_g16` without it 4). The texture is 64x16 with 5 levels,
+/// texel (x, y) of level n holding 1000 n + 64 y + x, under a point
+/// sampler. The gradients (1/16, 0) and (0, 19/32) span 4 and 9.5 texels:
+/// level 3.25, so level 3 (5.25 with a direction's halves swapped; 32-bit
+/// gradients read as 16-bit ones give level 4), where (u, v) = (0.3125,
+/// 0.75) is texel (2, 1). A clamp of 4 picks level 4, texel (1, 0). A
+/// comparison sample of 16-bit gradients is refused as the 32-bit one is
+/// (SM 6.6 has no `SampleCmpGrad`); the 3D forms are translated and
+/// validated only (the host tests have no 3D view).
+#[test]
+fn gradient_samples_of_16_bits() {
+    use windows::Win32::Graphics::Direct3D12::*;
+    // Descriptors: s[8:15] the texture (heap index 0), s[20:23] the raw UAV
+    // (1), s[16:19] the sampler.
+    let mut prefix = vec![s_mov_b32(5, 0x80), s_mov_b32(7, 0x80)];
+    for (op, dst, base, offset) in [(3u32, 8u32, 4u32, 0u32), (2, 20, 4, 0x20), (2, 16, 6, 0)] {
+        prefix.extend([
+            0x3D << 26 | op << 18 | dst << 6 | base >> 1,
+            125 << 25 | offset,
+        ]);
+    }
+    let used = [
+        (4, ResourceType::Srv, 0, 8),
+        (4, ResourceType::Uav, 8, 4),
+        (6, ResourceType::Sampler, 0, 4),
+    ];
+    // The address VGPRs set from literals, the sample into v20, stored.
+    let program = |op: u32, dim: u32, a16: bool, addr: &[u32]| {
+        let mut w = prefix.clone();
+        for (k, &x) in addr.iter().enumerate() {
+            w.extend([vop1(0x001, k as u8, 255), x]);
+        }
+        w.extend(mimg_sample(op, 20, 0, dim, a16));
+        w.extend(buffer_store_dword(20, 20, 0));
+        w.push(S_ENDPGM);
+        w
+    };
+    // Gradients x then y, then the coordinates and clamp; as f16, 1/16,
+    // 19/32, 0.3125, 0.75 and 4 are 0x2C00, 0x38C0, 0x3500, 0x3A00 and
+    // 0x4400.
+    let f = f32::to_bits;
+    let addr = |g16: bool, a16: bool, cl: bool| {
+        let mut a = if g16 {
+            vec![0x2C00, 0x38C0_0000]
+        } else {
+            vec![f(1.0 / 16.0), 0, 0, f(19.0 / 32.0)]
+        };
+        match (a16, cl) {
+            (false, false) => a.extend([f(0.3125), f(0.75)]),
+            (false, true) => a.extend([f(0.3125), f(0.75), f(4.0)]),
+            (true, false) => a.push(0x3A00_3500),
+            (true, true) => a.extend([0x3A00_3500, 0x4400]),
+        }
+        a
+    };
+    let at = |level: u32, x: u32, y: u32| (1000 * level + 64 * y + x) as f32;
+    let mut validator =
+        validator::Validator::load(validator::Validator::default_path().as_deref()).ok();
+    let mut lower = |label: &str, words: &[u32]| {
+        let shader = try_lower_cs32(words, &used).unwrap_or_else(|e| panic!("{label}: {e}"));
+        if let Some(v) = validator.as_mut() {
+            v.validate(&mut shader.dxil.clone())
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+        }
+        shader
+    };
+    // image_sample_d (0x22), _d_cl (0x23), and their `_g16` forms (0xA2,
+    // 0xA3), 2D.
+    let mut cases = Vec::new();
+    for (cl, g16, a16) in (0..8).map(|k| (k & 4 != 0, k & 2 != 0, k & 1 != 0)) {
+        let op = 0x22 | u32::from(cl) | u32::from(g16) << 7;
+        let label = format!(
+            "image_sample_d{}{}{}",
+            if cl { "_cl" } else { "" },
+            if g16 { "_g16" } else { "" },
+            if a16 { " a16" } else { "" }
+        );
+        let shader = lower(&label, &program(op, 1, a16, &addr(g16, a16, cl)));
+        let want = if cl { at(4, 1, 0) } else { at(3, 2, 1) };
+        cases.push((label, shader, want));
+    }
+    // 3D: x, y, z per direction, 16-bit gradients two VGPRs a direction.
+    for (label, op, a16, n) in [
+        ("3D image_sample_d a16", 0x22, true, 8),
+        ("3D image_sample_d_g16", 0xA2, false, 7),
+        ("3D image_sample_d_g16 a16", 0xA2, true, 6),
+    ] {
+        lower(label, &program(op, 2, a16, &vec![0; n]));
+    }
+    let refused = try_lower_cs32(&program(0xAA, 1, false, &[0; 5]), &used);
+    let Err(crate::ShaderError::Unsupported { what, .. }) = refused else {
+        panic!("translated image_sample_c_d_g16");
+    };
+    assert_eq!(what, "image_sample_c_d_g16");
+
+    let samplers = [D3D12_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        MaxAnisotropy: 1,
+        MaxLOD: f32::MAX,
+        ..Default::default()
+    }];
+    let mut texels = Vec::new();
+    for level in 0..5 {
+        for y in 0..16 >> level {
+            for x in 0..64 >> level {
+                texels.push([at(level, x, y), 0.0, 0.0, 1.0]);
+            }
+        }
+    }
+    let views = [View::Mipped(64, 16, 5, &texels), View::RawUav(1)];
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (adapter, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {adapter} device; skipped");
+            continue;
+        };
+        for (label, shader, want) in &cases {
+            let (root, pso) = host
+                .compute_pipeline(shader)
+                .unwrap_or_else(|e| panic!("{adapter} {label}: {e}"));
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(user_data_cs32(shader, 0)))],
+                        views: &views,
+                        samplers: &samplers,
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{adapter} {label}: {e}"));
+            assert_eq!(f32::from_bits(out[0][0]), *want, "{adapter}: {label}");
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device");
 }
 
 /// MIMG `image_atomic_<op> vdata, v[vaddr:vaddr+1], s[srsrc:srsrc+7]

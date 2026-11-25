@@ -8627,12 +8627,17 @@ impl<'a> Lower<'a> {
             self.end_guarded(at, &[]);
             return Ok(());
         }
-        let (op, sample) = match name {
+        // `_g16`: the same sample with 16-bit gradients, two per VGPR (see
+        // `grad_regs`), whatever `a16` says of the coordinates.
+        let (form, g16) = name
+            .strip_suffix("_g16")
+            .map_or((name, false), |form| (form, true));
+        let (op, sample) = match form {
             "image_sample" | "image_sample_o" => (60, true),
             "image_sample_lz" | "image_sample_l" => (62, true),
             "image_sample_b" => (61, true),
             "image_sample_c_lz" => (65, true),
-            "image_sample_d" | "image_sample_d_cl" | "image_sample_d_g16" => (63, true),
+            "image_sample_d" | "image_sample_d_cl" => (63, true),
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
@@ -8710,15 +8715,17 @@ impl<'a> Lower<'a> {
             let sh = self.handle(site, ss, true, (14 | if cmp { 0x8000 } else { 0 }, 0))?;
             // Texel offsets (`_o`) come first as a whole dword: x in bits 0-5,
             // y in 8-13, signed (programmable offsets: gathers only).
-            let offset_word = name.ends_with("_o");
+            let offset_word = form.ends_with("_o");
             let first =
                 usize::from(offset_word) + usize::from(name == "image_sample_b") + usize::from(cmp);
             // Coordinates the size divides (not the array slice); explicit
             // gradients (x then y) come before the coordinates, packed only
             // when `_g16` is set (independently of `a16`).
             let spatial = coords - usize::from(kind == 6 || kind == 7);
-            // (A cube's are two per direction, on the face.)
-            let g16 = name.ends_with("_g16");
+            // (A cube's are two per direction, on the face.) VGPRs per
+            // direction: with `_g16` each direction starts a VGPR, an odd
+            // last gradient alone in its low half (LLVM's GFX10 assembler
+            // tests, `gfx10_asm_mimg.s`: 3D `image_sample_d_g16` takes 7).
             let grad_dim = if kind == 5 { 2 } else { spatial };
             let grad_regs = if op == 63 {
                 if g16 { grad_dim.div_ceil(2) } else { grad_dim }
@@ -8872,7 +8879,7 @@ impl<'a> Lower<'a> {
                     let half = self.s.m.f32(0.5f32.to_bits());
                     let l = self.unary(23, m);
                     let mut lod = self.s.m.bin(c, Bin::Mul, l, half);
-                    if name.ends_with("_cl") {
+                    if form.ends_with("_cl") {
                         let x = addr_at(self, coord_base, *a16, coords)?;
                         let clamp = to_float(self, *a16, x);
                         lod = self.binary(35, lod, clamp);
@@ -8889,10 +8896,6 @@ impl<'a> Lower<'a> {
                     )
                 }
                 63 => {
-                    // With a16 each direction's gradients start a VGPR.
-                    if *a16 && spatial % 2 == 1 {
-                        return Err("16-bit gradients of a 1D or 3D image");
-                    }
                     let mut g = vec![fu; 6];
                     for k in 0..spatial {
                         let x = addr_at(self, first, g16, k)?;
@@ -8903,7 +8906,7 @@ impl<'a> Lower<'a> {
                     args.extend(&os);
                     args.extend(g);
                     // `_cl`: the least level of detail, after the coordinates.
-                    let clamp = if name.ends_with("_cl") {
+                    let clamp = if form.ends_with("_cl") {
                         let x = addr_at(self, coord_base, *a16, coords)?;
                         to_float(self, *a16, x)
                     } else {
