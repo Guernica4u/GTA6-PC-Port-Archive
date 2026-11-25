@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs victory.exe (or another Windows exe) under Proton's Wine on Linux,
 # with vkd3d-proton (D3D12) and DXVK (DXGI) from the Proton build.
-# See docs/linux-proton.md.
+# See the Linux / Proton section of README.md.
 #
 #   scripts/proton-run.sh config
 #   scripts/proton-run.sh run /path/to/game/<the title's exe> --execute
