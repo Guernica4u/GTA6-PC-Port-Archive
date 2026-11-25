@@ -2042,22 +2042,36 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
+    /// Writes `value` at `byte_offset` of the view in the table and marks
+    /// its 64 KiB page in `writes` (a bitmap, in words) from the view's
+    /// marks, as translated shaders do.
     const MARKED_WRITE_SOURCE: &str = r#"
-#define RS "DescriptorTable(UAV(u0)), SRV(t0), UAV(u1), RootConstants(num32BitConstants=3, b0)"
 RWByteAddressBuffer dst : register(u0);
 ByteAddressBuffer marks : register(t0);
-RWByteAddressBuffer writes : register(u1);
+RWStructuredBuffer<uint> writes : register(u1);
 cbuffer c : register(b0) { uint slot; uint byte_offset; uint value; }
-[RootSignature(RS)]
 [numthreads(1, 1, 1)]
 void main() {
     dst.Store(byte_offset, value);
     uint2 m = marks.Load2(slot * 8);
     uint bit = m.x + ((m.y + byte_offset) >> 16);
     uint old;
-    writes.InterlockedOr((bit >> 5) * 4, 1u << (bit & 31), old);
+    InterlockedOr(writes[bit >> 5], 1u << (bit & 31), old);
 }
 "#;
+
+    /// The marked write, its root signature a table (u0), the marks (t0),
+    /// the bitmap (u1) and 3 constants, as [`dispatch_marked_uav`] binds.
+    fn marked_writer() -> (ID3D12RootSignature, ID3D12PipelineState) {
+        let ranges = [range(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 0, 0, 1)];
+        let params = [
+            table(&ranges),
+            root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, 0, 0),
+            root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 1, 0),
+            crate::compute::constants(0, 3),
+        ];
+        compile_cs(MARKED_WRITE_SOURCE, &params)
+    }
 
     fn buffer_at_address(address: u64, bytes: u64) -> This {
         let desc: [u32; 14] = [
@@ -2177,7 +2191,7 @@ void main() {
         let view = crate::descriptor::view(slot0).expect("subpage uav view");
         let _ = heap_host.mirror(0, slot0, true);
 
-        let shader = compile_cs(MARKED_WRITE_SOURCE);
+        let shader = marked_writer();
         let list = host.new_list().unwrap();
         readable(&list, &used(ResourceType::Uav), &view, true);
         dispatch_marked_uav(&list, heap_host, &shader, 0, 0, 0, 0xDEAD_BEEF);
@@ -2218,7 +2232,7 @@ void main() {
         let _ = heap_host.mirror(0, slot0, true);
 
         let cpu_val = 0xCAFE_BABEu32.to_le_bytes();
-        let shader = compile_cs(MARKED_WRITE_SOURCE);
+        let shader = marked_writer();
         let list = host.new_list().unwrap();
         readable(&list, &used(ResourceType::Uav), &view, true);
         list.defer_copy((p + 0x2000) as *mut u8, cpu_val.as_ptr(), cpu_val.len());
@@ -2289,7 +2303,7 @@ void main() {
         let view = crate::descriptor::view(slot0).expect("cross-page subrange uav");
         let _ = heap_host.mirror(0, slot0, true);
 
-        let shader = compile_cs(MARKED_WRITE_SOURCE);
+        let shader = marked_writer();
         let list = host.new_list().unwrap();
         readable(&list, &used(ResourceType::Uav), &view, true);
         dispatch_marked_uav(&list, heap_host, &shader, 0, 0, 0, 0x1234_5678);
@@ -2332,7 +2346,7 @@ void main() {
         let _ = heap_host.mirror(1, slot1, true);
 
         let copy_src = 0x1111_1111u32.to_le_bytes();
-        let shader = compile_cs(MARKED_WRITE_SOURCE);
+        let shader = marked_writer();
         let list = host.new_list().unwrap();
         list.defer_copy((p + 0x200) as *mut u8, copy_src.as_ptr(), copy_src.len());
         readable(&list, &used(ResourceType::Uav), &view1, true);
@@ -2370,7 +2384,7 @@ void main() {
         let (heap, title_heap, heap_host) = view_heap(8);
         let _ = host.log_messages();
 
-        let shader = compile_cs(MARKED_WRITE_SOURCE);
+        let shader = marked_writer();
         let list = host.new_list().unwrap();
         let mut state = State::default();
         state.set_heaps(&[heap]);
@@ -3396,16 +3410,15 @@ void main(uint3 id : SV_DispatchThreadID) {
         let twin_slots = Slots::new(1);
         let twin_uav = View::Unordered(depth as usize, 0, Some([56, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
         twin_slots.make(0, &twin_uav);
-        let write_twin = compile_cs(
+        let write_twin = writer(
             r#"
-#define RS "DescriptorTable(UAV(u0))"
 RWTexture2D<float> d : register(u0);
-[RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     d[id.xy] = 49152.0 / 65535.0;
 }
 "#,
+            1,
         );
 
         let list = host.new_list().unwrap();
@@ -3608,30 +3621,29 @@ void main(uint3 id : SV_DispatchThreadID) {
         slots.make(2, &uav2);
         slots.make(3, &srv2);
 
-        let write = compile_cs(
+        let write = writer(
             r#"
-#define RS "DescriptorTable(UAV(u0))"
 RWTexture2D<float4> outTex : register(u0);
-[RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     outTex[id.xy] = float4((id.x + 1.0) / 8.0, (id.y + 1.0) / 8.0, 0.5, 1.0);
 }
 "#,
+            1,
         );
+        let ranges = [range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 0, 0, 1), range(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 0, 0, 1)];
         let copy_srv_to_uav = compile_cs(
             r#"
-#define RS "DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0))"
 Texture2D<float4> inTex : register(t0);
 RWTexture2D<float4> outTex : register(u0);
-[RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     outTex[id.xy] = inTex.Load(int3(id.xy, 0));
 }
 "#,
+            &[table(&ranges[..1]), table(&ranges[1..])],
         );
-        let read = compile_cs(READ);
+        let read = reader(READ, 1);
         let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
 
         let list = host.new_list().unwrap();
@@ -3715,29 +3727,27 @@ void main(uint3 id : SV_DispatchThreadID) {
         let heap_host = title_heap.host().expect("a host view heap");
         let _ = host.log_messages();
 
-        let write = compile_cs(
+        let write = writer(
             r#"
-#define RS "DescriptorTable(UAV(u0))"
 RWTexture2D<unorm float4> outTex : register(u0);
-[RootSignature(RS)]
 [numthreads(2, 2, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     outTex[id.xy] = float4(64.0 / 255.0, 0.0, 1.0, 1.0);
 }
 "#,
+            1,
         );
-        let read_bytes = compile_cs(
+        let read_bytes = reader(
             r#"
-#define RS "DescriptorTable(SRV(t0)), UAV(u1)"
 Texture2D<unorm float4> inTex : register(t0);
 RWByteAddressBuffer outBuf : register(u1);
-[RootSignature(RS)]
 [numthreads(2, 2, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     uint4 px = uint4(round(inTex.Load(int3(id.xy, 0)) * 255.0));
     outBuf.Store4((id.y * 2 + id.x) * 16, px);
 }
 "#,
+            1,
         );
         let (out, data) = host.shared_buffer(4 * 16).unwrap();
 
