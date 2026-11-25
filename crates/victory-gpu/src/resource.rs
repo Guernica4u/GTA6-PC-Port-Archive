@@ -251,7 +251,7 @@ const RGBA16_FLOAT: u32 = 10;
 /// and copies stay exact; hosts that refuse either (e.g. NVIDIA) widen
 /// render targets and UAVs of format 67 to `R16G16B16A16_FLOAT`.
 #[cfg(windows)]
-fn rgb9e5_target_supported() -> bool {
+pub(crate) fn rgb9e5_target_supported() -> bool {
     use std::sync::OnceLock;
     use windows::Win32::Graphics::Direct3D12::{
         D3D12_FEATURE_DATA_FORMAT_SUPPORT, D3D12_FEATURE_FORMAT_SUPPORT,
@@ -291,11 +291,11 @@ fn rgb9e5_target_supported() -> bool {
 }
 
 #[cfg(not(windows))]
-fn rgb9e5_target_supported() -> bool {
+pub(crate) fn rgb9e5_target_supported() -> bool {
     false
 }
 
-fn target_format_with(format: u32, rgb9e5_supported: bool) -> u32 {
+pub(crate) fn target_format_with(format: u32, rgb9e5_supported: bool) -> u32 {
     let format = pc_format(format);
     if format == R9G9B9E5_SHAREDEXP && !rgb9e5_supported {
         RGBA16_FLOAT

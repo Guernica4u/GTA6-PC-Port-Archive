@@ -1347,8 +1347,24 @@ fn make_marked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> (Option<Kept>, O
 fn fits(
     d: &D3D12_RESOURCE_DESC,
     castable: &[u32],
+    format: Option<&mut DXGI_FORMAT>,
+    unordered: bool,
+) -> bool {
+    fits_with(
+        d,
+        castable,
+        format,
+        unordered,
+        crate::resource::rgb9e5_target_supported(),
+    )
+}
+
+fn fits_with(
+    d: &D3D12_RESOURCE_DESC,
+    castable: &[u32],
     mut format: Option<&mut DXGI_FORMAT>,
     unordered: bool,
+    rgb9e5_supported: bool,
 ) -> bool {
     use crate::resource::{DEPTH_FORMATS, family};
     let allowed = if unordered {
@@ -1397,7 +1413,7 @@ fn fits(
     }
     // A texture whose console format PC forbids as a render target or UAV
     // was substituted (`resource::target_format`): views name its host format.
-    if view != own && crate::resource::target_format(view) == own {
+    if view != own && crate::resource::target_format_with(view, rgb9e5_supported) == own {
         if let Some(format) = format {
             *format = d.Format;
         }
@@ -1432,7 +1448,29 @@ fn fits_texture_srv(
     source_format: u32,
     desc: &mut Option<D3D12_SHADER_RESOURCE_VIEW_DESC>,
 ) -> bool {
-    if !fits(texture, castable, desc.as_mut().map(|d| &mut d.Format), false) {
+    fits_texture_srv_with(
+        texture,
+        castable,
+        source_format,
+        desc,
+        crate::resource::rgb9e5_target_supported(),
+    )
+}
+
+fn fits_texture_srv_with(
+    texture: &D3D12_RESOURCE_DESC,
+    castable: &[u32],
+    source_format: u32,
+    desc: &mut Option<D3D12_SHADER_RESOURCE_VIEW_DESC>,
+    rgb9e5_supported: bool,
+) -> bool {
+    if !fits_with(
+        texture,
+        castable,
+        desc.as_mut().map(|d| &mut d.Format),
+        false,
+        rgb9e5_supported,
+    ) {
         return false;
     }
     if source_format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP.0 as u32
@@ -2348,7 +2386,7 @@ mod tests {
         ] {
             let words = [67, 4, mapping, 0, 0, 1, 0, 0, 0, 0];
             let mut desc = Some(srv_desc(&words));
-            assert!(fits_texture_srv(&widened, &[], 67, &mut desc));
+            assert!(fits_texture_srv_with(&widened, &[], 67, &mut desc, false));
             let desc = desc.unwrap();
             assert_eq!(desc.Format, DXGI_FORMAT_R16G16B16A16_FLOAT);
             assert_eq!(desc.Shader4ComponentMapping, expected);
@@ -2369,7 +2407,7 @@ mod tests {
             ..Default::default()
         };
         let mut desc = None;
-        assert!(fits_texture_srv(&widened, &[], 67, &mut desc));
+        assert!(fits_texture_srv_with(&widened, &[], 67, &mut desc, false));
         let desc = desc.unwrap();
         assert_eq!(desc.Format, DXGI_FORMAT_R16G16B16A16_FLOAT);
         assert_eq!(desc.ViewDimension, D3D12_SRV_DIMENSION_TEXTURE2DARRAY);
