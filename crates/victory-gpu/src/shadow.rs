@@ -132,6 +132,40 @@ fn give_back(v: Vec<u8>) {
 /// Snapshot memory kept for reuse.
 const POOL_BYTES: usize = 512 << 20;
 
+/// The bytes a copy-back reads title memory into: from the pool, given back
+/// when it goes. A world frame copies dozens of ranges back, and a fresh
+/// buffer costs a page fault per 4 KiB of it (the frame report counts them).
+struct Back(Vec<u8>);
+
+impl Back {
+    /// A buffer of `n` bytes.
+    fn new(n: usize) -> Self {
+        let mut bytes = pooled(n);
+        bytes.resize(n, 0);
+        Back(bytes)
+    }
+}
+
+impl std::ops::Deref for Back {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Back {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.0
+    }
+}
+
+impl Drop for Back {
+    fn drop(&mut self) {
+        give_back(std::mem::take(&mut self.0));
+    }
+}
+
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
 // written only on the submitting thread.
 unsafe impl Send for Shadow {}
@@ -221,8 +255,8 @@ impl Shadow {
         let n = to - from;
         // SAFETY: inside the mapping; only the submitting thread writes it.
         let host = unsafe { std::slice::from_raw_parts(self.data.add(from - start), n) };
-        let mut title = vec![0u8; n];
-        if !crate::host::read_into(from as *const u8, &mut title) || title == host {
+        let mut title = Back::new(n);
+        if !crate::host::read_into(from as *const u8, &mut title) || title[..] == *host {
             return 0;
         }
         {
@@ -421,7 +455,7 @@ impl Shadow {
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
-            let mut title = vec![0u8; PIECE];
+            let mut title = Back::new(PIECE);
             let mut synced = Vec::new();
             let mut at = from;
             while at < to {
@@ -457,8 +491,8 @@ impl Shadow {
             // they had (a title write there shows at the next refresh).
             let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
             if let Some(t) = &self.tracked {
-                let whole: Vec<usize> = synced.into_iter().filter(|p| (first..last).contains(p)).collect();
-                t.taken(&whole);
+                synced.retain(|p| (first..last).contains(p));
+                t.taken(&synced);
             }
         }
         // Every submitted step that declared the range is done with it (one
@@ -508,7 +542,7 @@ impl Shadow {
         let n = to - from;
         // SAFETY: inside the mapping; only the submitting thread writes it.
         let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), n) };
-        let mut title = vec![0u8; n];
+        let mut title = Back::new(n);
         if !crate::host::read_into(from as *const u8, &mut title) {
             return 0;
         }
