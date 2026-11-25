@@ -200,6 +200,16 @@ impl HostHeap {
             u64::from(step),
             sampler,
         ));
+        // Every layout keeps the top of the heap free for the two raw
+        // null buffer views `NULL_BUFFER_VIEW` and the one below. The
+        // capped path stopped short of them already; the two successful
+        // ones did not, and there the null slots fell inside the dynamic
+        // range - the guard below then refused to install them, and a
+        // shader clamping an index to `HEAP_VIEWS - 1` named a slot a
+        // table had written (review on this PR: 737 856 and 934 464
+        // title views both end their dynamic range past 999 997 on a
+        // 1 000 000-slot heap).
+        let extra = extra.min(total.saturating_sub(count).saturating_sub(NULL_RESERVE));
         let h = HostHeap {
             heap,
             cpu,
