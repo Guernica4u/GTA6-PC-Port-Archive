@@ -1267,6 +1267,63 @@ impl BufferStates {
     fn clear(&mut self) {
         self.entries.clear();
     }
+
+    fn tracked_keys(&self) -> Vec<usize> {
+        self.entries.keys().copied().collect()
+    }
+}
+
+/// Splits recorded `[prelude?, list]` run spans into consecutive
+/// `ExecuteCommandLists` ranges so no tracked `Shadow` buffer identity repeats
+/// within the same queue call. D3D12 decays buffers back to `COMMON` only at
+/// `ExecuteCommandLists` boundaries, so a later list (or trailing card-compare
+/// pass) that assumes `COMMON` must land in a following call whenever a prior
+/// list in the current batch left that `Shadow` in a tracked state.
+fn shadow_decay_calls(
+    run_spans: &[(usize, usize)],
+    run_keys: &[Vec<usize>],
+    compare_index: Option<usize>,
+) -> Vec<(usize, usize)> {
+    debug_assert_eq!(run_spans.len(), run_keys.len());
+    let mut calls: Vec<(usize, usize)> = Vec::new();
+    let mut seen = std::collections::HashSet::<usize>::new();
+    let mut batch_start: Option<usize> = None;
+    let mut batch_end = 0usize;
+
+    for (&(start, end), keys) in run_spans.iter().zip(run_keys) {
+        let overlaps = keys.iter().any(|k| seen.contains(k));
+        if overlaps {
+            if let Some(bs) = batch_start.take() {
+                calls.push((bs, batch_end));
+            }
+            seen.clear();
+        }
+        if batch_start.is_none() {
+            batch_start = Some(start);
+        }
+        batch_end = end;
+        seen.extend(keys.iter().copied());
+    }
+
+    if let Some(cmp_idx) = compare_index {
+        let cmp_end = cmp_idx + 1;
+        if let Some(bs) = batch_start.take() {
+            if seen.is_empty() {
+                // No tracked Shadow in the current call: keep compare in the same call.
+                calls.push((bs, cmp_end));
+            } else {
+                // Flush tracked lists first so D3D12 decays Shadows to COMMON before compare SRV reads.
+                calls.push((bs, batch_end));
+                calls.push((cmp_idx, cmp_end));
+            }
+        } else {
+            calls.push((cmp_idx, cmp_end));
+        }
+    } else if let Some(bs) = batch_start {
+        calls.push((bs, batch_end));
+    }
+
+    calls
 }
 
 /// A host command list and its allocator, always used together.
@@ -6221,15 +6278,25 @@ impl Host {
             batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
         }
         stage.next("submit: the lists' steps");
+        let mut run_spans: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
+        let mut run_keys: Vec<Vec<usize>> = Vec::with_capacity(runs.len());
         for list in runs {
             list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
-            firsts.push(lists.len());
+            let run_start = lists.len();
+            firsts.push(run_start);
             // (None unless `VICTORY_PRELUDE_UPLOADS=1`.)
             let uploads = list.prelude_uploads(&mut batch);
             if let Some(prelude) = list.prelude(&uploads) {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
+            run_spans.push((run_start, lists.len()));
+            run_keys.push(
+                list.buffer_states
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .tracked_keys(),
+            );
         }
         batch.fill();
         stage.next("submit: the last refreshes");
@@ -6275,9 +6342,12 @@ impl Host {
         for (shadow, at, bytes) in batch.placed.drain(..) {
             shadow.placed_copy(at, &bytes);
         }
-        if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
+        #[cfg_attr(not(feature = "diagnostics"), allow(unused_mut))]
+        let mut compare_index = card.as_ref().and_then(|c| c.check.clone()).map(|check| {
+            let idx = lists.len();
             lists.push(Some(check));
-        }
+            idx
+        });
         split.part(4);
         stage.next("submit: waiting for the heaps' records");
         let heaps_began = std::time::Instant::now();
@@ -6299,6 +6369,13 @@ impl Host {
             lists.insert(0, Some(ahead));
             lists.push(Some(behind));
             firsts.iter_mut().for_each(|first| *first += 1);
+            run_spans.iter_mut().for_each(|(a, b)| {
+                *a += 1;
+                *b += 1;
+            });
+            if let Some(idx) = compare_index.as_mut() {
+                *idx += 1;
+            }
         }
         #[cfg(feature = "diagnostics")]
         let sending = crate::timeline::ticks();
@@ -6309,9 +6386,24 @@ impl Host {
                 lists.insert(0, Some(front));
                 lists.push(Some(behind));
                 firsts.iter_mut().for_each(|first| *first += 1);
+                run_spans.iter_mut().for_each(|(a, b)| {
+                    *a += 1;
+                    *b += 1;
+                });
+                if let Some(idx) = compare_index.as_mut() {
+                    *idx += 1;
+                }
             }
-            let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
-            // SAFETY: closed lists; the fence is ours.
+            let decay_calls = shadow_decay_calls(&run_spans, &run_keys, compare_index);
+            let mut cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
+            cuts.extend(decay_calls.iter().skip(1).map(|&(a, _)| a));
+            cuts.retain(|&c| c > 0 && c < lists.len());
+            cuts.sort_unstable();
+            cuts.dedup();
+            // SAFETY: closed lists; the fence is ours. Each range runs in
+            // order under `self.submitted`, respecting both `parts` splits
+            // and `decay_calls` boundaries so D3D12 decays tracked Shadow
+            // buffers to COMMON between calls.
             let signalled = unsafe {
                 let mut from = 0;
                 for to in cuts.into_iter().chain([lists.len()]) {
@@ -6352,25 +6444,40 @@ impl Host {
             return Some((submitted, sent));
         }
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
+        // The optional card-compare list is kept out of the last run's call
+        // when that run tracked Shadow buffers so D3D12 decays them to COMMON
+        // before compare reads them as compute SRVs.
         #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
-            firsts
-                .iter()
-                .zip(firsts.iter().skip(1).chain([&lists.len()]))
-                .map(|(&a, &b)| &lists[a..b])
-                .collect()
-        } else {
-            vec![&lists[..]]
-        };
+        let timed = timing();
         #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
+        let timed = false;
+        let groups: Vec<Vec<(usize, usize)>> = if timed {
+            let mut g: Vec<Vec<(usize, usize)>> = run_spans.iter().map(|&span| vec![span]).collect();
+            if let Some(cmp_idx) = compare_index {
+                if let Some(last) = g.last_mut() {
+                    let last_tracked = run_keys.last().is_some_and(|k| !k.is_empty());
+                    if last_tracked {
+                        last.push((cmp_idx, cmp_idx + 1));
+                    } else {
+                        last[0].1 = cmp_idx + 1;
+                    }
+                } else {
+                    g.push(vec![(cmp_idx, cmp_idx + 1)]);
+                }
+            }
+            g
+        } else {
+            vec![shadow_decay_calls(&run_spans, &run_keys, compare_index)]
+        };
         submitting(2, runs.len());
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
+                for &(a, b) in group {
+                    self.queue.ExecuteCommandLists(&lists[a..b]);
+                }
                 self.card_sent();
                 let waited = self
                     .queue
@@ -12153,6 +12260,173 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
                     cmd.Reset(&allocator, None).unwrap();
                 }
             }
+        }
+        assert_eq!(unsafe { device.GetDeviceRemovedReason() }, Ok(()));
+        if let Some(q) = info_queue {
+            let n = unsafe { q.GetNumStoredMessages() };
+            let mut errors = Vec::new();
+            for i in 0..n {
+                let mut len = 0usize;
+                let _ = unsafe { q.GetMessage(i, None, &mut len) };
+                if len == 0 {
+                    continue;
+                }
+                let mut raw = vec![0u8; len];
+                let msg = raw.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                if unsafe { q.GetMessage(i, Some(msg), &mut len) }.is_ok() {
+                    let m = unsafe { &*msg };
+                    if m.Severity == D3D12_MESSAGE_SEVERITY_ERROR
+                        || m.Severity == D3D12_MESSAGE_SEVERITY_CORRUPTION
+                    {
+                        let text = unsafe {
+                            std::slice::from_raw_parts(
+                                m.pDescription,
+                                m.DescriptionByteLength.saturating_sub(1),
+                            )
+                        };
+                        errors.push(String::from_utf8_lossy(text).into_owned());
+                    }
+                }
+            }
+            assert!(errors.is_empty(), "D3D12 debug errors: {errors:?}");
+        }
+    }
+
+    #[test]
+    fn shadow_decay_calls_splits_repeated_shadows_and_card_compare() {
+        // 1. Single run without compare stays one call.
+        assert_eq!(super::shadow_decay_calls(&[(0, 2)], &[vec![10]], None), vec![(0, 2)]);
+
+        // 2. Two disjoint [prelude, list] pairs remain batched in one call.
+        assert_eq!(
+            super::shadow_decay_calls(&[(0, 2), (2, 4)], &[vec![10], vec![20]], None),
+            vec![(0, 4)]
+        );
+
+        // 3. Nonadjacent runs reusing the same Shadow split right before the repeating run,
+        //    preserving each [prelude, list] pair intact.
+        assert_eq!(
+            super::shadow_decay_calls(
+                &[(0, 2), (2, 4), (4, 6)],
+                &[vec![10], vec![20], vec![10]],
+                None
+            ),
+            vec![(0, 4), (4, 6)]
+        );
+
+        // 4. Trailing card-compare gets its own following call after any tracked Shadow run.
+        assert_eq!(
+            super::shadow_decay_calls(&[(0, 2), (2, 4)], &[vec![10], vec![20]], Some(4)),
+            vec![(0, 4), (4, 5)]
+        );
+
+        // 5. Trailing card-compare stays in the same call when no run in that batch tracked a Shadow.
+        assert_eq!(
+            super::shadow_decay_calls(&[(0, 1), (1, 2)], &[vec![], vec![]], Some(2)),
+            vec![(0, 3)]
+        );
+    }
+
+    #[test]
+    fn shadow_decay_calls_multi_list_same_shadow_clean_under_d3d12() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::*;
+        use windows::core::Interface;
+
+        let mut debug: Option<ID3D12Debug> = None;
+        if unsafe { D3D12GetDebugInterface(&mut debug) }.is_ok() {
+            if let Some(d) = debug {
+                unsafe { d.EnableDebugLayer() };
+            }
+        }
+        let factory: IDXGIFactory4 = unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }.unwrap();
+        let adapter: IDXGIAdapter1 = unsafe { factory.EnumWarpAdapter() }.unwrap();
+        let mut device: Option<ID3D12Device> = None;
+        unsafe { D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut device) }.unwrap();
+        let device = device.unwrap();
+        let info_queue: Option<ID3D12InfoQueue> = device.cast().ok();
+        if let Some(q) = &info_queue {
+            unsafe { q.ClearStoredMessages() };
+        }
+
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 4096,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buf: Option<ID3D12Resource> = None;
+        unsafe {
+            device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut buf,
+            )
+        }
+        .unwrap();
+        let buf = buf.unwrap();
+
+        let queue: ID3D12CommandQueue = unsafe {
+            device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                ..Default::default()
+            })
+        }
+        .unwrap();
+        let alloc1: ID3D12CommandAllocator =
+            unsafe { device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) }.unwrap();
+        let cmd1: ID3D12GraphicsCommandList =
+            unsafe { device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc1, None) }.unwrap();
+        let alloc2: ID3D12CommandAllocator =
+            unsafe { device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) }.unwrap();
+        let cmd2: ID3D12GraphicsCommandList =
+            unsafe { device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc2, None) }.unwrap();
+        let fence: ID3D12Fence = unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.unwrap();
+
+        // List 1 leaves `buf` in UNORDERED_ACCESS; List 2 independently assumes COMMON -> GENERIC_READ.
+        let mut bs1 = super::BufferStates::default();
+        let b1 = bs1.transition_for(&buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS).unwrap();
+        unsafe {
+            cmd1.ResourceBarrier(&[super::transition(&buf, b1, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+            cmd1.Close().unwrap();
+        }
+        let mut bs2 = super::BufferStates::default();
+        let b2 = bs2.transition_for(&buf, D3D12_RESOURCE_STATE_GENERIC_READ).unwrap();
+        unsafe {
+            cmd2.ResourceBarrier(&[super::transition(&buf, b2, D3D12_RESOURCE_STATE_GENERIC_READ)]);
+            cmd2.Close().unwrap();
+        }
+
+        let lists: Vec<Option<ID3D12CommandList>> = vec![Some(cmd1.cast().unwrap()), Some(cmd2.cast().unwrap())];
+        let calls = super::shadow_decay_calls(
+            &[(0, 1), (1, 2)],
+            &[bs1.tracked_keys(), bs2.tracked_keys()],
+            None,
+        );
+        assert_eq!(calls, vec![(0, 1), (1, 2)]);
+
+        // Both calls execute in order before a single logical fence signal.
+        unsafe {
+            for &(a, b) in &calls {
+                queue.ExecuteCommandLists(&lists[a..b]);
+            }
+            queue.Signal(&fence, 1).unwrap();
+        }
+        while unsafe { fence.GetCompletedValue() } < 1 {
+            std::thread::yield_now();
         }
         assert_eq!(unsafe { device.GetDeviceRemovedReason() }, Ok(()));
         if let Some(q) = info_queue {
