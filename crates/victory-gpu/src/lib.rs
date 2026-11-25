@@ -51,6 +51,8 @@ pub mod queue;
 mod readout;
 #[cfg(windows)]
 mod rects;
+#[cfg(windows)]
+pub mod report;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]

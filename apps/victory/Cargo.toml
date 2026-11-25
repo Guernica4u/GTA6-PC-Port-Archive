@@ -14,11 +14,18 @@ victory-loader.workspace = true
 victory-hle.workspace = true
 victory-shader = { workspace = true, features = ["host"] }
 victory-game.workspace = true
+victory-gpu.workspace = true
 anyhow.workspace = true
 blake3.workspace = true
 memchr.workspace = true
 clap.workspace = true
 walkdir.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
+] }
 
 [features]
 # Debug-level logs and the debugging switches (frame capture, stack dumps,

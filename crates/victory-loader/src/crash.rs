@@ -127,13 +127,24 @@ fn report_end() -> String {
     format!("{host}{}", title_output())
 }
 
+/// The build of VIctory that runs, named in every crash report (the
+/// executable sets it before the crash log).
+static BUILD: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+/// Names `build` (e.g. `0.1.0 (71652a2)`) in crash reports; call before
+/// [`log_crashes_to`].
+pub fn crash_reports_name_build(build: &'static str) {
+    let _ = BUILD.set(build);
+}
+
 /// The line [`HOST`] holds.
 fn host() -> String {
-    format!("  host: {}, Windows {}\n", cpu_name(), windows_version())
+    let build = BUILD.get().map_or(String::new(), |b| format!(", VIctory {b}"));
+    format!("  host: {}, Windows {}{build}\n", cpu_name(), windows_version())
 }
 
 /// The CPU's brand string, e.g. `AMD Ryzen 7 5700X3D 8-Core Processor`.
-fn cpu_name() -> String {
+pub fn cpu_name() -> String {
     use std::arch::x86_64::__cpuid;
     if __cpuid(0x8000_0000).eax < 0x8000_0004 {
         return "an unnamed CPU".into();
@@ -152,7 +163,7 @@ fn cpu_name() -> String {
 
 /// The running Windows as `major.minor.build`. `RtlGetVersion` gives the
 /// real one; `GetVersionEx` gives what the executable's manifest declares.
-fn windows_version() -> String {
+pub fn windows_version() -> String {
     use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
     use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
     // SAFETY: a zeroed OSVERSIONINFOW is valid; its size field is set.

@@ -38,7 +38,8 @@ mod windows;
 
 #[cfg(windows)]
 pub use crash::{
-    locate, log_crash, log_crashes_to, note_title_output, report_crashes, report_unhandled,
+    cpu_name, crash_reports_name_build, locate, log_crash, log_crashes_to, note_title_output,
+    report_crashes, report_unhandled, windows_version,
 };
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use crash::save_on_crash;

@@ -7,6 +7,8 @@ mod census;
 mod inspect;
 mod run;
 mod shader;
+#[cfg(windows)]
+mod system;
 mod translate;
 
 use std::path::PathBuf;
@@ -14,10 +16,15 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 
+/// The version and the commit built from, as `--version`, `system` and
+/// crash reports name them.
+pub(crate) const VERSION: &str =
+    concat!(env!("CARGO_PKG_VERSION"), " (", env!("VICTORY_COMMIT"), ")");
+
 #[derive(Parser)]
 #[command(
     name = "victory",
-    version,
+    version = VERSION,
     about = "Run an Xbox Series title natively on Windows"
 )]
 struct Cli {
@@ -113,6 +120,10 @@ enum Command {
     },
     /// Show the resolved configuration and check it.
     Config,
+    /// Describe this machine for a test report: Windows, CPU, memory, the
+    /// GPU `run` would use and what of the title's work it can run.
+    #[cfg(windows)]
+    System,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -169,6 +180,8 @@ fn main() -> Result<()> {
             title_args: _,
         } => run::run(&exe, unimplemented, strict, execute, console),
         Command::Config => show_config(),
+        #[cfg(windows)]
+        Command::System => system::show(),
     }
 }
 

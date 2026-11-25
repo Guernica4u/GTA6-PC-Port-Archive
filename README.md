@@ -242,6 +242,7 @@ cargo xtask install-hooks                # asset-policy check on every commit
 copy victory.example.toml victory.toml   # then set your paths (outside the repo)
 cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths
+cargo run -p victory -- system           # this machine and GPU, for test reports
 ```
 
 Run the title:
@@ -280,7 +281,14 @@ victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
 victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
 victory config
+victory system
 ```
+
+`victory system` prints what a test report needs: the commit built from,
+Windows (or Wine), the CPU, memory and commit, the GPU `run` would use with
+its driver, and what of the title's work it cannot run (no 64-lane waves, a
+capped view heap, no mesh shaders). `--version` and `crashes.log` name the
+commit too.
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
