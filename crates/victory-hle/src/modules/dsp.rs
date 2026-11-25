@@ -173,9 +173,10 @@ pub extern "system" fn XDspActivate(
         }
         *active += 1;
     }
-    // SAFETY: `valid` checked the pointer and length; the IR stays alive in
-    // title memory for the stream's lifetime (the console copies it here).
     let convolver = if kind == CONVOLUTION {
+        // SAFETY: `valid` checked the pointer and length; the IR stays alive
+        // in title memory for the stream's lifetime (the console copies it
+        // here).
         let ir = unsafe { std::slice::from_raw_parts(desc.ir, desc.ir_floats as usize) };
         match Convolver::new(
             ir,
