@@ -1,7 +1,8 @@
-//! Random GFX10 programs through the whole translation: SSA, structurisation,
-//! resource tracking, I/O and DXIL emission. Each program translates or is
-//! refused with a reason, and a program that translates translates to the
-//! same bytes again.
+//! Random GFX10 programs through the whole translation: SSA and
+//! structurisation with bounded relative moves (`range`), resource
+//! tracking, I/O and DXIL emission. Each program translates or is refused
+//! with a reason, and a program that translates translates to the same
+//! bytes again.
 //!
 //! The title translates its shaders when it creates pipelines, in its own
 //! process: a panic in any of these stages ends the title, and translation
@@ -15,7 +16,9 @@
 //! from the root tables first, branches that land on an instruction a few
 //! before or after their own (loops among them), and a store or export at
 //! the end that needs what the body computes. Compute programs run as 32
-//! or 64 lanes, pixel programs read one interpolated input.
+//! or 64 lanes, pixel programs read one interpolated input. About one
+//! program in three has a relative move, and in half of those `range`
+//! proves a bound on M0 and builds the program again.
 //!
 //! `VICTORY_RANDOM_PROGRAMS=<n>` sets how many programs run (4,096 by
 //! default, a few seconds in a debug build) and `VICTORY_RANDOM_SEED=<s>`
@@ -36,7 +39,7 @@ use crate::native::{
     ComputeIo, HwStage, NativeProgram, PsInput, ResourceType, RootParam, RootType, StageIo, Usage,
     UsedResource,
 };
-use crate::{io, ir, resource, structure};
+use crate::{io, range, resource};
 use std::io::Write;
 
 const DEFAULT_PROGRAMS: u64 = 4096;
@@ -139,6 +142,29 @@ impl Rng {
     }
 }
 
+/// A register-relative move (`v_movrel*`, `v_swaprel_b32`), mostly after
+/// an M0 that `range` can bound: a constant, or an SGPR clamped by
+/// `s_min_u32` or `s_and_b32`. Branches around it make the bounds pass
+/// through phis, and a move that writes the registers its own index comes
+/// from tests its induction.
+fn relative_move(r: &mut Rng) -> Vec<u32> {
+    let moves: Vec<u32> = gfx10::opcodes(Encoding::Vop1)
+        .iter()
+        .filter(|(_, name)| name.contains("movrel") || name.contains("swaprel"))
+        .map(|&(op, _)| u32::from(op))
+        .collect();
+    let op = moves[r.below(moves.len() as u32) as usize];
+    let k = 128 + r.below(17); // 0 to 16
+    let mut words = match r.below(4) {
+        0 => vec![0xBE80_0300 | M0 << 16 | k], // s_mov_b32 m0, k
+        1 => vec![0x8380_0000 | M0 << 16 | k << 8 | r.sreg()], // s_min_u32 m0, s, k
+        2 => vec![0x8700_0000 | M0 << 16 | k << 8 | r.sreg()], // s_and_b32 m0, s, k
+        _ => vec![],
+    };
+    words.push(0x7E00_0000 | r.vgpr() << 17 | op << 9 | (256 + r.vgpr()));
+    words
+}
+
 /// One instruction: its words, a pending branch's offset still unset.
 fn instruction(r: &mut Rng, stage: HwStage) -> Vec<u32> {
     if stage == HwStage::Ps && r.percent(8) {
@@ -153,6 +179,9 @@ fn instruction(r: &mut Rng, stage: HwStage) -> Vec<u32> {
                 | r.below(4) << 8
                 | r.below(4),
         ];
+    }
+    if r.percent(4) {
+        return relative_move(r);
     }
     let mut lit = None;
     let mut words = match r.below(100) {
@@ -450,12 +479,11 @@ enum Outcome {
     Refused(String),
 }
 
-/// The stages in the order and with the inputs [`super::translate`] gives
-/// them.
+/// The stages in the order and with the inputs [`super::translate_with`]
+/// gives them.
 fn translate(native: &NativeProgram, c: &Container) -> Outcome {
     let run = || -> Result<super::HostShader, crate::ShaderError> {
-        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
-        let st = structure::structure(&p);
+        let (p, st) = range::build(&native.patched_code(), native.wave64, native.vgprs)?;
         let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
         let io = io::raise(&p, native)?;
         super::emit(c, native, &p, &st?, &io, &res)
