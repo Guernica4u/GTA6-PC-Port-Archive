@@ -926,6 +926,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         mesh_stride: 0,
         target: super::Target::ANY,
         console_cf: false,
+        per_lane_only: false,
         view_marks: false,
     })?;
     Ok(HostShader {

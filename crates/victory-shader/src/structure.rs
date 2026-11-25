@@ -457,6 +457,9 @@ pub struct Structured {
     pub masks: HashMap<Value, Bool>,
     /// Lane masks not derived from EXEC or VALU results (constants, opaque
     /// values, uniform selects) resolved at uses such as `v_cndmask_b32`.
+    /// In the console flow, also what a mask join takes on an edge such a
+    /// value arrives by: a loop's exit mask starts as a constant 0 before
+    /// lanes are added.
     pub other: HashMap<Value, Bool>,
     /// Exact Wave64 pairs for checking masks at their uses.
     paired_masks: Map<Key, Bool>,

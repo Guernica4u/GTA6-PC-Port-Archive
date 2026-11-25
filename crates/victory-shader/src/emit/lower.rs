@@ -93,18 +93,32 @@ pub(crate) struct Parts<'a> {
     /// Run the program as the console does (see [`CONSOLE_FLOW`]); `st`
     /// is then [`crate::structure::structure_console`]'s.
     pub console_cf: bool,
+    /// Never ask for the console flow: the per-lane form or nothing (what
+    /// a program falls back to when the console flow cannot lower it).
+    pub per_lane_only: bool,
     /// Writes through buffer views mark their pages (`emit`, "Write marks").
     pub view_marks: bool,
 }
 
-/// What [`lower`] stops with when a wave64 program needs its two 32-lane
-/// halves to exchange values on a host without 64-lane waves: lower it
-/// again from [`crate::structure::structure_console`] with
-/// [`Parts::console_cf`]. Every lane of the group (one console wave) then
-/// runs every block, branches are the console's (taken wave-wide, from
-/// masks both halves exchange through group-shared memory), and EXEC
-/// guards the vector instructions; both halves reach every exchange, so
-/// a group barrier orders it.
+/// What [`lower`] stops with when a program should run as the console runs
+/// it: lower it again from [`crate::structure::structure_console`] with
+/// [`Parts::console_cf`]. Every lane of a console wave then runs every
+/// block, branches are the console's (taken wave-wide) and EXEC guards the
+/// vector instructions. Two kinds of program ask for it:
+///
+/// * a wave64 program whose two 32-lane halves must exchange values on a
+///   host without 64-lane waves (a group of one console wave): the wave-wide
+///   tests come from masks both halves exchange through group-shared
+///   memory, and both halves reach every exchange, so a group barrier
+///   orders it;
+/// * on any host, a program that reads or writes a named lane
+///   (`v_readlane`, `v_writelane`) and has branches its lanes take
+///   differently. Those instructions ignore EXEC on the console, and a wave
+///   runs a loop while any lane does; in the per-lane form a lane that left
+///   a loop (or skipped a branch) is not there to be read, and never sees
+///   the scalars set inside. One host wave is the console wave here, so
+///   nothing is exchanged. If the console flow cannot lower such a program
+///   it keeps the per-lane form ([`Parts::per_lane_only`]).
 pub(crate) const CONSOLE_FLOW: &str = "a wave64 program whose halves exchange lanes (console flow)";
 
 /// Why the console flow ([`CONSOLE_FLOW`]) refuses a descriptor each lane
@@ -463,6 +477,75 @@ fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     })
 }
 
+/// The per-lane lowering can replace a proven restore with its original SGPR.
+fn restored_lane_read(st: &Structured, inst: &Inst) -> bool {
+    inst.writes
+        .first()
+        .is_some_and(|&(_, result)| st.restored.contains_key(&result))
+}
+
+/// Constant-lane SGPR writes whose VGPR is used only by other such writes
+/// and by proven restores. A VGPR use elsewhere, even through a phi, needs
+/// the original lane write to be carried out.
+fn spill_writes(
+    p: &Program,
+    st: &Structured,
+    phi_at: &HashMap<Value, Site>,
+) -> HashMap<Value, Option<Value>> {
+    let insts = || p.blocks.iter().flat_map(|b| &b.insts);
+    let mut spills = HashMap::new();
+    for inst in insts().filter(|i| i.name() == "v_writelane_b32") {
+        if let Fields::Valu(w) = &inst.fields
+            && let (Some(Operand::Vector { reg, .. }), [Operand::Scalar { code, .. }, lane]) =
+                (w.dst, w.src.as_slice())
+            && *code != NULL
+            && crate::resource::lane_of(*lane).is_some()
+            && let Some(result) = inst.write(Reg::V(reg))
+        {
+            spills.insert(result, inst.read(Reg::V(reg)));
+        }
+    }
+    if spills.is_empty() {
+        return spills;
+    }
+
+    let mut used: Vec<_> = insts()
+        .filter(|inst| !is_sgpr_spill(st, inst, &spills))
+        .flat_map(|inst| &inst.reads)
+        .filter_map(|&(reg, value)| matches!(reg, Reg::V(_)).then_some(value))
+        .collect();
+    let mut seen_phis = HashSet::new();
+    while let Some(value) = used.pop() {
+        if let Some(previous) = spills.remove(&value) {
+            used.extend(previous);
+        } else if let Some(&(b, i)) = phi_at.get(&value)
+            && seen_phis.insert(value)
+        {
+            used.extend(&p.blocks[b].phis[i].args);
+        }
+    }
+    spills
+}
+
+fn is_named_lane(inst: &Inst) -> bool {
+    matches!(inst.name(), "v_readlane_b32" | "v_writelane_b32")
+}
+
+fn is_sgpr_spill(
+    st: &Structured,
+    inst: &Inst,
+    spill_writes: &HashMap<Value, Option<Value>>,
+) -> bool {
+    match inst.name() {
+        "v_readlane_b32" => restored_lane_read(st, inst),
+        "v_writelane_b32" => inst
+            .writes
+            .first()
+            .is_some_and(|&(_, result)| spill_writes.contains_key(&result)),
+        _ => false,
+    }
+}
+
 /// Where half `h` (dword h / 2, the high half when odd) of the parameter
 /// whose first element is in row `a` comes from, when the console packs
 /// 16-bit values two per dword: a row and channel of `elements`, none for
@@ -616,12 +699,14 @@ impl<'a> Lower<'a> {
                 i.name().starts_with("ds_swizzle")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
             };
+            let spills = spill_writes(p, x.st, &phi_at);
+            let named_lane = |i: &Inst| is_named_lane(i) && !is_sgpr_spill(x.st, i, &spills);
             let whole = |i: &Inst| {
                 let n = i.name();
-                n.contains("permute")
-                    || n.starts_with("v_mbcnt")
-                    || matches!(n, "v_readlane_b32" | "v_writelane_b32")
-                    || reads_mask_as_data(x.st, i)
+                if is_named_lane(i) {
+                    return named_lane(i);
+                }
+                n.contains("permute") || n.starts_with("v_mbcnt") || reads_mask_as_data(x.st, i)
             };
             let reads_whole = insts().any(whole);
             let masks_held = {
@@ -648,8 +733,15 @@ impl<'a> Lower<'a> {
                         .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
                 })
             };
-            console_lanes = reads_whole || masks_held || insts().any(in_half);
+            // SGPR spills keep main's per-lane form: on a host that runs the
+            // console's wave size, with that wave size and the lane writes
+            // emulated; elsewhere, with no wave size (each restore is its
+            // SGPR).
             let wave = if x.native.wave64 { 64 } else { 32 };
+            console_lanes = reads_whole
+                || masks_held
+                || insts().any(in_half)
+                || x.target.runs(wave) && insts().any(is_named_lane);
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
             // On a host without 64-lane waves, a wave64 program whose lanes
             // read only their own half runs as two 32-lane waves: what each
@@ -681,9 +773,27 @@ impl<'a> Lower<'a> {
                 && cs.threads.iter().product::<u32>() <= 64
                 && !insts().any(|i| i.name().contains("permute"))
                 && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
+            // On a host that runs the console's wave size: lane reads and
+            // writes other than SGPR spills in a divergent program (see
+            // [`CONSOLE_FLOW`]).
+            let uniform = |when: Bool| {
+                x.st.bools
+                    .support(when)
+                    .iter()
+                    .all(|a| matches!(a, Atom::Uniform(_)))
+            };
+            wants_console_flow |= x.target.runs(wave)
+                && insts().any(named_lane)
+                && x.st
+                    .exits
+                    .iter()
+                    .any(|e| matches!(*e, LaneExit::Branch { when, .. } if !uniform(when)))
+                && !insts().any(|i| i.name().contains("permute"))
+                && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
             if x.console_cf {
                 console_lanes = true;
-                split = true;
+                // In halves only where the host cannot run the console wave.
+                split = x.native.wave64 && !x.target.runs(64);
             }
             if split {
                 s.wave_size = Some(32);
@@ -1393,7 +1503,7 @@ impl<'a> Lower<'a> {
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
-        if self.wants_console_flow && !self.x.console_cf {
+        if self.wants_console_flow && !self.x.console_cf && !self.x.per_lane_only {
             return Err(unsupported(0, CONSOLE_FLOW));
         }
         if let Some(n) = self.s.wave_size
@@ -1951,8 +2061,7 @@ impl<'a> Lower<'a> {
                 Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
             };
             let bit = self.boolean(m, at)?;
-            let word = self.ballot_word(at, bit);
-            let xy = self.exchange(at, word);
+            let xy = self.console_ballot(at, bit);
             self.ballots.insert(lo, xy);
             return Ok(if high { xy.1 } else { xy.0 });
         }
@@ -3229,6 +3338,10 @@ impl<'a> Lower<'a> {
     /// Console flow: `x` of console lane `lane` (uniform), from whichever
     /// half holds it.
     fn console_read_lane(&mut self, x: V, lane: V) -> V {
+        if !self.split {
+            // One host wave is the console wave, all of its lanes here.
+            return self.read_lane(x, lane);
+        }
         let c = self.cur;
         let (k31, k5, one, z) = (
             self.s.m.i32(31),
@@ -6834,12 +6947,7 @@ impl<'a> Lower<'a> {
             // An SGPR spilled to a VGPR lane and read back is the SGPR, in
             // every stage (in compute the VGPR's other lanes may hold what has
             // no host value, a descriptor's address say).
-            "v_readlane_b32"
-                if inst
-                    .writes
-                    .first()
-                    .is_some_and(|w| self.x.st.restored.contains_key(&w.1)) =>
-            {
+            "v_readlane_b32" if restored_lane_read(self.x.st, inst) => {
                 let a = self.i32_of(self.x.st.restored[&inst.writes[0].1])?;
                 int(self, a)
             }
@@ -6907,7 +7015,12 @@ impl<'a> Lower<'a> {
                         _ => Err(LANE_MASK),
                     }
                 };
-                let (lo, hi) = (word(self, EXEC)?, word(self, EXEC + 1)?);
+                let lo = word(self, EXEC)?;
+                let hi = if self.x.native.wave64 {
+                    word(self, EXEC + 1)?
+                } else {
+                    self.s.m.i32(0)
+                };
                 let i32t = self.s.t.i32;
                 let flo = self
                     .s
@@ -10567,11 +10680,27 @@ impl<'a> Lower<'a> {
     fn any_lane(&mut self, m: Bool) -> Result<V, Why> {
         let c = self.cur;
         let bit = self.boolean(m, c)?;
-        let lo = self.ballot_word(c, bit);
-        let (lo, hi) = self.exchange(c, lo);
+        let (lo, hi) = self.console_ballot(c, bit);
         let or = self.s.m.bin(c, Bin::Or, lo, hi);
         let z = self.s.m.i32(0);
         Ok(self.s.m.cmp(c, pred::NE, or, z))
+    }
+
+    /// Console flow: the console wave's ballot of `bit`, low and high word.
+    fn console_ballot(&mut self, at: usize, bit: V) -> (V, V) {
+        if self.split {
+            let word = self.ballot_word(at, bit);
+            return self.exchange(at, word);
+        }
+        // One host wave is the console wave (the high word is 0 in waves
+        // of 32).
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let r = self
+            .s
+            .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+        self.s.flags |= flags::WAVE_OPS;
+        (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1))
     }
 
     /// The host wave's ballot of `bit` (32 lanes: the first word).
@@ -10625,14 +10754,14 @@ impl<'a> Lower<'a> {
         f
     }
 
-    /// Split: this lane's console lane (0..63) and half (0, 1).
+    /// This lane's console lane (0..63, 0..31 in waves of 32) and its
+    /// half of a wave64 (0, 1).
     fn console_lane(&mut self) -> (V, V) {
         let f = self.console_flat();
         let e = self.s.entry;
-        let (k63, k5, one) = (self.s.m.i32(63), self.s.m.i32(5), self.s.m.i32(1));
-        let lane = self.s.m.bin(e, Bin::And, f, k63);
-        let h = self.s.m.bin(e, Bin::LShr, f, k5);
-        let half = self.s.m.bin(e, Bin::And, h, one);
+        let (mask, k5) = (self.s.m.i32(self.wave() - 1), self.s.m.i32(5));
+        let lane = self.s.m.bin(e, Bin::And, f, mask);
+        let half = self.s.m.bin(e, Bin::LShr, lane, k5);
         (lane, half)
     }
 
@@ -11352,7 +11481,10 @@ impl<'a> Lower<'a> {
                 // walks pop masks from memory): with console lanes the lane's
                 // own bit of the number, as `Atom::Opaque`.
                 let number = self.console_lanes && !self.x.native.wave64 && self.uniform_join(b);
-                let x = match (self.x.st.masks.get(&arg), self.vals.get(&arg)) {
+                // Console flow: every lane arrives by every edge, so a join
+                // also takes masks that are constants or built from scalars.
+                let other = self.console_cf.then(|| self.x.st.other.get(&arg)).flatten();
+                let x = match (self.x.st.masks.get(&arg).or(other), self.vals.get(&arg)) {
                     (Some(&m), _) => self.boolean(m, qb).map_err(|w| unsupported(offset, w))?,
                     (None, Some(&Val::I32(word))) if number => self.lane_bit(qb, word, None).map_err(|w| unsupported(offset, w))?,
                     (None, _) if !self.uniform_join(b) && self.no_mask_lane_on_edge(b, &phi.args, n) => {

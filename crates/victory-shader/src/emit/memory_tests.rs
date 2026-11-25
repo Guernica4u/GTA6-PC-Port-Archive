@@ -190,6 +190,7 @@ fn program() -> HostShader {
         mesh_stride: 0,
         target: super::Target::ANY,
         console_cf: false,
+        per_lane_only: false,
         view_marks: false,
     })
     .expect("lower");
@@ -421,6 +422,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         mesh_stride: 0,
         target: super::Target::ANY,
         console_cf: false,
+        per_lane_only: false,
         view_marks: false,
     })
     .expect("lower");
@@ -565,6 +567,7 @@ fn writes_through_views_mark_their_pages() {
         mesh_stride: 0,
         target: super::Target::ANY,
         console_cf: false,
+        per_lane_only: false,
         view_marks: true,
     })
     .expect("lower");
@@ -684,6 +687,7 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
             view_marks: true,
             target: super::Target::ANY,
             console_cf: false,
+            per_lane_only: false,
         })
         .expect("lower")
     };
@@ -809,6 +813,7 @@ fn straddling_writes_across_256mib_and_4gib_boundaries_mark_exact_pages() {
         mesh_stride: 0,
         target: super::Target::ANY,
         console_cf: false,
+        per_lane_only: false,
         view_marks: false,
     })
     .expect("lower");

@@ -211,6 +211,8 @@ mod diff_tests;
 mod flow_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+#[cfg(all(test, windows))]
+mod lane_read_loop_tests;
 mod lower;
 mod rect;
 pub use rect::{rectangle_gs, right_angle};
@@ -548,7 +550,7 @@ pub fn emit_with(
         }
         _ => 0,
     };
-    let parts = |st, res, console_cf| lower::Parts {
+    let parts = |st, res, console_cf, per_lane_only| lower::Parts {
         native,
         p,
         st,
@@ -560,12 +562,28 @@ pub fn emit_with(
         mesh_stride,
         target: options.target,
         console_cf,
+        per_lane_only,
         view_marks: options.view_marks,
     };
-    let l = match lower::lower(&parts(st, res, false)) {
+    let l = match lower::lower(&parts(st, res, false, false)) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSOLE_FLOW => {
-            let console = structure::structure_console(p)?;
-            lower::lower(&parts(&console, res, true))?
+            let console = structure::structure_console(p);
+            let lowered = match &console {
+                Ok(console) => lower::lower(&parts(console, res, true, false)),
+                Err(e) => Err(ShaderError::Unsupported {
+                    offset: 0,
+                    what: match e {
+                        ShaderError::Unsupported { what, .. } => what,
+                        _ => "a program the console structure cannot hold",
+                    },
+                }),
+            };
+            match lowered {
+                Ok(l) => l,
+                // What the console flow cannot lower keeps the per-lane form
+                // where that translates; else the console flow's reason.
+                Err(e) => lower::lower(&parts(st, res, false, true)).map_err(|_| e)?,
+            }
         }
         // Discarded lanes kept on as helpers can read what no surviving
         // lane does (a register only killed lanes skipped writing); such a
@@ -573,7 +591,7 @@ pub fn emit_with(
         Err(_) if !st.discards.is_empty() => {
             let st = structure::killing(p)?;
             let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-            lower::lower(&parts(&st, &res, false))?
+            lower::lower(&parts(&st, &res, false, false))?
         }
         l => l?,
     };

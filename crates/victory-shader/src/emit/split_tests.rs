@@ -69,6 +69,14 @@ const IN_HALF: &[u32] = &[
 fn run(host: &Host, native: &crate::NativeProgram, groups: u32) -> Result<Vec<u32>, String> {
     let target = host.target();
     let cs = emit_for(native, target).map_err(|e| e.to_string())?;
+    // The validator, where one is installed: drivers take some modules it
+    // refuses.
+    if let Ok(mut v) =
+        super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+    {
+        v.validate(&mut cs.dxil.clone())
+            .map_err(|e| format!("validation: {e}"))?;
+    }
     let (root, pso) = host.compute_pipeline(&cs)?;
     let data = vec![0; (cs.user_data_dwords() as usize).max(1)];
     let StageIo::Cs(io) = &native.io else {
@@ -298,10 +306,8 @@ fn console_flow_is_for_one_console_wave_per_group() {
 /// the upper half's go on to 63, and the console wave loops while any lane
 /// does. After it, s9 holds lane 40's id, as the last iteration read it.
 ///
-/// The per-lane form (hosts with 64-lane waves) gets this wrong: a lane
-/// that left the loop is not there for the later iterations' lane reads,
-/// and a lane that skipped the loop never sees the scalar it set (on an
-/// RDNA2 iGPU, lane 0 ends with 0 and lanes 41 to 63 with t).
+/// The per-lane form got this wrong on every host (#225); hosts with
+/// 64-lane waves now run it in the console flow too, without exchanges.
 #[test]
 fn loops_run_while_any_lane_of_the_console_wave_does() {
     let body = [
@@ -321,7 +327,7 @@ fn loops_run_while_any_lane_of_the_console_wave_does() {
         0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
         0x4A04_0409, // v_add_nc_u32 v2, s9, v2
     ];
-    flow_case("loop t times reading lane 40", &body, 64, |t| t + 40, false);
+    console_flow_case("loop t times reading lane 40", &body, 64, |t| t + 40);
 }
 
 /// DPP's row mask names the console's rows: with `row_mask:0x3` only
@@ -356,6 +362,61 @@ fn first_lane_reads_are_the_console_waves() {
     console_flow_case("DPP and v_readfirstlane", &body, 64, |_| 0);
 }
 
+/// `v_writelane` ignores EXEC: inside a branch only lanes below 20 take,
+/// it still writes lane 40. The per-lane form never had lane 40 there.
+#[test]
+fn lane_writes_reach_lanes_outside_the_branch() {
+    let body = [
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0004, // s_cbranch_execz +4
+        0xBE89_03FF,
+        0x0000_004D, // s_mov_b32 s9, 77
+        0xD761_0002,
+        0x0001_5009, // v_writelane_b32 v2, s9, 40
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+    ];
+    // The written VGPR is read as a vector after the join, so the lane
+    // write must still be emulated on a 32-lane host.
+    let wave32 = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    let cs = emit_for(&program(&body, 64), wave32).unwrap();
+    assert_eq!(wave_size(&cs.dxil), Some(32));
+    console_flow_case("if (lane < 20) writelane(40, 77)", &body, 64, |t| {
+        if t == 40 { 77 } else { 1 }
+    });
+}
+
+/// The loop form compilers emit: lanes that are done are added to an exit
+/// mask that starts as 0, EXEC loses them, and the mask restores EXEC
+/// after the loop. Lane t runs t + 1 iterations with a read of lane 40 in
+/// each; afterwards every lane has s9 = 40 and counts all 64 lanes in the
+/// exit mask.
+#[test]
+fn loops_with_an_exit_mask_grown_from_zero() {
+    let body = [
+        0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+        0xBE8A_0480, // s_mov_b64 s[10:11], 0
+        0xBE89_0380, // s_mov_b32 s9, 0
+        // loop:
+        0xD760_0009,
+        0x0001_5100, // v_readlane_b32 s9, v0, 40
+        0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+        0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+        0x888A_0A6A, // s_or_b64 s[10:11], vcc, s[10:11]
+        0x8AFE_0A7E, // s_andn2_b64 exec, exec, s[10:11]
+        0xBF89_FFF9, // s_cbranch_execnz loop
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+        0xBE8C_100A, // s_bcnt1_i32_b64 s12, s[10:11]
+        0x7E04_0209, // v_mov_b32 v2, s9
+        0x4A04_040C, // v_add_nc_u32 v2, s12, v2
+    ];
+    console_flow_case("exit-mask loop reading lane 40", &body, 64, |_| 40 + 64);
+}
+
 /// `s_*_saveexec` writes the old EXEC to its scalar destination and the new
 /// EXEC to EXEC, and sets SCC to whether the *new* EXEC is non-zero. In
 /// console flow, `s_cbranch_scc0` after `s_and_saveexec_b64` must branch on
@@ -374,6 +435,30 @@ fn saveexec_scc_tests_new_exec_not_saved_exec() {
         0x7E04_0209, // v_mov_b32 v2, s9
     ];
     console_flow_case("saveexec SCC tests new EXEC", &body, 64, |_| 42);
+}
+
+/// A loop that runs while `s_and_saveexec` leaves a lane: SCC is the new
+/// EXEC, so the wave leaves when its last lane does. Lane t stays for t + 1
+/// iterations and s9 counts the wave's: 64. Branching on the saved EXEC
+/// ran the loop once more, with no lane in it.
+#[test]
+fn loops_leave_on_the_new_exec_of_saveexec() {
+    let body = [
+        0xD760_000E,
+        0x0001_1500, // v_readlane_b32 s14, v0, 10 (takes the console flow)
+        0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+        0xBE8A_047E, // s_mov_b64 s[10:11], exec
+        0xBE89_0380, // s_mov_b32 s9, 0
+        // loop:
+        0x8009_8109, // s_add_u32 s9, s9, 1
+        0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+        0x7D82_0280, // v_cmp_lt_u32 vcc, 0, v1
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF85_FFFB, // s_cbranch_scc1 loop
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    console_flow_case("a loop leaving on saveexec's SCC", &body, 64, |_| 64);
 }
 
 /// A select on a mask held as a number (here the constant 5: lanes 0 and 2)
@@ -432,4 +517,71 @@ fn a_mask_copied_dword_by_dword_stops_instead_of_recursing() {
             .to_string();
         assert!(e.contains(why), "{lanes_min}..{lanes_max}: {e}");
     }
+}
+
+/// The lane writes are SGPR spills. The restore after the branch has
+/// two incoming VGPR values, but both hold the same scalar in lane 40.
+#[test]
+fn sgpr_spills_across_a_divergent_branch_stay_per_lane() {
+    let body = [
+        0xD761_0005,
+        0x0001_5008, // v_writelane_b32 v5, s8, 40
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0005, // s_cbranch_execz +5
+        0xD761_0005,
+        0x0001_0001, // v_writelane_b32 v5, s1, 0
+        0xD760_0009,
+        0x0001_5105, // v_readlane_b32 s9, v5, 40
+        0x7E04_0209, // v_mov_b32 v2, s9
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+        0xD760_0009,
+        0x0001_5105, // v_readlane_b32 s9, v5, 40
+        0x4A04_0409, // v_add_nc_u32 v2, s9, v2
+    ];
+    let p = program(&body, 64);
+    let wave32 = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    // Main's per-lane form: the console's wave size where the host runs it
+    // (the lane writes emulated), none on a 32-lane host. Both are the
+    // first pass's: it does not ask for the console flow.
+    let code = crate::ir::build(&p.code, p.wave64, p.vgprs).unwrap();
+    let st = crate::structure::structure(&code).unwrap();
+    let res = crate::resource::track(&code, &p.layout, p.stage, Some(&st)).unwrap();
+    let io = crate::io::raise(&code, &p).unwrap();
+    for (target, want) in [(super::Target::ANY, Some(64)), (wave32, None)] {
+        let cs = emit_for(&p, target).unwrap();
+        assert_eq!(wave_size(&cs.dxil), want, "{target:?}");
+        let per_lane = super::lower::lower(&super::lower::Parts {
+            native: &p,
+            p: &code,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+            target,
+            console_cf: false,
+            per_lane_only: false,
+            view_marks: false,
+        })
+        .unwrap_or_else(|e| panic!("{target:?}: {e}"));
+        assert_eq!(per_lane.dxil, cs.dxil, "{target:?}");
+    }
+    let Ok(warp) = Host::new(true) else {
+        return;
+    };
+    let out = run(&warp, &p, 2).unwrap();
+    let want: Vec<_> = (0..2)
+        .flat_map(|group| {
+            let offset = group * 64 * 4;
+            (0..64).map(move |lane| offset + if lane < 20 { offset } else { 1 })
+        })
+        .collect();
+    assert_eq!(out, want);
 }
