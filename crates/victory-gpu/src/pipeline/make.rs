@@ -23,7 +23,7 @@
 //! guess; a pass the title runs only once and whose pipeline takes longer
 //! is lost.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
@@ -236,6 +236,7 @@ impl QueueState {
 
 struct Scheduler {
     queue: Mutex<QueueState>,
+    inflight: Mutex<HashMap<usize, Arc<Pending>>>,
     wake: Condvar,
     done_lock: Mutex<()>,
     done_cv: Condvar,
@@ -263,6 +264,7 @@ impl Pool {
     ) -> Self {
         let scheduler = Arc::new(Scheduler {
             queue: Mutex::new(QueueState::default()),
+            inflight: Mutex::new(HashMap::new()),
             wake: Condvar::new(),
             done_lock: Mutex::new(()),
             done_cv: Condvar::new(),
@@ -366,6 +368,10 @@ impl Scheduler {
             } else {
                 (self.on_step)();
             }
+            self.inflight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&(p as *const Pending as usize));
         }
     }
 
@@ -434,6 +440,10 @@ impl Scheduler {
         if !p.queued.swap(true, Ordering::AcqRel) {
             let _ = p.scheduler.set(Arc::downgrade(self));
             self.note_queued();
+            self.inflight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(Arc::as_ptr(p) as usize, p.clone());
             let deps = p.deps.get_or_init(resolve_deps);
             if deps.is_empty() {
                 p.remaining_deps.store(0, Ordering::Release);
@@ -468,10 +478,15 @@ impl Scheduler {
             // demand priority.
             if !initial_demand && p.demand.load(Ordering::Acquire) {
                 for s in deps {
-                    if s.promote_to_demand()
-                        && !to_enqueue.iter().any(|(queued, _)| Arc::ptr_eq(queued, s))
-                    {
-                        to_enqueue.push((s.clone(), true));
+                    if s.promote_to_demand() {
+                        if let Some((_, priority)) = to_enqueue
+                            .iter_mut()
+                            .find(|(queued, _)| Arc::ptr_eq(queued, s))
+                        {
+                            *priority = true;
+                        } else {
+                            to_enqueue.push((s.clone(), true));
+                        }
                     }
                 }
             }
@@ -781,7 +796,10 @@ mod tests {
             .start_with_deps(&p, true, || p.shaders.clone());
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !p.resolved.load(Ordering::Acquire) && Instant::now() < deadline {
+        while (!p.resolved.load(Ordering::Acquire)
+            || pool.scheduler.waiting.load(Ordering::Relaxed) > 0)
+            && Instant::now() < deadline
+        {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
@@ -854,5 +872,40 @@ mod tests {
                 early_cs.hash.clone(),
             ]
         );
+    }
+
+    #[test]
+    fn dropped_title_pipeline_does_not_leak_waiting_count() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let gate = Shader::test_only("compute", "lifetime_gate");
+        let gate_hash = gate.hash.clone();
+        let pool = Pool::new(
+            1,
+            move |s| {
+                if s.hash == gate_hash {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.lock().unwrap().recv();
+                }
+                s.finish_translation(true);
+            },
+            |p| p.fail(),
+            |_| {},
+            || {},
+        );
+        let sched = pool.scheduler.clone();
+        let blocker = pending_with(vec![gate]);
+        sched.start_with_deps(&blocker, false, || blocker.shaders.clone());
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let target = pending_with(vec![Shader::test_only("compute", "lifetime_target")]);
+        sched.start_with_deps(&target, false, || target.shaders.clone());
+        let before = sched.waiting.load(Ordering::Acquire);
+        drop(target);
+        let _ = release_tx.send(());
+        drop(pool);
+        assert_eq!(before, 2);
+        assert!(blocker.resolved.load(Ordering::Acquire));
+        assert_eq!(sched.waiting.load(Ordering::Acquire), 0);
     }
 }
