@@ -131,3 +131,42 @@ fn host_memory_query_is_available() {
     println!("host memory available={} MiB, adaptive slots={slots}", bytes >> 20);
     assert!((1..=DEFAULT_SLOTS).contains(&slots));
 }
+
+#[test]
+fn growing_budget_admits_all_newly_available_slots() {
+    use std::sync::atomic::AtomicU64;
+    static AVAILABLE: AtomicU64 = AtomicU64::new(6 * GIB);
+    let gate = Gate::with_limit(Limit::Adaptive(|| Some(AVAILABLE.load(SeqCst))));
+    let first = gate.acquire(|_| panic!("first must proceed"));
+    let second = gate.acquire(|_| panic!("second must proceed"));
+    let waiting = AtomicUsize::new(0);
+    let (entered, received) = std::sync::mpsc::channel();
+    let (release, released) = (Mutex::new(false), Condvar::new());
+    let admitted = std::thread::scope(|scope| {
+        for _ in 0..3 {
+            let entered = entered.clone();
+            let waiting = &waiting;
+            let gate = &gate;
+            let release = &release;
+            let released = &released;
+            scope.spawn(move || {
+                let _slot = gate.acquire(|_| { waiting.fetch_add(1, SeqCst); });
+                entered.send(()).unwrap();
+                let _guard = released.wait_while(release.lock().unwrap(), |go| !*go).unwrap();
+            });
+        }
+        while waiting.load(SeqCst) != 3 { std::thread::yield_now(); }
+        AVAILABLE.store(16 * GIB, SeqCst);
+        drop(first);
+        let mut count = 0;
+        for _ in 0..3 {
+            if received.recv_timeout(Duration::from_secs(2)).is_ok() { count += 1; }
+            else { break; }
+        }
+        *release.lock().unwrap() = true;
+        released.notify_all();
+        drop(second);
+        count
+    });
+    assert_eq!(admitted, 3);
+}

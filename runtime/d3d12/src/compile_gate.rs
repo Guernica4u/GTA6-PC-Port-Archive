@@ -109,7 +109,13 @@ impl Gate {
 impl Drop for Slot<'_> {
     fn drop(&mut self) {
         *self.0.running.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
-        self.0.freed.notify_one();
+        // An adaptive budget can grow by more than one slot when memory
+        // becomes available. Wake every waiter so the new capacity can be
+        // used; the mutex and admission predicate still enforce the limit.
+        match &self.0.limit {
+            Limit::Adaptive(_) => self.0.freed.notify_all(),
+            Limit::Fixed(_) => self.0.freed.notify_one(),
+        }
     }
 }
 
