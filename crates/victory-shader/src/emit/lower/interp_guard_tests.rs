@@ -133,10 +133,12 @@ fn guarded_interp_preserves_inactive_lanes_prior_vgpr_value() {
         S_ENDPGM,
     ];
     let f16_pair_l = lower_ps(&f16_pair_words, false, true);
-    assert_eq!(
-        f16_pair_l.select_false_ints,
-        vec![Some(i64::from(SENTINEL_F16 as i32))]
-    );
+    let f16_const_false: Vec<i64> = f16_pair_l
+        .select_false_ints
+        .into_iter()
+        .flatten()
+        .collect();
+    assert_eq!(f16_const_false, vec![i64::from(SENTINEL_F16 as i32)]);
     #[cfg(windows)]
     if let Ok(mut v) = super::super::validator::Validator::load(
         super::super::validator::Validator::default_path().as_deref(),
