@@ -1290,6 +1290,58 @@ mod tests {
     }
 
     #[test]
+    fn raw_file_read_rejects_offset_overflow_after_a_partial_read() {
+        let offset = u64::MAX - 1;
+        let mut out = [0xcc; 4];
+        let mut calls = 0;
+        let result = read_file_into(&mut out, offset, true, |buf, at| {
+            calls += 1;
+            assert_eq!(at, offset);
+            buf[..2].copy_from_slice(b"ab");
+            Ok(2)
+        });
+
+        assert_eq!(result, Err(E_INVALIDARG));
+        assert_eq!(calls, 1);
+        assert_eq!(&out, b"ab\xcc\xcc");
+    }
+
+    #[test]
+    fn staged_raw_file_read_rejects_offset_overflow_after_a_partial_read() {
+        let offset = u64::MAX - 1;
+        let mut out = [0xcc; 4];
+        let unread = out[1..].as_ptr();
+        let mut calls = 0;
+        let result = read_file_into(&mut out, offset, true, |buf, at| {
+            calls += 1;
+            match calls {
+                1 => {
+                    assert_eq!(at, offset);
+                    buf[0] = b'a';
+                }
+                2 => {
+                    assert_eq!(at, u64::MAX);
+                    assert_eq!(buf.as_ptr(), unread);
+                    return Err(std::io::Error::from_raw_os_error(
+                        ERROR_INVALID_USER_BUFFER as i32,
+                    ));
+                }
+                3 => {
+                    assert_eq!(at, u64::MAX);
+                    assert_ne!(buf.as_ptr(), unread);
+                    buf[0] = b'b';
+                }
+                _ => panic!("unexpected read at offset {at}"),
+            }
+            Ok(1)
+        });
+
+        assert_eq!(result, Err(E_INVALIDARG));
+        assert_eq!(calls, 3);
+        assert_eq!(&out, b"ab\xcc\xcc");
+    }
+
+    #[test]
     fn staged_raw_file_read_reports_eof() {
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(b"abcd").unwrap();
