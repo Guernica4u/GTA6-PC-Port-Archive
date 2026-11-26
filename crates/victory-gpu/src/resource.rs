@@ -1790,6 +1790,10 @@ static TEXTURES_AT: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<usize>>
 /// one memory, and views of buffers are not matched.
 #[cfg(windows)]
 pub(crate) fn alias_source(placed: This) -> Option<This> {
+    // A shader view of no resource (a null view) has no memory.
+    if placed.is_null() {
+        return None;
+    }
     let copy = made(resource(placed))?;
     alias_source_for(placed, &copy)
 }

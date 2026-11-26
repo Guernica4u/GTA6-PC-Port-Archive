@@ -44,8 +44,7 @@ fn host_texture_for(
     if state & READ != 0 && state & TARGET == 0 {
         if let Some(from) = crate::resource::alias_source_for(resource, copy) {
             crate::texture::alias_copy_to(host, from, resource, copy);
-        }
-        if crate::texture::title_written(&copy.texture) {
+        } else if crate::texture::title_written(&copy.texture) {
             crate::texture::upload_copy(host, resource, copy);
         }
     }
