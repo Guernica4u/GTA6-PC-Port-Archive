@@ -81,7 +81,7 @@ static FINISHED_FENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     pub(crate) depth_bounds_supported: bool,
-    /// Resizable BAR (`D3D12_HEAP_TYPE_GPU_UPLOAD`) supported by device/OS.
+    /// Whether GPU upload was requested and is supported by the device.
     pub(crate) gpu_upload: bool,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
@@ -290,11 +290,15 @@ pub(crate) fn video_memory() -> Option<[(u64, u64); 2]> {
 }
 
 pub(crate) fn host() -> Option<&'static Host> {
-    HOST.get_or_init(|| match create() {
-        Ok(host) => Some(host),
-        Err(e) => {
-            tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
-            None
+    HOST.get_or_init(|| {
+        let gpu_upload_requested =
+            !cfg!(test) && std::env::var_os("VICTORY_GPU_UPLOAD").is_some_and(|v| v == "1");
+        match create(gpu_upload_requested) {
+            Ok(host) => Some(host),
+            Err(e) => {
+                tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
+                None
+            }
         }
     })
     .as_ref()
@@ -313,7 +317,7 @@ pub(crate) fn wait_in_flight_if_ready() {
     }
 }
 
-fn create() -> windows::core::Result<Host> {
+fn create(gpu_upload_requested: bool) -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
@@ -375,7 +379,7 @@ fn create() -> windows::core::Result<Host> {
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
-        let host = Host::from_device(device, messages)?;
+        let host = Host::from_device(device, messages, gpu_upload_requested)?;
         tracing::info!("host D3D12 device ready");
         Ok(host)
     }
@@ -385,6 +389,7 @@ impl Host {
     fn from_device(
         device: ID3D12Device,
         messages: Option<ID3D12InfoQueue>,
+        gpu_upload_requested: bool,
     ) -> windows::core::Result<Host> {
         // SAFETY: plain D3D12 feature query and queue, fence, event and
         // descriptor heap creation.
@@ -399,8 +404,7 @@ impl Host {
                 .is_ok()
                 && options.DepthBoundsTestSupported.as_bool();
             let mut options16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
-            let gpu_upload = !cfg!(test)
-                && std::env::var_os("VICTORY_GPU_UPLOAD").is_some_and(|v| v == "1")
+            let gpu_upload = gpu_upload_requested
                 && device
                     .CheckFeatureSupport(
                         D3D12_FEATURE_D3D12_OPTIONS16,
@@ -503,7 +507,7 @@ impl Host {
         let mut device: Option<ID3D12Device> = None;
         // SAFETY: `adapter` is a verified software WARP adapter.
         unsafe { D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()? };
-        Host::from_device(device?, None).ok()
+        Host::from_device(device?, None, false).ok()
     }
 }
 
@@ -586,6 +590,66 @@ mod tests {
     }
 
     use super::*;
+
+    /// Run in isolation with `--ignored --nocapture` to inspect both heap
+    /// selections on the host adapter. The process-wide host stays untouched.
+    #[test]
+    #[ignore = "uses the host D3D12 adapter and reports its GPU upload capability"]
+    fn upload_buffer_round_trips_on_selected_heap() {
+        const SIZE: usize = 64 << 10;
+        let mut expected = vec![0u8; SIZE];
+        for requested in [false, true] {
+            let host = create(requested).expect("create D3D12 host");
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+            // SAFETY: the live device receives the feature's sized output structure.
+            let supported = unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS16,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            }
+            .is_ok()
+                && options.GPUUploadHeapSupported.as_bool();
+            assert_eq!(host.gpu_upload, requested && supported);
+            let (upload, output) = host.upload_buffer(SIZE as u64).expect("allocate upload");
+            let (readback, input) = host.readback_buffer(SIZE as u64).expect("allocate readback");
+            let mut props = D3D12_HEAP_PROPERTIES::default();
+            let list = host.new_list().expect("create command list");
+            // SAFETY: live resources and an open list; the copy fits both buffers.
+            unsafe {
+                upload.GetHeapProperties(Some(&mut props), None).expect("get upload heap");
+                list.list.CopyBufferRegion(&readback, 0, &upload, 0, SIZE as u64);
+                list.list.Close().expect("close command list");
+            }
+            eprintln!(
+                "requested={requested}, GPUUploadHeapSupported={supported}, heap type={} (UPLOAD=2, GPU_UPLOAD=5)",
+                props.Type.0
+            );
+            assert!(
+                props.Type == D3D12_HEAP_TYPE_UPLOAD
+                    || (requested && supported && props.Type == D3D12_HEAP_TYPE_GPU_UPLOAD)
+            );
+
+            let command = list.list.cast::<ID3D12CommandList>().expect("cast command list");
+            let mut submitted = host.submitted.lock().unwrap();
+            for seed in [17usize, 193] {
+                for (i, byte) in expected.iter_mut().enumerate() {
+                    *byte = ((i ^ (i >> 8) ^ seed) % 251) as u8;
+                }
+                // SAFETY: the upload is mapped for SIZE bytes. The preceding
+                // copy, if any, completed before the buffer is written again.
+                unsafe { expected.as_ptr().copy_to_nonoverlapping(output, SIZE) };
+                host.execute_and_wait_locked(command.clone(), &mut submitted);
+                // SAFETY: the fence guards the mapping and both resources are live.
+                unsafe {
+                    host.device.GetDeviceRemovedReason().expect("device survived copy");
+                    assert_eq!(host.fence.GetCompletedValue(), *submitted);
+                    assert_eq!(std::slice::from_raw_parts(input, SIZE), expected.as_slice());
+                }
+            }
+        }
+    }
 
     /// A list with no work before its waits, as the title's queues meet one
     /// another halfway: each write goes as soon as the waits before it are
