@@ -486,6 +486,20 @@ impl State {
         let mut events = std::mem::take(&mut self.pending);
         if one_pad {
             let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
+            // Debugging aid (`VICTORY_PAD_LOG=1`, diagnostics): says what the
+            // title is handed whenever it asks while a button or a key is
+            // down. A front end that ignores the keyboard can then be told
+            // from one that never asks: the first shows readings here.
+            if cfg!(feature = "diagnostics")
+                && std::env::var_os("VICTORY_PAD_LOG").is_some()
+                && (pad.buttons != 0 || !keys.is_empty())
+            {
+                tracing::info!(
+                    buttons = format!("{:#x}", pad.buttons),
+                    keys = keys.len(),
+                    "pad reading handed over"
+                );
+            }
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
             self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
             return events;
