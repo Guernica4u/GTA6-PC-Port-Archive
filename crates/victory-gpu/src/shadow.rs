@@ -94,6 +94,8 @@ pub(crate) struct Shadow {
 #[derive(Default)]
 struct Snapshot {
     bytes: Vec<u8>,
+    /// The last captured size guides the first pool checkout next submission.
+    last_size: usize,
     /// Disjoint spans in address order, pointing into the capture buffer.
     spans: Vec<SnapshotSpan>,
     /// The 64 KiB pieces already compared, by title address.
@@ -113,6 +115,14 @@ impl Snapshot {
         let before = self.bytes.len();
         let mut at = start;
         let mut i = self.spans.partition_point(|span| span.end <= at);
+        if host.len() > self.bytes.capacity() - before {
+            let covered: usize = self.spans[i..]
+                .iter()
+                .take_while(|span| span.start < end)
+                .map(|span| span.end.min(end) - span.start.max(start))
+                .sum();
+            self.reserve(before + (host.len() - covered));
+        }
         while at < end {
             if let Some(span) = self.spans.get(i)
                 && span.start <= at
@@ -122,9 +132,6 @@ impl Snapshot {
                 continue;
             }
             let next = self.spans.get(i).map_or(end, |span| end.min(span.start));
-            if self.bytes.capacity() == 0 {
-                self.bytes = pooled(host.len());
-            }
             let offset = self.bytes.len();
             self.bytes
                 .extend_from_slice(&host[at - start..next - start]);
@@ -150,6 +157,27 @@ impl Snapshot {
         self.bytes.len() - before
     }
 
+    fn reserve(&mut self, required: usize) {
+        let capacity = self.bytes.capacity();
+        if required <= capacity {
+            return;
+        }
+        // Grow by enough to amortize copying, but use a smaller warm
+        // buffer if it can hold the new snapshot.
+        let growth = required.max(capacity.saturating_mul(2));
+        let preferred = if capacity == 0 {
+            growth.max(self.last_size)
+        } else {
+            growth
+        };
+        let mut grown = pooled(required, preferred).unwrap_or_else(|| Vec::with_capacity(growth));
+        grown.extend_from_slice(&self.bytes);
+        let old = std::mem::replace(&mut self.bytes, grown);
+        if capacity != 0 {
+            give_back(old);
+        }
+    }
+
     fn covers(&self, start: usize, end: usize) -> bool {
         let mut at = start;
         for span in &self.spans[self.spans.partition_point(|span| span.end <= start)..] {
@@ -173,6 +201,7 @@ impl Snapshot {
         scratch: &'a mut Vec<u8>,
     ) -> Option<&'a [u8]> {
         let end = start + host.len();
+        debug_assert!(self.covers(start, end));
         let first = self.spans.partition_point(|span| span.end <= start);
         let span = &self.spans[first];
         if end <= span.end {
@@ -188,7 +217,10 @@ impl Snapshot {
                     let from = span.start.max(start);
                     let to = span.end.min(end);
                     let offset = span.offset + (from - span.start);
-                    (&self.bytes[offset..offset + to - from], from - start..to - start)
+                    (
+                        &self.bytes[offset..offset + to - from],
+                        from - start..to - start,
+                    )
                 })
         };
         if fragments().all(|(old, range)| old == &host[range]) {
@@ -220,6 +252,7 @@ impl Snapshot {
         self.compared.clear();
         self.spans.clear();
         if !self.bytes.is_empty() {
+            self.last_size = self.bytes.len();
             give_back(std::mem::take(&mut self.bytes));
         }
     }
@@ -228,21 +261,21 @@ impl Snapshot {
 /// Snapshot memory kept for reuse (already touched, so no page faults).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
-/// An empty buffer with room for `n` bytes, from the pool if it has one.
-fn pooled(n: usize) -> Vec<u8> {
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let fit = pool
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| v.capacity() >= n)
-        .min_by_key(|(_, v)| v.capacity())
-        .map(|(i, _)| i);
-    let mut v = match fit {
-        Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
-    };
+/// An empty buffer with room for `required` bytes, preferring capacity
+/// of at least `preferred` and reusing touched memory when possible.
+fn pooled(required: usize, preferred: usize) -> Option<Vec<u8>> {
+    let mut v = {
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let fit = pool
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i, v.capacity()))
+            .filter(|&(_, capacity)| capacity >= required)
+            .min_by_key(|&(_, capacity)| (capacity < preferred, capacity));
+        fit.map(|(i, _)| pool.swap_remove(i))
+    }?;
     v.clear();
-    v
+    Some(v)
 }
 
 /// Returns a snapshot buffer to the pool, which keeps the largest up to
@@ -1408,9 +1441,15 @@ pub(crate) mod tests {
 
     #[test]
     fn overlapping_snapshots_keep_old_bytes_until_a_refresh() {
-        let mut snapshot = Snapshot::default();
+        let mut snapshot = Snapshot {
+            bytes: Vec::with_capacity(2),
+            ..Snapshot::default()
+        };
         let mut scratch = Vec::new();
         assert_eq!(snapshot.capture(4, &[14, 15]), 2);
+        let data = snapshot.bytes.as_ptr();
+        assert_eq!(snapshot.capture(4, &[0, 0]), 0);
+        assert_eq!(snapshot.bytes.as_ptr(), data, "covered bytes need no growth");
         assert_eq!(snapshot.capture(0, &[10, 11]), 2);
         assert!(!snapshot.covers(0, 6), "there is a gap");
         assert_eq!(snapshot.capture(1, &[21, 12, 13, 24, 25, 16]), 3);
