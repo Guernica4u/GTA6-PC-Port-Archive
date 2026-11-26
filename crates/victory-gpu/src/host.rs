@@ -4385,7 +4385,6 @@ mod batch {   // `mod tests` is already taken at the top of this file
         drop(copy);
         crate::watch::tests::free(p);
     }
-}
 
     /// A list reading title memory through a view heap's page table brings
     /// the copies up to date once, and again after a step that writes title

@@ -593,13 +593,6 @@ impl Shadow {
         }
         // Equal to title memory now (on what the copy holds of the page).
         t.taken(&[page / PAGE]);
-    }
-
-    #[test]
-        // Equal to title memory now: taken, unless it holds the page in part.
-        if from == page && to == page + PAGE {
-            t.taken(&[page / PAGE]);
-        }
         // So is the snapshot of declared ranges over the page: their
         // copy-backs must not take the title's bytes for the GPU's.
         self.sync_snapshot(from - start, host);
