@@ -90,3 +90,18 @@ fn group_shared_accesses_are_checked_against_the_declared_size() {
     }
     assert!(checked > 0, "no host profile translated the shared-memory program");
 }
+
+#[test]
+fn paired_carry_uses_paired_registers_and_only_needed_mask_locals() {
+    let &(_, threads, words) = programs::PROGRAMS.iter().find(|p| p.0 == "cmpx_carry").unwrap();
+    let hlsl = translate_paired_wave64(&program(threads, words)).unwrap().hlsl;
+    // The carry instructions write a scalar mask, but must not copy all
+    // vector operands back or snapshot a write-only mask.
+    let carry = hlsl.split_once("// 0x0018 v_add_co_u32").expect("carry instruction").1
+        .split("// 0x0024 v_add_co_ci_u32").next().unwrap();
+    assert!(!carry.contains("uint tbx_s30"), "{carry}");
+    assert!(!carry.contains("v0__0 = v0;"), "{carry}");
+    assert!(!carry.contains("uint tbx_vcc_lo"), "{carry}");
+    assert!(carry.contains("v10__0 = t0;"), "{carry}");
+    assert!(carry.contains("v0__0"), "{carry}");
+}

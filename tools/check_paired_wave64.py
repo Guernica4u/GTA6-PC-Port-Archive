@@ -84,6 +84,25 @@ PROGRAMS = {
 }
 
 
+PROGRAMS['carry_chain'] = [
+    'v_mov_b32_e32 v10, v0',
+    'v_mov_b32_e32 v11, 0xffffffff',
+    'v_add_co_u32 v10, s[30:31], v10, 0xfffffc00',
+] + [
+    'v_add_co_ci_u32_e64 v10, s[30:31], v10, v11, s[30:31]',
+    'v_add_co_ci_u32_e64 v11, vcc, v11, v10, s[30:31]',
+    'v_add_co_ci_u32_e64 v10, s[30:31], v0, v10, vcc',
+] * 16 + ['s_bcnt1_i32_b64 s20, s[30:31]', 's_bcnt1_i32_b64 s21, vcc']
+
+PROGRAMS['mad64_chain'] = [
+    'v_mov_b32_e32 v10, v0',
+    'v_mov_b32_e32 v11, 0xffffffff',
+] + [
+    'v_mad_u64_u32 v[10:11], s[30:31], v0, v1, v[10:11]',
+    'v_mad_u64_u32 v[10:11], vcc, v10, v11, v[10:11]',
+] * 16 + ['s_bcnt1_i32_b64 s20, s[30:31]', 's_bcnt1_i32_b64 s21, vcc']
+
+
 def assemble(llvm_mc, lines):
     result = subprocess.run([str(llvm_mc), "-triple=amdgcn-amd-amdhsa", "-mcpu=gfx1030",
                              "-mattr=-wavefrontsize32,+wavefrontsize64", "-show-encoding"],
@@ -232,6 +251,17 @@ def step(w, text):
             source = ((l & ~15) ^ 16) | sel
             if w.active(l) and w.active(source): w.v[int(ops[0][1:])][l] = old[source]
         return
+    if base == 'v_mad_u64_u32':
+        dst, high = map(int, re.fullmatch(r'v\[(\d+):(\d+)\]', ops[0]).groups())
+        a, b = map(int, re.fullmatch(r'v\[(\d+):(\d+)\]', ops[4]).groups())
+        mask = 0
+        for lane in range(64):
+            if w.active(lane):
+                total = w.value(ops[2], lane) * w.value(ops[3], lane) + (w.v[a][lane] | w.v[b][lane] << 32)
+                w.v[dst][lane], w.v[high][lane] = total & M32, (total >> 32) & M32
+                mask |= int(total > M64) << lane
+        w.store(ops[1], mask)
+        return
     dst = int(ops[0][1:])
     if base in ('v_add_co_u32', 'v_add_co_ci_u32'):
         carry_out, a, b = ops[1], ops[2], ops[3]
@@ -324,7 +354,7 @@ def inputs(rng):
 def selected():
     """Each program in one console wave per group, and some in four."""
     single = [(name, body, 64) for name, body in PROGRAMS.items()]
-    return single + [(f"{name}_x4", PROGRAMS[name], 256) for name in ("saveexec", "waterfall", "permlane", "dispatch")]
+    return single + [(f"{name}_x4", PROGRAMS[name], 256) for name in ("saveexec", "waterfall", "permlane", "dispatch", "carry_chain", "mad64_chain")]
 
 
 def main(argv=None):

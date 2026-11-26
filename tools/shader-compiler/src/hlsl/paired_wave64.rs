@@ -132,6 +132,27 @@ fn identifiers(code: &str) -> impl Iterator<Item = (&str, &str)> {
     })
 }
 
+/// Rename VGPR identifiers in a single lane's emitted arithmetic body.
+/// The two lanes have disjoint VGPR storage, so reads, assignments and
+/// in/out arguments can address the paired register directly. Keep the
+/// existing lexical boundaries: do not touch comments, members or literals.
+fn paired_vector_code(code: &str, lane: u32) -> String {
+    let mut result = String::with_capacity(code.len());
+    for line in code.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\r', '\n']);
+        let mut copied = 0;
+        for (word, after) in identifiers(body).filter(|(word, _)| is_vector_register(word)) {
+            let end = body.len() - after.len();
+            let start = end - word.len();
+            result.push_str(&line[copied..start]);
+            let _ = write!(result, "{word}__{lane}");
+            copied = end;
+        }
+        result.push_str(&line[copied..]);
+    }
+    result
+}
+
 /// The two words of the lane mask a vector instruction writes through `operand`.
 fn mask_words(operand: &Opnd) -> Option<[String; 2]> {
     match operand {
@@ -441,7 +462,16 @@ pub(super) fn emit(em: &mut Emitter<'_>, idx: usize, ins: &Insn, is_ps: bool, br
             return Err(format!("paired wave64: {m} writes {word} outside a known mask"));
         }
     }
-    let vectors: BTreeSet<&str> = identifiers(&code).map(|(word, _)| word).filter(|w| is_vector_register(w)).collect();
+    let names: BTreeSet<&str> = identifiers(&code).map(|(word, _)| word).collect();
+    let vectors: BTreeSet<&str> = names.iter().copied().filter(|w| is_vector_register(w)).collect();
+    // EXEC is needed for ballot reconstruction even when the body does
+    // not mention it. Other masks need a local only if used or written.
+    read.retain(|pair| pair[0] == "exec_lo" || written.contains(pair)
+        || pair.iter().any(|word| names.contains(word.as_str())));
+    // Arithmetic has no cross-lane VGPR access here: DPP sources were
+    // captured before either lane writes, and wave intrinsics were rejected.
+    // Keep the existing shadow path for memory instructions.
+    let direct = matches!(ins.enc, Enc::Vop1 | Enc::Vop2 | Enc::Vop3 | Enc::Vopc);
     let mut shadowed = read.clone();
     for words in &written {
         if !shadowed.contains(words) {
@@ -454,7 +484,9 @@ pub(super) fn emit(em: &mut Emitter<'_>, idx: usize, ins: &Insn, is_ps: bool, br
             em.line(line);
         }
     }
-    for [low, high] in &shadowed {
+    // A write-only mask starts at zero in each lane. Its full original
+    // value is never consumed; avoid snapshotting it.
+    for [low, high] in &read {
         em.line(&format!("uint tbx_{low} = {low}, tbx_{high} = {high};"));
     }
     for [low, _] in &written {
@@ -475,14 +507,20 @@ pub(super) fn emit(em: &mut Emitter<'_>, idx: usize, ins: &Insn, is_ps: bool, br
         }
         for vector in &vectors {
             em.regs.insert((*vector).to_string());
-            em.line(&format!("uint {vector} = {vector}__{lane};"));
+            if !direct {
+                em.line(&format!("uint {vector} = {vector}__{lane};"));
+            }
         }
         if moved.is_some() {
             em.line(&format!("uint {} = tbd_{lane};", name(&Opnd::Temp(MOVED))?));
         }
-        em.body.push_str(&code);
-        for vector in &vectors {
-            em.line(&format!("{vector}__{lane} = {vector};"));
+        if direct {
+            em.body.push_str(&paired_vector_code(&code, lane));
+        } else {
+            em.body.push_str(&code);
+            for vector in &vectors {
+                em.line(&format!("{vector}__{lane} = {vector};"));
+            }
         }
         for [low, _] in &written {
             em.line(&format!("tbm_{low}_{lane} = ({low} & 1u) != 0u;"));
