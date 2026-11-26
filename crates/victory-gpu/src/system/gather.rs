@@ -225,7 +225,10 @@ fn cpu() -> Cpu {
             "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
             "ProcessorNameString",
         )
-        .map_or_else(|| "unknown processor".to_owned(), |name| name.trim().to_owned()),
+        .map_or_else(
+            || "unknown processor".to_owned(),
+            |name| name.trim().to_owned(),
+        ),
         threads: info.dwNumberOfProcessors,
         // SAFETY: plain call.
         avx2: unsafe { IsProcessorFeaturePresent(PF_AVX2_INSTRUCTIONS_AVAILABLE) }.as_bool(),
