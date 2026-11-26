@@ -60,6 +60,18 @@ target\diag\victory.exe shaders <the shader archives>   # every shader translate
 target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
 ```
 
+When a run does not go well, this says what the machine is, without the title:
+
+```powershell
+target\diag\victory.exe system
+```
+
+The Windows version, the processor, the memory, and for every adapter the waves,
+shader model, view heap and mesh shaders a run would get, then what stands in
+the way. A test report whose output is this can be placed against a build
+(#104), and says which of the wave64, view-heap and commit limits (#9, #15,
+#74) it met.
+
 Commands, debugging switches and upstream's own description:
 [docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
 described in a comment where it is read.

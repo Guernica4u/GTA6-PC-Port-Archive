@@ -21,13 +21,20 @@ use clap::{Parser, Subcommand, ValueEnum};
 #[derive(Parser)]
 #[command(
     name = "victory",
-    version,
+    version = VERSION,
     about = "Run an Xbox Series title natively on Windows"
 )]
 struct Cli {
     #[command(subcommand)]
     command: Command,
 }
+
+/// The version, and the commit it was built from when the build knew one
+/// (`build.rs`): a test report that says `0.1.0 (7a0ccd3)` can be placed.
+const VERSION: &str = match option_env!("VICTORY_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
 
 #[derive(Subcommand)]
 enum Command {
@@ -127,6 +134,12 @@ enum Command {
         #[arg(long, hide = true)]
         these: Option<String>,
     },
+    /// What this machine is (#104): the Windows version, the processor and
+    /// the memory, and every adapter with the waves, shader model and view
+    /// heap a run would get, then what stands in the way. None of it needs a
+    /// title or a game file.
+    #[cfg(windows)]
+    System,
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -216,6 +229,8 @@ fn main() -> Result<()> {
         Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
         #[cfg(windows)]
         Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
+        #[cfg(windows)]
+        Command::System => show_system(),
         Command::Run {
             exe,
             unimplemented,
@@ -231,6 +246,19 @@ fn main() -> Result<()> {
         Command::Replay(options) => replay::run(options),
         Command::Config => show_config(),
     }
+}
+
+/// Prints what this machine is (#104), as [`victory_gpu::system::Facts`] asks
+/// it: the same questions a run asks before it makes a device.
+#[cfg(windows)]
+fn show_system() -> Result<()> {
+    let mut facts = victory_gpu::system::gather();
+    // The commit is this program's, which the GPU side cannot know.
+    facts.version = env!("CARGO_PKG_VERSION").to_owned();
+    facts.commit = option_env!("VICTORY_COMMIT").map(str::to_owned);
+    facts.debug = cfg!(debug_assertions);
+    print!("{facts}");
+    Ok(())
 }
 
 fn show_config() -> Result<()> {
