@@ -6784,10 +6784,9 @@ impl<'a> Lower<'a> {
             Operand::Scalar { code, .. } if code != NULL => {
                 pair(self, Reg::S(code), Reg::S(code + 1))
             }
-            Operand::Const(k @ 128..=208) => {
-                let x = crate::resource::inline(k).ok_or("a special operand")?;
-                let hi = if (x as i32) < 0 { u32::MAX } else { 0 };
-                Ok((self.s.m.i32(x), self.s.m.i32(hi)))
+            Operand::Const(k @ (128..=208 | 240..=248)) => {
+                let x = crate::resource::inline64(k).ok_or("a special operand")?;
+                Ok((self.s.m.i32(x as u32), self.s.m.i32((x >> 32) as u32)))
             }
             Operand::Literal(x) if inst.name().ends_with("_i64") => {
                 let hi = if (x as i32) < 0 { u32::MAX } else { 0 };
