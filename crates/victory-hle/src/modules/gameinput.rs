@@ -180,9 +180,13 @@ fn merge_scripted(pads: &mut [Option<PadState>; PADS], scripted: &[KeyState]) {
 /// tokens (`fwd`, `back`, `left`, `right`, `look_left`, `look_right`,
 /// `look_up`, `look_down`, `lt`, `rt`, buttons `a`...`y`, `menu`, `view`,
 /// `lb`, `rb`, `ls`, `rs`, d-pad `du`, `dd`, `dl`, `dr`, or `off`).
+/// An entry with an unknown token is dropped whole, leaving the last valid
+/// state active: applying the recognised tokens would invent a state the
+/// script never asked for (a typo in `look_rigth` would look like `off`).
 #[cfg(any(test, feature = "diagnostics"))]
 fn parse_script(text: &str) -> Vec<(u64, PadState)> {
     let mut segments = Vec::new();
+    let mut warned = std::collections::HashSet::new();
     for entry in text.split(';') {
         let Some((at, state)) = entry.trim().split_once(':') else {
             continue;
@@ -191,9 +195,11 @@ fn parse_script(text: &str) -> Vec<(u64, PadState)> {
             continue;
         };
         let mut pad = PadState::default();
+        let mut unknown = false;
         let axis = |value: &mut f32, delta: f32| *value = (*value + delta).clamp(-1.0, 1.0);
         for token in state.split(['+', ',']) {
-            match token.trim() {
+            let token = token.trim();
+            match token {
                 "fwd" => axis(&mut pad.left_y, 1.0),
                 "back" => axis(&mut pad.left_y, -1.0),
                 "left" => axis(&mut pad.left_x, -1.0),
@@ -218,12 +224,24 @@ fn parse_script(text: &str) -> Vec<(u64, PadState)> {
                 "rb" => pad.buttons |= RIGHT_SHOULDER,
                 "ls" => pad.buttons |= LEFT_STICK,
                 "rs" => pad.buttons |= RIGHT_STICK,
-                // `off` is an explicit neutral state; an unknown token is
-                // ignored rather than dropping the whole entry.
-                _ => {}
+                "off" => {}
+                // `off` is an explicit neutral state; a bad token drops the
+                // whole entry so the previous state stays active.
+                _ => {
+                    unknown = true;
+                    if warned.insert(token) {
+                        tracing::warn!(
+                            token,
+                            entry = entry.trim(),
+                            "unknown scripted input token; entry ignored"
+                        );
+                    }
+                }
             }
         }
-        segments.push((frame, pad));
+        if !unknown {
+            segments.push((frame, pad));
+        }
     }
     // A stable sort keeps the last of two entries for one frame: below, the
     // last segment at or before a frame wins.
@@ -2013,8 +2031,12 @@ mod tests {
 
     #[test]
     fn scripted_input_timeline_holds_the_last_state() {
-        let segments = parse_script("20:fwd;10:left+turn_right+a;bad;30:off;40:fwd+bogus;40:back");
-        assert_eq!(segments.len(), 5);
+        // `bad` has no frame, `40:fwd+bogus` and `50:look_rigth` have an
+        // unknown token: all three are dropped, so the last valid state wins.
+        let segments = parse_script(
+            "20:fwd;10:left+turn_right+a;bad;30:off;40:fwd+bogus;40:back;50:look_rigth",
+        );
+        assert_eq!(segments.len(), 4);
         assert_eq!(scripted_pad_at(&segments, 9), None);
         assert_eq!(
             scripted_pad_at(&segments, 10),
@@ -2041,7 +2063,75 @@ mod tests {
                 ..Default::default()
             })
         );
+        assert_eq!(
+            scripted_pad_at(&segments, 49),
+            Some(PadState {
+                left_y: -1.0,
+                ..Default::default()
+            }),
+            "a typo must not turn the last good state off"
+        );
         assert!(parse_script("").is_empty());
+    }
+
+    /// A bad token is reported once, at parse time, with the entry that
+    /// contained it (not on every frame that uses the timeline).
+    #[test]
+    fn scripted_input_warns_once_per_unknown_token() {
+        use tracing::field::{Field, Visit};
+        use tracing::{Event, Metadata, Subscriber, span};
+
+        #[derive(Default)]
+        struct Fields {
+            token: String,
+            entry: String,
+        }
+
+        impl Visit for Fields {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                match field.name() {
+                    "token" => self.token = value.to_owned(),
+                    "entry" => self.entry = value.to_owned(),
+                    _ => {}
+                }
+            }
+            fn record_debug(&mut self, _: &Field, _: &dyn std::fmt::Debug) {}
+        }
+
+        struct Capture(Arc<Mutex<Vec<(String, String)>>>);
+
+        impl Subscriber for Capture {
+            fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+                metadata.is_event() && metadata.fields().field("token").is_some()
+            }
+            fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+                unreachable!()
+            }
+            fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+            fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+            fn enter(&self, _: &span::Id) {}
+            fn exit(&self, _: &span::Id) {}
+            fn event(&self, event: &Event<'_>) {
+                assert_eq!(event.metadata().level(), &tracing::Level::WARN);
+                let mut fields = Fields::default();
+                event.record(&mut fields);
+                self.0.lock().unwrap().push((fields.token, fields.entry));
+            }
+        }
+
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        let dispatch = tracing::Dispatch::new(Capture(warnings.clone()));
+        let segments = tracing::dispatcher::with_default(&dispatch, || {
+            parse_script("10:fwd;20:fwd+look_rigth;30:fwrd+look_rigth;40:look_rigth;50:off")
+        });
+        assert_eq!(segments.len(), 2, "bad entries are dropped");
+        assert_eq!(
+            *warnings.lock().unwrap(),
+            [
+                ("look_rigth".to_owned(), "20:fwd+look_rigth".to_owned()),
+                ("fwrd".to_owned(), "30:fwrd+look_rigth".to_owned()),
+            ]
+        );
     }
 
     #[test]
