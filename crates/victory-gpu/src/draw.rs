@@ -984,11 +984,13 @@ impl State {
             once!(kind, "a shader reads a host value this build does not know");
             return 0;
         }
-        // The title address of the buffer view at that dword of the table.
+        // The title address of the buffer or ray-tracing structure view at
+        // that dword of the table, as for a view the shader picks from the
+        // heap (`SLOT_VIEW_ADDRESSES`): the programs that walk structures
+        // take the structure's address out of its view.
         let address = match self.roots_ref(compute).get(usize::from(slot)) {
             Some(&Root::Table(table)) => crate::descriptor::view(table + u64::from(dword) * 4)
-                .and_then(|view| crate::descriptor::host::buffer_range(&view))
-                .map_or(0, |range| range.0),
+                .map_or(0, |view| crate::descriptor::host::view_address(&view)),
             _ => 0,
         };
         if address == 0 {
@@ -4159,5 +4161,30 @@ mod tests {
         assert_eq!(jump_window(remembered, (7, 0, 12), 1 << 20), None);
         assert_eq!(jump_window(remembered, (7, 10, 16), 1 << 20), None);
         assert_eq!(jump_window(None, (7, 10, 12), 1 << 20), None);
+    }
+
+    /// A program that walks a ray-tracing structure takes the structure's
+    /// address out of its view at a fixed place of a table: the host gives
+    /// it the address the view's description holds (the view has no
+    /// resource, so a buffer's range gave 0, and every walk ended at an
+    /// empty root before its first node test).
+    #[test]
+    fn a_structure_view_in_a_table_gives_the_structure_address() {
+        use victory_shader::emit::USER_VIEW_ADDRESS;
+        let null = std::ptr::null();
+        let mut table = vec![0u64; 4 * 2]; // two 32-byte slots
+        let base = table.as_mut_ptr() as u64;
+        let mut desc = [0u32; 10];
+        desc[1] = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32;
+        // (the union begins on 8 bytes: the location is words 4 and 5)
+        desc[4] = 0x2345_6700;
+        desc[5] = 0x12;
+        crate::descriptor::create_srv(null, null, &desc, base + 32);
+        let mut state = State::default();
+        state.compute = vec![Root::None, Root::Table(base)];
+        assert_eq!(state.host_word(true, USER_VIEW_ADDRESS, 1, 8, None), 0x2345_6700);
+        assert_eq!(state.host_word(true, USER_VIEW_ADDRESS + 1, 1, 8, None), 0x12);
+        // An empty slot, as before: 0.
+        assert_eq!(state.host_word(true, USER_VIEW_ADDRESS, 1, 0, None), 0);
     }
 }

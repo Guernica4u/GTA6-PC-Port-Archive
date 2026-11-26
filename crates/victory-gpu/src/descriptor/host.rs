@@ -2145,11 +2145,11 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     }
 }
 
-/// The title memory a buffer shader or unordered access view reads: its
-/// address and length.
 /// The title address a buffer view or a ray-tracing structure view starts
-/// at; 0 for other views.
-fn view_address(view: &View) -> u64 {
+/// at; 0 for other views. (A structure's view has no resource: its
+/// description holds the address, and the shader walks the structure from
+/// there itself.)
+pub(crate) fn view_address(view: &View) -> u64 {
     if let Some((start, _)) = buffer_range(view) {
         return start;
     }
@@ -2167,6 +2167,8 @@ fn view_address(view: &View) -> u64 {
     }
 }
 
+/// The title memory a buffer shader or unordered access view reads: its
+/// address and length.
 pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
     let (base, words): (u64, &[u32; 10]) = match view {
         View::Shader(r, Some(desc)) => (
