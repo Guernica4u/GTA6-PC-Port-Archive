@@ -417,6 +417,8 @@ fn scheduler() -> Option<&'static Scheduler> {
 }
 
 impl Scheduler {
+    /// Workers receive the scheduler directly. They must not call
+    /// `scheduler()` while its `OnceLock` is still initializing.
     fn start(workers: usize, mut spawn: impl FnMut(usize, Arc<Self>) -> bool) -> Option<Arc<Self>> {
         let scheduler = Arc::new(Self {
             lanes: Mutex::new(Lanes {
