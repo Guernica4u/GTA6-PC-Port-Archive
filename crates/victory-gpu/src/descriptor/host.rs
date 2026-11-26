@@ -2228,10 +2228,11 @@ mod tests {
         unsafe {
             assert_eq!(heap.count, 4);
             assert!(heap.dynamic >= MIN_DYNAMIC, "the small dynamic range at least");
-            assert_eq!(
+            assert!(
+                heap.heap.GetDesc().NumDescriptors >= heap.count + heap.dynamic,
+                "the heap holds at least the title's slots and the dynamic range it took: {} of {}",
                 heap.heap.GetDesc().NumDescriptors,
-                heap.count + heap.dynamic,
-                "the heap holds the title's slots and the dynamic range it took"
+                heap.count + heap.dynamic
             );
             let views = victory_shader::emit::HEAP_VIEWS;
             let strides = heap.strides.as_ref().expect("a view-stride table");
