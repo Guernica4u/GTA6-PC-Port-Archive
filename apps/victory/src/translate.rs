@@ -654,13 +654,22 @@ fn check(
                     .get(&format!("validator: {first}"))
                     .map_or(0, |f| f.0);
                 if n < 3 {
+                    // The readable part is 40 alphanumeric characters, which
+                    // two different reasons can share once their punctuation
+                    // is dropped ("A" and "A (and 1 more error)" both become
+                    // "Aand1moreerror" when the suffix is long enough to
+                    // reach the cut). A hash of the whole reason keeps the
+                    // files apart, so a dump is never overwritten by another
+                    // reason that merely reads alike.
+                    let digest = blake3::hash(first.as_bytes());
                     let name = format!(
-                        "{dir}/{}_{n}",
+                        "{dir}/{}_{}_{n}",
                         first
                             .chars()
                             .filter(char::is_ascii_alphanumeric)
                             .take(40)
-                            .collect::<String>()
+                            .collect::<String>(),
+                        &digest.to_hex()[..8]
                     );
                     let _ = std::fs::write(format!("{name}.dxil"), &shader.dxil);
                     let _ = std::fs::write(format!("{name}.txt"), format!("{}\n{text}", label()));
@@ -957,4 +966,3 @@ Validation failed.";
         assert_eq!(validator_reason(""), "");
     }
 }
-
