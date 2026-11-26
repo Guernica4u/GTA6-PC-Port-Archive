@@ -1060,6 +1060,9 @@ enum Step {
     Memory(usize),
 }
 
+type VramRead = (ID3D12Resource, u64, usize, u64);
+type VramProbe = Box<dyn Fn(&mut Vec<VramRead>) + Send>;
+
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload buffers its GPU commands read, kept until the list is reset.
@@ -1095,6 +1098,12 @@ struct Deferred {
     missed: Vec<Box<dyn Fn() -> bool + Send>>,
     /// Kept until the list is reset ([`HostList::keep_until_reset`]).
     held: Vec<Box<dyn std::any::Any + Send>>,
+    /// Per-list VRAM/RAM dirty bitmaps (`crate::memory::bind`) to zero before
+    /// execution and read back after.
+    vram_bitmaps: Vec<(ID3D12Resource, ID3D12Resource)>,
+    /// Probes run after bitmap readbacks to collect any VRAM-backed `memory`
+    /// shadow pages that need CPU readback before `after` callbacks run.
+    vram_probes: Vec<VramProbe>,
 }
 
 /// The submission lock's state.
@@ -1761,6 +1770,18 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        let vram_uploads = crate::shadow::take_vram_uploads();
+        let mut vram_bitmaps: Vec<(ID3D12Resource, ID3D12Resource)> = Vec::new();
+        let mut seen_bitmaps = std::collections::HashSet::new();
+        for list in runs {
+            for (vram, ram) in &list.deferred().vram_bitmaps {
+                use windows::core::Interface;
+                if seen_bitmaps.insert(vram.as_raw() as usize) {
+                    vram_bitmaps.push((vram.clone(), ram.clone()));
+                }
+            }
+        }
+        self.upload_vram_copies(&vram_uploads, &vram_bitmaps);
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
@@ -1838,6 +1859,40 @@ impl Host {
                 last_notes(all),
                 removed_during(all, removed_in)
             ));
+        }
+        {
+            let mut seen = std::collections::HashSet::new();
+            let mut reads = Vec::new();
+            for list in runs {
+                for step in &list.deferred().copies {
+                    if let Step::GpuWrite(shadow, address, len, _, _) = step
+                        && seen.insert((std::sync::Arc::as_ptr(shadow) as usize, *address, *len))
+                        && let Some((cpu_ptr, base, start, buf_len)) = shadow.vram_readback()
+                    {
+                        let s = (*address as u64).max(start);
+                        let e = ((*address + *len) as u64).min(start + buf_len);
+                        if e > s {
+                            let off_in_shadow = s - start;
+                            reads.push((
+                                shadow.buffer.clone(),
+                                base + off_in_shadow,
+                                cpu_ptr + off_in_shadow as usize,
+                                e - s,
+                            ));
+                        }
+                    }
+                }
+            }
+            self.readback_vram_copies(&reads, &vram_bitmaps, true);
+            let mut extra_reads = crate::shadow::vram_marked_reads();
+            for list in runs {
+                for probe in &list.deferred().vram_probes {
+                    probe(&mut extra_reads);
+                }
+            }
+            if !extra_reads.is_empty() {
+                self.readback_vram_copies(&extra_reads, &[], false);
+            }
         }
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(prepared.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -2762,6 +2817,21 @@ impl HostList {
         self.deferred().after.push(Box::new(work));
     }
 
+    /// Registers a per-list VRAM/RAM dirty bitmap pair to zero before
+    /// execution and read back afterward.
+    pub(crate) fn defer_vram_bitmap(&self, vram: ID3D12Resource, ram: ID3D12Resource) {
+        self.deferred().vram_bitmaps.push((vram, ram));
+    }
+
+    /// Registers a probe run after bitmap readbacks to collect VRAM-backed
+    /// shadow pages written through the title-memory page table.
+    pub(crate) fn defer_vram_probe(
+        &self,
+        probe: impl Fn(&mut Vec<(ID3D12Resource, u64, usize, u64)>) + Send + 'static,
+    ) {
+        self.deferred().vram_probes.push(Box::new(probe));
+    }
+
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.deferred().writes.push((dst as usize, what, bytes));
@@ -3320,9 +3390,62 @@ mod title_copies {
 }
 
 impl Host {
+    /// Whether the host adapter uses unified memory architecture (APUs, WARP).
+    pub(crate) fn is_uma(&self) -> bool {
+        static UMA: OnceLock<bool> = OnceLock::new();
+        *UMA.get_or_init(|| {
+            let mut arch = D3D12_FEATURE_DATA_ARCHITECTURE::default();
+            // SAFETY: valid D3D12 feature query.
+            unsafe {
+                self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_ARCHITECTURE,
+                    (&raw mut arch).cast(),
+                    size_of_val(&arch) as u32,
+                )
+            }
+            .is_ok()
+                && arch.UMA.as_bool()
+        })
+    }
+
+    /// Safe VRAM budget (bytes) for hot shadow buffers on discrete GPUs.
+    pub(crate) fn vram_shadow_budget(&self) -> u64 {
+        if self.is_uma() {
+            return 0;
+        }
+        static BUDGET: OnceLock<u64> = OnceLock::new();
+        *BUDGET.get_or_init(|| {
+            let Some([local, _]) = video_memory() else {
+                return 0;
+            };
+            // Cap at 25% of local DXGI budget (~2.5-3.0 GB on a 12 GB card) so
+            // streaming textures never get evicted.
+            ((local.1 * 1_000_000.0) as u64) / 4
+        })
+    }
+
     /// A buffer in the upload heap, mapped for writing.
     /// A GPU-only buffer of `size` bytes in the copy-destination state.
     pub(crate) fn default_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        self.default_buffer_with(size, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST)
+    }
+
+    /// A GPU-only buffer of `size` bytes with unordered-access support in the
+    /// common state (promotes implicitly to SRV/CBV/UAV/copy/indirect).
+    pub(crate) fn default_uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        self.default_buffer_with(
+            size,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COMMON,
+        )
+    }
+
+    fn default_buffer_with(
+        &self,
+        size: u64,
+        flags: D3D12_RESOURCE_FLAGS,
+        state: D3D12_RESOURCE_STATES,
+    ) -> Option<ID3D12Resource> {
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_DEFAULT,
             ..Default::default()
@@ -3335,6 +3458,7 @@ impl Host {
             MipLevels: 1,
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: flags,
             ..Default::default()
         };
         let mut buffer: Option<ID3D12Resource> = None;
@@ -3344,12 +3468,245 @@ impl Host {
                 &heap,
                 D3D12_HEAP_FLAG_NONE,
                 &desc,
-                D3D12_RESOURCE_STATE_COPY_DEST,
+                state,
                 None,
                 &mut buffer,
             )
         };
         made.ok().and(buffer)
+    }
+
+    /// Streams dirty CPU shadow ranges into VRAM via a reusable 64 MiB upload ring
+    /// and syncs dirty page-table/bitmap metadata before GPU lists run.
+    fn upload_vram_copies(
+        &self,
+        uploads: &[crate::shadow::VramCopy],
+        vram_bitmaps: &[(ID3D12Resource, ID3D12Resource)],
+    ) {
+        if uploads.is_empty()
+            && !crate::memory::needs_vram_pre(vram_bitmaps)
+            && !crate::shadow::has_vram_bitmaps()
+        {
+            return;
+        }
+        const RING_BYTES: u64 = 64 << 20;
+        static RING: Mutex<Option<(ID3D12Resource, usize)>> = Mutex::new(None);
+        let (ring_buf, ring_ptr) = {
+            let mut guard = RING.lock().unwrap_or_else(|e| e.into_inner());
+            let (buf, ptr) = guard.get_or_insert_with(|| {
+                let (b, p) = self.upload_buffer(RING_BYTES).expect("vram upload ring");
+                (b, p as usize)
+            });
+            (buf.clone(), *ptr as *mut u8)
+        };
+
+        let mut offset = 0u64;
+        let mut batch: Vec<(ID3D12Resource, u64, u64, u64)> = Vec::new();
+        let flush = |batch: &mut Vec<(ID3D12Resource, u64, u64, u64)>, sync_meta: bool| {
+            if batch.is_empty() && !sync_meta {
+                return;
+            }
+            self.run_copy_list(
+                |list| {
+                    for (dst, dst_off, src_off, len) in batch.iter() {
+                        // SAFETY: valid upload ring and destination VRAM buffer regions.
+                        unsafe { list.CopyBufferRegion(dst, *dst_off, &ring_buf, *src_off, *len) };
+                    }
+                    if sync_meta {
+                        crate::memory::sync_vram_pre(list, vram_bitmaps);
+                        crate::shadow::sync_bitmaps_pre(list);
+                    }
+                },
+                true,
+            );
+            batch.clear();
+        };
+
+        for u in uploads {
+            let mut done = 0u64;
+            while done < u.len {
+                let mut avail = RING_BYTES - offset;
+                if avail == 0 {
+                    flush(&mut batch, false);
+                    offset = 0;
+                    avail = RING_BYTES;
+                }
+                let chunk = (u.len - done).min(avail);
+                // SAFETY: `u.src_ptr + done` is kept live by `u._cpu` and `ring_ptr + offset` is mapped.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        (u.src_ptr as *const u8).add(done as usize),
+                        ring_ptr.add(offset as usize),
+                        chunk as usize,
+                    );
+                }
+                batch.push((u.dst.clone(), u.dst_off + done, offset, chunk));
+                offset = (offset + chunk).next_multiple_of(16).min(RING_BYTES);
+                done += chunk;
+            }
+        }
+        flush(&mut batch, true);
+    }
+
+    /// Copies GPU-written VRAM ranges and dirty bitmaps back to CPU memory via a
+    /// reusable 32 MiB readback ring after GPU lists finish.
+    fn readback_vram_copies(
+        &self,
+        reads: &[(ID3D12Resource, u64, usize, u64)],
+        vram_bitmaps: &[(ID3D12Resource, ID3D12Resource)],
+        sync_meta: bool,
+    ) {
+        let do_meta = sync_meta && (!vram_bitmaps.is_empty() || crate::shadow::has_vram_bitmaps());
+        if reads.is_empty() && !do_meta {
+            return;
+        }
+        const RING_BYTES: u64 = 32 << 20;
+        static RING: Mutex<Option<(ID3D12Resource, usize)>> = Mutex::new(None);
+        let (ring_buf, ring_ptr) = {
+            let mut guard = RING.lock().unwrap_or_else(|e| e.into_inner());
+            let (buf, ptr) = guard.get_or_insert_with(|| {
+                let (b, p) = self.mapped_buffer(RING_BYTES, true).expect("vram readback ring");
+                (b, p as usize)
+            });
+            (buf.clone(), *ptr as *mut u8)
+        };
+
+        let mut offset = 0u64;
+        let mut batch: Vec<(ID3D12Resource, u64, u64, usize, u64)> = Vec::new();
+        let flush = |batch: &mut Vec<(ID3D12Resource, u64, u64, usize, u64)>, sync_meta: bool| {
+            if batch.is_empty() && !sync_meta {
+                return;
+            }
+            self.run_copy_list(
+                |list| {
+                    for (src, src_off, dst_off, _, len) in batch.iter() {
+                        // SAFETY: valid VRAM buffer and readback ring regions.
+                        unsafe { list.CopyBufferRegion(&ring_buf, *dst_off, src, *src_off, *len) };
+                    }
+                    if sync_meta {
+                        crate::memory::sync_vram_post(list, vram_bitmaps);
+                        crate::shadow::sync_bitmaps_post(list);
+                    }
+                },
+                true,
+            );
+            for (_, _, ring_off, cpu_ptr, len) in batch.drain(..) {
+                // SAFETY: GPU finished writing `ring_buf`; `cpu_ptr` is valid for `len` bytes.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        ring_ptr.add(ring_off as usize),
+                        cpu_ptr as *mut u8,
+                        len as usize,
+                    );
+                }
+            }
+        };
+
+        for (src, src_off, cpu_ptr, total_len) in reads {
+            let mut done = 0u64;
+            while done < *total_len {
+                let mut avail = RING_BYTES - offset;
+                if avail == 0 {
+                    flush(&mut batch, false);
+                    offset = 0;
+                    avail = RING_BYTES;
+                }
+                let chunk = (*total_len - done).min(avail);
+                batch.push((src.clone(), *src_off + done, offset, *cpu_ptr + done as usize, chunk));
+                offset = (offset + chunk).next_multiple_of(16).min(RING_BYTES);
+                done += chunk;
+            }
+        }
+        flush(&mut batch, do_meta);
+    }
+
+    #[cfg(test)]
+    fn run_test_copy_sync<F: FnOnce(&ID3D12GraphicsCommandList)>(&self, record: F) {
+        // SAFETY: valid D3D12 device creating a test fence.
+        let Ok(fence): windows::core::Result<ID3D12Fence> =
+            (unsafe { self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) })
+        else {
+            return;
+        };
+        self.run_copy_list(record, false);
+        // SAFETY: valid test fence and host event/queue.
+        unsafe {
+            if self.queue.Signal(&fence, 1).is_ok()
+                && fence.SetEventOnCompletion(1, self.event).is_ok()
+            {
+                WaitForSingleObject(self.event, INFINITE);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_upload_buffer(&self, dst: &ID3D12Resource, dst_off: u64, src: *const u8, len: u64) {
+        let Some((up, ptr)) = self.upload_buffer(len.max(1)) else { return };
+        // SAFETY: `src` is valid for `len` bytes and `ptr` is mapped.
+        unsafe { std::ptr::copy_nonoverlapping(src, ptr, len as usize) };
+        self.run_test_copy_sync(|list| {
+            // SAFETY: valid test buffer regions.
+            unsafe { list.CopyBufferRegion(dst, dst_off, &up, 0, len) };
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn flush_test_vram_uploads(&self) {
+        let uploads = crate::shadow::take_vram_uploads();
+        if !uploads.is_empty() {
+            self.upload_vram_copies(&uploads, &[]);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_readback_buffer(&self, src: &ID3D12Resource, src_off: u64, dst: *mut u8, len: u64) {
+        let Some((rb, ptr)) = self.mapped_buffer(len.max(1), true) else { return };
+        self.run_test_copy_sync(|list| {
+            // SAFETY: valid test buffer regions.
+            unsafe { list.CopyBufferRegion(&rb, 0, src, src_off, len) };
+        });
+        // SAFETY: GPU copy finished before fence wait returned.
+        unsafe { std::ptr::copy_nonoverlapping(ptr, dst, len as usize) };
+    }
+
+    fn run_copy_list<F: FnOnce(&ID3D12GraphicsCommandList)>(&self, record: F, wait: bool) {
+        static CMD: Mutex<Option<(ID3D12CommandAllocator, ID3D12GraphicsCommandList, ID3D12Fence, u64)>> =
+            Mutex::new(None);
+        let mut guard = CMD.lock().unwrap_or_else(|e| e.into_inner());
+        let (alloc, list, fence, seq) = guard.get_or_insert_with(|| {
+            // SAFETY: valid D3D12 device creating a direct allocator, fence, and closed command list.
+            unsafe {
+                let alloc: ID3D12CommandAllocator = self
+                    .device
+                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                    .unwrap();
+                let list: ID3D12GraphicsCommandList = self
+                    .device
+                    .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)
+                    .unwrap();
+                let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+                let _ = list.Close();
+                (alloc, list, fence, 0)
+            }
+        });
+        // SAFETY: `alloc` and `list` are exclusively held under `CMD`; `fence` or caller's
+        // test fence serializes reuse between submissions.
+        unsafe {
+            alloc.Reset().expect("reset copy allocator");
+            list.Reset(&*alloc, None).expect("reset copy list");
+            record(list);
+            list.Close().expect("close copy list");
+            let cmd: Option<ID3D12CommandList> = list.cast().ok();
+            self.queue.ExecuteCommandLists(&[cmd]);
+            if wait {
+                *seq += 1;
+                if self.queue.Signal(&*fence, *seq).is_ok()
+                    && fence.SetEventOnCompletion(*seq, self.event).is_ok()
+                {
+                    WaitForSingleObject(self.event, INFINITE);
+                }
+            }
+        }
     }
 
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
