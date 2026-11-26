@@ -9128,6 +9128,20 @@ impl<'a> Lower<'a> {
         if e.compressed && !matches!(e.target, Target::Color(_)) {
             return Err("a compressed export");
         }
+        // Nor does it say how the halves were made: a `compr` dword from
+        // `v_cvt_norm_u16_f16`/`v_cvt_norm_i16_f16` (or any other producer)
+        // holds UNORM16/SNORM16 halves, which `legacyF16ToF32` would read as
+        // f16. Each source dword must come from `v_cvt_pkrtz_f16_f32`, the
+        // one instruction that packs two f32 values as f16.
+        if e.compressed
+            && !e
+                .values
+                .iter()
+                .flatten()
+                .all(|&value| self.f16_packed(value))
+        {
+            return Err("a compressed export");
+        }
         let guard = self.guard(b, i)?;
         let mesh = self.s.mesh.is_some();
         let c = self.cur;
@@ -9725,6 +9739,42 @@ impl<'a> Lower<'a> {
             .find(|i| i.writes.iter().any(|w| w.1 == v))
     }
 
+    /// Whether `v` holds two f16 values this shader packed with
+    /// `v_cvt_pkrtz_f16_f32`, through plain `v_mov_b32` copies of its
+    /// result (a copy keeps the bits). A `compr` export's dwords carry no
+    /// format, so only this producer proves the halves are f16 and not
+    /// UNORM16/SNORM16 ones ([`Lower::export`]).
+    fn f16_packed(&self, v: Value) -> bool {
+        let mut v = v;
+        // Copies chain a few deep at most; a cycle (a phi the block map made
+        // a move) ends the walk.
+        for _ in 0..8 {
+            let Some(inst) = self.def_inst(v) else {
+                return false;
+            };
+            let Fields::Valu(f) = &inst.fields else {
+                return false;
+            };
+            if f.sdwa.is_some() || f.dpp.is_some() {
+                return false;
+            }
+            if inst.name() == "v_cvt_pkrtz_f16_f32" {
+                return true;
+            }
+            if inst.name() != "v_mov_b32" {
+                return false;
+            }
+            let Some(&Operand::Vector { reg, .. }) = f.src.first() else {
+                return false;
+            };
+            let Some(src) = inst.read(Reg::V(reg)) else {
+                return false;
+            };
+            v = src;
+        }
+        false
+    }
+
     /// The constant `v` holds, `env` giving phi values: moves of constants.
     fn konst(&self, env: &HashMap<Value, u32>, v: Value) -> Option<u32> {
         if let Some(&k) = env.get(&v) {
@@ -10094,9 +10144,8 @@ mod tests {
         assert!(lowers(&[0xE1C8_0000, 0, S_ENDPGM], 0).is_ok(), "buffer_gl1_inv");
     }
 
-    /// Lowers a pixel program with one float `SV_Target0`: whether it
-    /// translates.
-    fn lowers_ps(words: &[u32]) -> Result<(), crate::ShaderError> {
+    /// Lowers a pixel program with one float `SV_Target0`.
+    fn lowers_ps(words: &[u32]) -> Result<Lowered, crate::ShaderError> {
         let target = crate::emit::container::SigElement {
             name: "SV_Target".into(),
             index: 0,
@@ -10116,7 +10165,7 @@ mod tests {
     fn lowers_ps_with(
         words: &[u32],
         outputs: Vec<crate::emit::container::SigElement>,
-    ) -> Result<(), crate::ShaderError> {
+    ) -> Result<Lowered, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Ps,
@@ -10148,34 +10197,71 @@ mod tests {
             mesh_stride: 0,
             view_marks: false,
         })
-        .map(|_| ())
+    }
+
+    /// The two words of `exp mrt<target>, <pair0>, <pair1> done compr`.
+    /// A compressed export names two source dwords, one per f16 pair, in the
+    /// second word at bits 0 and 8; the channel bits in the first word do not
+    /// name them. Build the words here so the pairs stay correct.
+    fn exp_compr(mrt: u32, pair0: u32, pair1: u32) -> [u32; 2] {
+        [0xF800_0C0F | (mrt << 4), pair0 | (pair1 << 8)]
     }
 
     #[test]
     fn a_compressed_export_unpacks_two_f16_channels_per_dword() {
         // A compr export: each source dword packs two f16 channels, the
-        // low half first, so four channels come from two VGPRs.
+        // low half first, so four channels come from two VGPRs. Both dwords
+        // come from v_cvt_pkrtz_f16_f32, the producer that proves the halves
+        // are f16.
+        let mut words = vec![
+            0x7E00_0282,                         // v_mov_b32 v0, 2
+            0x7E02_0282,                         // v_mov_b32 v1, 2
+            0x2F << 25 | 2 << 17 | 2 << 9 | 256, // v_cvt_pkrtz_f16_f32 v2, 1.0, v2
+            0x2F << 25 | 3 << 17 | 3 << 9 | 256, // v_cvt_pkrtz_f16_f32 v3, 1.0, v3
+        ];
+        words.extend(exp_compr(0, 2, 3));
+        words.push(S_ENDPGM);
+        // Both dwords are pkrtz results, so the producer gate admits the
+        // export and the four halves widen through legacyF16ToF32. The
+        // stored values need a D3D run; the DXIL here is bitcode, whose
+        // function names are not contiguous bytes to search.
+        lowers_ps(&words).unwrap();
+    }
+
+    #[test]
+    fn a_compressed_export_from_another_producer_stays_refused() {
+        // A compr dword carries no format. Only v_cvt_pkrtz_f16_f32 proves
+        // the halves are f16; a dword built by moves could hold UNORM16 or
+        // SNORM16 halves, which legacyF16ToF32 would misread.
         let words = [
             0x7E00_0282, // v_mov_b32 v0, 2
             0x7E02_0282, // v_mov_b32 v1, 2
-            0xF800_0C0F,
-            0x0000_0100, // exp mrt0, v0, v0, v1, v1 done compr
+            0xF800_0C0F, // exp mrt0, v0, v0, v1, v1 done compr
+            0x0000_0100,
             S_ENDPGM,
         ];
-        lowers_ps(&words).unwrap();
+        assert!(matches!(
+            lowers_ps(&words),
+            Err(crate::ShaderError::Unsupported {
+                what: "a compressed export",
+                ..
+            })
+        ));
     }
 
     #[test]
     fn a_compressed_export_to_a_uint_target_stays_refused() {
         // The halves of a compr dword are f16 values: a uint target would
-        // store their f32 bits as integers, so the export stays refused.
-        let words = [
-            0x7E00_0282, // v_mov_b32 v0, 2
-            0x7E02_0282, // v_mov_b32 v1, 2
-            0xF800_0C0F,
-            0x0000_0100, // exp mrt0, v0, v0, v1, v1 done compr
-            S_ENDPGM,
+        // store their f32 bits as integers, so the export stays refused. The
+        // sources are pkrtz-fed, so only the target type refuses it.
+        let mut words = vec![
+            0x7E00_0282,                         // v_mov_b32 v0, 2
+            0x7E02_0282,                         // v_mov_b32 v1, 2
+            0x2F << 25 | 2 << 17 | 2 << 9 | 256, // v_cvt_pkrtz_f16_f32 v2, 1.0, v2
+            0x2F << 25 | 3 << 17 | 3 << 9 | 256, // v_cvt_pkrtz_f16_f32 v3, 1.0, v3
         ];
+        words.extend(exp_compr(0, 2, 3));
+        words.push(S_ENDPGM);
         let target = crate::emit::container::SigElement {
             name: "SV_Target".into(),
             index: 0,
