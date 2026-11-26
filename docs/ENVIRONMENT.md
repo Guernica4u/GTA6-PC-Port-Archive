@@ -30,7 +30,7 @@ The launcher sets these for a Proton or Wine launch. A value you set yourself is
 | `__GL_SHADER_DISK_CACHE` | `1` | NVIDIA driver cache; `0` leaves it off |
 | `__GL_SHADER_DISK_CACHE_PATH` | `<prefix>/shadercache` | Gives each prefix its own NVIDIA cache |
 | `__GL_SHADER_DISK_CACHE_SKIP_CLEANUP` | `1` | Asks the NVIDIA driver not to trim the cache |
-| `__GL_SHADER_DISK_CACHE_SIZE` | 32 GiB | The limit if the driver trims anyway |
+| `__GL_SHADER_DISK_CACHE_SIZE` | 4 GiB | Size limit; larger cache files stopped being indexed |
 | `TUXBOX_LOG` | `1` (`stderr` on Windows) | Sends provider messages to the game log |
 | `WINEDEBUG`, `VKD3D_DEBUG`, `DXVK_LOG_LEVEL` | warnings and errors | Backend messages in the game log |
 | `UMU_RUNTIME_UPDATE` | `0` for offline launches (always set) | Stops umu-run from needing the network |

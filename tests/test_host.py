@@ -429,7 +429,7 @@ class NvidiaShaderCache(unittest.TestCase):
             self.assertEqual(env["__GL_SHADER_DISK_CACHE"], "1")
             self.assertEqual(env["__GL_SHADER_DISK_CACHE_PATH"], str(cache))
             self.assertEqual(env["__GL_SHADER_DISK_CACHE_SKIP_CLEANUP"], "1")
-            self.assertEqual(env["__GL_SHADER_DISK_CACHE_SIZE"], str(32 << 30))
+            self.assertEqual(env["__GL_SHADER_DISK_CACHE_SIZE"], str(4 << 30))
             self.assertTrue(cache.is_dir())
 
     def test_explicit_path_and_disabled_cache_stay(self):
@@ -438,7 +438,7 @@ class NvidiaShaderCache(unittest.TestCase):
         configure_nvidia_shader_cache(env)
         self.assertEqual(env["__GL_SHADER_DISK_CACHE_PATH"], "/games/nv")
         self.assertEqual(env["__GL_SHADER_DISK_CACHE_SKIP_CLEANUP"], "0")
-        self.assertEqual(env["__GL_SHADER_DISK_CACHE_SIZE"], str(32 << 30))
+        self.assertEqual(env["__GL_SHADER_DISK_CACHE_SIZE"], str(4 << 30))
         sized = {"WINEPREFIX": "/unused", "__GL_SHADER_DISK_CACHE_PATH": "/games/nv",
                  "__GL_SHADER_DISK_CACHE_SIZE": "1024"}
         reports = []

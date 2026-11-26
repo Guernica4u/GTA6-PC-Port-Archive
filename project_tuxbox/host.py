@@ -26,9 +26,11 @@ PINNED_PROTON = "GE-Proton11-14"
 # crash handler uploads minidumps to an online service.
 OFFLINE_EXECUTABLES = ("game_scarlett_master.exe",)
 
-# Room for a title's compiled GPU pipelines. Cleanup is also switched off, so
-# this only matters to a driver that ignores that.
-NVIDIA_CACHE_BYTES = 32 << 30
+# Room for a title's compiled GPU pipelines. With 32 GiB, ProjectScarlett's
+# cache file reached 13.7 GB and the driver stopped updating its index after
+# about 5 GB, so nothing written later was found again. Keep each file small
+# enough to stay indexed.
+NVIDIA_CACHE_BYTES = 4 << 30
 
 
 def requires_offline(executable):

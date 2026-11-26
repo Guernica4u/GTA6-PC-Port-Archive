@@ -8,7 +8,7 @@ On Linux, the launcher prepares shaders before opening Frosty, from a profile of
 
 The launcher shows compilation progress and reuses the cache on later runs. After a TuxBox update, shaders that translate to the same source reuse their compiled output. While ProjectScarlett runs, a small panel over the game shows shader and pipeline progress. Pass `--prepare-only` to prepare the cache without opening the game, or `--no-shader-prep` to skip preparation for one launch. Place either option before the game path.
 
-On Linux, each prefix keeps its GPU caches in its `shadercache` folder: vkd3d-proton's pipeline cache and, on NVIDIA, the driver cache. TuxBox asks the NVIDIA driver not to trim its cache, with a 32 GiB limit in case it does. [Environment variables](ENVIRONMENT.md) lists these and the other settings.
+On Linux, each prefix keeps its GPU caches in its `shadercache` folder: vkd3d-proton's pipeline cache and, on NVIDIA, the driver cache. TuxBox asks the NVIDIA driver not to trim its cache, with a 4 GiB limit. A larger cache file stopped being indexed, so every launch compiled the same pipelines again. [Environment variables](ENVIRONMENT.md) lists these and the other settings.
 
 ## Project Scarlett graphics trials
 
