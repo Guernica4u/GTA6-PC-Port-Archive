@@ -533,6 +533,54 @@ fn lds_overflow_fails_explicitly() {
     }
 }
 
+/// DPP row ops stay inside a 32-lane half, so under Emulate they need no LDS
+/// barrier and remain legal when EXEC is narrowed (FIND-7 / #1317 H-6.3).
+#[test]
+fn divergent_dpp_row_emits_under_wave64_emulate() {
+    // if (v0 < 32) { v1 = v0 row_shr:1; } else { v1 = 0; } store(v1)
+    let mut code = Vec::new();
+    code.push(v_mov_b32(1, inline_u(0)));
+    code.push(v_cmp_gt_u32(inline_u(32), 0)); // 32 > v0
+    code.push(s_and_saveexec_b64(6, VCC));
+    let br_idx = code.len();
+    code.push(0); // placeholder for s_cbranch_execz
+    code.extend_from_slice(&dpp_row_shr(0x25, 1, 0, 0, 0x111, 0xF)); // v_add_nc row_shr:1
+    let after_then = code.len();
+    code[br_idx] = s_cbranch_execz((after_then - (br_idx + 1)) as i16);
+    code.push(s_or_b64(EXEC_LO, EXEC_LO, 6));
+    emit_uav_store(&mut code, 1, 0);
+    code.push(S_ENDPGM);
+
+    let prog = make_cs_program(&code, [64, 1, 1], 0, false);
+    assert!(
+        emit_cs(&prog, Wave64Mode::Native).is_ok(),
+        "native must still emit"
+    );
+    let emu = emit_cs(&prog, Wave64Mode::Emulate)
+        .unwrap_or_else(|e| panic!("FIND-7: divergent DPP under Emulate must emit, got {e}"));
+    assert_eq!(psv_wave_range(&emu), (0, u32::MAX));
+    // A 64-wide ballot in the same shape still needs a barrier and stays refused.
+    let mut ballot = Vec::new();
+    ballot.push(v_mov_b32(1, inline_u(0)));
+    ballot.push(v_cmp_gt_u32(inline_u(32), 0));
+    ballot.push(s_and_saveexec_b64(6, VCC));
+    let br = ballot.len();
+    ballot.push(0);
+    ballot.push(v_cmp_gt_u32(inline_u(10), 0));
+    ballot.push(s_bcnt1_i32_b64(4, VCC));
+    ballot.push(v_mov_b32(1, 4));
+    let after = ballot.len();
+    ballot[br] = s_cbranch_execz((after - (br + 1)) as i16);
+    ballot.push(s_or_b64(EXEC_LO, EXEC_LO, 6));
+    emit_uav_store(&mut ballot, 1, 0);
+    ballot.push(S_ENDPGM);
+    let ballot_prog = make_cs_program(&ballot, [64, 1, 1], 0, false);
+    assert!(
+        emit_cs(&ballot_prog, Wave64Mode::Emulate).is_err(),
+        "divergent 64-bit ballots must still be refused"
+    );
+}
+
 #[test]
 fn divergent_cross_half_ballot_is_rejected_instead_of_hanging() {
     // if (v0 < 32) { s4 = bcnt1(v0 < 10); v1 = s4; } else { v1 = 0; } store(v1)

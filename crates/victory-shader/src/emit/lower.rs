@@ -3137,7 +3137,7 @@ impl<'a> Lower<'a> {
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
             let use_quad = mesh_quad || self.helpers_read(quad);
-            let src_ok = self.src_lane_active(src, guard, mesh_quad);
+            let src_ok = self.src_lane_active(src, guard, mesh_quad, false);
             let mut r = if use_quad {
                 self.quad_pick(x, src)
             } else if self.wave64 == Wave64Mode::Emulate {
@@ -5786,13 +5786,18 @@ impl<'a> Lower<'a> {
         }
         let use_quad = mesh_quad || self.helpers_read(quad);
         let c = self.cur;
-        let emulate = self.wave64 == Wave64Mode::Emulate && !mesh_quad;
-        let lane = if emulate || self.s.mesh.is_some() {
+        // DPP row, quad and DPP8 never leave a 32-lane half (#1317 H-6.3 /
+        // FIND-7): under Wave64Mode::Emulate the host wave is that half, so
+        // the pick uses host lanes and WaveReadLaneAt — no LDS barrier, and
+        // legal in divergent control flow. (v_permlanex16 and 64-wide
+        // v_readlane still go through exchange_64.)
+        let half_local_emu = self.wave64 == Wave64Mode::Emulate && !mesh_quad;
+        let lane = if self.s.mesh.is_some() {
             self.lane_index()
         } else {
             self.host_lane_index()
         };
-        let mask_lane = if !emulate && self.s.mesh.is_none() && self.emulating_wave64() {
+        let mask_lane = if !half_local_emu && self.s.mesh.is_none() && self.emulating_wave64() {
             self.lane_index()
         } else {
             lane
@@ -5874,7 +5879,7 @@ impl<'a> Lower<'a> {
         let src_active = if fi {
             None
         } else {
-            self.src_lane_active(src, guard, mesh_quad)
+            self.src_lane_active(src, guard, mesh_quad, half_local_emu)
         };
         let valid = match (inside, src_active) {
             (Some(in_b), Some(act)) => Some(self.s.m.bin(c, Bin::And, in_b, act)),
@@ -5887,9 +5892,8 @@ impl<'a> Lower<'a> {
         };
         let mut r = if use_quad {
             self.quad_pick(x, safe_src)
-        } else if emulate {
-            self.exchange_64(x, safe_src)?
         } else {
+            // Half-local Emulate: host WaveReadLaneAt (see half_local_emu).
             self.read_lane(x, safe_src)
         };
         let mut enable = None;

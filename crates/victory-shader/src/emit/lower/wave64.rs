@@ -1328,7 +1328,17 @@ impl<'a> Lower<'a> {
     /// branch-structurised control flow). Returns `None` for unguarded pixel
     /// quad ops so WQM helper lanes remain active (`waveActiveBallot` excludes
     /// helper lanes in DXIL).
-    pub(super) fn src_lane_active(&mut self, src: V, guard: Option<V>, mesh_quad: bool) -> Option<V> {
+    ///
+    /// `half_local`: the source lane index is within one host wave (DPP under
+    /// `Wave64Mode::Emulate`, FIND-7). Use the host ballot even in divergent
+    /// flow; a 64-lane ballot would need a barrier across halves.
+    pub(super) fn src_lane_active(
+        &mut self,
+        src: V,
+        guard: Option<V>,
+        mesh_quad: bool,
+        half_local: bool,
+    ) -> Option<V> {
         let c = self.cur;
         if self.s.pixel {
             let g = guard?;
@@ -1337,7 +1347,7 @@ impl<'a> Lower<'a> {
             let picked = self.quad_pick(active_i32, src);
             return Some(self.s.m.cmp(c, pred::NE, picked, zero));
         }
-        if self.emulating_wave64() && !mesh_quad {
+        if self.emulating_wave64() && !mesh_quad && !half_local {
             let g = guard?;
             let uniform_here = self.uniform.get(self.cur_ir).copied().unwrap_or(false);
             let (lo, hi) = self.compute_ballot_bit(g, uniform_here).ok()?;
