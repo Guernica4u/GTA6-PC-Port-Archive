@@ -142,3 +142,22 @@ fn wave64_lds_64_threads_readfirstlane_keeps_wave_size_64() {
     assert!(!lowered.lds_wave32_sync);
     assert_eq!(lowered.lds_barriers, 0);
 }
+
+#[test]
+fn wave64_lds_64_threads_scalar_mask_mod_keeps_wave_size_64() {
+    // Modifying a lane mask with s_bitset1_b32 and branching on it can diverge across two Wave32s.
+    let words = [
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE94_046A, // s_mov_b64 s[20:21], vcc
+        0xBEB4_1D80, // s_bitset1_b32 s20, 0
+        0xBF06_8114, // s_cmp_eq_u32 s20, 1
+        0xBF85_0002, // s_cbranch_scc1 +2
+        0xD834_0000, // ds_write_b32 v0, v1
+        0x0000_0100,
+        S_ENDPGM,
+    ];
+    let lowered = lower_wave_cs(&words, [64, 1, 1], 16);
+    assert_eq!(lowered.wave_size, Some(64));
+    assert!(!lowered.lds_wave32_sync);
+    assert_eq!(lowered.lds_barriers, 0);
+}

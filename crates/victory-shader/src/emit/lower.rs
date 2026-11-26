@@ -8644,9 +8644,6 @@ impl<'a> Lower<'a> {
                     self.write(inst, Reg::V(reg + k), x, None);
                 }
             }
-            if self.lds_wave32_sync {
-                self.emit_lds_barrier();
-            }
             return Ok(());
         }
         if store {

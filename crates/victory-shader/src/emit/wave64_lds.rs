@@ -74,6 +74,19 @@ pub(super) fn can_sync_wave64_lds(p: &Program, x: &Parts) -> bool {
             {
                 return false;
             }
+            if inst.name() == "s_barrier" && divergent[b] {
+                return false;
+            }
+            // A scalar instruction reading a lane mask (`x.st.masks`) can
+            // materialize a `waveActiveBallot` word that differs between Wave64
+            // and two Wave32 waves, making downstream `Atom::Uniform` branches
+            // diverge across the two Wave32s.
+            if matches!(inst.fields, Fields::Sop { .. })
+                && inst.write(crate::ir::Reg::S(crate::ir::EXEC)).is_none()
+                && inst.reads.iter().any(|&(_, r)| x.st.masks.contains_key(&r))
+            {
+                return false;
+            }
             if !matches!(inst.fields, Fields::Ds { gds: false, .. }) {
                 continue;
             }
