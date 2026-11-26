@@ -7870,8 +7870,10 @@ impl<'a> Lower<'a> {
             }
             "v_bfe_u32" | "v_bfe_i32" => {
                 let (a, off, w) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
-                let w = m31(self, w);
-                self.bfe(a, off, w, name == "v_bfe_i32")
+                // DXIL's Ibfe and Ubfe already use five bits of width and offset.
+                let op = if name == "v_bfe_i32" { 51 } else { 52 };
+                self.s
+                    .op(c, "tertiary.i32", Attr::ReadNone, self.s.t.i32, op, &[w, off, a])
             }
             "v_bfi_b32" => {
                 let (m, a, b) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
@@ -11493,6 +11495,16 @@ mod tests {
 
     fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
         lower_valu(body).map(|_| ())
+    }
+
+    #[test]
+    fn vector_bitfield_extract_instruction_count() {
+        for (name, op) in [("v_bfe_u32", 0x148), ("v_bfe_i32", 0x149)] {
+            // Use three runtime inputs and store the extracted field to a UAV.
+            let words = [0xD400_0000 | op << 16, 0x101 | 0x102 << 9 | 0x103 << 18];
+            let count = lower_valu(&words).unwrap().instructions;
+            assert_eq!(count, 19, "{name} DXIL instruction count");
+        }
     }
 
     #[test]
