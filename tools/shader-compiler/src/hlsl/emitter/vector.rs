@@ -148,7 +148,7 @@ impl<'a> Emitter<'a> {
             } else { lane };
             let value = r(&s[0])?;
             let read = if self.portable_wave64 {
-                format!("tb_reduction_read(gtid.x, {value}, {lane})")
+                format!("tb_reduction_read({}, {value}, {lane})", wave_sum::portable_lane_id(compute_group(self.ex)))
             } else { format!("WaveReadLaneAt({value}, {lane})") };
             return self.ws(&d, &read);
         }

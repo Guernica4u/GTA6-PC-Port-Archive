@@ -363,7 +363,7 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
         }
     }
     em.portable_wave64 = (straight_exchange || (required_wave_size == Some(64)
-        && compute_group(ex) == [64, 1, 1]))
+        && compute_group(ex).into_iter().try_fold(1u32, u32::checked_mul) == Some(64)))
         && em.lockstep.is_none()
         && ex.stage == Stage::Compute
         && !wave_cull && !page_waves && !allocation_wave64 && !requires_ballot
@@ -484,7 +484,7 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
         hlsl.insert_str(0, instance_cull_hzb::HIDDEN_DECLARATIONS);
     }
     if light_grid { hlsl.insert_str(0, light_grid::DECLARATIONS); }
-    if em.portable_wave64 { hlsl.insert_str(0, wave_sum::PORTABLE_DECLARATIONS); }
+    if em.portable_wave64 { hlsl.insert_str(0, &wave_sum::portable_declarations(compute_group(ex))); }
     if shared_mask {
         hlsl.insert_str(0, &page_waves::ballot_declarations(compute_group(ex).into_iter().product()));
     }
