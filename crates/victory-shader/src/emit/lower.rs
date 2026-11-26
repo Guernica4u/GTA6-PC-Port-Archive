@@ -477,7 +477,9 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
-fn has_side_effect(inst: &Inst) -> bool {
+/// A whole-wave simulation must refuse global loads that write LDS.
+/// Their ordinary lowering and error policy belong to the flat-memory path.
+fn has_whole_wave_side_effect(inst: &Inst) -> bool {
     let name = inst.name();
     matches!(inst.fields, Fields::Exp { .. })
         || matches!(inst.fields, Fields::Flat { .. }) && !name.starts_with("global_load_")
@@ -1389,7 +1391,7 @@ impl<'a> Lower<'a> {
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
                         let inst = &p.blocks[b].insts[j];
-                        if has_side_effect(inst) || self.x.st.discards.contains_key(&(b, j)) {
+                        if has_whole_wave_side_effect(inst) || self.x.st.discards.contains_key(&(b, j)) {
                             return Err(unsupported(
                                 inst.machine.offset,
                                 "a side effect in a whole-wave section",
