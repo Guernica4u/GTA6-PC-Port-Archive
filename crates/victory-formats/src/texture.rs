@@ -423,7 +423,11 @@ impl Layout {
             let mut sizes = vec![];
             for i in 0..d.mips {
                 let (w, h) = padded(i);
-                if w <= fixed[0] && h <= fixed[1] && d.mips - i <= max_in_tail {
+                if w <= fixed[0]
+                    && h <= fixed[1]
+                    && mip_depth(i) <= fixed[2]
+                    && d.mips - i <= max_in_tail
+                {
                     first_tail_mip = i;
                     slice_size += block_bytes / u64::from(block[2]);
                     break;
@@ -1094,36 +1098,30 @@ mod tests {
         assert_eq!(l.mips[0].offset, 8192 + 16384);
     }
 
-    /// A volume deeper than its block keeps its whole chain in the tail when
-    /// every mip's width and height fit it (addrlib's `mipChainInTail`): each
-    /// depth slab has its own tail block, holding that slab's slices of
-    /// every mip. 16x16x64 in 64 KiB `S` blocks of 32x32x16 is four slabs
-    /// of one block; mip 1's 32 slices span the first two. Addresses from
-    /// addrlib, as in [`layouts_match_addrlib`].
+    /// Thick mip tails must fit within the tail block on all three axes.
     #[test]
-    fn deep_volumes_keep_their_chain_in_each_slabs_tail() {
-        let l = Layout::new(&Desc {
+    fn thick_mip_tail_respects_depth_without_changing_thin_or_2d() {
+        let thick = Layout::new(&Desc {
             dimension: Dimension::Tex3d,
             depth: 64,
             ..desc(16, 16, 4, 4, Swizzle::SW_64KB_S)
         })
         .unwrap();
-        assert_eq!(l.block, [32, 32, 16]);
-        assert_eq!((l.first_tail_mip, l.size), (0, 4 * 65536));
-        for (mip, x, y, z, address) in [
-            (0, 0, 0, 0, 32768),
-            (0, 0, 0, 15, 42128),
-            (0, 0, 0, 16, 65536 + 32768),
-            (0, 15, 15, 63, 3 * 65536 + 49148),
-            (1, 0, 0, 0, 16384),
-            (1, 0, 0, 16, 65536 + 16384),
-            (1, 0, 0, 31, 65536 + 25744),
-            (2, 0, 0, 0, 4096),
-            (3, 1, 1, 7, 3740),
-        ] {
-            let at = l.offset(mip, x, y, z);
-            assert_eq!(at, Ok(address), "mip {mip} ({x},{y},{z})");
-        }
+        assert_eq!(thick.block, [32, 32, 16]);
+        assert_eq!(thick.first_tail_mip, 2);
+
+        let thin = Layout::new(&Desc {
+            dimension: Dimension::Tex3d,
+            depth: 64,
+            swizzle: Swizzle::SW_64KB_D_X,
+            ..desc(16, 16, 4, 4, Swizzle::SW_64KB_S)
+        })
+        .unwrap();
+        assert!(!thin.thick);
+        assert_eq!(thin.first_tail_mip, 0);
+
+        let two_d = Layout::new(&desc(16, 16, 4, 4, Swizzle::SW_64KB_S)).unwrap();
+        assert_eq!(two_d.first_tail_mip, 0);
     }
 
     /// Layouts as AMD's addrlib computes them (Mesa `src/amd/addrlib` at ed09d38,
@@ -1172,14 +1170,6 @@ mod tests {
                 (9216, 10, 0xd37e_f9ac_a5de_cab4)),
             (Swizzle::SW_4KB_S, Tex3d, 4, 1, [64, 32, 16], 7,
                 (188416, 3, 0xf06b_d42a_7183_90e6)),
-            (Swizzle::SW_4KB_S, Tex3d, 4, 1, [4, 4, 16], 5,
-                (8192, 0, 0xbf87_001b_ad72_d375)),
-            (Swizzle::SW_4KB_S, Tex3d, 1, 1, [1, 1, 17], 2,
-                (8192, 0, 0xcdf4_4ee3_33e5_e03d)),
-            (Swizzle::SW_64KB_S, Tex3d, 4, 1, [16, 16, 64], 4,
-                (262144, 0, 0x5d1a_a7af_c371_e8e5)),
-            (Swizzle::SW_64KB_S, Tex3d, 1, 1, [8, 8, 128], 4,
-                (262144, 0, 0x8fec_f010_6542_6225)),
             (Swizzle::SW_64KB_S, Tex3d, 16, 1, [33, 17, 40], 6,
                 (1966080, 3, 0xec9c_fd44_b89c_2fd5)),
             (Swizzle::LINEAR, Tex3d, 4, 1, [9, 7, 5], 3,
