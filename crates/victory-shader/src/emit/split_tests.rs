@@ -11,7 +11,7 @@ use crate::native::{RootParam, RootType, StageIo};
 const S_ENDPGM: u32 = 0xBF81_0000;
 
 /// The wave size a DXIL container's `PSV0` requires (minimum = maximum).
-fn wave_size(dxil: &[u8]) -> Option<u32> {
+pub(super) fn wave_size(dxil: &[u8]) -> Option<u32> {
     let c = crate::Container::parse(dxil).ok()?;
     let psv = c.part(crate::FourCC::PSV0)?.data;
     let u = |at: usize| crate::dxbc::u32_at(psv, at).ok();

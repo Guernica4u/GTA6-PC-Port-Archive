@@ -148,7 +148,8 @@ thread_local! {
 /// vector instructions. Two kinds of program ask for it:
 ///
 /// * a wave64 program whose two 32-lane halves must exchange values on a
-///   host without 64-lane waves (a group of one console wave): the wave-wide
+///   host without 64-lane waves (a group of one console wave). This includes
+///   divergent loops that leave scalar state for later code. The wave-wide
 ///   tests come from masks both halves exchange through group-shared
 ///   memory, and both halves reach every exchange, so a group barrier
 ///   orders it;
@@ -1089,6 +1090,22 @@ impl SubDword {
 }
 
 impl<'a> Lower<'a> {
+    /// Whether the existing split console flow can lower this thread group.
+    fn can_split_console_flow(x: &Parts<'_>, lds_dwords: u32) -> bool {
+        x.native.wave64
+            && !x.target.runs(64)
+            && x.target.runs(32)
+            && lds_dwords == 0
+            && matches!(x.native.io, StageIo::Cs(cs) if cs.threads.iter().product::<u32>() <= 64)
+            && !x
+                .p
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| i.name().contains("permute"))
+            && (0..x.p.blocks.len()).all(|b| super::wave::sections(x.p, b).is_empty())
+    }
+
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, numeric_selects: bool) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
@@ -1193,15 +1210,8 @@ impl<'a> Lower<'a> {
             // The rest of such programs need the halves to exchange values
             // (masks read whole, lanes of the other half): the console flow,
             // for a group of one console wave without LDS.
-            wants_console_flow = console_lanes
-                && !split
-                && x.native.wave64
-                && !x.target.runs(64)
-                && x.target.runs(32)
-                && s.lds_dwords == 0
-                && cs.threads.iter().product::<u32>() <= 64
-                && !insts().any(|i| i.name().contains("permute"))
-                && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
+            wants_console_flow =
+                console_lanes && !split && Self::can_split_console_flow(x, s.lds_dwords);
             // On a host that runs the console's wave size: lane reads and
             // writes in a program whose lanes branch differently (see
             // [`CONSOLE_FLOW`]).
@@ -2003,6 +2013,21 @@ impl<'a> Lower<'a> {
             }
         }
         self.find_loop_exits();
+        // The per-lane form recovers loop scalars with a host-wave reduction.
+        // With two host waves it recovers two different final iterations.
+        if !self.console_cf
+            && self.split_loop_needs_scalars()
+            && Self::can_split_console_flow(self.x, self.s.lds_dwords)
+        {
+            return Err(unsupported(
+                0,
+                if self.x.per_lane_only {
+                    "a divergent loop's scalar results in a split wave"
+                } else {
+                    CONSOLE_FLOW
+                },
+            ));
+        }
         self.cur = self.s.entry;
         self.find_sections();
         self.inputs()?;
@@ -12256,6 +12281,43 @@ impl<'a> Lower<'a> {
             }
             self.loop_bodies.insert(h, body);
         }
+    }
+
+    /// Does a divergent loop leave scalar data that must be shared by both
+    /// halves of the console wave?
+    fn split_loop_needs_scalars(&self) -> bool {
+        // An address-based dispatch can exit some threads before the first
+        // barrier. Resource waterfall loops are also lane-local.
+        if !matches!(self.s.threads, Some(threads) if threads.iter().product::<u32>() > 32)
+            || self.x.res.addresses
+            || !self.x.res.waterfall.compares.is_empty()
+        {
+            return false;
+        }
+        let st = self.x.st;
+        self.loop_exits.values().flatten().any(|(header, values)| {
+            let body = &self.loop_bodies[header];
+            values.iter().any(|v| {
+                !st.masks.contains_key(v)
+                    && !st.highs.contains_key(v)
+                    && !self.mask_scc.contains_key(v)
+            }) && body.iter().any(|&b| {
+                let LaneExit::Branch {
+                    when,
+                    taken,
+                    not_taken,
+                } = st.exits[b]
+                else {
+                    return false;
+                };
+                body.contains(&taken) != body.contains(&not_taken)
+                    && st
+                        .bools
+                        .support(when)
+                        .iter()
+                        .any(|a| !matches!(a, Atom::Uniform(_)))
+            })
+        })
     }
 
     /// Entering `b`, a join of branches (not a loop header): its scalar

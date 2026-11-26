@@ -1337,7 +1337,7 @@ fn tbuffer_d16_loads_pack_two_channels_per_dword() {
 
 /// A wave64 compute program of 64 lanes (thread id in v0) with `body` between
 /// the descriptor load and the store of v0 at byte 4 * lane.
-fn build_lanes_cs(body: &[u32]) -> Result<HostShader, String> {
+fn lanes_program(body: &[u32]) -> NativeProgram {
     let mut words = Vec::new();
     words.push(s_mov_b32(5, 0x80));
     words.extend_from_slice(&s_load_dwordx4(8, 4));
@@ -1351,7 +1351,7 @@ fn build_lanes_cs(body: &[u32]) -> Result<HostShader, String> {
     ]);
     words.push(S_ENDPGM);
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    let native = NativeProgram {
+    NativeProgram {
         stage: HwStage::Cs,
         wave64: true,
         vgprs: 16,
@@ -1388,7 +1388,11 @@ fn build_lanes_cs(body: &[u32]) -> Result<HostShader, String> {
             threads: [64, 1, 1],
         }),
         code,
-    };
+    }
+}
+
+fn build_lanes_cs(body: &[u32]) -> Result<HostShader, String> {
+    let native = lanes_program(body);
     let p = ir::build(&native.code, native.wave64, native.vgprs).map_err(|e| format!("{e:?}"))?;
     let res = resource::track(&p, &native.layout, native.stage).map_err(|e| format!("{e:?}"))?;
     let io = io::raise(&p, &native).map_err(|e| format!("{e:?}"))?;
@@ -1465,6 +1469,49 @@ fn loop_exit_mask_counted_after_the_loop() {
     );
 }
 
+fn check_loop_scalar_count(body: &[u32], expected: u32) {
+    const WAVE32: super::Target = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    let native = lanes_program(body);
+    let host = Host::new(false).unwrap();
+    let target = host.target();
+    let run = |target| {
+        let shader = super::tests::emit_for(&native, target).expect("translation");
+        if target == WAVE32 {
+            assert_eq!(super::split_tests::wave_size(&shader.dxil), Some(32));
+        }
+        if let Ok(mut validator) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            validator
+                .validate(&mut shader.dxil.clone())
+                .expect("DXIL validation");
+        }
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(64)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch");
+        assert_eq!(&out[0][..64], &[expected; 64], "{target:?}");
+    };
+    run(target);
+    // A 32–64 lane adapter can also exercise the split flow in real wave32.
+    if target.runs(32) && target != WAVE32 {
+        run(WAVE32);
+    }
+}
+
 /// A scalar counter a divergent loop adds to in every iteration, read after
 /// the loop: the console runs the loop until its last lane leaves, so every
 /// lane reads the count of the wave's iterations.
@@ -1484,24 +1531,7 @@ fn scalar_counted_in_a_divergent_loop_read_after_it() {
         0x88FE_027E, // s_or_b64 exec, exec, s[2:3]
         0x7E00_0206, // v_mov_b32 v0, s6
     ];
-    let shader = build_lanes_cs(&body).unwrap_or_else(|e| panic!("translation: {e}"));
-    let host = Host::new(false).unwrap();
-    let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
-    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
-    let out = host
-        .dispatch(
-            &root,
-            &pso,
-            &Dispatch {
-                roots: vec![(0, Root::Constants(ud))],
-                views: &[View::RawUav(64)],
-                samplers: &[],
-                groups: [1, 1, 1],
-            },
-        )
-        .expect("dispatch");
-    let got: Vec<u32> = out[0][..64].to_vec();
-    assert!(got.iter().all(|&x| x == 64), "iterations counted: {got:?}");
+    check_loop_scalar_count(&body, 64);
 }
 
 /// A lane mask holding lanes from before a divergent branch and lanes added
@@ -1571,25 +1601,5 @@ fn scalar_counted_in_nested_divergent_loops() {
         0x88FE_027E, // s_or_b64 exec, exec, s[2:3]
         0x7E00_0206, // v_mov_b32 v0, s6
     ];
-    let shader = build_lanes_cs(&body).unwrap_or_else(|e| panic!("translation: {e}"));
-    let host = Host::new(false).unwrap();
-    let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
-    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
-    let out = host
-        .dispatch(
-            &root,
-            &pso,
-            &Dispatch {
-                roots: vec![(0, Root::Constants(ud))],
-                views: &[View::RawUav(64)],
-                samplers: &[],
-                groups: [1, 1, 1],
-            },
-        )
-        .expect("dispatch");
-    let got: Vec<u32> = out[0][..64].to_vec();
-    assert!(
-        got.iter().all(|&x| x == 16),
-        "inner iterations counted: {got:?}"
-    );
+    check_loop_scalar_count(&body, 16);
 }
