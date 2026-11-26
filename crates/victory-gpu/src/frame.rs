@@ -74,7 +74,7 @@ fn frame_interval(length: u32, pacing: Pacing) -> Duration {
             let minimum = Duration::from_nanos(1_000_000_000_u64.div_ceil(u64::from(DEFAULT_FPS)));
             requested.max(minimum)
         }
-        Pacing::Fixed(fps) => Duration::from_nanos(1_000_000_000 / u64::from(fps)),
+        Pacing::Fixed(fps) => Duration::from_nanos((1_000_000_000 / u64::from(fps)).max(1)),
         Pacing::Uncapped => requested,
     }
 }
@@ -243,6 +243,22 @@ mod tests {
             frame_interval(33_333, Pacing::Fixed(120)),
             Duration::from_nanos(8_333_333)
         );
+    }
+
+    #[test]
+    fn fixed_fps_uses_at_least_one_nanosecond() {
+        for (fps, nanos) in [
+            (1_000_000, 1_000),
+            (1_000_000_000, 1),
+            (1_000_000_001, 1),
+            (u32::MAX, 1),
+        ] {
+            assert_eq!(
+                frame_interval(33_333, Pacing::Fixed(fps)),
+                Duration::from_nanos(nanos),
+                "{fps} FPS"
+            );
+        }
     }
 
     #[test]
