@@ -20,6 +20,19 @@ mod gather;
 /// Bytes in a gibibyte.
 const GIB: f64 = (1u64 << 30) as f64;
 
+/// `D3D_SHADER_MODEL_6_0`, the value the later models count up from.
+const SHADER_MODEL_6_0: u32 = 0x60;
+
+/// The major and minor a `D3D_SHADER_MODEL` stands for.
+///
+/// `D3D12_FEATURE_DATA_SHADER_MODEL` answers with a value of that enum, not
+/// with the number of the model: 6.0 is `0x60` and 6.7 is `0x67` (103), so a
+/// report that took 100 for 6.0 called 6.7 "6.3" and blamed the title's
+/// shaders for it.
+pub fn shader_model(value: u32) -> (u32, u32) {
+    (6, value.saturating_sub(SHADER_MODEL_6_0))
+}
+
 /// Views the title's own heap holds: a little over a million in the retail
 /// game. A host whose shader-visible heaps take fewer is capped at the
 /// descriptor code's `PORTABLE_VIEWS`; see `descriptor/host.rs`.
@@ -303,6 +316,16 @@ mod tests {
             used: Some(0),
             wine: false,
         }
+    }
+
+    #[test]
+    fn a_shader_model_value_is_read_as_the_model_it_names() {
+        assert_eq!(shader_model(0x60), (6, 0));
+        assert_eq!(shader_model(0x63), (6, 3));
+        assert_eq!(shader_model(0x67), (6, 7));
+        assert_eq!(shader_model(0x69), (6, 9));
+        // Below 6.0 there is no minor to name, and no model this build knows.
+        assert_eq!(shader_model(0x50), (6, 0));
     }
 
     #[test]
