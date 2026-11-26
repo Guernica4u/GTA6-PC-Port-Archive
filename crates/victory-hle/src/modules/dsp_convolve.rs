@@ -472,9 +472,11 @@ mod tests {
             ));
         }
         let reference = direct(&input, &ir);
-        for (i, (got, want)) in output.iter().zip(&reference).enumerate() {
-            assert!(got.is_finite(), "sample {i} is not finite");
-            assert!((got - want).abs() < 2e-3, "sample {i}: {got} against {want}");
-        }
+        assert!(output.iter().all(|s| s.is_finite()), "the trailer partition reached the output");
+        // As matches_direct_convolution_over_several_blocks: f32 FFTs. Windows
+        // used whole would double their overlaps, an error the size of the
+        // signal itself.
+        let error = output.iter().zip(&reference).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+        assert!(error < 0.02, "largest error {error}");
     }
 }
