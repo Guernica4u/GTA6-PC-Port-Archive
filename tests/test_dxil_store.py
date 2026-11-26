@@ -5,10 +5,10 @@ import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from project_tuxbox.dxil_store import DxilStore, write_identity
-from project_tuxbox.runtime_shaders import compile_request
+from project_tuxbox.runtime_shaders import DeferredShader, compile_request
 
 
 def container(tag):
@@ -72,6 +72,32 @@ class DxilReuse(unittest.TestCase):
         self.assertEqual(len(self.calls), 1)
         self.assertEqual((self.root / "runtime/b" / (hashlib.sha256(b"shader").hexdigest() + ".sha256")).read_text(),
                          hashlib.sha256(second).hexdigest())
+
+    def test_large_admission_only_on_cold_dxc_and_deferral_leaves_no_entry(self):
+        cache = self.cache("a")
+        data = b"large source"
+        key = hashlib.sha256(data).hexdigest()
+        source = self.root / (key + ".dxbc")
+        source.write_bytes(data)
+        self.hlsl = "void main() {}" + " " * (256 << 10)
+        admit = Mock(side_effect=DeferredShader)
+        with patch("project_tuxbox.runtime_shaders.run_tool", side_effect=self.run_tool):
+            with self.assertRaises(DeferredShader):
+                compile_request(source, key, self.tools, cache, None, admit_large=admit)
+            admit.assert_called_once_with(len(self.hlsl))
+            self.assertEqual(self.calls, [])
+            self.assertFalse(any(cache.glob("*.cso")))
+            self.assertFalse(any(cache.glob("*.unsupported")))
+            self.assertTrue(source.exists())
+            admit.side_effect = None
+            self.assertTrue(compile_request(source, key, self.tools, cache, None, admit_large=admit))
+            admit.reset_mock()
+            admit.side_effect = AssertionError("cache hits must not reserve a large slot")
+            self.assertFalse(compile_request(source, key, self.tools, cache, None, admit_large=admit))
+            self.assertTrue(compile_request(source, key, self.tools, self.cache("b"), None,
+                                            admit_large=admit))
+            admit.assert_not_called()
+        self.assertEqual(len(self.calls), 1)
 
     def test_changed_hlsl_profile_or_toolchain_recompiles(self):
         self.compile(self.cache("a"))

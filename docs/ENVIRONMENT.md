@@ -41,6 +41,7 @@ The launcher sets these for a Proton or Wine launch. A value you set yourself is
 | --- | --- | --- |
 | `TUXBOX_RUNTIME_SHADERS` | on | `0` stops translating shaders during play |
 | `TUXBOX_RUNTIME_SHADER_JOBS` | half the CPU cores, at least 2 where there are two, at most 32 | Compiler jobs during play, 1 to 32 |
+| `TUXBOX_RUNTIME_FAST_LANE` | off (experimental) | `1` reserves one live worker for smaller requests when there are at least two workers |
 | `TUXBOX_SHADER_PREP_JOBS` | one per CPU core, at most 32 | Compiler jobs for ProjectScarlett preparation |
 | `TUXBOX_SHADER_PREP` | `chase` | Frosty preparation: `0`, `1`, `menu` or `chase` |
 | `TUXBOX_SHADER_PREP_UI` | on for ProjectScarlett | `1` shows a desktop progress window |
@@ -93,3 +94,14 @@ All are off by default. Capture variables write the game's data to disk, so don'
 ## Build and test tools
 
 `TUXBOX_XSHADER` selects the shader compiler for launcher preparation and `DXC` selects the DirectX Shader Compiler. `TUXBOX_BLESS_PROFILES`, `TUXBOX_ORACLE_*`, `TUXBOX_TEST_*` and the probe and replay variables in `tools/` belong to individual checks. `TUXBOX_PROVIDER`, `TUXBOX_SHADER_SESSION` and `TUXBOX_WINE_*` are internal; don't set them.
+
+
+The experimental runtime fast lane uses the size of translated HLSL (256 KiB
+or larger) as a hint for large cold DXC compiles, not as a guarantee of
+compiler cost. Warm entries bypass the admission check. If all large slots
+are occupied, a new large request stays pending without a failure marker
+and is translated again when a slot is free. Known large requests keep
+their relative publication order. This can delay batches consisting solely
+of large shaders, and small but expensive programs can still occupy the
+reserved worker. The existing worker count remains a hard limit; one
+worker behaves as before. Launch-time shader preparation is unchanged.

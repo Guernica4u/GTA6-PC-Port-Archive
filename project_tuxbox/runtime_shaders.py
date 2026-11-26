@@ -292,7 +292,7 @@ def compile_dxil(dxc, dxv, target, hlsl, output, store, request, stage):
     return validated_dxil(dxv, output, stage)
 
 
-def compile_request(source, key, tools, cache, session, *, remember=None, persistent=None):
+def compile_request(source, key, tools, cache, session, *, remember=None, persistent=None, admit_large=None):
     linked = source.suffix == ".link"
     xshader, dxc, dxv = tools
     with TemporaryDirectory(dir=cache) as tmp:
@@ -398,6 +398,8 @@ def compile_request(source, key, tools, cache, session, *, remember=None, persis
             if data is None or portable_stage(data) != target_stage:
                 output.unlink(missing_ok=True)
                 data = None
+                if admit_large is not None:
+                    admit_large(hlsl.stat().st_size)
                 if (persistent is not None and target == "cs_6_0"
                         and not (store and store.is_slow(key, target))
                         and persistent.compile(dxc, hlsl, output)):
@@ -428,7 +430,7 @@ def remove_request(path):
         path.unlink(missing_ok=True)
 
 
-def serve(session, stop, report, archive=None, jobs=1, *, dxc_helper=None):
+def serve(session, stop, report, archive=None, jobs=1, *, dxc_helper=None, fast_lane=False):
     # Cargo can replace the release executable while another title is running.
     # Keep the executable we fingerprint private to this host worker.
     with TemporaryDirectory(prefix="tuxbox-xshader-") as tmp, request_notifications(session / "requests", stop) as wait:
@@ -442,7 +444,8 @@ def serve(session, stop, report, archive=None, jobs=1, *, dxc_helper=None):
             except OSError as error:
                 report(f"Could not stage persistent DXC, using the CLI: {error}")
         with PersistentDxc(pinned, jobs, report) if pinned else nullcontext() as persistent:
-            _serve_requests(session, stop, report, Path(tmp) / "xshader", wait, archive, jobs, persistent=persistent)
+            _serve_requests(session, stop, report, Path(tmp) / "xshader", wait, archive, jobs,
+                            persistent=persistent, fast_lane=fast_lane)
 
 
 @contextmanager
@@ -537,7 +540,59 @@ def ordered_requests(directory):
     return [source for _, _, source in sorted(entries)]
 
 
-def _serve_requests(session, stop, report, xshader, wait, archive, jobs=1, *, persistent=None):
+# Match the existing large pixel compiler policy. Size is a scheduling hint,
+# not a guarantee of compilation cost or a change to shader semantics.
+LARGE_HLSL_BYTES = 256 << 10
+
+
+class DeferredShader(Exception):
+    """Retry a translated cold request when a large-compile slot is free."""
+
+
+class FastLane:
+    """Reserve one live worker for requests not known to need large DXC work."""
+
+    def __init__(self, jobs):
+        if jobs < 2:
+            raise ValueError("fast lane requires at least two workers")
+        self.limit = jobs - 1
+        self.lock = Lock()
+        self.known = set()
+        self.large = set()
+        self.deferrals = 0
+
+    def start(self, key):
+        """Reserve capacity before resubmitting a previously deferred request."""
+        with self.lock:
+            if key not in self.known:
+                return True
+            if len(self.large) >= self.limit:
+                return False
+            self.large.add(key)
+            return True
+
+    def admit(self, key, size):
+        """A newly translated cold shader cannot consume the reserved lane."""
+        if size < LARGE_HLSL_BYTES:
+            return
+        with self.lock:
+            self.known.add(key)
+            if key in self.large:
+                return
+            if len(self.large) >= self.limit:
+                self.deferrals += 1
+                raise DeferredShader()
+            self.large.add(key)
+
+    def finish(self, key, deferred):
+        with self.lock:
+            self.large.discard(key)
+            if not deferred:
+                self.known.discard(key)
+
+
+def _serve_requests(session, stop, report, xshader, wait, archive, jobs=1, *,
+                    persistent=None, fast_lane=False):
     def bind_cache():
         options = {"dxc_helper": persistent.helper} if persistent is not None else {}
         tools, cache = snapshot_compiler_cache(xshader, session.parent, **options)
@@ -554,6 +609,7 @@ def _serve_requests(session, stop, report, xshader, wait, archive, jobs=1, *, pe
         except (OSError, ValueError, subprocess.SubprocessError):
             pass  # Retry and report the error if this game needs a shader.
     refused = cached_refusals = 0
+    budget = FastLane(jobs) if fast_lane and jobs >= 2 else None
     record_requests = archive is not None
     archive_lock = Lock()
     archive_errors = []
@@ -574,16 +630,20 @@ def _serve_requests(session, stop, report, xshader, wait, archive, jobs=1, *, pe
         options = {"remember": remember} if record_requests else {}
         if persistent is not None:
             options["persistent"] = persistent
+        if budget is not None:
+            options["admit_large"] = lambda size: budget.admit(key, size)
         return compile_request(source, key, bound_tools, bound_cache, session, **options)
 
     def complete(source, key, future=None, error=None):
         nonlocal refused, cached_refusals
-        failed = False
+        failed = deferred = False
         try:
             if error is not None:
                 raise error
             if future.result():
                 report(f"Compiled Xbox shader {key}")
+        except DeferredShader:
+            deferred = True
         except ShaderRefused as exc:
             failed = True
             if exc.cached:
@@ -600,13 +660,18 @@ def _serve_requests(session, stop, report, xshader, wait, archive, jobs=1, *, pe
             # Publish the terminal result before releasing the source name.
             # Once it disappears, the guest may clear the old failure and
             # publish a new generation of the same request.
-            if failed:
-                (session / (key + ".failed")).touch()
-            remove_request(source)
+            if budget is not None:
+                budget.finish(key, deferred)
+            if not deferred:
+                if failed:
+                    (session / (key + ".failed")).touch()
+                remove_request(source)
 
     directory = session / "requests"
     active = {}
     report(f"Xbox shader worker: up to {jobs} concurrent requests")
+    if budget is not None:
+        report(f"Xbox shader fast lane: up to {budget.limit} large cold compiles at once")
     with ThreadPoolExecutor(max_workers=jobs, thread_name_prefix="xshader") as pool:
         while active or not stop.is_set():
             for key, (source, future) in list(active.items()):
@@ -636,6 +701,8 @@ def _serve_requests(session, stop, report, xshader, wait, archive, jobs=1, *, pe
                         except (OSError, ValueError, subprocess.SubprocessError) as exc:
                             complete(source, key, error=exc)
                             continue
+                    if budget is not None and not budget.start(key):
+                        continue
                     active[key] = (source, pool.submit(compile_one, source, key, tools, cache))
             if active:
                 # Wake immediately when any worker completes, with a bounded
@@ -644,6 +711,8 @@ def _serve_requests(session, stop, report, xshader, wait, archive, jobs=1, *, pe
                              timeout=0.05, return_when=FIRST_COMPLETED)
             elif not stop.is_set():
                 wait()
+    if budget is not None:
+        report(f"Xbox shader fast lane: {budget.deferrals} large cold requests deferred")
     if refused or cached_refusals:
         report(f"Xbox shader worker: {refused} new unsupported translations, {cached_refusals} cached refusals")
 
@@ -678,6 +747,8 @@ def shader_session(cache, env, report, *, archive=None):
         stop = Event()
         helper = env.get("TUXBOX_PERSISTENT_DXC")
         options = {"dxc_helper": helper} if helper else {}
+        if env.get("TUXBOX_RUNTIME_FAST_LANE") == "1":
+            options["fast_lane"] = True
         worker = Thread(target=serve, args=(session, stop, report, archive, runtime_jobs(env, report)),
                         kwargs=options, name="shader-compiler", daemon=True)
         worker.start()
