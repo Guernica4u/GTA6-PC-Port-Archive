@@ -6,6 +6,8 @@
 //! near `1.0`, turn-range reduction for `v_sin_*`/`v_cos_*`, and denormal
 //! operands of `v_mul_legacy_f32`.
 
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32_UINT;
+
 use super::host::{Dispatch, Host, Root, View};
 use super::{HostShader, lower, validator};
 use crate::native::{
@@ -1974,6 +1976,15 @@ fn image_atomics_of_64_bits() {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
+        // `R32G32_UINT` atomics are not a given: an adapter without them
+        // refuses the pipeline with `E_INVALIDARG`, so ask first.
+        if host.supports_64_bit_uav_atomics() == Some(false) {
+            eprintln!(
+                "{label}: no 64-bit typed UAV atomics (Support2 {:#x}); skipped",
+                host.uav_atomic_support(DXGI_FORMAT_R32G32_UINT).unwrap_or(0)
+            );
+            continue;
+        }
         let (root, pso) = host
             .compute_pipeline(&shader)
             .unwrap_or_else(|e| panic!("{label}: {e}"));

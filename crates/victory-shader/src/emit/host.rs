@@ -595,6 +595,39 @@ impl Host {
         unsafe { device.CreatePipelineState(&desc) }.map_err(err)
     }
 
+    /// Whether a typed UAV of `R32G32_UINT` takes the atomics the 64-bit
+    /// image lowering emits: exchange, compare-and-swap and unsigned
+    /// min/max. Queried rather than assumed — an adapter without them
+    /// (Intel Xe-LPG here) refuses the pipeline with `E_INVALIDARG`, which
+    /// is indistinguishable from a bad module without asking.
+    pub fn supports_64_bit_uav_atomics(&self) -> Option<bool> {
+        let support = self.uav_atomic_support(DXGI_FORMAT_R32G32_UINT)?;
+        let want = D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_EXCHANGE.0
+            | D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_COMPARE_STORE_OR_COMPARE_EXCHANGE.0
+            | D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_UNSIGNED_MIN_OR_MAX.0;
+        Some(support & want == want)
+    }
+
+    /// `D3D12_FORMAT_SUPPORT2` for a typed UAV of `format`, or `None` when
+    /// the query itself fails.
+    pub fn uav_atomic_support(&self, format: DXGI_FORMAT) -> Option<i32> {
+        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: format,
+            ..Default::default()
+        };
+        // SAFETY: `support` is the structure the query fills, sized by
+        // `size_of_val`.
+        unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        }
+        .ok()?;
+        Some(support.Support2.0)
+    }
+
     /// Whether this device fuses DXIL `FMad`, which the lowering emits for
     /// the console's fused `v_fma_f32`/`v_fmac_f32`/`v_fma_mix*`: where it
     /// does not, their results can differ in kind (NaN where an overflowing
