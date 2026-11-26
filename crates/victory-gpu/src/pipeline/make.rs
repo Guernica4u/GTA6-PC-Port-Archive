@@ -664,12 +664,12 @@ mod tests {
     #[test]
     fn skipped_pipeline_stays_off_the_queue() {
         let hashes = crate::pipeline::parse_skip_hashes(" 0123456789ABCDEF ");
-        let shader = Arc::new(Shader {
-            stage: "compute",
-            hash: "0123456789abcdef".into(),
-            container: Vec::new(),
-            translated: OnceLock::new(),
-        });
+        let shader = Shader::from_parts(
+            "compute",
+            "0123456789abcdef".into(),
+            Vec::new(),
+            None,
+        );
         let cold = Arc::new(Pending::new(vec![shader.clone()], None, &hashes));
         let warm = Arc::new(Pending::new(vec![shader.clone()], None, &hashes));
         assert!(ready(&cold).is_none());

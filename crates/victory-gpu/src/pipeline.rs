@@ -122,6 +122,23 @@ impl Shader {
         let _ = shader.translated.set(Some(translated));
         Arc::new(shader)
     }
+
+    #[cfg(all(test, windows, feature = "diagnostics"))]
+    pub(crate) fn from_parts(
+        stage: &'static str,
+        hash: String,
+        container: Vec<u8>,
+        translated: Option<Translated>,
+    ) -> Arc<Shader> {
+        Arc::new(Shader {
+            stage,
+            hash,
+            container,
+            translated: OnceLock::from(translated),
+            scheduled: std::sync::atomic::AtomicBool::new(false),
+            deps: std::sync::Mutex::new(ShaderDeps::default()),
+        })
+    }
 }
 
 /// A translated shader and the console resources its code reads.
