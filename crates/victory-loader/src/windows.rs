@@ -169,7 +169,7 @@ fn map_dll(
     let original = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     let prepared = prepare(&original).with_context(|| format!("preparing {}", path.display()))?;
     let image =
-        load(&prepared, dirs.1, &name).with_context(|| format!("loading {}", path.display()))?;
+        load(&prepared, dirs.1, name).with_context(|| format!("loading {}", path.display()))?;
     map_imports(&image.info, dirs, wanted, seen, loaded)?;
     loaded.push((key, image));
     Ok(())
