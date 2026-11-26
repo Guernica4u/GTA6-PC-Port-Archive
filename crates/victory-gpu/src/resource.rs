@@ -242,37 +242,13 @@ pub(crate) fn pc_format(format: u32) -> u32 {
     }
 }
 
-/// The host's render-target and typed-UAV support bits for `format`: zero
-/// without a host GPU (or a failed query).
+/// The host's format support bits for `format`: zero without a host GPU (or a failed query).
 #[cfg(windows)]
-fn format_support(format: u32) -> i32 {
-    use std::mem::size_of_val;
-    use windows::Win32::Graphics::Direct3D12::{
-        D3D12_FEATURE_DATA_FORMAT_SUPPORT, D3D12_FEATURE_FORMAT_SUPPORT,
-    };
-    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
-
+pub(crate) fn format_support(format: u32) -> (u32, u32) {
     let Some(host) = crate::host::host() else {
-        return 0;
+        return (0, 0);
     };
-    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
-        Format: DXGI_FORMAT(pc_format(format) as i32),
-        ..Default::default()
-    };
-    // SAFETY: a plain query into a struct of its size.
-    if unsafe {
-        host.device.CheckFeatureSupport(
-            D3D12_FEATURE_FORMAT_SUPPORT,
-            (&raw mut support).cast(),
-            size_of_val(&support) as u32,
-        )
-    }
-    .is_ok()
-    {
-        support.Support1.0
-    } else {
-        0
-    }
+    host.format_support(pc_format(format))
 }
 
 /// The typeless format of a format's family (itself if it has none).
@@ -1302,7 +1278,8 @@ fn takes(t: &HostTexture, d: &ResourceDesc) -> bool {
     let td = unsafe { t.texture.GetDesc() };
     let (flags, own) = (td.Flags.0 as u32, td.Format.0 as u32);
     d.flags & USES & !flags == 0
-        && (family(d.format) == family(own) || t.castable.contains(&d.format))
+        && (family(d.format) == family(own)
+            || t.castable.iter().any(|&c| family(c) == family(d.format)))
 }
 
 /// Whether `this`'s host texture is still its memory's (not replaced by one
@@ -1330,7 +1307,7 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     use windows::core::Interface;
     const RENDER_TARGET: u32 = 1;
     let host = crate::host::host()?;
-    let mut d = *d;
+    let d = *d;
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
     let mut clear_value = (!clear.is_null()).then(|| {
@@ -1339,43 +1316,10 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         value[0] = pc_format(value[0]);
         value
     });
-    // A host that refuses a title format's RTV or UAV gets a promoted
-    // format of the same shape, so views of one memory share this texture.
-    let typeless = family(d.format) == d.format && family(d.format + 1) == d.format;
-    if !typeless {
-        let mut support = format_support(d.format);
-        let need_rtv = d.flags & RENDER_TARGET != 0
-            && support & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 == 0;
-        let need_uav = d.flags & UNORDERED != 0
-            && support & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 == 0;
-        let promoted = match d.format {
-            67 if need_rtv || (need_uav && d.flags & !UNORDERED != 0) => 26,
-            115 if need_rtv || need_uav => 87,
-            86 if need_rtv => 87,
-            _ => 0,
-        };
-        if promoted != 0 {
-            d.format = promoted;
-            if let Some(v) = clear_value.as_mut() {
-                v[0] = promoted;
-            }
-            support = format_support(promoted);
-        }
-        if d.flags & UNORDERED != 0
-            && support & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 == 0
-        {
-            d.flags &= !UNORDERED;
-        }
-        if d.flags & RENDER_TARGET != 0
-            && support & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 == 0
-        {
-            d.flags &= !RENDER_TARGET;
-        }
-        if d.flags & (RENDER_TARGET | DEPTH) == 0 {
-            clear_value = None;
-        }
+    if d.flags & (RENDER_TARGET | DEPTH) == 0 {
+        clear_value = None;
     }
-    let clear_value = clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast::<D3D12_CLEAR_VALUE>());
+    let mut clear_value = clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast::<D3D12_CLEAR_VALUE>());
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
@@ -1459,6 +1403,28 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     }
     if texture.is_none() {
         castable_formats.clear();
+        let mut d = d;
+        let typeless = family(d.format) == d.format && family(d.format + 1) == d.format;
+        if !typeless {
+            let (s1, _) = format_support(d.format);
+            use windows::Win32::Graphics::Direct3D12::{
+                D3D12_FORMAT_SUPPORT1_RENDER_TARGET,
+                D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW,
+            };
+            if d.flags & RENDER_TARGET != 0
+                && s1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 as u32 == 0
+            {
+                d.flags &= !RENDER_TARGET;
+            }
+            if d.flags & UNORDERED != 0
+                && s1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 as u32 == 0
+            {
+                d.flags &= !UNORDERED;
+            }
+            if d.flags & (RENDER_TARGET | DEPTH) == 0 {
+                clear_value = None;
+            }
+        }
         // SAFETY: the description has the host layout (checked size, same
         // fields); the out pointer is ours.
         let made = unsafe {
@@ -2588,16 +2554,71 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn host_texture_handles_unsupported_rtv_and_uav_formats() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+
         let Some(host) = crate::host::host() else {
             return; // no host GPU
         };
         let tex = |format, flags| ResourceDesc { flags, ..texture(64, 64, format, 1) };
         for (format, flags) in [(67, 5), (67, 4), (86, 5), (115, 1)] {
             let clear = [format, 0, 0, 0, 0];
-            assert!(
-                make_texture(&tex(format, flags), 0, clear.as_ptr().cast()).is_some(),
-                "format {format} flags {flags}"
-            );
+            let d = host_desc(&tex(format, flags)).expect("host_desc");
+            // host_desc must drop unsupported RTV/UAV flags without changing the format or element size
+            assert_eq!(d.format, pc_format(format));
+            assert_eq!(element(d.format), element(format));
+
+            let ht = make_texture(&d, 0, clear.as_ptr().cast())
+                .unwrap_or_else(|| panic!("format {format} flags {flags}"));
+            // SAFETY: a live D3D12 resource.
+            let res_desc = unsafe { ht.texture.GetDesc() };
+            assert_eq!(res_desc.Format, DXGI_FORMAT(pc_format(format) as i32));
+
+            // Verify SRV creation
+            let srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT(pc_format(format) as i32),
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: 0x1688, // D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_SRV {
+                        MostDetailedMip: 0,
+                        MipLevels: 1,
+                        PlaneSlice: 0,
+                        ResourceMinLODClamp: 0.0,
+                    },
+                },
+            };
+            // SAFETY: a live CPU descriptor heap.
+            let cpu_handle = unsafe { host.cpu_views.GetCPUDescriptorHandleForHeapStart() };
+            // SAFETY: a valid descriptor handle and a live resource.
+            unsafe {
+                host.device.CreateShaderResourceView(
+                    &ht.texture,
+                    Some(&srv_desc),
+                    cpu_handle,
+                );
+            }
+
+            // Verify copy footprint / layout query with element bpp
+            let mut layout = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            let mut num_rows = 0u32;
+            let mut row_size_in_bytes = 0u64;
+            let mut total_bytes = 0u64;
+            // SAFETY: a plain query for copyable footprint of a valid resource description.
+            unsafe {
+                host.device.GetCopyableFootprints(
+                    &res_desc,
+                    0,
+                    1,
+                    0,
+                    Some(&mut layout),
+                    Some(&mut num_rows),
+                    Some(&mut row_size_in_bytes),
+                    Some(&mut total_bytes),
+                );
+            }
+            let (bpp, _) = element(format).expect("element");
+            assert_eq!(row_size_in_bytes, 64 * bpp);
         }
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
