@@ -483,20 +483,24 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     }
     // SAFETY: checked non-null.
     let n = unsafe { *count };
+    if n.checked_mul(PAGE).filter(|&s| s > 0).is_none() {
+        return 0;
+    }
+    let per = section_pages();
+    let Some(sections) = make_sections(n, per) else {
+        // SAFETY: checked non-null.
+        unsafe { count.write(0) };
+        return 0;
+    };
     tracing::debug!(
         n,
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    let Some(first) = allocate_physical(n, section_pages()) else {
-        // SAFETY: checked non-null.
-        unsafe { count.write(0) };
-        return 0;
-    };
-    for index in 0..n {
+    number_pages(n, per, sections, |index, number| {
         // SAFETY: the title passes room for `n` page numbers.
-        unsafe { pages.add(index).write(first + index * FRAMES) };
-    }
+        unsafe { pages.add(index).write(number) };
+    });
     1
 }
 
@@ -533,11 +537,10 @@ fn pages_per_section(mb: usize) -> usize {
     }
 }
 
-/// Makes `n` physical pages in pagefile-backed sections of at most `per`
-/// pages each and numbers them consecutively; the first page's number, or
-/// `None` (nothing made) if the host refuses.
-fn allocate_physical(n: usize, per: usize) -> Option<usize> {
-    n.checked_mul(PAGE).filter(|&size| size > 0)?;
+/// Makes `n` physical pages (`n * PAGE` neither 0 nor too large) in
+/// pagefile-backed sections of at most `per` pages each, or `None` (nothing
+/// made) if the host refuses.
+fn make_sections(n: usize, per: usize) -> Option<Vec<Arc<Section>>> {
     let mut sections = Vec::new();
     for start in (0..n).step_by(per) {
         let size = (n - start).min(per) * PAGE;
@@ -562,12 +565,29 @@ fn allocate_physical(n: usize, per: usize) -> Option<usize> {
         };
         if handle.is_null() {
             let error = std::io::Error::last_os_error();
-            tracing::warn!(n, size, %error, "XMemAllocatePhysicalPages failed");
+            if size == n * PAGE {
+                // One section for the whole request: the line as before.
+                tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
+            } else {
+                tracing::warn!(n, size, %error, "XMemAllocatePhysicalPages failed");
+            }
             // The sections made so far close as `sections` drops.
             return None;
         }
         sections.push(Arc::new(Section(handle)));
     }
+    Some(sections)
+}
+
+/// Numbers the `n` pages of `sections` (from [`make_sections`] with `per`)
+/// consecutively and gives each page's index and number to `out`, under
+/// the page table's lock as each page goes in.
+fn number_pages(
+    n: usize,
+    per: usize,
+    sections: Vec<Arc<Section>>,
+    mut out: impl FnMut(usize, usize),
+) {
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -578,12 +598,11 @@ fn allocate_physical(n: usize, per: usize) -> Option<usize> {
                 section: section.clone(),
                 index,
             };
-            physical
-                .pages
-                .insert(first + (start + index) * FRAMES, slice);
+            let number = first + (start + index) * FRAMES;
+            physical.pages.insert(number, slice);
+            out(start + index, number);
         }
     }
-    Some(first)
 }
 
 /// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of
@@ -1526,8 +1545,29 @@ mod tests {
 
     /// `n` pages of one new allocation, in sections of at most `per` pages.
     fn allocate_in(n: usize, per: usize) -> Vec<usize> {
-        let first = allocate_physical(n, per).expect("allocated");
-        (0..n).map(|k| first + k * FRAMES).collect()
+        let sections = make_sections(n, per).expect("allocated");
+        let mut pages = Vec::new();
+        number_pages(n, per, sections, |index, number| {
+            assert_eq!(index, pages.len());
+            pages.push(number);
+        });
+        pages
+    }
+
+    /// A count of pages no section could hold is refused as before the
+    /// sections were split: nothing made, and the count left as it was
+    /// (only a host refusal sets it to 0).
+    #[test]
+    fn a_count_too_large_is_refused_as_before() {
+        let mut page = 0usize;
+        for asked in [usize::MAX, usize::MAX / PAGE + 1] {
+            let mut count = asked;
+            assert_eq!(XMemAllocatePhysicalPages(0, &mut count, &mut page), 0);
+            assert_eq!(count, asked);
+        }
+        let mut count = 0;
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut count, &mut page), 0);
+        assert_eq!(count, 0);
     }
 
     #[test]
