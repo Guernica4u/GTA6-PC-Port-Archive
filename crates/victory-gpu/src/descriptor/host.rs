@@ -4116,15 +4116,6 @@ fn make_twinned(
                     h.finish()
                 };
                 let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
-                let mut around = [0u32; 48];
-                // SAFETY: the title's own record around the description.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        std::ptr::from_ref(desc).cast::<u32>().sub(24),
-                        around.as_mut_ptr(),
-                        around.len(),
-                    )
-                };
                 if (said.len() < 512 && said.insert(key)) || times.is_power_of_two() {
                     #[cfg(all(windows, feature = "diagnostics"))]
                     let (keys, addresses) = crate::resource::placed_textures_like(resource);
@@ -4133,7 +4124,7 @@ fn make_twinned(
                     tracing::warn!(
                         address = format_args!("{at:#x}"),
                         times,
-                        "placed unordered texture view that is not mirrored (null: writes through it are lost): unordered {unordered}, resource {resource:?}, desc {desc:?}, around {around:?}, matches {keys}, addresses {addresses:?}",
+                        "placed unordered texture view that is not mirrored (null: writes through it are lost): unordered {unordered}, resource {resource:?}, desc {desc:?}, matches {keys}, addresses {addresses:?}",
                     );
                 }
                 return None;

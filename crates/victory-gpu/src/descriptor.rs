@@ -1330,37 +1330,21 @@ pub(crate) extern "system" fn create_placed_srv(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    #[cfg(feature = "diagnostics")]
-    {
-        static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        static EMPTY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        if !resource.is_null() && !desc.is_null() {
-            // SAFETY: the title passes both descriptions.
-            let (r, d) = unsafe { (resource.read_unaligned(), desc.read_unaligned()) };
-            if r[0] != 1 {
-                let made = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                let empty = if d[10] == 0 && d[11] == 0 {
-                    EMPTY.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
-                } else {
-                    EMPTY.load(std::sync::atomic::Ordering::Relaxed)
-                };
-                if made <= 2 || made.is_power_of_two() {
-                    let mut raw = [0u32; 128];
-                    // SAFETY: 128 words of the title's stack around the view.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(desc.cast::<u32>().sub(64), raw.as_mut_ptr(), raw.len())
-                    };
-                    tracing::warn!(
-                        made,
-                        empty,
-                        "placed SRV raw: view_ptr {:#x}, resource {r:?}, view {d:?}, around {raw:?}",
-                        desc as usize
-                    );
-                }
+    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+        #[cfg(feature = "diagnostics")]
+        if resource[0] != 1 {
+            static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            static EMPTY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let made = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let empty = if desc[10] == 0 && desc[11] == 0 {
+                EMPTY.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+            } else {
+                EMPTY.load(std::sync::atomic::Ordering::Relaxed)
+            };
+            if made <= 2 || made.is_power_of_two() {
+                tracing::warn!(made, empty, ?resource, ?desc, "placed texture SRV");
             }
         }
-    }
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
         record(handle, View::Placed(false, resource, desc));
     }
 }
