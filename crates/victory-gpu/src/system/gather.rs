@@ -158,7 +158,9 @@ fn caps(device: &ID3D12Device, gpu: &mut Gpu) {
     };
     if supports(device, D3D12_FEATURE_SHADER_MODEL, &mut model) {
         // The call answers with the highest it takes of the one asked for.
-        gpu.shader_model = Some(crate::system::shader_model(model.HighestShaderModel.0.max(0) as u32));
+        gpu.shader_model = Some(crate::system::shader_model(
+            model.HighestShaderModel.0.max(0) as u32,
+        ));
     }
     let mut options7 = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
     if supports(device, D3D12_FEATURE_D3D12_OPTIONS7, &mut options7) {

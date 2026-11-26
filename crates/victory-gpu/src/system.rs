@@ -3,10 +3,15 @@
 //! A test report says little without the facts the run met: the width of the
 //! waves decides which console compute programs can be translated at all
 //! (#9), the size of a host view heap decides whether the title's own heap
-//! fits (#15, #74), mesh shaders and shader model 6.6 decide which passes can
-//! be made, and the commit space decides whether the title gets the 43 GiB it
-//! asks for (Windows refuses with error 1455 below that). None of these needs
-//! a game file or a running title, so `victory system` can print them.
+//! fits (#15, #74), and mesh shaders and shader model 6.6 decide which passes
+//! can be made. None of these needs a game file or a running title, so
+//! `victory system` can print them.
+//!
+//! Commit is different: the title's own working set is said to run 40-46 GiB
+//! (the README's numbers), but nothing here can measure it, and a run reached
+//! the world streaming in with 40.5 GiB of commit free — so the figure is
+//! printed with the working set it is measured against, as a risk and not a
+//! verdict.
 //!
 //! This module holds the facts and what they mean; [`gather`] (Windows only)
 //! asks the machine for them. Everything but `gather` is a plain function of
@@ -38,10 +43,11 @@ pub fn shader_model(value: u32) -> (u32, u32) {
 /// descriptor code's `PORTABLE_VIEWS`; see `descriptor/host.rs`.
 const TITLE_VIEWS: u32 = 1_000_000;
 
-/// Commit the title asks for while it streams the world in, in bytes. Below
-/// this Windows refuses the allocation with error 1455 ("the paging file is
-/// too small for this operation to complete"), which reads as a crash.
-const TITLE_COMMIT: u64 = 43 * (1u64 << 30);
+/// What the title's own working set is said to run, in bytes (the README's
+/// 40-46 GiB). It is not a limit we can test from here, so it only qualifies
+/// the commit figure a report prints; Windows answers error 1455 when the
+/// commit runs out while the title streams.
+const TITLE_MEMORY: u64 = 46 * (1u64 << 30);
 
 /// The shader model the title's world shaders are written for.
 const TITLE_SHADER_MODEL: (u32, u32) = (6, 6);
@@ -156,11 +162,12 @@ impl Facts {
                 model.0, model.1, TITLE_SHADER_MODEL.0, TITLE_SHADER_MODEL.1
             ));
         }
-        if self.memory.commit_free < TITLE_COMMIT {
+        if self.memory.commit_free < TITLE_MEMORY {
             out.push(format!(
-                "{} GiB of commit free: the title asks for about {} GiB and Windows refuses 1455 below that",
+                "{} GiB of commit free: the title's own working set is said to run 40-{} GiB, so a long \
+                 session may meet 1455 as it streams (#15)",
                 gib(self.memory.commit_free),
-                TITLE_COMMIT / (1u64 << 30)
+                TITLE_MEMORY / (1u64 << 30)
             ));
         }
         out
@@ -397,7 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn a_machine_with_little_commit_is_a_blocker_named_after_1455() {
+    fn little_commit_names_the_working_set_it_is_measured_against() {
         let mut facts = machine();
         facts.memory.commit_free = 8 << 30;
         let blockers = facts.blockers();
@@ -406,7 +413,17 @@ mod tests {
             blockers[0].contains("8.0 GiB of commit free"),
             "{blockers:?}"
         );
-        assert!(blockers[0].contains("1455"), "{blockers:?}");
+        // The 1455 risk is stated as one, against the README's working set:
+        // this module cannot measure what the title will ask for.
+        assert!(blockers[0].contains("may meet 1455"), "{blockers:?}");
+        assert!(blockers[0].contains("40-46 GiB"), "{blockers:?}");
+    }
+
+    #[test]
+    fn plenty_of_commit_names_no_risk() {
+        let mut facts = machine();
+        facts.memory.commit_free = 60 << 30;
+        assert!(facts.blockers().is_empty(), "{:?}", facts.blockers());
     }
 
     #[test]

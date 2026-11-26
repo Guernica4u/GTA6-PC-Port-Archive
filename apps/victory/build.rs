@@ -9,9 +9,13 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    // `.git/HEAD` moves on every checkout, and `refs` under it on every
-    // commit: rerun the build when either does.
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
+    // What `HEAD` is, not only what `HEAD` says: a commit on the branch
+    // writes the branch's own file and leaves `HEAD`'s text alone, so
+    // watching `HEAD` alone kept the first commit ever built in the version
+    // line while the branch moved on.
+    for path in watched() {
+        println!("cargo:rerun-if-changed={path}");
+    }
     let package = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
     match commit() {
         Some(commit) => {
@@ -21,6 +25,28 @@ fn main() {
         // No commit to name: the version stands alone, as before.
         None => println!("cargo:rustc-env=VICTORY_VERSION={package}"),
     }
+}
+
+/// The files that decide which commit `HEAD` is, those that exist.
+///
+/// A watched path that does not exist makes cargo rerun the script every
+/// time, so `packed-refs` is watched only when a packed checkout has it.
+fn watched() -> Vec<String> {
+    let mut paths = vec!["../../.git/HEAD".to_owned()];
+    if let Ok(head) = std::fs::read_to_string("../../.git/HEAD")
+        && let Some(reference) = head.trim().strip_prefix("ref: ")
+    {
+        // The branch file exists in an ordinary checkout and is where a
+        // commit lands; in a packed checkout the ref lives in the pack.
+        let branch = format!("../../.git/{reference}");
+        let packed = "../../.git/packed-refs".to_owned();
+        if std::path::Path::new(&branch).exists() {
+            paths.push(branch);
+        } else if std::path::Path::new(&packed).exists() {
+            paths.push(packed);
+        }
+    }
+    paths
 }
 
 /// The commit this checkout is at, seven hex digits, as git prints them.
