@@ -173,6 +173,7 @@ fn lower_words(words: &[u32], host_wave_max: u32) -> Result<lower::Lowered, crat
         prims: Vec::new(),
         mesh_stride: 0,
         host_wave_max,
+        view_marks: false,
     })
 }
 
@@ -181,6 +182,7 @@ fn build(host_wave_max: u32) -> HostShader {
     let lowered = lower_words(&program(), host_wave_max).expect("lower");
     let shader = HostShader {
         stage: HwStage::Cs,
+        view_marks: false,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
         samplers: lowered.samplers,
@@ -303,6 +305,7 @@ fn a_split_lane_read_in_a_lane_branch_reads_within_its_half() {
     let lowered = lower_words(&w, 32).expect("split lowers it");
     let shader = HostShader {
         stage: HwStage::Cs,
+        view_marks: false,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
         samplers: lowered.samplers,
