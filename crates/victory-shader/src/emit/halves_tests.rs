@@ -15,11 +15,11 @@ use crate::native::{
 };
 use crate::{gfx10, io, ir, resource, structure};
 
-const S_ENDPGM: u32 = 0xBF81_0000;
-const S_WAITCNT_LGKM: u32 = 0xBF8C_C07F; // s_waitcnt lgkmcnt(0)
+pub(super) const S_ENDPGM: u32 = 0xBF81_0000;
+pub(super) const S_WAITCNT_LGKM: u32 = 0xBF8C_C07F; // s_waitcnt lgkmcnt(0)
 
 /// `s[40:43]`: the raw UAV at table dword 16 (s0 is the table's address).
-const PROLOGUE: [u32; 5] = [
+pub(super) const PROLOGUE: [u32; 5] = [
     0xBE84_0300, // s_mov_b32 s4, s0
     0xBE85_0380, // s_mov_b32 s5, 0
     0xF408_0A02,
@@ -28,7 +28,7 @@ const PROLOGUE: [u32; 5] = [
 ];
 
 /// `buffer_store_dword v<vdata>, v16, s[40:43], 0 offen offset:<offset>`.
-const fn store(vdata: u8, offset: u32) -> [u32; 2] {
+pub(super) const fn store(vdata: u8, offset: u32) -> [u32; 2] {
     [0xE070_1000 | offset, 0x800A_0010 | (vdata as u32) << 8]
 }
 
@@ -86,7 +86,7 @@ fn console(l: u32) -> [u32; 8] {
     ]
 }
 
-fn native(words: &[u32], wave64: bool, threads: u32, lds_bytes: u32) -> NativeProgram {
+pub(super) fn native(words: &[u32], wave64: bool, threads: u32, lds_bytes: u32) -> NativeProgram {
     let range = |kind, table_offset_dwords, dwords| UsedResource {
         kind,
         root: RootType::Table,
@@ -123,7 +123,7 @@ fn native(words: &[u32], wave64: bool, threads: u32, lds_bytes: u32) -> NativePr
     }
 }
 
-fn lowered(
+pub(super) fn lowered(
     native: &NativeProgram,
     host_wave32: bool,
 ) -> Result<lower::Lowered, crate::ShaderError> {
@@ -146,7 +146,7 @@ fn lowered(
     })
 }
 
-fn shader(l: lower::Lowered) -> super::HostShader {
+pub(super) fn shader(l: lower::Lowered) -> super::HostShader {
     super::HostShader {
         stage: HwStage::Cs,
         dxil: l.dxil,
@@ -175,7 +175,18 @@ fn refusal(words: &[u32], threads: u32, lds_bytes: u32) -> String {
 /// The hand-encoded words are the instructions their comments name.
 #[test]
 fn the_test_programs_are_what_their_comments_say() {
-    let programs: [(Vec<u32>, &[&str]); 22] = [
+    let programs: [(Vec<u32>, &[&str]); 23] = [
+        (
+            mask_kept_by_a_shift(),
+            &[
+                "v_xor_b32 v3, 5, v0",
+                "s_cmp_eq_u32 s5, 0",
+                "s_cbranch_scc0",
+                "v_cmp_gt_u32 vcc, v3, v4",
+                "v_mov_b32 v4, vcc_hi",
+                "v_add_nc_u32 v4, v2, v2 row_shr:15",
+            ],
+        ),
         (
             masks_and_first_lane(),
             &[
@@ -1147,23 +1158,23 @@ fn every_thread_keeps_its_own_id_in_halves_on_every_gpu() {
     );
 }
 
-const fn sop1(sdst: u8, op: u8, ssrc0: u8) -> u32 {
+pub(super) const fn sop1(sdst: u8, op: u8, ssrc0: u8) -> u32 {
     0xBE80_0000 | (sdst as u32) << 16 | (op as u32) << 8 | ssrc0 as u32
 }
 
-const fn vop1(vdst: u8, op: u8, src0: u16) -> u32 {
+pub(super) const fn vop1(vdst: u8, op: u8, src0: u16) -> u32 {
     (0x3F << 25) | (vdst as u32) << 17 | (op as u32) << 9 | (src0 as u32 & 0x1FF)
 }
 
-const fn vop2(vdst: u8, op: u8, src0: u16, vsrc1: u8) -> u32 {
+pub(super) const fn vop2(vdst: u8, op: u8, src0: u16, vsrc1: u8) -> u32 {
     (op as u32) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
 }
 
-const fn dpp16(vsrc0: u8, ctrl: u16) -> u32 {
+pub(super) const fn dpp16(vsrc0: u8, ctrl: u16) -> u32 {
     0xFF << 24 | (ctrl as u32) << 8 | vsrc0 as u32
 }
 
-const fn vop3(vdst: u8, op: u16, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
+pub(super) const fn vop3(vdst: u8, op: u16, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
     [
         0xD400_0000 | (op as u32) << 16 | vdst as u32,
         (src0 as u32 & 0x1FF) | ((src1 as u32 & 0x1FF) << 9) | ((src2 as u32 & 0x1FF) << 18),
@@ -1175,7 +1186,7 @@ const fn vop3(vdst: u8, op: u16, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
 /// `wave::tests::exec_minus_two_masks_lane_zero_and_enforces_dpp_guard`):
 /// row sums by DPP, the rows below added through lane reads, then shifted
 /// by one lane. It writes `s[0:2]` and `v1`-`v5`.
-fn prefix_sum_section() -> Vec<u32> {
+pub(super) fn prefix_sum_section() -> Vec<u32> {
     use crate::ir::EXEC;
     let mut w = vec![sop1(0, 0x25, 193)]; // s_or_saveexec_b64 s[0:1], -1
     w.extend(vop3(1, 0x101, 128, 256, 0)); // v_cndmask_b32 v1, 0, v0, s[0:1]
@@ -1536,6 +1547,46 @@ fn collectives_cross_the_halves_on_every_gpu() {
         failed.extend(differences(&small_group(), threads, 4, &small));
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// A mask's high dword read as data under a branch on a scalar compare,
+/// then kept by a DPP shift after the join in the lanes without a source
+/// lane (0-14 of each row).
+fn mask_kept_by_a_shift() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0xD765_0001,
+        0x0001_00C1,               // v_mbcnt_lo_u32_b32 v1, -1, 0
+        vop1(2, 0x01, 256),        // v_mov_b32 v2, v0
+        vop2(3, 0x1D, 128 + 5, 0), // v_xor_b32 v3, 5, v0
+        vop1(4, 0x01, 256),        // v_mov_b32 v4, v0
+        0xBF06_8005,               // s_cmp_eq_u32 s5, 0
+        0xBF84_0002,               // s_cbranch_scc0 2
+        0x7D88_0903,               // v_cmp_gt_u32 vcc, v3, v4
+        vop1(4, 0x01, 107),        // v_mov_b32 v4, vcc_hi
+        vop2(4, 0x25, 0xFA, 2),
+        dpp16(2, 0x11F), // v_add_nc_u32 v4, v2, v2 row_shr:15
+    ]);
+    w.extend(store(4, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// In halves a write under a lane guard (here DPP's lanes without a source)
+/// is refused when what the other lanes keep was refused: there, a mask
+/// read where the halves cannot meet (a branch on a scalar compare, in a
+/// group of two console waves). Kept as zero it would store 0 where the
+/// console stores the mask. In a group of one console wave the halves meet
+/// there and trade.
+#[test]
+fn a_kept_refused_value_refuses_the_write_in_halves() {
+    let why = refusal(&mask_kept_by_a_shift(), 128, 0);
+    assert!(
+        why.contains("a lane mask read as data, written where not every thread of the group meets"),
+        "{why}"
+    );
+    assert_eq!(refusal(&mask_kept_by_a_shift(), 64, 0), "translated");
 }
 
 /// [`in_halves`] on every hardware adapter: in halves, and as one wave64

@@ -2801,12 +2801,19 @@ impl<'a> Lower<'a> {
                 let read = o.is_some_and(|o| self.read_phis.contains(&o));
                 let old = match o.map(|o| self.i32_of(o)) {
                     Some(Ok(o)) => o,
+                    // In halves what lanes keep may be a read refused where
+                    // the halves cannot meet: kept as zero it would be wrong.
+                    Some(Err(why)) if self.halves => {
+                        self.vals.insert(new, Val::Missing(why));
+                        return;
+                    }
                     // The validator refuses reads of undef.
                     _ => self.s.m.i32(0),
                 };
                 // What lanes keep is zero where it has no DXIL form (as
-                // above), so keeping a phi does not make it live.
-                if let Some(o) = o.filter(|_| !read) {
+                // above), so keeping a phi does not make it live, except in
+                // halves (as above).
+                if let Some(o) = o.filter(|_| !read && !self.halves) {
                     self.read_phis.remove(&o);
                 }
                 self.s.m.select(self.cur, g, x, old)
