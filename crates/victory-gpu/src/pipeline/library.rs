@@ -363,8 +363,9 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+/// Writes the changed early list and adapter library independently once
+/// `SAVE_EVERY` has passed (or `now`). Without an adapter identity the
+/// library stays dirty for a later save, protecting the shared legacy cache.
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
@@ -396,12 +397,13 @@ pub(crate) fn save(now: bool) {
     }
 
     let Some(library) = library() else { return };
+    let cache = cache_dir(dir);
     let (adapter, blob, prebuilt, added, prebuilt_changed) = {
         let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
         if l.added == 0 && !l.prebuilt_changed {
             return;
         }
-        let Some(adapter) = cache_dir(dir) else {
+        let Some(adapter) = cache else {
             static WARNED: std::sync::Once = std::sync::Once::new();
             WARNED.call_once(|| {
                 tracing::warn!("host pipeline library not saved: adapter unavailable")
