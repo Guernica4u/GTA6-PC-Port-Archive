@@ -3499,8 +3499,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         let _one = ALIASED.lock().unwrap_or_else(|e| e.into_inner());
         let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
         // Format written and size, what the shader writes, format read and
-        // size, the texel expected, whether the formats are compatible for
-        // sharing if the host accepts the castable format list.
+        // size, the texel expected, whether one host texture.
         type Case = (u32, u32, &'static str, u32, u32, [f32; 4], bool);
         let cases: [Case; 2] = [
             // R32_UINT holding R9G9B9E5 (1, 0.5, 0.25): the sky's tables.
@@ -3524,7 +3523,7 @@ void main(uint3 id : SV_DispatchThreadID) {
                 false,
             ),
         ];
-        for (round, (written, size, put, format, read_size, want, can_share)) in cases.into_iter().enumerate() {
+        for (round, (written, size, put, format, read_size, want, shared)) in cases.into_iter().enumerate() {
             let address = title_memory(1 << 20);
             let object = texture_at_address(address, &texture_words(size, size, written, 0x105, 4));
             let view = placed_view(address, texture_words(read_size, read_size, format, 0x105, 0));
@@ -3533,12 +3532,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             };
             let a = crate::resource::host_copy(object).unwrap();
             let b = crate::resource::host_copy(placed as This).unwrap();
-            let shared = std::sync::Arc::ptr_eq(&a, &b);
-            assert_eq!(
-                shared,
-                can_share && a.castable.contains(&format),
-                "round {round}: host texture sharing did not match its castable formats"
-            );
+            assert_eq!(std::sync::Arc::ptr_eq(&a, &b), shared, "round {round}: one host texture");
             let unordered = View::Unordered(object as usize, 0, Some([written, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
             slots.make(0, &unordered);
             slots.make(1, &view);
