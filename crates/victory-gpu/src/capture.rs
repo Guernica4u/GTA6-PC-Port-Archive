@@ -129,11 +129,22 @@ const MAX_TEXELS: u64 = 1 << 27;
 /// Most bytes a target's read-back buffer takes.
 const MAX_READBACK: u64 = 1 << 30;
 
+/// The bytes `rows` rows take `pitch` bytes apart: every row pitched but
+/// the last, which the runtime leaves unpadded (a block-compressed
+/// footprint's rows are rows of blocks). What a copy's total covers and what
+/// its mapping spans. `None` when the footprint names no row at all, or a
+/// row longer than its pitch.
+fn row_bytes(pitch: u64, rows: u32, row: u64) -> Option<u64> {
+    let rows = u64::from(rows);
+    (rows > 0 && row > 0 && row <= pitch).then(|| pitch * (rows - 1) + row)
+}
+
 /// Whether `f` is a copy of `d`'s first subresource: a format with a known
 /// element ([`crate::resource::element`]), the description's own extent at
 /// mip 0 (block-aligned), a row pitch holding a row, a third dimension of
-/// the copy as deep as the description is, and no more texels than a dump
-/// decodes. What the host gives for a texture it cannot copy is a
+/// the copy as deep as the description is, no more texels than a dump
+/// decodes, and nothing multi-sampled (a multi-sampled resource is not
+/// copied out at all). What the host gives for a texture it cannot copy is a
 /// footprint of 0xFF in every field — the format included — and no total:
 /// sizing anything from that is what aborted a capture run (0xFFFFFFFF by
 /// 0xFFFFFFFF texels named 103,079,215,080 bytes of PNG rows).
@@ -157,7 +168,8 @@ fn footprint_fits(d: &D3D12_RESOURCE_DESC, f: &D3D12_SUBRESOURCE_FOOTPRINT) -> b
     let texels = (w / block)
         .checked_mul(h / block)
         .and_then(|t| t.checked_mul(depth));
-    width > 0
+    d.SampleDesc.Count == 1
+        && width > 0
         && height > 0
         && w == width
         && h == height
@@ -192,11 +204,13 @@ pub(crate) fn read_back(
         // Footprints the host cannot give are not copies: refuse them here,
         // where a buffer would take their size, rather than at whichever
         // arithmetic reads them later (the title aborts on that allocation).
+        // Rows of no rows (or of none) are refused by name, not left to the
+        // subtraction.
         let f = footprint.Footprint;
-        let expected = u64::from(f.RowPitch)
-            .saturating_mul(u64::from(rows).saturating_sub(1))
-            .saturating_add(row);
-        if !footprint_fits(&desc, &f) || expected == 0 || total < expected || total > MAX_READBACK {
+        let expected = row_bytes(u64::from(f.RowPitch), rows, row);
+        let copyable = footprint_fits(&desc, &f)
+            && expected.is_some_and(|expected| total >= expected && total <= MAX_READBACK);
+        if !copyable {
             tracing::info!(
                 resource =
                     format_args!("{:#x}", windows::core::Interface::as_raw(texture) as usize),
@@ -205,6 +219,8 @@ pub(crate) fn read_back(
                 height = f.Height,
                 depth = f.Depth,
                 pitch = f.RowPitch,
+                rows,
+                row,
                 total,
                 "target not read back: the host gives no copyable footprint"
             );
@@ -619,19 +635,45 @@ fn dump_one(
         );
         return;
     }
+    // One row of a format this dump decodes is a row of texels; a
+    // block-compressed footprint's rows are rows of blocks, which this dump
+    // (as before) does not decode.
+    let Some((texel, 1)) = crate::resource::element(f.Format.0 as u32) else {
+        tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
+        return;
+    };
     let mut data = std::ptr::null_mut();
-    // SAFETY: the copy finished; the mapping spans the footprint's rows.
+    // SAFETY: the copy finished; the mapping spans the rows read below.
     unsafe {
         if buffer.Map(0, None, Some(&mut data)).is_err() {
             return;
         }
         let pitch = f.RowPitch as usize;
-        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
+        let row = f.Width as usize * texel as usize;
+        // The buffer's own bytes, not `pitch * height`: a copy stops at the
+        // last row's own size (a 1x1 target fills 4 bytes of a 256-byte
+        // pitch), so the pitch-named bytes past it are not there.
+        let len = (buffer.GetDesc().Width as usize).min(MAX_READBACK as usize);
+        let Some(span) = row_bytes(f.RowPitch as u64, f.Height, row as u64)
+            .map(|bytes| bytes as usize)
+            .filter(|&bytes| bytes <= len)
+        else {
+            tracing::info!(
+                format = f.Format.0,
+                ?resource,
+                pitch,
+                height = f.Height,
+                buffer = len,
+                "target not dumped: its rows do not fit its read-back"
+            );
+            buffer.Unmap(0, None);
+            return;
+        };
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), span);
         // Tiny targets (exposure, averages): their values as they are.
         if u64::from(f.Width) * u64::from(f.Height) <= 16 {
-            let texel = crate::resource::element(f.Format.0 as u32).map_or(4, |(b, _)| b as usize);
             let words: Vec<String> = (0..f.Height as usize)
-                .flat_map(|y| rows[y * pitch..][..f.Width as usize * texel].chunks(4))
+                .flat_map(|y| rows[y * pitch..][..row].chunks(4))
                 .map(|c| {
                     let w = u32::from_le_bytes(c.try_into().unwrap_or_default());
                     format!("{w:#x}={}", f32::from_bits(w))
@@ -1140,7 +1182,18 @@ mod tests {
         // Another description's shape, and a pitch too short for a row.
         assert!(!footprint_fits(&desc, &copy(61, 1280, 720, 1, 1280)));
         assert!(!footprint_fits(&desc, &copy(61, 2560, 1440, 1, 1024)));
-        assert!(MAX_READBACK >= 2560 * 1440);
+        // Nothing multi-sampled is copied out, whatever its footprint says.
+        let msaa = D3D12_RESOURCE_DESC {
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 4,
+                Quality: 0,
+            },
+            ..desc
+        };
+        assert!(!footprint_fits(&msaa, &copy(61, 2560, 1440, 1, 2560)));
+        const {
+            assert!(MAX_READBACK >= 2560 * 1440);
+        }
     }
 
     /// 6 x 0xFFFFFFFF texels are 103,079,215,080 bytes of PNG rows: no
@@ -1150,6 +1203,27 @@ mod tests {
         assert_eq!(super::to_rgba(61, 6, u32::MAX as usize, 256, &[]), None);
         assert_eq!(super::to_rgba(61, u32::MAX as usize, 6, 256, &[]), None);
         assert_eq!(super::to_rgba(u32::MAX, 0, 0, 0, &[]), None);
+    }
+
+    /// A mapped copy spans its rows, not its pitch: the last row is its own
+    /// size (the read-back buffers a live matrix measured: a 1x1 target's
+    /// 4 bytes in a 256-byte pitch, D24 64x64's 32,512, BC7 64x64's 4,096).
+    #[test]
+    fn a_mapping_spans_its_rows_and_not_its_pitch() {
+        use super::row_bytes;
+
+        // R8G8B8A8_UNORM 1x1: 4 bytes, not 256.
+        assert_eq!(row_bytes(256, 1, 4), Some(4));
+        // R8_UNORM 2560x1440: every row pitched but the last.
+        assert_eq!(row_bytes(2560, 1440, 2560), Some(1439 * 2560 + 2560));
+        // D24_UNORM_S8_UINT 64x64: 32,512 bytes, not 64 * 512.
+        assert_eq!(row_bytes(512, 64, 256), Some(63 * 512 + 256));
+        // BC7_UNORM 64x64: 16 rows of blocks, 4,096 bytes, not 64 * 256.
+        assert_eq!(row_bytes(256, 16, 256), Some(15 * 256 + 256));
+        // No rows, no row, or a row longer than the pitch it sits in.
+        assert_eq!(row_bytes(256, 0, 4), None);
+        assert_eq!(row_bytes(256, 1, 0), None);
+        assert_eq!(row_bytes(256, 1, 300), None);
     }
 }
 
