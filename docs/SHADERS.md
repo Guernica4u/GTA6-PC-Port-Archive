@@ -152,6 +152,12 @@ The console branches once per wave, but the translator normally branches once pe
 
 A [GPU check](../tools/check_lockstep_gpu.py) compares both paths with a model of the console on an RTX 4070 Ti SUPER: 245 cases match. Programs that translate through the targeted checks still branch once per thread. With the final branch that routes them to whole-wave translation removed, 160 of 210 cases of the same programs give wrong results, so some shaders that translate today are likely to compute wrong values. This hasn't been traced to anything visible in a game.
 
+### Lane masks read as numbers
+
+Each thread of a translated program holds only its own bit of a lane mask. Counting a mask's lanes, finding its first one or counting those before a lane reads the other bits too, and gave 0 or 1 for a whole wave. Compute programs now take the wave's ballot where such a mask is computed and read that ([analysis](../tools/shader-compiler/src/hlsl/mask_ballots.rs)). Both words of a wave64 mask have to come from the same lane masks on every path to the read, and the ballot is only taken where every lane that can be in the mask runs together: not in code that a branch on another mask skips or repeats, nor after some lanes have left. The program then runs in complete waves of the guest's width, so a wave64 one needs an adapter with wave64. Ray tracing resolve programs keep whole masks already and are left alone. Otherwise the old translation stays.
+
+A [GPU check](../tools/check_mask_ballots_gpu.py) compares both widths with a model of the console on an RX 9060 XT: 300 cases match, and 200 of them don't without the ballots. In ProjectScarlett this affects the passes that hand out shadow mask tiles, where most lit tiles shared a few slots and shadows showed as 16-pixel blocks.
+
 Most wave reduction refusals come from programs over 6,000 instructions, where the translator doesn't try its one-lane-per-wave form. In a trial on an earlier set of 1,442 such compute shaders, removing that limit translated 1,211. Six sampled outputs compiled in 2 to 12 seconds with DXC optimization off, and mostly produced 1 to 2 MB of DXIL. Large compiles in a recorded run took the driver 6 minutes or more, so the limit stays until the generated code compiles faster. The outputs weren't tested in a game.
 
 ### 64-lane programs on 32-lane hosts

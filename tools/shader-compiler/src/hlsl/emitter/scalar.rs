@@ -336,12 +336,14 @@ impl<'a> Emitter<'a> {
                 // Population count of a 64-bit value — typically the number of active
                 // lanes (wave-level allocation). One invocation = one lane, so a lane
                 // mask counts as 0 or 1.
-                let ah = r(&hi(&s[0]))?;
+                let a = mask_ballots::word(self, idx, &s[0]).unwrap_or(a);
+                let ah = mask_ballots::word(self, idx, &hi(&s[0])).map_or_else(|| r(&hi(&s[0])), Ok)?;
                 self.ws(&d, &format!("(countbits({a}) + countbits({ah}))"))?;
                 self.line(&format!("scc = ({} != 0u) ? 1u : 0u;", name(&d)?));
                 Ok(())
             }
             "s_bcnt1_i32_b32" => {
+                let a = mask_ballots::word(self, idx, &s[0]).unwrap_or(a);
                 self.ws(&d, &format!("countbits({a})"))?;
                 self.line(&format!("scc = ({} != 0u) ? 1u : 0u;", name(&d)?));
                 Ok(())
@@ -358,12 +360,16 @@ impl<'a> Emitter<'a> {
                 let ah = r(&hi(&s[0]))?;
                 self.ws(&d, &ff0_b64_expr(&a, &ah))
             }
-            "s_ff1_i32_b32" => self.ws(&d, &format!("firstbitlow({a})")),
+            "s_ff1_i32_b32" => {
+                let a = mask_ballots::word(self, idx, &s[0]).unwrap_or(a);
+                self.ws(&d, &format!("firstbitlow({a})"))
+            }
             // s_ff1_i32_b64 is firstbitlow over the 64-bit value: the low word
             // decides when it is nonzero, otherwise the high word.
             "s_ff1_i32_b64" => {
                 self.touch(&hi(&s[0]));
-                let ah = r(&hi(&s[0]))?;
+                let a = mask_ballots::word(self, idx, &s[0]).unwrap_or(a);
+                let ah = mask_ballots::word(self, idx, &hi(&s[0])).map_or_else(|| r(&hi(&s[0])), Ok)?;
                 self.ws(&d, &ff1_b64_expr(&a, &ah))
             }
             "s_sext_i32_i8" => self.ws(&d, &format!("asuint(asint({a} << 24) >> 24)")),

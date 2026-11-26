@@ -87,7 +87,18 @@ int main() {
         std::ifstream cases("cases.txt");
         std::string name, view;
         UINT stride, groups;
-        while (cases >> name >> stride >> view >> groups) dispatch(ctx, receipt, name, stride, view, groups);
+        D3D12_FEATURE_DATA_D3D12_OPTIONS1 waves{};
+        check(ctx.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &waves, sizeof(waves)), "wave lane range");
+        std::fprintf(receipt, "wave_lanes_max=%u\n", waves.WaveLaneCountMax);
+        while (cases >> name >> stride >> view >> groups) {
+            // A case may name the wave width its shader requires. A host without it cannot create the pipeline.
+            UINT needed = 0;
+            if (std::ifstream(name + ".minwave") >> needed && needed > waves.WaveLaneCountMax) {
+                std::fprintf(receipt, "%s_skipped=%u\n", name.c_str(), needed);
+                continue;
+            }
+            dispatch(ctx, receipt, name, stride, view, groups);
+        }
         if (!cases.eof()) throw std::runtime_error("invalid compute cases");
     } catch (const std::exception &error) {
         std::fprintf(receipt, "error=%s\n", error.what());

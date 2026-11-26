@@ -5,6 +5,8 @@ use Opnd::{ConstInt as I, ExecLo, Literal, Scc, Sgpr as S, VccLo, Vgpr as V, M0}
 
 pub(super) struct MeshExports {
     pub start: usize,
+    /// The first instruction after the export sequence's vertex-count guard.
+    pub vertex_start: usize,
     pub lane_index: Opnd,
     pub vertices: Opnd,
     pub primitives: Opnd,
@@ -245,30 +247,104 @@ fn allocation_128(seq: &mut Sequence<'_>) -> Result<(Opnd, Opnd, Opnd, [Opnd; 3]
     Ok((vertices, primitives, invalid, temps, lane))
 }
 
+/// The 128-vertex allocation when one register holds both output counts. The
+/// compiler checks that count once and combines each mask with itself, and no
+/// register holds the limit.
+fn allocation_shared(seq: &mut Sequence<'_>) -> Result<(Opnd, Opnd, Opnd, [Opnd; 3], Opnd), String> {
+    let op = seq.next("s_cmp_eq_u32")?;
+    // The count must survive the temporary mask and allocation registers s0..7.
+    let count = match op.src[..] {
+        [n @ S(8..), I(0)] if op.dst == [Scc] => n,
+        _ => return Err("unsupported mesh count guard".into()),
+    };
+    seq.write(S(0), "s_cselect_b64", &[ExecLo, I(0)])?;
+    if seq.imm("s_cmpk_gt_u32", 128)?.dst != [count] {
+        return Err("mesh count limit uses a different register".into());
+    }
+    seq.write(S(2), "s_cselect_b64", &[ExecLo, I(0)])?;
+    seq.write(S(0), "s_or_b64", &[S(0), S(0)])?;
+    seq.write(S(2), "s_or_b64", &[S(2), S(2)])?;
+    seq.write(S(0), "s_or_b64", &[S(2), S(0)])?;
+    let bad = seq.assign("v_cndmask_b32", &[I(0), I(1), S(0)])?;
+    seq.write(S(0), "v_readfirstlane_b32", &[bad])?;
+    seq.write(S(0), "s_and_b32", &[I(1), S(0)])?;
+    seq.write(Scc, "s_cmp_eq_u32", &[S(0), I(1)])?;
+    seq.write(S(0), "s_mov_b64", &[ExecLo])?;
+    let invalid = S(2);
+    seq.write(invalid, "s_cselect_b64", &[ExecLo, I(0)])?;
+    let output = seq.assign("v_cndmask_b32", &[count, I(1), invalid])?;
+    if ![bad, output].iter().all(|op| matches!(op, V(_))) {
+        return Err("unsupported temporary registers in mesh allocation".into());
+    }
+    let temps = [bad, output, output];
+    seq.write(S(4), "s_xor_b64", &[invalid, I(-1)])?;
+    seq.write(S(6), "v_readfirstlane_b32", &[output])?;
+    let first = seq.next("v_cmpx_eq_u32")?;
+    let [I(0), lane @ V(_)] = first.src[..] else {
+        return Err(format!("unsupported operands for mesh v_cmpx_eq_u32 at {:#x}", first.offset));
+    };
+    if first.dst != [VccLo] || temps.contains(&lane) {
+        return Err("unsupported temporary registers in mesh allocation".into());
+    }
+    let restore = seq.branch("s_cbranch_execz")?;
+    seq.write(S(7), "s_lshl_b32", &[S(6), I(12)])?;
+    seq.write(VccLo, "s_andn2_b64", &[ExecLo, invalid])?;
+    seq.write(S(6), "s_or_b32", &[S(7), S(6)])?;
+    seq.write(M0, "s_mov_b32", &[S(6)])?;
+    seq.imm("s_sendmsg", 9)?;
+    seq.imm("s_waitcnt", 0)?;
+    let valid = seq.branch("s_cbranch_vccnz")?;
+    seq.imm("s_barrier", 0)?;
+    let null = seq.assign("v_bfrev_b32", &[I(1)])?;
+    if null != bad {
+        return Err("unexpected null primitive register".into());
+    }
+    seq.export(12, 0, 2)?;
+    if seq.export(20, 1, 2)?.src.first() != Some(&null) {
+        return Err("missing null primitive in mesh allocation".into());
+    }
+    seq.arrive(valid)?;
+    seq.arrive(restore)?;
+    seq.imm("s_waitcnt", -241)?;
+    seq.write(ExecLo, "s_mov_b64", &[S(0)])?;
+    seq.imm("s_barrier", 0)?;
+    Ok((count, count, invalid, temps, lane))
+}
+
 pub(super) fn recognize(
     insns: &[Insn],
     max_vertices: u16,
     clip_mask: Option<u8>,
 ) -> Result<MeshExports, String> {
     let compact = max_vertices == 128;
-    let start = insns
-        .iter()
-        .position(|op| op.mnemonic == "s_sendmsg")
-        .and_then(|send| {
-            insns[..send]
-                .iter()
-                .enumerate()
-                .rev()
-                .filter(|(_, op)| !is_wait(op))
-                .nth(if compact { 28 } else { 27 })
-                .map(|(index, _)| index)
-        })
+    // Where the allocation begins, counted in instructions back from its request.
+    let before_request = |back: usize| {
+        let send = insns.iter().position(|op| op.mnemonic == "s_sendmsg")?;
+        insns[..send]
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, op)| !is_wait(op))
+            .nth(back)
+            .map(|(index, _)| index)
+    };
+    // With one count the 128-vertex allocation is six instructions shorter.
+    let shared = before_request(21)
+        .filter(|&index| compact && insns[index].mnemonic == "s_cmp_eq_u32")
+        .filter(|&index| {
+            let mut after = insns[index + 1..].iter().filter(|op| !is_wait(op));
+            after.nth(1).is_some_and(|op| op.mnemonic == "s_cmpk_gt_u32")
+        });
+    let start = shared
+        .or_else(|| before_request(if compact { 28 } else { 27 }))
         .ok_or("missing mesh allocation request")?;
     let mut seq = Sequence {
         code: insns,
         at: start,
     };
-    let (vertices, primitives, invalid, temps, lane_index) = if compact {
+    let (vertices, primitives, invalid, temps, lane_index) = if shared.is_some() {
+        allocation_shared(&mut seq)?
+    } else if compact {
         allocation_128(&mut seq)?
     } else {
         let (vertices, primitives, invalid, temps) = allocation(&mut seq)?;
@@ -349,6 +425,7 @@ pub(super) fn recognize(
     }
     seq.write(S(0), "s_and_saveexec_b64", &[S(0)])?;
     let end_vertices = seq.branch("s_cbranch_execz")?;
+    let vertex_start = seq.at;
     let mut vertex_exports = Vec::new();
     let mut targets = 0u64;
     // Registers the program sets for later exports. The emitter reads the values directly.
@@ -440,6 +517,7 @@ pub(super) fn recognize(
     };
     Ok(MeshExports {
         start,
+        vertex_start,
         lane_index,
         vertices,
         primitives,

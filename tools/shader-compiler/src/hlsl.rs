@@ -46,6 +46,9 @@ mod raw_idxen;
 #[path = "tests/hlsl/wide_atomic_test.rs"]
 mod wide_atomic_test;
 #[cfg(test)]
+#[path = "tests/hlsl/image_cmpswap.rs"]
+mod image_cmpswap;
+#[cfg(test)]
 #[path = "tests/hlsl/cpu_oracle.rs"]
 mod cpu_oracle;
 #[cfg(test)]
@@ -101,9 +104,12 @@ mod fspx_wave;
 mod singleton_wave;
 mod wave_sum;
 mod lockstep;
+mod mask_ballots;
 mod wave_loops;
 mod paired_wave64;
 pub use paired_wave64::translate_paired_wave64;
+/// Generated HLSL above this size would need more than about 9 GB of DXC memory.
+pub const MAX_HLSL_BYTES: usize = 8 << 20;
 mod raw_index;
 mod reflection_compact;
 pub(crate) mod radiance_probe;
@@ -335,10 +341,13 @@ struct Emitter<'a> {
     compute_swizzle: bool,
     vote_defs: BTreeSet<usize>,
     vote_uses: BTreeMap<usize, usize>,
+    /// Lane masks read as numbers.
+    mask_ballots: Option<mask_ballots::Ballots>,
     exec_snapshots: exec_snapshot::Snapshots,
     reflected_lds_words: Option<u32>,
     hoisted_swizzle: Option<usize>,
     indexed_lane: bool,
+    indexed_lane_wave32: bool,
     /// Complete 32-thread wave using independent one-word vector comparison masks.
     single_wave32: bool,
     resolve_wave32: bool,

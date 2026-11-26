@@ -869,42 +869,69 @@ fn guard_region(
     false
 }
 
+/// Validate the control flow of a single reduction region: the one whose first
+/// DPP instruction is at `first`, spanning the byte offsets `start..=end`.
+/// Returns an error when the region may execute on a partial lane set (an early
+/// exit before it, or a divergent branch crossing it). `verified_reads` are the
+/// result reads of the regions before this one, matching the order
+/// [`check_control_flow`] processes them.
+pub(super) fn check_region(
+    insns: &[Insn],
+    first: usize,
+    start: i64,
+    end: i64,
+    verified_reads: &[usize],
+) -> Result<(), String> {
+    let ins = &insns[first];
+    // A row scan sums with the integer add's identity.
+    let operation = if ins.op == DPP_SCAN { "v_add_nc_u32" } else { ins.mnemonic.as_str() };
+    for (branch_index, branch) in insns.iter().enumerate().filter(|(_, i)| i.enc == Enc::Sopp) {
+        let pc = branch.offset as i64;
+        if branch.op == 1 && pc < start {
+            return Err(format!("wave reduction at {start:#x} after an early exit"));
+        }
+        if Emitter::branch_cond(branch.op).is_some() {
+            let target = pc + 4 + 4 * branch.aux.imm;
+            if (pc < start && target >= start) || (pc > end && target <= end)
+                || (pc >= start && pc <= end)
+            {
+                if !guard_region(insns, branch_index, start as usize, end as usize, first, operation, verified_reads) {
+                    if std::env::var("TUXBOX_WAVE_DEBUG").is_ok() {
+                        let prev = insns.get(branch_index.checked_sub(1).unwrap_or(0));
+                        eprintln!("WAVEDEBUG region=[{start:#x}..{end:#x}] op={} branch_idx={} op={} pc={:#x} target={:#x} prev={:?}",
+                            ins.mnemonic, branch_index, branch.op, pc, target,
+                            prev.map(|p| (p.mnemonic.as_str(), p.src.iter().map(|o| format!("{o:?}")).collect::<Vec<_>>())));
+                    }
+                    return Err(format!(
+                        "wave reduction at {start:#x} may execute in divergent control flow"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Validate fixed-width reductions and return EXECZ instruction indices whose
 /// masked region and whole-wave arrival permit a wave-wide empty-EXEC vote.
 pub(super) fn check_control_flow(insns: &[Insn], width: u32) -> Result<BTreeSet<usize>, String> {
     let mut execz_guards = BTreeSet::new();
     let mut verified_reads = Vec::new();
     for (first, region) in reduction_regions(insns, width) {
-        let ins = &insns[first];
-        // A row scan sums with the integer add's identity.
-        let operation = if ins.op == DPP_SCAN { "v_add_nc_u32" } else { ins.mnemonic.as_str() };
         let start = insns[*region.start()].offset as i64;
         let end = insns[*region.end()].offset as i64;
         let last_read = *region.end() - 1;
+        check_region(insns, first, start, end, &verified_reads)?;
+        // Every branch that affects the region passed `check_region`, so the
+        // EXECZ ones among them are safe to vote on.
         for (branch_index, branch) in insns.iter().enumerate().filter(|(_, i)| i.enc == Enc::Sopp) {
             let pc = branch.offset as i64;
-            if branch.op == 1 && pc < start {
-                return Err(format!("wave reduction at {start:#x} after an early exit"));
-            }
-            if Emitter::branch_cond(branch.op).is_some() {
+            if branch.op == 8 && Emitter::branch_cond(branch.op).is_some() {
                 let target = pc + 4 + 4 * branch.aux.imm;
                 if (pc < start && target >= start) || (pc > end && target <= end)
                     || (pc >= start && pc <= end)
                 {
-                    if !guard_region(insns, branch_index, start as usize, end as usize, first, operation, &verified_reads) {
-                        if std::env::var("TUXBOX_WAVE_DEBUG").is_ok() {
-                            let prev = insns.get(branch_index.checked_sub(1).unwrap_or(0));
-                            eprintln!("WAVEDEBUG region=[{start:#x}..{end:#x}] op={} branch_idx={} op={} pc={:#x} target={:#x} prev={:?}",
-                                ins.mnemonic, branch_index, branch.op, pc, target,
-                                prev.map(|p| (p.mnemonic.as_str(), p.src.iter().map(|o| format!("{o:?}")).collect::<Vec<_>>())));
-                        }
-                        return Err(format!(
-                            "wave reduction at {start:#x} may execute in divergent control flow"
-                        ));
-                    }
-                    if branch.op == 8 {
-                        execz_guards.insert(branch_index);
-                    }
+                    execz_guards.insert(branch_index);
                 }
             }
         }

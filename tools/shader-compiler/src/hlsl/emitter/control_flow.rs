@@ -209,7 +209,7 @@ impl<'a> Emitter<'a> {
             if ins.mnemonic == "tb_indexed_readlane" && !active.is_empty() {
                 self.end_guard(&mut open);
                 cur.clear();
-                self.emit_indexed_read(i, ins)?;
+                self.emit_indexed_read(i, ins, &active)?;
                 self.hoisted_swizzle = Some(i);
             }
             if self.micropoly_vote == Some(i) {

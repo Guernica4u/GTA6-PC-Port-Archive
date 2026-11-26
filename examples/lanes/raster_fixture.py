@@ -1,11 +1,26 @@
-"""The synthetic Xbox vertex and pixel programs of the `raster-tables` self-test.
+"""The synthetic Xbox programs of the `raster-tables` and `raster-samplers` self-tests.
 
-Both are small hand-written console programs, not taken from any game. The
-vertex program draws a fullscreen triangle. The pixel program reads one dword
-through table 1 of a root with two descriptor tables, from the table pointer in
-s9 at slot 2, and writes it to a uint render target. Its FSSM records and PSV
-binding name that descriptor `t3, space2`, a register the title's root does not
-declare, so the pipeline needs the root its tables are reflected into.
+All are small hand-written console programs, not taken from any game. The
+vertex program draws a fullscreen triangle. The `raster-tables` pixel program
+reads one dword through table 1 of a root with two descriptor tables, from the
+table pointer in s9 at slot 2, and writes it to a uint render target. Its FSSM
+records and PSV binding name that descriptor `t3, space2`, a register the
+title's root does not declare, so the pipeline needs the root its tables are
+reflected into.
+
+The `raster-samplers` pixel program samples a texture at table 1 slot 0 with a
+linear clamped sampler it builds from literal words, as the console compiles a
+static sampler into the program. It declares that sampler as `s0`, where the
+title's root has a point-filtered static sampler, so only the literal words
+give the console's result.
+
+The `mesh-samplers` pixel program is the same, drawn through a mesh pipeline. It
+declares two samplers, `s0` and `s1`, both of which the title's root has as
+point-filtered static samplers, so no declared register can stand in for the
+literal state. Its mesh program is a records-only console container: its FSSM
+records name root constant `b501` where the root declares `b500`, so the
+provider rewrites the root for the mesh stage, and its translation is a desktop
+mesh shader (`mesh_samplers.hlsl`) prepared under its digest.
 """
 from pathlib import Path
 import struct
@@ -37,17 +52,58 @@ PIXEL_RESOURCES = ([4, 2, 3, 3],)
 EXPECTED = 0x7AB1E001
 DECOY = 0xD0000000
 
+# gfx1030, checked with `llvm-mc -mcpu=gfx1030 -show-encoding`.
+SAMPLER_PIXEL_CODE = (
+    0xBE800309,              # s_mov_b32 s0, s9          table 1 pointer
+    0xBE810380,              # s_mov_b32 s1, 0
+    0xF40C0100, 0xFA000000,  # s_load_dwordx8 s[4:11], s[0:1], 0x0   slot 0
+    0xB0140092,              # s_movk_i32 s20, 0x92      sampler word 0: clamp in U, V and W
+    0xBE9503FF, 0x00C00000,  # s_mov_b32 s21, 0xc00000   word 1: max LOD 12
+    0xBE9603FF, 0x18500000,  # s_mov_b32 s22, 0x18500000 word 2: linear min, mag and mip filters
+    0xBE970380,              # s_mov_b32 s23, 0          word 3: border colour
+    0x7E0802FF, 0x3EC00000,  # v_mov_b32 v4, 0.375       u
+    0x7E0A02F0,              # v_mov_b32 v5, 0.5         v
+    0xBF8CC07F,              # s_waitcnt lgkmcnt(0)
+    0xF09C0108, 0x00A10704,  # image_sample_lz v7, v[4:5], s[4:11], s[20:23] dmask:0x1 dim:2D
+    0xBF8C3F70,              # s_waitcnt vmcnt(0)
+    0xF8001801, 0x00000007,  # exp mrt0 v7, off, off, off done vm
+    0xBF810000,              # s_endpgm
+)
+# The texture descriptor is table 1 (s9) at dword 0, a typed SRV, register 0;
+# the sampler is an inlined static sampler, register 0.
+SAMPLER_PIXEL_USER = ([3, 0, 1, 0, 0x109],)
+SAMPLER_PIXEL_USED = ([0x300, 0, 0, 0, 0x1_0908], [0x401, 0, 0, 0, 0])
+# PSV bindings: texture t0, space1 (what the title's root has at that slot) and sampler s0, space0.
+SAMPLER_PIXEL_RESOURCES = ([3, 1, 0, 0], [1, 0, 0, 0])
+# A 2x1 texture of 1.0 and 3.0 sampled at u = 0.375: a quarter of the way
+# between the texel centres. Linear filtering gives 1.5, point filtering 1.0.
+SAMPLER_TEXELS = (1.0, 3.0)
+SAMPLER_LINEAR, SAMPLER_POINT = 1.5, 1.0
+
+# The mesh pipeline's pixel program declares a second static sampler, s1, so
+# that neither declared register is the program's only one.
+MESH_SAMPLER_PIXEL_USED = (*SAMPLER_PIXEL_USED, [0x401, 0, 1, 0, 0])
+MESH_SAMPLER_PIXEL_RESOURCES = (*SAMPLER_PIXEL_RESOURCES, [1, 0, 1, 1])
+# The mesh program's records: root constant parameter 2 in s8, named b500 by the
+# title's root and b501 by the program, so the mesh stage gets a root of its own.
+MESH_USER = ([0, 0, 1, 501, 0x200],)
+MESH_USED = ([2, 0, 501, 0, 0x2_0004],)
+MESH_RESOURCES = ([2, 0, 501, 501],)
+MESH_CODE = (0xBF810000,)  # s_endpgm: the desktop replacement runs instead
+
 ABSENT = 0xDEADBEEFDEADBEEF
 ROWS_AT, CODE_AT = 0x240, 0x280
 
 
 def image(slot, code, user=(), used=(), inputs=0):
     """An FSSM 1.1 image with one stage descriptor at 0x68, after the directory."""
-    data = bytearray(CODE_AT)
+    # The code follows the rows; more than three rows move it later.
+    code_at = max(CODE_AT, -(-(ROWS_AT + 20 * (len(user) + len(used))) // 0x40) * 0x40)
+    data = bytearray(code_at)
     struct.pack_into("<Q", data, 0, 6)
     for n in range(12):
         struct.pack_into("<Q", data, 8 + 8 * n, 0x68 if n == slot else ABSENT)
-    struct.pack_into("<QQ", data, 0x68, CODE_AT, 4 * len(code))
+    struct.pack_into("<QQ", data, 0x68, code_at, 4 * len(code))
     # Descriptor fields at 0xd8: user-data and used-resource row offsets and counts.
     used_at = ROWS_AT + 20 * len(user)
     struct.pack_into("<QQII", data, 0xd8, ROWS_AT if user else 0, used_at if used else 0, len(user), len(used))
@@ -110,12 +166,42 @@ def pixel():
     ])
 
 
-def header(vertex_data, pixel_data):
+def sampler_pixel():
+    return container(0x60, image(5, SAMPLER_PIXEL_CODE, SAMPLER_PIXEL_USER, SAMPLER_PIXEL_USED, inputs=2), [
+        (b"ISGN", signature([("SV_Position", 0, 1, 3, 0, 15, 0)])),
+        (b"OSGN", signature([("SV_Target", 0, 64, 3, 0, 1, 0)])),
+        (b"PSV0", validation(0, SAMPLER_PIXEL_RESOURCES)),
+    ])
+
+
+def mesh_sampler_pixel():
+    return container(0x60, image(5, SAMPLER_PIXEL_CODE, SAMPLER_PIXEL_USER, MESH_SAMPLER_PIXEL_USED, inputs=2), [
+        (b"ISGN", signature([("SV_Position", 0, 1, 3, 0, 15, 0)])),
+        (b"OSGN", signature([("SV_Target", 0, 64, 3, 0, 1, 0)])),
+        (b"PSV0", validation(0, MESH_SAMPLER_PIXEL_RESOURCES)),
+    ])
+
+
+def mesh():
+    """The records-only console mesh program (shader model 6.5, stage 13)."""
+    return container(0xD0065, image(2, MESH_CODE, MESH_USER, MESH_USED), [
+        (b"OSGN", signature([("SV_Position", 0, 1, 3, 0, 15, 0)])),
+        (b"PSV0", validation(13, MESH_RESOURCES)),
+    ])
+
+
+def header(vertex_data, pixel_data, sampler_data=None):
     def array(name, data):
         return f"constexpr unsigned char {name}[] = {{{','.join(str(byte) for byte in data)}}};\n"
+    sampler_data = sampler_pixel() if sampler_data is None else sampler_data
+    texels = ", ".join(f"{texel!r}f" for texel in SAMPLER_TEXELS)
     return ("// Generated from raster_fixture.py.\n"
             + array("raster_vertex", vertex_data) + array("raster_pixel", pixel_data)
-            + f"constexpr UINT raster_expected = {EXPECTED:#x}, raster_decoy = {DECOY:#x};\n")
+            + f"constexpr UINT raster_expected = {EXPECTED:#x}, raster_decoy = {DECOY:#x};\n"
+            + array("raster_sampler_pixel", sampler_data)
+            + f"constexpr float raster_sampler_texels[] = {{{texels}}};\n"
+            + f"constexpr float raster_sampler_linear = {SAMPLER_LINEAR!r}f, raster_sampler_point = {SAMPLER_POINT!r}f;\n"
+            + array("mesh_sampler_mesh", mesh()) + array("mesh_sampler_pixel", mesh_sampler_pixel()))
 
 
 if __name__ == "__main__":

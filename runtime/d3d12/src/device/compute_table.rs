@@ -73,7 +73,25 @@ fn missing_literal_samplers(shader: &[u8], stage: u32, existing: &[[u32; 13]]) -
     if private.iter().all(covered) { Vec::new() } else { private }
 }
 
-fn static_sampler(s: [u32; 13]) -> D3D12_STATIC_SAMPLER_DESC {
+/// Private static samplers for each literal state no static sampler of the root
+/// visible to the stage has (`inline_sampler::unmatched`). They take registers
+/// after every sampler register the root uses: the translator names a sampler by
+/// its register, so `missing_literal_samplers`' registers from 0 can overlap the
+/// root's own in another space. That also covers a root that indexes the heap
+/// (flag 0x800) and a program `inline_sampler::private` cannot vouch for.
+/// `missing_literal_samplers` remains for the rest.
+fn literal_samplers(shader: &[u8], stage: u32, signature: &tuxbox_dxbc::rootsig::RootSig) -> Vec<[u32; 13]> {
+    if let Some(unmatched) = tuxbox_dxbc::inline_sampler::unmatched(shader, stage, signature) {
+        return unmatched;
+    }
+    if signature.flags & 0x800 == 0 {
+        missing_literal_samplers(shader, stage, &signature.static_samplers)
+    } else {
+        Vec::new()
+    }
+}
+
+pub(super) fn static_sampler(s: [u32; 13]) -> D3D12_STATIC_SAMPLER_DESC {
     D3D12_STATIC_SAMPLER_DESC {
         Filter: D3D12_FILTER(s[0] as i32),
         AddressU: D3D12_TEXTURE_ADDRESS_MODE(s[1] as i32),
@@ -97,10 +115,7 @@ pub(super) fn sampler_root(
     node: u32,
 ) -> Result<Option<(ID3D12RootSignature, RootSource)>> {
     let Ok(signature) = parse_rts0(original.payload()) else { return Ok(None) };
-    if signature.flags & 0x800 != 0 {
-        return Ok(None);
-    }
-    let recovered = missing_literal_samplers(shader, 5, &signature.static_samplers);
+    let recovered = literal_samplers(shader, 5, &signature);
     if recovered.is_empty() {
         return Ok(None);
     }
@@ -187,8 +202,8 @@ fn reflected_root(
             }
             if signature.static_samplers.is_empty() && signature.flags & 0x800 == 0 {
                 recovered_samplers = tuxbox_dxbc::inline_sampler::private(shader, 5).unwrap_or_default();
-            } else if signature.flags & 0x800 == 0 {
-                recovered_samplers = missing_literal_samplers(shader, 5, &signature.static_samplers);
+            } else {
+                recovered_samplers = literal_samplers(shader, 5, &signature);
             }
             let checked = tuxbox_dxbc::compute_table::compute_root_bindings(&layout_view(shader), &signature).map(
                 |(bindings, constants)| {
@@ -225,7 +240,11 @@ fn reflected_root(
             corroborated_raster = true;
             // A static sampler the title compiled into the pixel shader and left out
             // of this root. The translation reads the root built here, so it finds it.
-            recovered_samplers = tuxbox_dxbc::inline_sampler::omitted(pixel, &signature).unwrap_or_default();
+            // Otherwise (a heap-indexing program, or a state the root names another
+            // way), each literal state the root lacks takes a private register.
+            recovered_samplers = tuxbox_dxbc::inline_sampler::omitted(pixel, &signature)
+                .or_else(|| tuxbox_dxbc::inline_sampler::unmatched(pixel, 0, &signature))
+                .unwrap_or_default();
             Some(bindings)
         }
         (Program::Raster { vertex, pixel }, [table, rest @ ..])
@@ -265,8 +284,8 @@ fn reflected_root(
                     .or_else(|| tuxbox_dxbc::inline_sampler::private(pixel, 0))
                     .unwrap_or_default();
             }
-            else if !signature.static_samplers.is_empty() && signature.flags & 0x800 == 0 {
-                recovered_samplers = missing_literal_samplers(pixel, 0, &signature.static_samplers);
+            else if !signature.static_samplers.is_empty() {
+                recovered_samplers = literal_samplers(pixel, 0, &signature);
             }
             for b in pixel_bindings {
                 if let Some(existing) = bindings.iter().find(|r| r.slot == b.slot) {
@@ -448,8 +467,9 @@ fn reflected_root(
             desc.Anonymous.Desc_1_1.NumParameters = parameters.len() as u32;
         }
         let samplers: Vec<_> = recovered_samplers.into_iter().map(static_sampler).collect();
-        // Recovered samplers join the root's own: `omitted` gives them registers the
-        // root does not use, and the other recoveries apply only to a root with none.
+        // Recovered samplers join the root's own: `omitted` and `unmatched` give them
+        // registers the root does not use, `missing_literal_samplers` the private
+        // space, and the other recoveries apply only to a root with none.
         let samplers: Vec<_> = if samplers.is_empty() || source.NumStaticSamplers == 0 {
             samplers
         } else {
@@ -523,7 +543,15 @@ fn append_corroborated_ranges(
         for (index, param) in signature.params.iter().enumerate() {
             let RootParamKind::Table(declared) = &param.kind else { continue };
             let additions: Vec<_> = extra.iter().filter(|binding| binding.table as usize == index).collect();
+            // Root replacement invalidates arguments in every table, not
+            // just the one receiving a range. Paging must reserve the
+            // original tables' resident spans as well.
+            let Some((mut extent, mut views)) = finite_table(declared) else {
+                return Ok(TableLayout::Unsupported);
+            };
             if additions.is_empty() {
+                lengths[index] = extent;
+                accessed_views.extend(views.into_iter().map(|range| (index, range)));
                 continue;
             }
             let table = parameters[index].Anonymous.DescriptorTable;
@@ -556,7 +584,7 @@ fn append_corroborated_ranges(
                 NumDescriptorRanges: stored[index].len() as u32,
                 pDescriptorRanges: stored[index].as_ptr(),
             };
-            let Some((mut extent, mut views)) = finite_table(declared) else { continue };
+
             for binding in &additions {
                 extent = extent.max(binding.slot.saturating_add(1));
                 if binding.kind < 2 {
