@@ -171,7 +171,10 @@ fn libraries() -> Option<&'static [Shared; SHARDS]> {
             for shard in 0..SHARDS {
                 let blob = read(shard_file(shard)).unwrap_or_default();
                 let tag = tag(&blob);
-                let mut library = open(&device, blob)?;
+                let Some(mut library) = open(&device, blob) else {
+                    tracing::warn!(shard, "no host pipeline library: pipelines are not kept");
+                    return None;
+                };
                 // The pre-build's list, if it was saved with this shard's bytes.
                 if let Some(list) = read(prebuilt_file(shard))
                     && !library._blob.is_empty()
