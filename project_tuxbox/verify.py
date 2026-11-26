@@ -753,7 +753,8 @@ def _verify(host, output, adapter, selected=None, samples=1):
         if "present" in selected:
             # The desktop's rootless XWayland can't be sampled; present into a private rootful
             # Xwayland instead, and fail fast with the cause if that isn't possible either.
-            capture = screen_capture_problem()
+            capture = screen_capture_problem(display=host.env.get("DISPLAY", ""),
+                                             xauthority=host.env.get("XAUTHORITY"))
             server = private_x_server(work, adapter=adapter) if capture else nullcontext()
             saved = {key: host.env.get(key) for key in ("DISPLAY", "XAUTHORITY", "MESA_VK_WSI_DEBUG")}
             with server as private:

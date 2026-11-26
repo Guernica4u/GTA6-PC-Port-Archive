@@ -113,6 +113,11 @@ class HeadlessDisplayTests(unittest.TestCase):
                 self.assertRegex(display, r"^:[0-9]+$")
                 self.assertEqual(cookie.stat().st_mode & 0o777, 0o600)
                 self.assertIsNone(screen_capture_problem(display=display, xauthority=str(cookie)))
+                if shutil.which("xdpyinfo"):
+                    env = dict(os.environ, DISPLAY=display, XAUTHORITY=str(cookie))
+                    import subprocess
+                    probe = subprocess.run(["xdpyinfo"], env=env, capture_output=True, timeout=5)
+                    self.assertEqual(probe.returncode, 0, probe.stderr.decode(errors="replace"))
                 raise RuntimeError("guest failed")
         self.assertFalse(cookie.exists())
         self.assertEqual(host.env, {"XAUTHORITY": "/old"})
