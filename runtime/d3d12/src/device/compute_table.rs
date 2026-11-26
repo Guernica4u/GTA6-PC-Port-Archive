@@ -91,7 +91,7 @@ fn literal_samplers(shader: &[u8], stage: u32, signature: &tuxbox_dxbc::rootsig:
     }
 }
 
-fn static_sampler(s: [u32; 13]) -> D3D12_STATIC_SAMPLER_DESC {
+pub(super) fn static_sampler(s: [u32; 13]) -> D3D12_STATIC_SAMPLER_DESC {
     D3D12_STATIC_SAMPLER_DESC {
         Filter: D3D12_FILTER(s[0] as i32),
         AddressU: D3D12_TEXTURE_ADDRESS_MODE(s[1] as i32),
@@ -543,7 +543,15 @@ fn append_corroborated_ranges(
         for (index, param) in signature.params.iter().enumerate() {
             let RootParamKind::Table(declared) = &param.kind else { continue };
             let additions: Vec<_> = extra.iter().filter(|binding| binding.table as usize == index).collect();
+            // Root replacement invalidates arguments in every table, not
+            // just the one receiving a range. Paging must reserve the
+            // original tables' resident spans as well.
+            let Some((mut extent, mut views)) = finite_table(declared) else {
+                return Ok(TableLayout::Unsupported);
+            };
             if additions.is_empty() {
+                lengths[index] = extent;
+                accessed_views.extend(views.into_iter().map(|range| (index, range)));
                 continue;
             }
             let table = parameters[index].Anonymous.DescriptorTable;
@@ -576,7 +584,7 @@ fn append_corroborated_ranges(
                 NumDescriptorRanges: stored[index].len() as u32,
                 pDescriptorRanges: stored[index].as_ptr(),
             };
-            let Some((mut extent, mut views)) = finite_table(declared) else { continue };
+
             for binding in &additions {
                 extent = extent.max(binding.slot.saturating_add(1));
                 if binding.kind < 2 {

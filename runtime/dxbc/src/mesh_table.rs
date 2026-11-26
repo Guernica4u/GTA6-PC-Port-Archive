@@ -118,8 +118,9 @@ impl MeshLayout {
                 (0x300, 8, _) => (3, 1),
                 (0x303, 8, _) if pixel => (6, 1),
                 // Typed unordered-access views can also record four words, textures
-                // included (ProjectScarlett pixel programs load those as eight).
-                (0x303, 4, 4) if pixel && named(6) == 1 && named(8) == 0 => (6, 1),
+                // included (ProjectScarlett pixel programs load those as eight; its mesh programs
+                // record the four-word form too).
+                (0x303, 4, 4) if named(6) == 1 && named(8) == 0 => (6, 1),
                 (0x300, 4, n) if (4..=2048).contains(&n) && n % 4 == 0 => (5, 1),
                 (0x302, 4, 0) => (2, 1),
                 (0x100, 4, 1) => (4, 2),

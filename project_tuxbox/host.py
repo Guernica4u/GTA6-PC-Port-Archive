@@ -78,10 +78,12 @@ def proton_installation(selection):
                 return path.parent.resolve()
         return resolved
     steam = Path(os.environ.get("STEAM_COMPAT_CLIENT_INSTALL_PATH") or Path.home() / ".steam/root")
-    libraries = [steam, Path.home() / ".local/share/Steam"]
-    vdf = steam / "steamapps/libraryfolders.vdf"
-    if vdf.is_file():
-        libraries += [Path(p) for p in re.findall(r'"path"\s*"([^"]+)"', vdf.read_text(errors="replace"))]
+    libraries = [steam, Path.home() / ".local/share/Steam",
+                 Path.home() / ".var/app/com.valvesoftware.Steam/.local/share/Steam"]
+    for installation in libraries.copy():
+        vdf = installation / "steamapps/libraryfolders.vdf"
+        if vdf.is_file():
+            libraries += [Path(p) for p in re.findall(r'"path"\s*"([^"]+)"', vdf.read_text(errors="replace"))]
     for library in libraries:
         for parent in ("compatibilitytools.d", "steamapps/common"):
             # The release archive adds the architecture; Proton managers may not.

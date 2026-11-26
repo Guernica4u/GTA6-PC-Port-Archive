@@ -4,12 +4,14 @@
 Each synthetic program counts a mask's lanes, finds its first one or counts
 those before each lane, some of them after EXEC was narrowed to one elected
 lane. The reference models the console. Each program runs in waves of its own
-width. Only the translator's input and output are instrumented. No game data is
-needed.
+width, where the host has them, and each 64-lane program also runs in the form a
+32-lane host uses, with two console lanes per thread. Only the translator's input
+and output are instrumented. No game data is needed.
 """
 import argparse
 import json
 from pathlib import Path
+import re
 import struct
 import subprocess
 import sys
@@ -21,6 +23,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 from check_lockstep_gpu import LIMIT, branch, label, words_of  # noqa: E402
 from check_wave_guard import cases  # noqa: E402
 from frosty_gpu_guest import run_gpu_guest  # noqa: E402
+from project_tuxbox.dxil_store import COMPUTE_FLAGS  # noqa: E402
 from project_tuxbox.inspect import digest  # noqa: E402
 
 # Results go to v10, v11 and v12. s12 holds the entry EXEC and v14 the lane's index.
@@ -112,6 +115,26 @@ def instrument(hlsl, width):
     return "RWBuffer<uint> output : register(u0);\n" + hlsl[:end] + stores + "}\n"
 
 
+def instrument_paired(hlsl):
+    """Two console lanes per thread: lane `l` in one half and `l + 32` in the other."""
+    start = re.search(r"^    s\d+ = gid\.x; s\d+ = gid\.y; s\d+ = gid\.z;\n", hlsl, re.M)
+    if not start or "tb_pair" not in hlsl or "[WaveSize(32)]" not in hlsl or "WaveActiveBallot" not in hlsl:
+        raise ValueError("fixture must take the paired translation")
+    lanes = [f"(tb_first + tb_pair + {32 * half}u)" for half in (0, 1)]
+    load = "".join(f"    uint input{half} = output[{lanes[half]}];\n    v0__{half} = input{half} & 0x7fffffffu;\n"
+                   for half in (0, 1))
+    load += ("    exec_lo = WaveActiveBallot((input0 >> 31) != 0u).x;\n"
+             "    exec_hi = WaveActiveBallot((input1 >> 31) != 0u).x;\n")
+    stores = ""
+    for half in (0, 1):
+        low, high, last = (f"v{n}__{half}" if re.search(rf"\bv{n}__{half}\b", hlsl) else "0u" for n in (10, 11, 12))
+        stores += (f"    output[64u + {lanes[half]}] = {low} | ({high} << 8u) | ((WaveGetLaneCount() * 2u) << 16u);\n"
+                   f"    output[128u + {lanes[half]}] = {last};\n")
+    hlsl = hlsl[:start.end()] + load + hlsl[start.end():]
+    end = hlsl.rstrip().rfind("}")
+    return "RWBuffer<uint> output : register(u0);\n" + hlsl[:end] + stores + "}\n"
+
+
 def inputs(width):
     yield from cases(width)
     yield "below", (1 << width) - 1, list(range(width))
@@ -154,37 +177,49 @@ def main(argv=None):
     with TemporaryDirectory(dir=work) as tmp:
         trial = Path(tmp)
         trials, shaders = {}, {}
-        for width, bodies in ((32, WAVE32), (64, WAVE64)):
+        native = set()
+        for form, width, bodies in (("32", 32, WAVE32), ("64", 64, WAVE64), ("64-paired", 64, WAVE64)):
+            paired = form == "64-paired"
             for name, body in bodies.items():
                 words = words_of(program(body, width), args.llvm_mc, *WAVE_OPTIONS[width])
                 emitted = subprocess.check_output(
-                    [args.emitter.resolve(), str(width), *(f"{word:08x}" for word in words)], text=True, timeout=30)
-                source = trial / f"{name}{width}.hlsl"
-                source.write_text(instrument(emitted, width))
-                blob = trial / f"{name}{width}.cso"
-                subprocess.run([args.dxc, "-T", "cs_6_6", "-E", "main", "-Fo", blob, source], check=True, timeout=30,
-                               capture_output=True)
+                    [args.emitter.resolve(), form, *(f"{word:08x}" for word in words)], text=True, timeout=30)
+                shader = f"{name}{width}" + ("paired" if paired else "")
+                source = trial / f"{shader}.hlsl"
+                source.write_text(instrument_paired(emitted) if paired else instrument(emitted, width))
+                blob = trial / f"{shader}.cso"
+                subprocess.run([args.dxc, "-T", "cs_6_6", "-E", "main", *(COMPUTE_FLAGS if paired else ()), "-Fo", blob,
+                                source], check=True, timeout=30, capture_output=True)
                 subprocess.run([args.dxv, blob], check=True, timeout=30, capture_output=True)
-                shaders[f"{name}{width}"] = dict(hlsl_sha256=digest(source), dxil_sha256=digest(blob))
+                shaders[shader] = dict(hlsl_sha256=digest(source), dxil_sha256=digest(blob))
                 for case, mask, values in inputs(width):
-                    trial_name = f"{name}{width}_{case}"
+                    trial_name = f"{shader}_{case}"
                     trials[trial_name] = name, seed_for(mask, values), mask, values
                     (trial / f"{trial_name}.seed").write_bytes(struct.pack("<384I", *trials[trial_name][1]))
                     (trial / f"{trial_name}.cso").hardlink_to(blob)
+                    if form == "64":
+                        (trial / f"{trial_name}.minwave").write_text("64\n")
+                        native.add(trial_name)
         (trial / "cases.txt").write_text("".join(f"{name} 0 uint 1\n" for name in trials))
         exe, status, fields = run_gpu_guest(
             ROOT / "tools/reference/independent-shaders/compute.cpp", "ballots.exe", trial, work,
             args.proton.resolve(), args.prefix, args.provider, args.compiler_dir)
+        # Only a host that reports narrower waves may leave the native 64-lane programs out.
+        narrow = int(fields.get("wave_lanes_max", 0)) in range(1, 64)
+        skipped = {trial_name for trial_name in native if narrow and fields.get(f"{trial_name}_skipped") == "64"}
         wrong = {}
         for trial_name, (name, seed, mask, values) in trials.items():
+            if trial_name in skipped:
+                continue
             path = trial / f"{trial_name}.bin"
             found = difference(name, seed, mask, values, path.read_bytes() if path.is_file() else b"")
             if found:
                 wrong[trial_name] = found
         passed = status == 0 and fields.get("adapter") == args.adapter and not wrong
         report = dict(passed=passed, scope="Synthetic programs reading lane masks as numbers",
-                      adapter=fields.get("adapter"), guest_exit=status, cases=len(trials),
-                      compared_words=len(trials) * 384, wrong=wrong, shaders=shaders,
+                      adapter=fields.get("adapter"), guest_exit=status, cases=len(trials) - len(skipped),
+                      compared_words=(len(trials) - len(skipped)) * 384, wrong=wrong, shaders=shaders,
+                      native_wave64_cases_not_run=len(skipped), wave_lanes_max=fields.get("wave_lanes_max"),
                       emitter_sha256=digest(args.emitter), guest_sha256=digest(exe))
         if fields.get("error"):
             report["error"] = fields["error"]
@@ -193,9 +228,11 @@ def main(argv=None):
     for name, detail in wrong.items():
         print(f"WRONG {name}: {detail}")
     if not passed:
-        print(f"FAIL: {len(wrong)} of {len(trials)} cases, guest exit {status}")
+        print(f"FAIL: {len(wrong)} of {len(trials) - len(skipped)} cases, guest exit {status}")
         return 1
-    print(f"PASS: {len(trials)} cases, {len(trials) * 384} words, adapter {fields['adapter']}")
+    ran = len(trials) - len(skipped)
+    note = f", {len(skipped)} native wave64 cases not run (host has no 64-lane waves)" if skipped else ""
+    print(f"PASS: {ran} cases, {ran * 384} words, adapter {fields['adapter']}{note}")
     return 0
 
 

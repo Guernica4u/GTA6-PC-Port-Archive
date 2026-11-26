@@ -299,6 +299,13 @@ pub(super) fn ray_library(bytes: &[u8], source: &str) -> Option<Vec<u8>> {
     library
 }
 
+/// Whether the program is Xbox compute code without an embedded root signature,
+/// so that only the pipeline root names the register of each descriptor.
+pub(super) fn rootless_compute(shader: &[u8]) -> bool {
+    shader_code(shader) == Some((Stage::Compute, ShaderCode::Xbox))
+        && tuxbox_dxbc::Dxbc::parse(shader).is_ok_and(|dxbc| dxbc.chunk(b"RTS0").is_none())
+}
+
 pub(super) fn prepared(shader: &[u8]) -> Option<Vec<u8>> {
     let (stage, ShaderCode::Xbox) = shader_code(shader)? else {
         return None;
@@ -320,6 +327,16 @@ pub(super) fn refused_for_heap_strides(shader: &[u8], root: &[u8]) -> bool {
     let variant = with_root(shader, root);
     let Some(key) = source_digest(variant.as_deref().unwrap_or(shader)) else { return false };
     compile::refusal_reason(&key).is_some_and(|reason| reason.contains("IDXEN needs the console descriptor stride"))
+}
+
+/// A retry with the stride table translated `shader`, so the attempts without
+/// it, on `root` and root-less, are not unsupported shaders.
+pub(super) fn superseded(shader: &[u8], root: &[u8]) {
+    for attempt in [with_root(shader, root).as_deref(), Some(shader)].into_iter().flatten() {
+        if let Some(key) = source_digest(attempt) {
+            crate::progress::supersede(&key);
+        }
+    }
 }
 
 /// The original table layout has already been verified. A program whose

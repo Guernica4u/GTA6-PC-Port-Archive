@@ -194,13 +194,30 @@ impl InitTransition {
         Ok(Self { queue, allocator, list, fence, value: 0 })
     }
 
+    fn wait_for_queue(&mut self) -> windows::core::Result<()> {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+        unsafe {
+            self.value += 1;
+            self.queue.Signal(&self.fence, self.value)?;
+            if self.fence.GetCompletedValue() < self.value {
+                let event = CreateEventW(None, false, false, None)?;
+                let set = self.fence.SetEventOnCompletion(self.value, event);
+                if set.is_ok() {
+                    WaitForSingleObject(event, INFINITE);
+                }
+                let _ = CloseHandle(event);
+                set?;
+            }
+        }
+        Ok(())
+    }
+
     fn apply(
         &mut self,
         resource: &ID3D12Resource,
         target: D3D12_RESOURCE_STATES,
     ) -> windows::core::Result<()> {
-        use windows::Win32::Foundation::CloseHandle;
-        use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
         unsafe {
             self.allocator.Reset()?;
             self.list.Reset(&self.allocator, None)?;
@@ -225,20 +242,65 @@ impl InitTransition {
             self.list.Close()?;
             let command_list: ID3D12CommandList = self.list.clone().into();
             self.queue.ExecuteCommandLists(&[Some(command_list)]);
-            self.value += 1;
-            self.queue.Signal(&self.fence, self.value)?;
-            if self.fence.GetCompletedValue() < self.value {
-                let event = CreateEventW(None, false, false, None)?;
-                let set = self.fence.SetEventOnCompletion(self.value, event);
-                if set.is_ok() {
-                    WaitForSingleObject(event, INFINITE);
-                }
-                let _ = CloseHandle(event);
-                set?;
-            }
         }
-        Ok(())
+        self.wait_for_queue()
     }
+
+    fn map_tiles(
+        &mut self,
+        resource: &ID3D12Resource,
+        runs: &[(ID3D12Heap, u32)],
+    ) -> windows::core::Result<()> {
+        let mut tile_offset = 0u32;
+        for (heap, tiles) in runs {
+            let coordinate = D3D12_TILED_RESOURCE_COORDINATE {
+                X: tile_offset,
+                Y: 0,
+                Z: 0,
+                Subresource: 0,
+            };
+            let region = D3D12_TILE_REGION_SIZE {
+                NumTiles: *tiles,
+                ..Default::default()
+            };
+            let range_start = 0u32;
+            unsafe {
+                self.queue.UpdateTileMappings(
+                    resource,
+                    1,
+                    Some(&coordinate),
+                    Some(&region),
+                    Some(heap),
+                    1,
+                    Some(&D3D12_TILE_RANGE_FLAG_NONE),
+                    Some(&range_start),
+                    Some(tiles),
+                    D3D12_TILE_MAPPING_FLAG_NONE,
+                );
+            }
+            tile_offset = tile_offset
+                .checked_add(*tiles)
+                .ok_or(windows::Win32::Foundation::E_INVALIDARG)?;
+        }
+        self.wait_for_queue()
+    }
+}
+
+fn with_init_transition<T>(
+    device: &ID3D12Device,
+    slot: &std::sync::Mutex<Option<InitTransition>>,
+    op: impl FnOnce(&mut InitTransition) -> windows::core::Result<T>,
+) -> windows::core::Result<T> {
+    let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+    let runner = match slot.as_mut() {
+        Some(runner) => runner,
+        None => slot.insert(InitTransition::new(device)?),
+    };
+    let result = op(runner);
+    if result.is_err() {
+        *slot = None;
+    }
+    result
 }
 
 pub(super) fn transition_initial_state(
@@ -252,23 +314,19 @@ pub(super) fn transition_initial_state(
     {
         return Ok(());
     }
-    let mut slot = device
-        .state
-        .init_transition
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let runner = match slot.as_mut() {
-        Some(runner) => runner,
-        None => match InitTransition::new(&device.native) {
-            Ok(runner) => slot.insert(runner),
-            Err(error) => return Err(error.code()),
-        },
-    };
-    if let Err(error) = runner.apply(resource, target) {
-        *slot = None;
-        return Err(error.code());
-    }
-    Ok(())
+    with_init_transition(&device.native, &device.state.init_transition, |runner| {
+        runner.apply(resource, target)
+    })
+    .map_err(|error| error.code())
+}
+
+pub(super) fn map_reserved_tiles(
+    device: &ID3D12Device,
+    slot: &std::sync::Mutex<Option<InitTransition>>,
+    resource: &ID3D12Resource,
+    runs: &[(ID3D12Heap, u32)],
+) -> windows::core::Result<()> {
+    with_init_transition(device, slot, |runner| runner.map_tiles(resource, runs))
 }
 
 pub(super) fn packed_requirements(

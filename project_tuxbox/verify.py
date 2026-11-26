@@ -21,7 +21,7 @@ from .inspect import digest, export_table, image, launch_target
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / "build"
-BASE_SUITES = ("cpu", "xmem", "xapu", "xgameruntime", "xcrdapi", "graphics", "graphics-abi", "guest-frame", "present", "lanes", "lanes-selftest", "lanes-shader-cache", "lanes-raster-tables", "lanes-benchmark",
+BASE_SUITES = ("cpu", "xmem", "xapu", "xgameruntime", "xcrdapi", "graphics", "graphics-abi", "guest-frame", "present", "lanes", "lanes-selftest", "lanes-shader-cache", "lanes-raster-tables", "lanes-compute-root", "lanes-compute-root-recovery", "lanes-benchmark",
                "cpu-benchmark", "d3d12-exports", "d3d12-features", "d3d12-indirect", "d3d12-queries", "d3d12-queues", "d3d12-tables",
                "d3d12-heaps", "d3d12-placement", "d3d12-copy-resource", "d3d12-draw", "d3d12-stream", "d3d12-frame-events",
                "d3d12-guids", "d3d12-signatures", "xg-provider")
@@ -419,8 +419,124 @@ def missing_provider_imports(modules, provider, expected):
     return sorted(set(expected) - found)
 
 
+def lanes_compute_root(host, check, gpu_args, pci, memory_symbols):
+    """Dispatch the Lanes root-less console compute programs under a root with three tables.
+
+    The provider cannot reflect that root, so each program must be translated
+    against it while the game runs. The first program's translation writes the
+    scenario's word. The second is refused for this root and must stay refused:
+    neither may fall back to a translation without the root, whose register
+    the root does not declare.
+    """
+    from examples.lanes.shader_fixture import root_shader
+    from .runtime_shaders import shader_session
+    from .shader_prep import SOURCE_CACHE
+
+    sources = Path(host.env["WINEPREFIX"]) / SOURCE_CACHE
+    rootless = {hashlib.sha256(root_shader(offset)).hexdigest() for offset in (0x40, 0xA0)}
+    messages = []
+
+    def requested(prefix):
+        return {match[1] for line in messages if (match := re.match(prefix + r"([0-9a-f]{64})\b", line))}
+
+    def forget(keys):
+        # Only these programs' entries; a prefix may hold a title cache.
+        for key in keys:
+            for path in [*sources.glob(f"{key}.*"), *sources.parent.glob(f"runtime/*/{key}.*")]:
+                path.unlink()
+
+    def expect_root_translations(output):
+        compiled, refused = requested("Compiled Xbox shader "), requested("Xbox shader ")
+        if (compiled | refused) & rootless:
+            return f"the worker translated a program without its root: {messages}"
+        if not compiled:
+            return f"the worker translated no program against the three-table root: {messages}"
+        if not any("unmapped descriptor at s5 + 0xa0" in line for line in messages):
+            return f"the worker did not refuse the program that reads past table 1: {messages}"
+        # Exactly one stand-in: the refused program's.
+        if "substituted null compute pipeline for an untranslated shader (1 so far)" not in output:
+            return "the provider did not give the refused program a stand-in"
+        if "substituted null compute pipeline for an untranslated shader (2 so far)" in output:
+            return "the provider substituted a stand-in for the program its root can bind"
+        return None
+
+    names = ("TUXBOX_LOG", "WINEDEBUG", "TUXBOX_SHADER_SESSION")
+    saved = {name: host.env.get(name) for name in names}
+    host.env.update(TUXBOX_LOG="1", WINEDEBUG="-all,+debugstr")
+    host.env.pop("TUXBOX_SHADER_SESSION", None)
+    try:
+        forget(rootless)
+        with shader_session(sources.parent, host.env, messages.append):
+            check("lanes-compute-root", "lanes/lanes.exe", ["--selftest", "compute-root", *gpu_args, "--report"],
+                  rf"lanes-selftest PASS pci={pci} scenario=compute-root passed=1",
+                  providers={"lanes/xmem.dll": memory_symbols, "lanes/GameInput.dll": ("#1",),
+                             "lanes/d3d12_xs.dll": ("D3D12XboxCreateDevice",)},
+                  config="lanes/MicrosoftGame.config", device_factory="xbox", log_check=expect_root_translations)
+    finally:
+        forget(rootless | requested("Compiled Xbox shader ") | requested("Xbox shader "))
+        for name, value in saved.items():
+            if value is None:
+                host.env.pop(name, None)
+            else:
+                host.env[name] = value
+
+
+def lanes_compute_root_recovery(host, check, gpu_args, pci, memory_symbols):
+    """Run the partially reflected second-table shader with paged descriptors."""
+    from examples.lanes.shader_fixture import recovered_root_shader
+    from .runtime_shaders import shader_session
+    from .shader_prep import SOURCE_CACHE
+
+    sources = Path(host.env["WINEPREFIX"]) / SOURCE_CACHE
+    rootless = {hashlib.sha256(recovered_root_shader()).hexdigest()}
+    messages = []
+
+    def requested(prefix):
+        return {match[1] for line in messages if (match := re.match(prefix + r"([0-9a-f]{64})\b", line))}
+
+    def forget(keys):
+        # Only these programs' entries; a prefix may hold a title cache.
+        for key in keys:
+            for path in [*sources.glob(f"{key}.*"), *sources.parent.glob(f"runtime/*/{key}.*")]:
+                path.unlink()
+
+    def expect_root_translations(output):
+        compiled, refused = requested("Compiled Xbox shader "), requested("Xbox shader ")
+        if (compiled | refused) & rootless:
+            return f"the worker translated a program without its root: {messages}"
+        if not compiled:
+            return f"the worker translated no program against the two-table root: {messages}"
+        if "substituted null compute pipeline" in output:
+            return "the recovered program received a stand-in"
+        if "created compute pipeline with 4 reflected FSSM descriptor slots" not in output:
+            return "the recovered program did not account for both reflected tables"
+        return None
+
+    names = ("TUXBOX_LOG", "WINEDEBUG", "TUXBOX_SHADER_SESSION", "TUXBOX_DESCRIPTOR_HEAP_LIMIT", "TUXBOX_NULL_PIPELINES")
+    saved = {name: host.env.get(name) for name in names}
+    host.env.update(TUXBOX_LOG="1", WINEDEBUG="-all,+debugstr", TUXBOX_DESCRIPTOR_HEAP_LIMIT="64", TUXBOX_NULL_PIPELINES="0")
+    host.env.pop("TUXBOX_SHADER_SESSION", None)
+    try:
+        forget(rootless)
+        with shader_session(sources.parent, host.env, messages.append):
+            check("lanes-compute-root-recovery", "lanes/lanes.exe", ["--selftest", "compute-root-recovery", *gpu_args, "--report"],
+                  rf"lanes-selftest PASS pci={pci} scenario=compute-root-recovery passed=1",
+                  providers={"lanes/xmem.dll": memory_symbols, "lanes/GameInput.dll": ("#1",),
+                             "lanes/d3d12_xs.dll": ("D3D12XboxCreateDevice",)},
+                  config="lanes/MicrosoftGame.config", device_factory="xbox", log_check=expect_root_translations)
+    finally:
+        forget(rootless | requested("Compiled Xbox shader ") | requested("Xbox shader "))
+        for name, value in saved.items():
+            if value is None:
+                host.env.pop(name, None)
+            else:
+                host.env[name] = value
+
+
 # Table slots the reflected `raster-samplers` root holds (see `lanes_raster_tables`).
 RASTER_SAMPLER_SLOTS = 1
+# Table slots the `mesh-samplers` mesh root holds: the pixel program's texture.
+MESH_SAMPLER_SLOTS = 1
 
 
 def lanes_raster_tables(host, check, gpu_args, pci, memory_symbols):
@@ -433,14 +549,20 @@ def lanes_raster_tables(host, check, gpu_args, pci, memory_symbols):
     so it samples correctly only with the private static sampler the provider
     adds to the reflected root. That root is serialized while the game runs, so
     nothing is prepared before launch: the host worker translates both programs
-    against it.
+    against it. `mesh-samplers`: the same pixel program, declaring two samplers
+    the root has in another state, in a mesh pipeline. Only its records-only
+    mesh program's desktop translation (`mesh_samplers.hlsl`) is prepared; the
+    provider must add the literal state to the mesh root it builds and have the
+    worker translate the pixel program against that root.
     """
-    from examples.lanes.raster_fixture import pixel, sampler_pixel, vertex
+    from examples.lanes.raster_fixture import mesh, mesh_sampler_pixel, pixel, sampler_pixel, vertex
     from .runtime_shaders import shader_session
-    from .shader_prep import SOURCE_CACHE
+    from .shader_prep import SOURCE_CACHE, compiler_tools, run_tool
 
     sources = Path(host.env["WINEPREFIX"]) / SOURCE_CACHE
-    rootless = {hashlib.sha256(data).hexdigest() for data in (vertex(), pixel(), sampler_pixel())}
+    rootless = {hashlib.sha256(data).hexdigest()
+                for data in (vertex(), pixel(), sampler_pixel(), mesh_sampler_pixel())}
+    mesh_key = hashlib.sha256(mesh()).hexdigest()
     messages = []
 
     def compiled():
@@ -453,12 +575,21 @@ def lanes_raster_tables(host, check, gpu_args, pci, memory_symbols):
             for path in [*sources.glob(f"{key}.*"), *sources.parent.glob(f"runtime/*/{key}.*")]:
                 path.unlink()
 
-    def expect_reflected(slots):
+    def prepare_mesh():
+        # The console mesh program has records only; its translation is this desktop shader.
+        sources.mkdir(parents=True, exist_ok=True)
+        hlsl = Path(__file__).resolve().parents[1] / "examples/lanes/mesh_samplers.hlsl"
+        run_tool([compiler_tools()[1], "-T", "ms_6_5", "-E", "main", "-O3", "-Fo", sources / f"{mesh_key}.cso", hlsl])
+
+    def expect_reflected(slots, mesh_pipeline=False):
         def problem(output):
             if "substituted null " in output:
                 return "the provider substituted a stand-in pipeline"
+            if mesh_pipeline:
+                if "created Xbox mesh pipeline" not in output:
+                    return "the provider did not create the mesh pipeline"
             # +debugstr escapes the quotes of the logged map.
-            if not re.search(r'multi-table raster roots after 1 pipelines: \{\\?"reflected\\?": 1\}', output):
+            elif not re.search(r'multi-table raster roots after 1 pipelines: \{\\?"reflected\\?": 1\}', output):
                 return "the provider did not reflect the two-table root"
             if f"created raster pipeline with {slots} reflected FSSM descriptor slots" not in output:
                 return "the provider did not create the pipeline under the reflected root"
@@ -474,18 +605,22 @@ def lanes_raster_tables(host, check, gpu_args, pci, memory_symbols):
     for name in ("TUXBOX_SHADER_SESSION", "TUXBOX_RASTER_ROOT_FALLBACK"):
         host.env.pop(name, None)
     try:
-        for scenario, slots in (("raster-tables", 3), ("raster-samplers", RASTER_SAMPLER_SLOTS)):
-            forget(rootless)
+        for scenario, slots in (("raster-tables", 3), ("raster-samplers", RASTER_SAMPLER_SLOTS),
+                                ("mesh-samplers", MESH_SAMPLER_SLOTS), ("mesh-sampler-single", MESH_SAMPLER_SLOTS)):
+            forget(rootless | {mesh_key})
+            if scenario.startswith("mesh-"):
+                prepare_mesh()
             messages.clear()
             with shader_session(sources.parent, host.env, messages.append):
                 check(f"lanes-{scenario}", "lanes/lanes.exe", ["--selftest", scenario, *gpu_args, "--report"],
                       rf"lanes-selftest PASS pci={pci} scenario={scenario} passed=1",
                       providers={"lanes/xmem.dll": memory_symbols, "lanes/GameInput.dll": ("#1",),
                                  "lanes/d3d12_xs.dll": ("D3D12XboxCreateDevice",)},
-                      config="lanes/MicrosoftGame.config", device_factory="xbox", log_check=expect_reflected(slots))
+                      config="lanes/MicrosoftGame.config", device_factory="xbox",
+                      log_check=expect_reflected(slots, scenario.startswith("mesh-")))
             forget(compiled())
     finally:
-        forget(rootless | compiled())
+        forget(rootless | compiled() | {mesh_key})
         for name, value in saved.items():
             if value is None:
                 host.env.pop(name, None)
@@ -833,6 +968,10 @@ def verify(host, output, adapter, selected=None, samples=1):
             lanes_wave_alloc(host, check, gpu_args, pci, memory_symbols, work)
         if "lanes-raster-tables" in selected and host.backend == "proton":
             lanes_raster_tables(host, check, gpu_args, pci, memory_symbols)
+        if "lanes-compute-root" in selected and host.backend == "proton":
+            lanes_compute_root(host, check, gpu_args, pci, memory_symbols)
+        if "lanes-compute-root-recovery" in selected and host.backend == "proton":
+            lanes_compute_root_recovery(host, check, gpu_args, pci, memory_symbols)
         if "cpu-benchmark" in selected:
             readings = []
             for _ in range(samples):
@@ -946,6 +1085,9 @@ GATE_LABELS = {
     "lanes-raster-tables": "Console raster programs drawn under the root reflected from their two descriptor tables",
     "lanes-shader-cache-wave-alloc": "A wave32 masked DPP exclusive prefix lowered to WavePrefixSum and loaded by the provider",
     "lanes-raster-samplers": "A console pixel program's literal linear sampler, which the title's root names in another state",
+    "lanes-compute-root": "Root-less console compute programs translated only against a three-table root",
+    "lanes-mesh-samplers": "The same literal sampler in a mesh pipeline, added to the mesh root the provider builds",
+    "lanes-compute-root-recovery": "Partially reflected compute root with an appended descriptor range and paging",
     "lanes-package-replay": "Lanes gameplay replay (earlier guest with desktop graphics)", "cpu-replay": "8,388,608-move CPU replay",
 }
 

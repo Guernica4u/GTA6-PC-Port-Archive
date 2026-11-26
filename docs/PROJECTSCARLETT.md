@@ -847,3 +847,16 @@ The issue #39 log contains 262 failed driver allocation attempts and
 131 host import failure messages, not a confirmed VRAM exhaustion or
 a proven fault in these provider call sites. The opt-in trace is intended
 to distinguish those possibilities in a subsequent authorized run.
+
+
+### Comparing provider revisions
+
+A run from a different checkout does not redeploy the title's DLLs.
+The launcher logs SHA-256 of the staged D3D12 provider and of the local
+`build/d3d12-smoke/d3d12_xs.dll` when available. It warns if they differ.
+For an A/B test, build and deploy the intended provider explicitly, then
+pass `--require-current-provider` before the title path to refuse a launch
+unless the staged file matches the local build. This does not rebuild or
+replace a DLL, prove which source revision produced the local build, or
+inspect modules actually loaded by Wine. Record the build revision and
+driver separately.

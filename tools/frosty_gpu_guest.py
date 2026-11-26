@@ -15,7 +15,11 @@ def run_gpu_guest(source, name, trial, work, proton, prefix_source, provider, co
     exe = trial / name
     tools.link(exe, obj, "d3d12.lib", "dxgi.lib", "kernel32.lib", *link_libraries)
     prefix = trial / "prefix"
-    subprocess.run(["cp", "-a", "--reflink=auto", prefix_source.resolve(), prefix], check=True)
+    # Skip the rebuilt GPU caches: ext4 has no reflinks, and a full prefix carries
+    # tens of GB of them, so the trial is bounded to what keeps it disposable.
+    shutil.copytree(prefix_source.resolve(), prefix,
+                    ignore=shutil.ignore_patterns("shadercache", "tuxbox_shader_cache"),
+                    symlinks=True)
     if fresh_shader_cache or warm_shader_cache is not None:
         # Only touch the disposable prefix. Never traverse a linked cache.
         shader_cache = prefix / SOURCE_CACHE.parent
