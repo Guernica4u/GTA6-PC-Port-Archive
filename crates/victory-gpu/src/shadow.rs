@@ -629,6 +629,8 @@ impl Shadow {
         };
         let mut copied = 0;
         for (a, b) in runs {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::RefreshCalls, 1);
             copied += self.copy(a, b);
             sync_before(a, b);
         }
@@ -672,6 +674,7 @@ impl Shadow {
             use crate::copystat::{C, add};
             add(C::WholeBytes, (to - from) as u64);
             add(C::WholeUs, started.elapsed().as_micros() as u64);
+            add(C::RefreshCalls, 1);
         }
         to - from
     }
