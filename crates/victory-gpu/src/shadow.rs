@@ -585,6 +585,7 @@ impl Shadow {
                     if merge_writeback(title, host, old) {
                         let _writing = crate::watch::writing(start + at, n);
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                        self.queue_vram_upload(at as u64, n as u64);
                         written += n;
                     }
                     synced.push((start + at) / PAGE);
@@ -663,6 +664,9 @@ impl Shadow {
         if let Some(bytes) = written {
             let _writing = crate::watch::writing(from, n);
             crate::host::write_mapped(from as *mut u8, bytes, n);
+            if saved.is_some() {
+                self.queue_vram_upload((from - start) as u64, n as u64);
+            }
         }
         // Equal to title memory now: taken, unless it holds the page in part.
         if from == page && to == page + PAGE {
@@ -1767,8 +1771,11 @@ pub(crate) mod tests {
     /// before) and a page nobody marked: the shader's byte and the title's
     /// both stay in the first; the second keeps the title's, and the copy's
     /// byte there (no mark) is not put back. The bits are cleared.
+    static TEST_BITMAP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn marked_pages_go_back_by_the_bytes_the_gpu_changed() {
+        let _bitmap_lock = TEST_BITMAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let p = crate::watch::tests::pool(3);
         let len = 3 * PAGE;
         register(p, p as u64, len as u64);
@@ -1816,6 +1823,7 @@ pub(crate) mod tests {
     /// marks of the same submission go back.
     #[test]
     fn marks_of_shaders_using_title_memory_are_held_back() {
+        let _bitmap_lock = TEST_BITMAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let p = crate::watch::tests::pool(2);
         let len = 2 * PAGE;
         register(p, p as u64, len as u64);
@@ -1947,6 +1955,7 @@ pub(crate) mod tests {
     /// without a `Step::GpuWrite` still reaches title memory on `Host::execute`.
     #[test]
     fn vram_marked_view_writes_go_back_to_title() {
+        let _bitmap_lock = TEST_BITMAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(host) = host() else {
             return; // no host GPU here
         };
@@ -1963,11 +1972,13 @@ pub(crate) mod tests {
         };
         copy.update(p, PAGE);
         let list = host.new_list().unwrap();
-        let copy_w = Arc::clone(&copy);
         let vram_gpu = b.gpu;
-        list.defer_host(move || {
-            copy_w.write_host(p as u64, &0x1337_c0deu32.to_le_bytes());
-        });
+        let (up_val, up_val_ptr) = host.upload_buffer(4).expect("upload value");
+        // SAFETY: mapped 4-byte upload buffer.
+        unsafe { up_val_ptr.cast::<u32>().write_volatile(0x1337_c0de) };
+        list.keep(&up_val);
+        // SAFETY: open command list and valid buffer regions.
+        unsafe { list.list.CopyBufferRegion(&copy.buffer, 0, &up_val, 0, 4) };
         // Set the VIEW_WRITES mark bit directly on GPU (or RAM when UMA) without Step::GpuWrite.
         let word_off = ((base / 32) * 4) as u64;
         let bit_mask = 1u32 << (base % 32);

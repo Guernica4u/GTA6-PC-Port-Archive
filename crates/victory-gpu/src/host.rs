@@ -1331,6 +1331,29 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
+        let gpu = prepared.elapsed();
+        SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
+        SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+        // The host resets a device whose submission runs for about 2 s.
+        if gpu > std::time::Duration::from_millis(250) {
+            let pipelines: std::collections::BTreeSet<String> = runs
+                .iter()
+                .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                .collect();
+            tracing::warn!(ms = gpu.as_millis(), lists = runs.len(), ?pipelines, "slow host submission");
+        }
+        // Check device removal before VRAM readback so DRED / removal diagnostics
+        // are reported instead of panicking inside `run_copy_list` reset.
+        // SAFETY: a plain query.
+        if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+            fail(format_args!(
+                "host GPU device removed after a submission of {} lists{}{}{}",
+                runs.len(),
+                self.removal_data(runs),
+                last_notes(runs),
+                removed_during(runs, removed_in)
+            ));
+        }
         {
             let mut seen = std::collections::HashSet::new();
             let mut reads = Vec::new();
@@ -1364,27 +1387,6 @@ impl Host {
             if !extra_reads.is_empty() {
                 self.readback_vram_copies(&extra_reads, &[], false, &mut submitted);
             }
-        }
-        let gpu = prepared.elapsed();
-        SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
-        SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
-        // The host resets a device whose submission runs for about 2 s.
-        if gpu > std::time::Duration::from_millis(250) {
-            let pipelines: std::collections::BTreeSet<String> = runs
-                .iter()
-                .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
-                .collect();
-            tracing::warn!(ms = gpu.as_millis(), lists = runs.len(), ?pipelines, "slow host submission");
-        }
-        // SAFETY: a plain query.
-        if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
-            fail(format_args!(
-                "host GPU device removed after a submission of {} lists{}{}{}",
-                runs.len(),
-                self.removal_data(runs),
-                last_notes(runs),
-                removed_during(runs, removed_in)
-            ));
         }
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
@@ -2987,21 +2989,7 @@ impl Host {
 
     #[cfg(test)]
     fn run_test_copy_sync<F: FnOnce(&ID3D12GraphicsCommandList)>(&self, record: F) {
-        // SAFETY: valid D3D12 device creating a test fence.
-        let Ok(fence): windows::core::Result<ID3D12Fence> =
-            (unsafe { self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) })
-        else {
-            return;
-        };
-        self.run_copy_list(record, None);
-        // SAFETY: valid test fence and host event/queue.
-        unsafe {
-            if self.queue.Signal(&fence, 1).is_ok()
-                && fence.SetEventOnCompletion(1, self.event).is_ok()
-            {
-                WaitForSingleObject(self.event, INFINITE);
-            }
-        }
+        self.run_copy_list(record, Some(0));
     }
 
     #[cfg(test)]
@@ -3017,6 +3005,8 @@ impl Host {
 
     #[cfg(test)]
     pub(crate) fn flush_test_vram_uploads(&self) {
+        static FLUSH: Mutex<()> = Mutex::new(());
+        let _guard = FLUSH.lock().unwrap_or_else(|e| e.into_inner());
         let uploads = crate::shadow::take_vram_uploads();
         if !uploads.is_empty() {
             let mut dummy = 0u64;
@@ -3036,11 +3026,20 @@ impl Host {
     }
 
     fn run_copy_list<F: FnOnce(&ID3D12GraphicsCommandList)>(&self, record: F, wait_fence: Option<u64>) {
-        static CMD: Mutex<Option<(ID3D12CommandAllocator, ID3D12GraphicsCommandList, ID3D12Fence, u64)>> =
-            Mutex::new(None);
+        struct CopyEvent(HANDLE);
+        // SAFETY: Win32 event handle is only waited on while `CMD` mutex is held.
+        unsafe impl Send for CopyEvent {}
+        struct CopyCmd {
+            alloc: ID3D12CommandAllocator,
+            list: ID3D12GraphicsCommandList,
+            fence: ID3D12Fence,
+            event: CopyEvent,
+            seq: u64,
+        }
+        static CMD: Mutex<Option<CopyCmd>> = Mutex::new(None);
         let mut guard = CMD.lock().unwrap_or_else(|e| e.into_inner());
-        let (alloc, list, fence, seq) = guard.get_or_insert_with(|| {
-            // SAFETY: valid D3D12 device creating a direct allocator, fence, and closed command list.
+        let cmd = guard.get_or_insert_with(|| {
+            // SAFETY: valid D3D12 device creating a direct allocator, fence, event, and closed command list.
             unsafe {
                 let alloc: ID3D12CommandAllocator = self
                     .device
@@ -3051,25 +3050,31 @@ impl Host {
                     .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)
                     .unwrap();
                 let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+                let event = CopyEvent(CreateEventW(None, false, false, None).unwrap());
                 let _ = list.Close();
-                (alloc, list, fence, 0)
+                CopyCmd {
+                    alloc,
+                    list,
+                    fence,
+                    event,
+                    seq: 0,
+                }
             }
         });
-        // SAFETY: `alloc` and `list` are exclusively held under `CMD`; `fence` or caller's
-        // test fence serializes reuse between submissions.
+        // SAFETY: `alloc`, `list`, `fence`, and `event` are exclusively held under `CMD`.
         unsafe {
-            alloc.Reset().expect("reset copy allocator");
-            list.Reset(&*alloc, None).expect("reset copy list");
-            record(list);
-            list.Close().expect("close copy list");
-            let cmd: Option<ID3D12CommandList> = list.cast().ok();
-            self.queue.ExecuteCommandLists(&[cmd]);
+            cmd.alloc.Reset().expect("reset copy allocator");
+            cmd.list.Reset(&cmd.alloc, None).expect("reset copy list");
+            record(&cmd.list);
+            cmd.list.Close().expect("close copy list");
+            let list_cmd: Option<ID3D12CommandList> = cmd.list.cast().ok();
+            self.queue.ExecuteCommandLists(&[list_cmd]);
             if wait_fence.is_some() {
-                *seq += 1;
-                if self.queue.Signal(&*fence, *seq).is_ok()
-                    && fence.SetEventOnCompletion(*seq, self.event).is_ok()
+                cmd.seq += 1;
+                if self.queue.Signal(&cmd.fence, cmd.seq).is_ok()
+                    && cmd.fence.SetEventOnCompletion(cmd.seq, cmd.event.0).is_ok()
                 {
-                    WaitForSingleObject(self.event, INFINITE);
+                    WaitForSingleObject(cmd.event.0, INFINITE);
                 }
             }
         }
