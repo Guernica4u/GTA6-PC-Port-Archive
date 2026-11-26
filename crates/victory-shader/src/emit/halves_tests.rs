@@ -174,7 +174,21 @@ fn refusal(words: &[u32], threads: u32, lds_bytes: u32) -> String {
 /// The hand-encoded words are the instructions their comments name.
 #[test]
 fn the_test_programs_are_what_their_comments_say() {
-    let programs: [(Vec<u32>, &[&str]); 6] = [
+    let programs: [(Vec<u32>, &[&str]); 7] = [
+        (
+            small_group(),
+            &[
+                "v_cmp_gt_u32 vcc, 10, v0",
+                "s_bcnt1_i32_b64 s12, vcc",
+                "v_mov_b32 v7, vcc_hi",
+                "v_readlane_b32 s13, v0, 5",
+                "s_or_saveexec_b64 s[0:1], -1",
+                "v_add_nc_u32 v1, v1, v1 row_shr:8",
+                "v_readlane_b32 s2, v1, 47",
+                "s_mov_b64 exec, s[0:1]",
+                "buffer_store_dword v8, v16, s[40:43], 0 offen offset:12",
+            ],
+        ),
         (
             every_id(3, 2),
             &[
@@ -686,6 +700,144 @@ fn every_thread_keeps_its_own_id_in_halves_on_every_gpu() {
             }
         }
     }
+    assert!(
+        failed.is_empty(),
+        "{}",
+        failed.join(
+            "
+"
+        )
+    );
+}
+
+const fn sop1(sdst: u8, op: u8, ssrc0: u8) -> u32 {
+    0xBE80_0000 | (sdst as u32) << 16 | (op as u32) << 8 | ssrc0 as u32
+}
+
+const fn vop1(vdst: u8, op: u8, src0: u16) -> u32 {
+    (0x3F << 25) | (vdst as u32) << 17 | (op as u32) << 9 | (src0 as u32 & 0x1FF)
+}
+
+const fn vop2(vdst: u8, op: u8, src0: u16, vsrc1: u8) -> u32 {
+    (op as u32) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
+}
+
+const fn dpp16(vsrc0: u8, ctrl: u16) -> u32 {
+    0xFF << 24 | (ctrl as u32) << 8 | vsrc0 as u32
+}
+
+const fn vop3(vdst: u8, op: u16, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
+    [
+        0xD400_0000 | (op as u32) << 16 | vdst as u32,
+        (src0 as u32 & 0x1FF) | ((src1 as u32 & 0x1FF) << 9) | ((src2 as u32 & 0x1FF) << 18),
+    ]
+}
+
+/// The exclusive prefix sum of `v0` over the active lanes, in `v2`, as the
+/// console compiler expands `WavePrefixSum` in a wave64 (the section of
+/// `wave::tests::exec_minus_two_masks_lane_zero_and_enforces_dpp_guard`):
+/// row sums by DPP, the rows below added through lane reads, then shifted
+/// by one lane. It writes `s[0:2]` and `v1`-`v5`.
+fn prefix_sum_section() -> Vec<u32> {
+    use crate::ir::EXEC;
+    let mut w = vec![sop1(0, 0x25, 193)]; // s_or_saveexec_b64 s[0:1], -1
+    w.extend(vop3(1, 0x101, 128, 256, 0)); // v_cndmask_b32 v1, 0, v0, s[0:1]
+    for shift in [1u16, 2, 4, 8] {
+        w.push(vop2(1, 0x25, 0xFA, 1)); // v_add_nc_u32 v1, v1, v1 row_shr:shift
+        w.push(dpp16(1, 0x110 + shift));
+    }
+    // Each row adds the sums of the rows below it (lanes 15, 31, 47).
+    for (lane, lo, hi) in [
+        (15u16, 0xFFFF_0000u32, 0u32),
+        (31, 0, 0x0000_FFFF),
+        (47, 0, 0xFFFF_0000),
+    ] {
+        w.extend(vop3(2, 0x360, 257, 128 + lane, 0)); // v_readlane_b32 s2, v1, lane
+        w.extend([sop1(EXEC, 0x03, 255), lo, sop1(EXEC + 1, 0x03, 255), hi]);
+        w.push(vop2(1, 0x25, 2, 1)); // v_add_nc_u32 v1, s2, v1
+    }
+    w.push(sop1(EXEC, 0x04, 193)); // s_mov_b64 exec, -1
+    w.push(vop1(3, 0x01, 257)); // v_mov_b32 v3, v1
+    w.push(vop1(3, 0x01, 0xFA)); // v_mov_b32 v3, v1 row_shr:1
+    w.push(dpp16(1, 0x111));
+    // The first lane of each row takes the last lane of the row below.
+    for (lane, lo, hi) in [
+        (15u16, 0x0001_0000u32, 0u32),
+        (31, 0, 1),
+        (47, 0, 0x0001_0000),
+    ] {
+        w.extend(vop3(2, 0x360, 257, 128 + lane, 0)); // v_readlane_b32 s2, v1, lane
+        w.extend([sop1(EXEC, 0x03, 255), lo, sop1(EXEC + 1, 0x03, 255), hi]);
+        w.push(vop1(3, 0x01, 2)); // v_mov_b32 v3, s2
+    }
+    w.push(sop1(EXEC, 0x04, 193)); // s_mov_b64 exec, -1
+    w.push(vop1(2, 0x01, 128)); // v_mov_b32 v2, 0
+    w.push(vop1(5, 0x01, 135)); // v_mov_b32 v5, 7
+    w.push(sop1(EXEC, 0x04, 194)); // s_mov_b64 exec, -2
+    w.push(vop1(2, 0x01, 259)); // v_mov_b32 v2, v3
+    w.push(sop1(EXEC, 0x04, 0)); // s_mov_b64 exec, s[0:1]
+    w
+}
+
+/// Per thread `l`, four dwords at `l * 32`: the exclusive prefix sum of the
+/// thread ids below it, the number of threads below 10 (`s_bcnt1_i32_b64`
+/// of a compare's mask), that mask's high dword and lane 5's thread id.
+fn small_group() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085,         // v_lshlrev_b32 v16, 5, v0
+        0x7D88_008A,         // v_cmp_gt_u32 vcc, 10, v0
+        sop1(12, 0x10, 106), // s_bcnt1_i32_b64 s12, vcc
+        vop1(6, 0x01, 12),   // v_mov_b32 v6, s12
+        vop1(7, 0x01, 107),  // v_mov_b32 v7, vcc_hi
+    ]);
+    w.extend(vop3(13, 0x360, 256, 128 + 5, 0)); // v_readlane_b32 s13, v0, 5
+    w.push(vop1(8, 0x01, 13)); // v_mov_b32 v8, s13
+    w.extend(prefix_sum_section());
+    for (vdata, slot) in [(2, 0), (6, 1), (7, 2), (8, 3)] {
+        w.extend(store(vdata, 4 * slot));
+    }
+    w.push(S_ENDPGM);
+    w
+}
+
+/// In a group of 32 threads or fewer one host wave holds the whole console
+/// wave: masks read as data, wave prefix sums and a lane read of a constant
+/// lane below 32 translate in halves; the same reads in a group of 64, and a
+/// lane read past the group, are refused.
+#[test]
+fn a_group_one_host_wave_holds_reads_nothing_across_halves() {
+    assert_eq!(refusal(&small_group(), 32, 0), "translated");
+    assert_eq!(refusal(&small_group(), 16, 0), "translated");
+    let why = refusal(&small_group(), 64, 0);
+    assert!(why.contains("(wave64 on a 32-lane host)"), "{why}");
+    let readlane = [
+        PROLOGUE.as_slice(),
+        &[
+            0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+            0xD760_000C,
+            0x0001_5100, // v_readlane_b32 s12, v0, 40
+            0x7E02_020C, // v_mov_b32 v1, s12
+        ],
+        &store(1, 0),
+        &[S_ENDPGM],
+    ]
+    .concat();
+    let why = refusal(&readlane, 32, 0);
+    assert!(
+        why.contains("a lane read that may cross 32-lane halves"),
+        "{why}"
+    );
+}
+
+/// [`small_group`] in a group of 32 on every hardware adapter, in halves and
+/// as one wave64 where the adapter runs those: the console's results.
+#[test]
+fn a_group_one_host_wave_holds_matches_the_console_on_every_gpu() {
+    let want: Vec<u32> = (0..32)
+        .flat_map(|l| [l * (l.max(1) - 1) / 2, 10, 0, 5])
+        .collect();
+    let failed = differences(&small_group(), 32, 4, &want);
     assert!(
         failed.is_empty(),
         "{}",

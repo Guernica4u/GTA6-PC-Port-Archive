@@ -1189,7 +1189,7 @@ impl<'a> Lower<'a> {
             Shape::Prefix(op, src, mask, ident, inclusive) => {
                 (op, src, mask, ident, Some(inclusive))
             }
-            Shape::Half(..) if self.halves => return Err(ACROSS),
+            Shape::Half(..) if self.halves && !self.one_host_wave() => return Err(ACROSS),
             Shape::Half(_, src, mask, ident, hi) => {
                 // The high half is a console lane's: compute only.
                 if self.mask_data != MaskData::Console {
@@ -6686,9 +6686,7 @@ impl<'a> Lower<'a> {
                     self.s.flags |= flags::WAVE_OPS;
                 } else {
                     self.cross_lane(false)?;
-                    self.same_half(
-                        "a lane read that may cross 32-lane halves (wave64 on a 32-lane host)",
-                    )?;
+                    self.lane_read(v.src.get(1).copied())?;
                 }
                 let r = self.read_lane(a, lane);
                 int(self, r)

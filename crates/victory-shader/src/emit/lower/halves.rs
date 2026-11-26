@@ -21,7 +21,10 @@
 //! * across halves, refused: ballots (a mask read as data holds the other
 //!   half's lanes), `v_readlane_b32` of a lane that may be in the other half
 //!   (SGPR spills read back are not lane reads), and whole-wave reductions
-//!   and prefix sums;
+//!   and prefix sums. In a group of 32 threads or fewer, which one host wave
+//!   holds whole, nothing is in the other half: its ballots' high dwords are
+//!   0 and its reductions run over every lane the console has, as on the
+//!   console, and a lane read of a constant lane below 32 is the host's;
 //! * `v_readfirstlane_b32` reads the host wave's first lane, which in the
 //!   upper half is console lane 32 or later: kept for a value the same in
 //!   every lane of the console wave ([`lane_uniform`], what the compiler
@@ -143,9 +146,29 @@ impl Lower<'_> {
             .is_some_and(|t| t.iter().product::<u32>() <= HALF)
     }
 
-    /// Refuses a read into the other half of the console wave in halves.
+    /// Refuses a read into the other half of the console wave in halves,
+    /// unless the group fits one host wave (no lane in the other half).
     pub(super) fn same_half(&self, what: Why) -> Result<(), Why> {
-        if self.halves { Err(what) } else { Ok(()) }
+        if self.halves && !self.one_host_wave() {
+            Err(what)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Refuses `v_readlane_b32` of `lane` in halves, but for a constant lane
+    /// below 32 of a group one host wave holds: a lane past the group holds
+    /// whatever its registers did on the console.
+    pub(super) fn lane_read(&self, lane: Option<Operand>) -> Result<(), Why> {
+        let low = self.one_host_wave()
+            && lane
+                .and_then(crate::resource::lane_of)
+                .is_some_and(|l| l < HALF);
+        if self.halves && !low {
+            Err("a lane read that may cross 32-lane halves (wave64 on a 32-lane host)")
+        } else {
+            Ok(())
+        }
     }
 }
 
