@@ -235,6 +235,12 @@ cargo build --locked --profile diag -p victory --features diagnostics
 scripts\play-nvidia.ps1 -Exe <path of your copy's executable>
 ```
 
+On Windows 10, if the in-box D3D12 runtime reports shader model 6.5, install
+[Microsoft Direct3D 12 Agility SDK 1.620.2](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12/1.620.2).
+Open the `.nupkg` as a ZIP archive and copy `build/native/bin/x64/D3D12Core.dll`
+to `target/diag/D3D12/D3D12Core.dll` before launching. For a release build,
+use `target/release/D3D12/` instead. The path is relative to the executable.
+
 `scripts\play-nvidia.ps1` starts a copy of the build named `victory_sm.exe`, so
 NVIDIA Smooth Motion applies every time once it is turned on for that exe in the
 NVIDIA App. `-NoSmoothMotion` runs `victory.exe` itself; `-SeriesX` uses the
