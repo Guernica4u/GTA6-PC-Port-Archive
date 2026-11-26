@@ -671,12 +671,14 @@ fn check(
     }
 }
 
-/// The validator's own answer, with the reason it refuses the shader in
-/// it: every error it named, without the opening line that only announces
-/// the refusal. That line reads "Entry function performs some operation
-/// that is incompatible with the shader stage or other entry properties.
-/// See other errors for details." — taken alone it names no operation, and
-/// the errors after it are what say which stage or feature is at fault.
+/// The validator's own answer: the first error it named, plus how many other
+/// distinct ones it named, without the opening line that only announces the
+/// refusal. That line reads "Entry function performs some operation that is
+/// incompatible with the shader stage or other entry properties. See other
+/// errors for details." — taken alone it names no operation, and the errors
+/// after it are what say which stage or feature is at fault. An error the
+/// validator repeats per site counts once, so the text is the same for two
+/// programs whose messages are the same and the tally does not split them.
 fn validator_reason(text: &str) -> String {
     let errors: Vec<&str> = text
         .lines()
@@ -694,8 +696,9 @@ fn validator_reason(text: &str) -> String {
             named.push(e);
         }
     }
-    // The errors kept beyond the one reported.
-    let more = errors.len().saturating_sub(1);
+    // The errors kept beyond the one reported: the distinct ones, so a
+    // message repeated per site does not report a phantom "and 1 more".
+    let more = named.len().saturating_sub(1);
     if more == 0 {
         return named[0].to_owned();
     }
@@ -919,6 +922,16 @@ Validation failed.";
             "Function: main: error: Opcode DecodeShaderTable is invalid in shader stage Compute. \
              (and 1 more error)"
         );
+        // The same error repeated for two sites is one error, not two: no
+        // "(and 1 more error)", and no split tally key for two programs that
+        // say the same thing.
+        let repeated = "Function: main: error: Opcode DecodeShaderTable is invalid in shader stage Compute.\n\
+Function: main: error: Opcode DecodeShaderTable is invalid in shader stage Compute.\n\
+Validation failed.";
+        assert_eq!(
+            validator_reason(repeated),
+            "Function: main: error: Opcode DecodeShaderTable is invalid in shader stage Compute."
+        );
         // The real shape of those refusals: the announcement, then the one
         // error that names the stage.
         assert_eq!(
@@ -944,3 +957,4 @@ Validation failed.";
         assert_eq!(validator_reason(""), "");
     }
 }
+
