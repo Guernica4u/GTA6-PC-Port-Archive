@@ -175,7 +175,7 @@ fn refusal(words: &[u32], threads: u32, lds_bytes: u32) -> String {
 /// The hand-encoded words are the instructions their comments name.
 #[test]
 fn the_test_programs_are_what_their_comments_say() {
-    let programs: [(Vec<u32>, &[&str]); 25] = [
+    let programs: [(Vec<u32>, &[&str]); 26] = [
         (
             lds_tree_step(true),
             &[
@@ -196,7 +196,7 @@ fn the_test_programs_are_what_their_comments_say() {
             ],
         ),
         (
-            mask_kept_by_a_shift(),
+            mask_kept_by_a_shift(true),
             &[
                 "v_xor_b32 v3, 5, v0",
                 "s_cmp_eq_u32 s5, 0",
@@ -307,6 +307,7 @@ fn the_test_programs_are_what_their_comments_say() {
         (
             lds_written_and_read_in_a_branch(),
             &[
+                "ds_write_b32 v2, v5",
                 "s_cbranch_execz",
                 "ds_write_b32 v2, v1",
                 "ds_read_b32 v4, v3",
@@ -314,7 +315,25 @@ fn the_test_programs_are_what_their_comments_say() {
         ),
         (
             lds_written_twice_in_a_branch(),
-            &["ds_write_b32 v2, v1", "ds_write_b32 v3, v1"],
+            &[
+                "ds_write_b32 v2, v1",
+                "ds_write_b32 v3, v1",
+                "ds_read_b32 v4, v2",
+            ],
+        ),
+        (
+            wide_branch(8, true),
+            &[
+                "v_mul_u32_u24 v6, 3, v0",
+                "v_cmp_le_u32 vcc, 8, v1",
+                "v_add_nc_u32 v6, lit(0x000003e8), v6",
+                "v_readfirstlane_b32 s12, v0",
+                "v_cmp_gt_u32 vcc, 40, v1",
+                "s_bcnt1_i32_b64 s13, vcc",
+                "v_readlane_b32 s14, v0, 50",
+                "v_readlane_b32 s15, v6, 7",
+                "s_mov_b64 exec, s[20:21]",
+            ],
         ),
         (
             lane_reads(),
@@ -466,21 +485,15 @@ fn reads_across_32_lane_halves_are_refused_with_their_reason() {
     // the halves; the same program translates for 64-lane hosts.
     assert_eq!(refusal(&readlane, 64, 0), "translated");
     assert!(lowered(&native(&readlane, true, 64, 0), false).is_ok());
-    // Inside a branch only lanes below 20 take, the halves cannot meet.
-    let why = refusal(&lane_read_in_a_branch(), 64, 0);
-    assert!(
-        why.contains("where not every thread of the group meets"),
-        "{why}"
-    );
+    // Inside a branch only lanes below 20 take, the halves cannot meet: the
+    // branch runs wave-wide.
+    assert_eq!(refusal(&lane_read_in_a_branch(), 64, 0), "translated");
     // Under a branch on a uniform condition both halves of a console wave
-    // go alike, but two console waves of one group need not.
+    // go alike, but two console waves of one group need not: in a group of
+    // two, the branch runs wave-wide.
     let uniform = lane_read_under_a_uniform_branch();
     assert_eq!(refusal(&uniform, 64, 0), "translated");
-    let why = refusal(&uniform, 128, 0);
-    assert!(
-        why.contains("where not every thread of the group meets"),
-        "{why}"
-    );
+    assert_eq!(refusal(&uniform, 128, 0), "translated");
 
     let first = [
         PROLOGUE.as_slice(),
@@ -519,19 +532,20 @@ fn reads_across_32_lane_halves_are_refused_with_their_reason() {
     assert_eq!(refusal(&unused_first, 64, 0), "translated");
     // A buffer dword loaded at an offset the same in every lane, through a
     // scalar descriptor, is one value: its first lane is the console's, even
-    // inside a branch lanes of both halves take, where they cannot trade.
+    // inside a branch lanes of both halves take, with no trade. At an offset
+    // that differs (the thread id) the branch runs wave-wide and the halves
+    // trade.
     assert_eq!(
         refusal(&first_lane_of_a_buffer_load(3), 64, 0),
         "translated"
     );
+    for offset in [3, 0] {
+        let words = first_lane_of_a_buffer_load_in_a_branch(offset, 40);
+        assert_eq!(refusal(&words, 64, 0), "translated", "{offset}");
+    }
     assert_eq!(
-        refusal(&first_lane_of_a_buffer_load_in_a_branch(3, 40), 64, 0),
-        "translated"
-    );
-    let why = refusal(&first_lane_of_a_buffer_load_in_a_branch(0, 40), 64, 0);
-    assert!(
-        why.contains("a first-lane read of a value that may differ between 32-lane halves"),
-        "{why}"
+        barriers(&first_lane_of_a_buffer_load_in_a_branch(3, 40), 64, 0),
+        0
     );
 
     // A value read across halves that nothing uses costs nothing.
@@ -554,9 +568,9 @@ fn reads_across_32_lane_halves_are_refused_with_their_reason() {
 /// A group of one console wave64 shares LDS without barriers; in halves its
 /// accesses are put in the console's order with group barriers. A region
 /// only some lanes run cannot be ordered inside, so one that both writes
-/// and reads, or writes twice, is refused. A group of 32 threads or fewer
-/// is one host wave, and one of several console waves keeps the console's
-/// barriers.
+/// and reads, or writes twice, runs wave-wide, where it can. A group of 32
+/// threads or fewer is one host wave, and one of several console waves
+/// keeps the console's barriers.
 #[test]
 fn lds_of_a_one_wave64_group_is_ordered_in_halves() {
     let lds = [
@@ -585,11 +599,7 @@ fn lds_of_a_one_wave64_group_is_ordered_in_halves() {
         lds_written_and_read_in_a_branch(),
         lds_written_twice_in_a_branch(),
     ] {
-        let why = refusal(&words, 64, 256);
-        assert!(
-            why.contains("both writes and reads (or writes twice)"),
-            "{why}"
-        );
+        assert_eq!(refusal(&words, 64, 256), "translated");
     }
 }
 
@@ -684,14 +694,17 @@ fn lds_after_a_spin() -> Vec<u32> {
     w
 }
 
-/// Lanes below 48 write their dword and read lane `tid ^ 32`'s, both inside
-/// one branch.
+/// Every thread writes 0 at its dword; lanes below 48 then write `tid + 1`
+/// there and read lane `tid ^ 32`'s, both inside one branch.
 fn lds_written_and_read_in_a_branch() -> Vec<u32> {
     let mut w = PROLOGUE.to_vec();
     w.extend([
         0x3420_0085, // v_lshlrev_b32 v16, 5, v0
         0x3404_0082, // v_lshlrev_b32 v2, 2, v0
         0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+        0x7E0A_0280, // v_mov_b32 v5, 0
+        0xD834_0000,
+        0x0000_0502, // ds_write_b32 v2, v5
         0x7D88_00B0, // v_cmp_gt_u32 vcc, 48, v0
         0xBE94_246A, // s_and_saveexec_b64 s[20:21], vcc
         0xBF88_0007, // s_cbranch_execz 7
@@ -709,7 +722,9 @@ fn lds_written_and_read_in_a_branch() -> Vec<u32> {
     w
 }
 
-/// Lanes below 48 write two dwords in two instructions inside one branch.
+/// Lanes below 48 write two dwords in two instructions inside one branch
+/// (their own and lane `tid ^ 32`'s); after the join every lane reads its
+/// own.
 fn lds_written_twice_in_a_branch() -> Vec<u32> {
     let mut w = PROLOGUE.to_vec();
     w.extend([
@@ -726,8 +741,11 @@ fn lds_written_twice_in_a_branch() -> Vec<u32> {
         0xD834_0000,
         0x0000_0103, // ds_write_b32 v3, v1
         0xBEFE_0414, // s_mov_b64 exec, s[20:21]
+        0xD8D8_0000,
+        0x0400_0002, // ds_read_b32 v4, v2
+        S_WAITCNT_LGKM,
     ]);
-    w.extend(store(1, 0));
+    w.extend(store(4, 0));
     w.push(S_ENDPGM);
     w
 }
@@ -1476,7 +1494,8 @@ fn sum_under_a_uniform_branch() -> Vec<u32> {
 /// Where every thread of the group meets, the halves trade first-lane
 /// reads, masks read as data and whole-wave sums: groups of 48, 64, 96 and
 /// 128 translate. Inside a branch only some lanes take, or one on a uniform
-/// condition in a group of several console waves, they are refused.
+/// condition in a group of several console waves, the region runs
+/// wave-wide, where they meet.
 #[test]
 fn collectives_are_traded_where_every_thread_meets() {
     for threads in [48, 64, 96, 128] {
@@ -1489,24 +1508,13 @@ fn collectives_are_traded_where_every_thread_meets() {
             assert_eq!(refusal(&words, threads, 0), "translated", "{threads}");
         }
     }
-    let why = refusal(&first_lane_in_a_branch(40), 64, 0);
-    assert!(
-        why.contains("a first-lane read of a value that may differ between 32-lane halves, where not every thread of the group meets"),
-        "{why}"
-    );
-    let why = refusal(&mask_in_a_branch(40), 64, 0);
-    assert!(
-        why.contains("a lane mask read as data, written where not every thread of the group meets"),
-        "{why}"
-    );
+    // Inside a branch lanes of both halves take, or one on a uniform
+    // condition in a group of several console waves, the region runs
+    // wave-wide.
+    assert_eq!(refusal(&first_lane_in_a_branch(40), 64, 0), "translated");
+    assert_eq!(refusal(&mask_in_a_branch(40), 64, 0), "translated");
     assert_eq!(refusal(&sum_under_a_uniform_branch(), 64, 0), "translated");
-    let why = refusal(&sum_under_a_uniform_branch(), 128, 0);
-    assert!(
-        why.contains(
-            "a wave reduction over both 32-lane halves where not every thread of the group meets"
-        ),
-        "{why}"
-    );
+    assert_eq!(refusal(&sum_under_a_uniform_branch(), 128, 0), "translated");
 }
 
 /// [`masks_and_first_lane`], [`first_lane_in_exec`], [`wave_sums`] and
@@ -1570,8 +1578,9 @@ fn collectives_cross_the_halves_on_every_gpu() {
 
 /// A mask's high dword read as data under a branch on a scalar compare,
 /// then kept by a DPP shift after the join in the lanes without a source
-/// lane (0-14 of each row).
-fn mask_kept_by_a_shift() -> Vec<u32> {
+/// lane (0-14 of each row). With `ends`, the branch ends the program where
+/// a second scalar compare holds (it never does).
+fn mask_kept_by_a_shift(ends: bool) -> Vec<u32> {
     let mut w = PROLOGUE.to_vec();
     w.extend([
         0x3420_0085, // v_lshlrev_b32 v16, 5, v0
@@ -1581,9 +1590,21 @@ fn mask_kept_by_a_shift() -> Vec<u32> {
         vop2(3, 0x1D, 128 + 5, 0), // v_xor_b32 v3, 5, v0
         vop1(4, 0x01, 256),        // v_mov_b32 v4, v0
         0xBF06_8005,               // s_cmp_eq_u32 s5, 0
-        0xBF84_0002,               // s_cbranch_scc0 2
-        0x7D88_0903,               // v_cmp_gt_u32 vcc, v3, v4
-        vop1(4, 0x01, 107),        // v_mov_b32 v4, vcc_hi
+    ]);
+    let mut body = vec![
+        0x7D88_0903,        // v_cmp_gt_u32 vcc, v3, v4
+        vop1(4, 0x01, 107), // v_mov_b32 v4, vcc_hi
+    ];
+    if ends {
+        body.extend([
+            0xBF06_8105, // s_cmp_eq_u32 s5, 1
+            0xBF84_0001, // s_cbranch_scc0 1
+            S_ENDPGM,
+        ]);
+    }
+    w.push(0xBF84_0000 | body.len() as u32); // s_cbranch_scc0 past it
+    w.extend(body);
+    w.extend([
         vop2(4, 0x25, 0xFA, 2),
         dpp16(2, 0x11F), // v_add_nc_u32 v4, v2, v2 row_shr:15
     ]);
@@ -1595,17 +1616,19 @@ fn mask_kept_by_a_shift() -> Vec<u32> {
 /// In halves a write under a lane guard (here DPP's lanes without a source)
 /// is refused when what the other lanes keep was refused: there, a mask
 /// read where the halves cannot meet (a branch on a scalar compare, in a
-/// group of two console waves). Kept as zero it would store 0 where the
-/// console stores the mask. In a group of one console wave the halves meet
-/// there and trade.
+/// group of two console waves, that may end the program and so cannot run
+/// wave-wide). Kept as zero it would store 0 where the console stores the
+/// mask. In a group of one console wave the halves meet there and trade;
+/// without the end the branch runs wave-wide.
 #[test]
 fn a_kept_refused_value_refuses_the_write_in_halves() {
-    let why = refusal(&mask_kept_by_a_shift(), 128, 0);
+    let why = refusal(&mask_kept_by_a_shift(true), 128, 0);
     assert!(
         why.contains("a lane mask read as data, written where not every thread of the group meets"),
         "{why}"
     );
-    assert_eq!(refusal(&mask_kept_by_a_shift(), 64, 0), "translated");
+    assert_eq!(refusal(&mask_kept_by_a_shift(true), 64, 0), "translated");
+    assert_eq!(refusal(&mask_kept_by_a_shift(false), 128, 0), "translated");
 }
 
 /// Every thread writes `tid + 1` at its LDS dword. In a branch only lanes of
@@ -1674,8 +1697,8 @@ fn lds_tree_step_want(low: bool, l: u32) -> u32 {
 /// A branch only one half's lanes take (a compare of the thread id with a
 /// constant, in a group of one console wave or several) lets that half's
 /// host wave run alone: a first-lane read, a mask read as data and LDS both
-/// read and written there translate in halves. The same with lanes of both
-/// halves in the branch are refused.
+/// read and written there translate in halves, the first lane and the mask
+/// with no barrier.
 #[test]
 fn one_half_regions_translate_in_halves() {
     for threads in [64, 128] {
@@ -1690,18 +1713,165 @@ fn one_half_regions_translate_in_halves() {
     for low in [true, false] {
         assert_eq!(refusal(&lds_tree_step(low), 64, 256), "translated", "{low}");
     }
-    for words in [first_lane_in_a_branch(40), mask_in_a_branch(40)] {
-        let why = refusal(&words, 64, 0);
-        assert!(
-            why.contains("where not every thread of the group meets"),
-            "{why}"
-        );
+    for words in [first_lane_in_a_branch(20), mask_in_a_branch(20)] {
+        assert_eq!(barriers(&words, 64, 0), 0);
     }
-    let why = refusal(&lds_written_and_read_in_a_branch(), 64, 256);
-    assert!(
-        why.contains("both writes and reads (or writes twice)"),
-        "{why}"
-    );
+}
+
+/// Group barriers in `words` lowered in halves.
+fn barriers(words: &[u32], threads: u32, lds_bytes: u32) -> u32 {
+    let n = native(words, true, threads, lds_bytes);
+    lowered(&n, true).expect("halves").barriers
+}
+
+/// In a branch the console lanes from `from` take (1 to 31: lanes of both
+/// halves): the first lane's thread id (`v2`), how many of the branch's
+/// lanes are below 40 (`v3`), lane 50's thread id (`v4`), and lane 50's
+/// `v6` (three times its thread id, which the branch adds 1000 to), or with
+/// `outside` that of lane `from - 1`, which does not take the branch and
+/// keeps the old value (`v5`). Lanes outside the branch store 0xdead in
+/// each.
+fn wide_branch(from: u32, outside: bool) -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0xD766_0001,
+        0x0002_02C1,               // v_mbcnt_hi_u32_b32 v1, -1, v1
+        vop2(6, 0x0B, 128 + 3, 0), // v_mul_u32_u24 v6, 3, v0
+    ]);
+    for d in 2..6 {
+        w.extend([vop1(d, 0x01, 255), 0xDEAD]); // v_mov_b32 vd, 0xdead
+    }
+    let read = if outside { from - 1 } else { 50 };
+    let mut body = vec![
+        vop2(6, 0x25, 255, 6), // v_add_nc_u32 v6, 1000, v6
+        1000,
+        vop1(12, 0x02, 256),                     // v_readfirstlane_b32 s12, v0
+        vop1(2, 0x01, 12),                       // v_mov_b32 v2, s12
+        0x7C00_0000 | 0xC4 << 17 | 1 << 9 | 168, // v_cmp_gt_u32 vcc, 40, v1
+        sop1(13, 0x10, 106),                     // s_bcnt1_i32_b64 s13, vcc
+        vop1(3, 0x01, 13),                       // v_mov_b32 v3, s13
+    ];
+    body.extend(vop3(14, 0x360, 256, 128 + 50, 0)); // v_readlane_b32 s14, v0, 50
+    body.push(vop1(4, 0x01, 14)); // v_mov_b32 v4, s14
+    body.extend(vop3(15, 0x360, 256 + 6, 128 + read as u16, 0)); // v_readlane_b32 s15, v6, read
+    body.push(vop1(5, 0x01, 15)); // v_mov_b32 v5, s15
+    w.extend([
+        0x7C00_0000 | 0xC3 << 17 | 1 << 9 | (128 + from), // v_cmp_le_u32 vcc, from, v1
+        0xBE94_246A,                                      // s_and_saveexec_b64 s[20:21], vcc
+        0xBF88_0000 | body.len() as u32,                  // s_cbranch_execz past it
+    ]);
+    w.extend(body);
+    w.push(0xBEFE_0414); // s_mov_b64 exec, s[20:21]
+    for (slot, d) in (2..6).enumerate() {
+        w.extend(store(d, 4 * slot as u32));
+    }
+    w.push(S_ENDPGM);
+    w
+}
+
+/// What the console stores for [`wide_branch`]'s thread `l`.
+fn wide_branch_want(from: u32, outside: bool, l: u32) -> [u32; 4] {
+    let (base, lane) = (l & !63, l & 63);
+    if lane < from {
+        return [0xDEAD; 4];
+    }
+    let read = if outside {
+        3 * (base + from - 1)
+    } else {
+        3 * (base + 50) + 1000
+    };
+    [base + from, 40 - from, base + 50, read]
+}
+
+/// A branch lanes of both halves take, with first lanes, masks, lane reads,
+/// a whole-wave sum, or LDS both written and read, runs wave-wide in
+/// halves: it translates and pays for its trades only, two group barriers
+/// each.
+#[test]
+fn wave_wide_regions_translate_in_halves() {
+    assert_eq!(barriers(&first_lane_in_a_branch(40), 64, 0), 2);
+    assert_eq!(barriers(&mask_in_a_branch(40), 64, 0), 2);
+    assert_eq!(barriers(&lane_read_in_a_branch(), 64, 0), 2);
+    // A first lane, a mask and two lane reads.
+    for threads in [64, 128] {
+        for outside in [false, true] {
+            let words = wide_branch(8, outside);
+            assert_eq!(barriers(&words, threads, 0), 8, "{threads} {outside}");
+        }
+    }
+    assert_eq!(refusal(&sum_under_a_uniform_branch(), 128, 0), "translated");
+    for words in [
+        lds_written_and_read_in_a_branch(),
+        lds_written_twice_in_a_branch(),
+    ] {
+        assert_eq!(refusal(&words, 64, 256), "translated");
+    }
+}
+
+/// Wave-wide regions on every hardware adapter, in halves and as one wave64
+/// where the adapter runs those, in groups of 64 and 128: [`wide_branch`]
+/// (with `outside` in halves only, as [`lane_read_in_a_branch`]: the
+/// one-wave64 form reads a lane that does not run as the host does, which
+/// D3D leaves undefined), [`mask_in_a_branch`] of the lanes below 40, and in
+/// a group of 64, LDS written and read, or written twice, in a branch.
+#[test]
+fn wave_wide_regions_match_the_console_on_every_gpu() {
+    let mut failed = Vec::new();
+    for threads in [64, 128] {
+        for from in [8, 20] {
+            for outside in [false, true] {
+                let words = wide_branch(from, outside);
+                let want: Vec<u32> = (0..threads)
+                    .flat_map(|l| wide_branch_want(from, outside, l))
+                    .collect();
+                failed.extend(if outside {
+                    differences_in_halves(&words, threads, 4, &want)
+                } else {
+                    differences(&words, threads, 4, &want)
+                });
+            }
+        }
+        let mask: Vec<u32> = (0..threads).map(|l| if l < 40 { 10 } else { 0 }).collect();
+        failed.extend(differences(&mask_in_a_branch(40), threads, 1, &mask));
+        let read: Vec<u32> = (0..threads).map(|l| if l < 20 { 40 } else { 0 }).collect();
+        failed.extend(differences_in_halves(
+            &lane_read_in_a_branch(),
+            threads,
+            1,
+            &read,
+        ));
+    }
+    let written_and_read: Vec<u32> = (0..64)
+        .map(|l| match l ^ 32 {
+            o if l < 48 && o < 48 => o + 1,
+            _ => 0,
+        })
+        .collect();
+    failed.extend(differences_with_lds(
+        &lds_written_and_read_in_a_branch(),
+        64,
+        256,
+        1,
+        &written_and_read,
+    ));
+    let twice: Vec<u32> = (0..64)
+        .map(|l| match l ^ 32 {
+            o if o < 48 => o + 1,
+            _ if l < 48 => l + 1,
+            _ => 0,
+        })
+        .collect();
+    failed.extend(differences_with_lds(
+        &lds_written_twice_in_a_branch(),
+        64,
+        256,
+        1,
+        &twice,
+    ));
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
 /// [`lds_tree_step`] in a group of 64 on every hardware adapter, in halves

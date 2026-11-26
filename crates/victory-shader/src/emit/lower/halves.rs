@@ -66,6 +66,7 @@
 //! wave ([`lane_uniform`]): justrealyme's analysis (chippy01/VIctory#1),
 //! ported from fxceless/victory-fork (#497 there).
 
+use super::wide::Plan;
 use super::*;
 
 /// Console lanes per host wave in halves.
@@ -174,6 +175,13 @@ impl Lower<'_> {
         self.exchange.half.get(b).copied().flatten()
     }
 
+    /// `why`, a refusal at IR block `b` for want of a meeting, noted for the
+    /// next attempt, which may run its region wave-wide ([`super::wide`]).
+    fn apart(&self, b: usize, why: Why) -> Why {
+        self.plan.ask(b);
+        why
+    }
+
     /// Whether every thread of the group meets at the IR block being
     /// lowered ([`Exchange`]), where the halves may trade.
     fn meets(&self) -> bool {
@@ -187,7 +195,8 @@ impl Lower<'_> {
     /// `v_readlane_b32` (`inst`) of `x` at `lane` in halves: `None` where the
     /// host wave's own read is the console's (not halves; a constant lane
     /// below 32 of a group one host wave holds), the lane's own `x` where `x`
-    /// is the same in every lane of the console wave ([`lane_uniform`]), else
+    /// is the same in every lane of the console wave ([`lane_uniform`]) and
+    /// every lane holds it ([`Lower::held_everywhere`]), else
     /// what the halves trade ([`Lower::across`]). In a group one host wave
     /// holds, any other lane read is refused: a lane past the group holds
     /// whatever its registers did on the console.
@@ -213,11 +222,24 @@ impl Lower<'_> {
         if let Some(&Operand::Vector { reg, .. }) = v.src.first()
             && inst
                 .read(Reg::V(reg))
-                .is_some_and(|r| self.alike.contains(&r))
+                .is_some_and(|r| self.alike.contains(&r) && self.held_everywhere(r))
         {
             return Ok(Some(x));
         }
         self.across(x, lane).map(Some)
+    }
+
+    /// Whether every lane of the console wave holds value `v`: it was
+    /// written where every thread meets, and not wave-wide. A lane outside
+    /// the branch a value is written in keeps the register's old value,
+    /// which a lane read of it gives.
+    fn held_everywhere(&self, v: Value) -> bool {
+        let at = self
+            .def_block
+            .get(&v)
+            .copied()
+            .or_else(|| self.phi_at.get(&v).map(|&(b, _)| b));
+        at.is_none_or(|b| self.exchange.meet.get(b) == Some(&true) && !self.wide.inside[b])
     }
 
     /// Lane `lane`'s `x` in every lane of the console wave: each half reads
@@ -225,7 +247,7 @@ impl Lower<'_> {
     /// holding `lane` gives the read.
     fn across(&mut self, x: V, lane: V) -> Result<V, Why> {
         if !self.meets() {
-            return Err(APART);
+            return Err(self.apart(self.cur_ir, APART));
         }
         let c = self.cur;
         let (k0, k1, k5, k31) = (
@@ -313,19 +335,22 @@ impl Lower<'_> {
         let Some(&Operand::Vector { reg, .. }) = v.src.first() else {
             return Ok(None);
         };
+        // Wave-wide, the lanes outside the block keep older values.
         if !self.trades()
-            || inst
-                .read(Reg::V(reg))
-                .is_some_and(|r| self.alike.contains(&r))
+            || !self.wide.inside[self.cur_ir]
+                && inst
+                    .read(Reg::V(reg))
+                    .is_some_and(|r| self.alike.contains(&r))
         {
             return Ok(None);
         }
         // Where one half's lanes alone run, its host wave's first lane in
         // EXEC is the console's, unless a guard may leave EXEC empty (the
         // console then reads lane 0, which may not be running here).
-        let alone = match self.meets() {
-            true => None,
-            false => Some(self.alone(self.cur_ir).ok_or(FIRST_ACROSS)?),
+        let alone = match (self.meets(), self.alone(self.cur_ir)) {
+            (true, _) => None,
+            (false, Some(h)) => Some(h),
+            (false, None) => return Err(self.apart(self.cur_ir, FIRST_ACROSS)),
         };
         let b = self.cur_ir;
         let i = self.x.p.blocks[b]
@@ -372,7 +397,7 @@ impl Lower<'_> {
         let b = self.def_block.get(&mask).copied().unwrap_or(0);
         let meets = self.exchange.meet.get(b).copied().unwrap_or(false);
         if self.trades() && !meets && self.alone(b).is_none() {
-            return Err(MASK_APART);
+            return Err(self.apart(b, MASK_APART));
         }
         Ok(())
     }
@@ -404,7 +429,7 @@ impl Lower<'_> {
     /// every thread of the group meets ([`Lower::reduce_halves`]).
     pub(super) fn reduction_meets(&self) -> Result<(), Why> {
         if self.trades() && !self.meets() && self.alone(self.cur_ir).is_none() {
-            return Err(REDUCTION_APART);
+            return Err(self.apart(self.cur_ir, REDUCTION_APART));
         }
         Ok(())
     }
@@ -587,11 +612,16 @@ pub(super) struct Exchange {
 }
 
 impl Exchange {
-    pub(super) fn new(x: &Parts, halves: bool) -> Self {
+    /// With `wide`, the IR blocks run wave-wide ([`super::wide`]), which
+    /// every thread meets at; `plan` hears of LDS refused elsewhere.
+    pub(super) fn new(x: &Parts, halves: bool, wide: &[bool], plan: &Plan) -> Self {
         if !halves {
             return Exchange::default();
         }
-        let meet = meeting(x);
+        let mut meet = meeting(x);
+        for (m, &w) in meet.iter_mut().zip(wide) {
+            *m |= w;
+        }
         let half = super::confine::confined(x, &meet);
         let one_wave_lds = match &x.native.io {
             StageIo::Cs(cs) => {
@@ -600,7 +630,7 @@ impl Exchange {
             }
             _ => false,
         };
-        let (lds, refused) = match one_wave_lds.then(|| lds_fences(x, &meet, &half)) {
+        let (lds, refused) = match one_wave_lds.then(|| lds_fences(x, &meet, &half, plan)) {
             Some(Ok(l)) => (Some(l), None),
             Some(Err(why)) => (None, Some(why)),
             None => (None, None),
@@ -631,9 +661,9 @@ struct Lds {
 /// that both writes and reads LDS, or writes it in two instructions, cannot
 /// be put in the console's order without a barrier inside it, unless every
 /// block of it accessing LDS is one that only one half's lanes run (`half`),
-/// the same half: its host wave runs them in the console's order.
-fn lds_fences(x: &Parts, meet: &[bool], half: &[Option<u8>]) -> Result<Lds, Why> {
-    const MIXED: Why = "LDS a branch only some lanes take both writes and reads (or writes twice), in a group of one console wave64 on a host of 32-lane waves";
+/// the same half: its host wave runs them in the console's order. `plan`
+/// hears of the blocks of a refused region that access LDS.
+fn lds_fences(x: &Parts, meet: &[bool], half: &[Option<u8>], plan: &Plan) -> Result<Lds, Why> {
     let (p, st) = (x.p, x.st);
     let n = st.exits.len();
     let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -699,9 +729,20 @@ fn lds_fences(x: &Parts, meet: &[bool], half: &[Option<u8>]) -> Result<Lds, Why>
             }
         }
     }
-    if access.values().any(|&([r, w, a], alone)| {
-        alone.is_none() && ((w > 0 && r > 0) || (a > 0 && w + r > 0) || a > 1 || w > 1)
-    }) {
+    let mixed: HashSet<usize> = access
+        .iter()
+        .filter(|(_, e)| {
+            let ([r, w, a], alone) = **e;
+            alone.is_none() && ((w > 0 && r > 0) || (a > 0 && w + r > 0) || a > 1 || w > 1)
+        })
+        .map(|(&root, _)| root)
+        .collect();
+    if !mixed.is_empty() {
+        for b in (0..n).filter(|&b| !meets(b)) {
+            if mixed.contains(&find(&mut root, b)) {
+                plan.ask(b);
+            }
+        }
         return Err(MIXED);
     }
     let mut lds = Lds::default();
@@ -724,16 +765,11 @@ fn lds_fences(x: &Parts, meet: &[bool], half: &[Option<u8>]) -> Result<Lds, Why>
 /// form branches on the console's wave-wide tests too). In a group of
 /// several console waves, which may each take a uniform branch their own
 /// way, no branch at all. Nowhere with an indirect exit.
-fn meeting(x: &Parts) -> Vec<bool> {
-    let st = x.st;
-    let several = match &x.native.io {
-        StageIo::Cs(cs) => cs.threads.iter().product::<u32>() > 64,
-        _ => true,
+pub(super) fn meeting(x: &Parts) -> Vec<bool> {
+    let Some(regions) = lane_regions(x) else {
+        return vec![false; x.st.exits.len()];
     };
-    let Some(regions) = branch_regions(st, several) else {
-        return vec![false; st.exits.len()];
-    };
-    let mut meet = vec![true; st.exits.len()];
+    let mut meet = vec![true; x.st.exits.len()];
     for (_, region) in regions {
         for (b, r) in region.iter().enumerate() {
             if *r {
@@ -743,6 +779,26 @@ fn meeting(x: &Parts) -> Vec<bool> {
     }
     meet
 }
+
+/// [`branch_regions`] of the branches that may part a group's threads: in
+/// a group of several console waves, which may each take a uniform branch
+/// their own way, every branch.
+pub(super) fn lane_regions(x: &Parts) -> Option<Vec<(usize, Vec<bool>)>> {
+    let several = match &x.native.io {
+        StageIo::Cs(cs) => cs.threads.iter().product::<u32>() > 64,
+        _ => true,
+    };
+    branch_regions(x.st, several)
+}
+
+/// Whether a refusal in halves is for want of a meeting, which a region run
+/// wave-wide ([`super::wide`]) may give.
+pub(super) fn for_want_of_a_meeting(what: Why) -> bool {
+    [APART, FIRST_ACROSS, MASK_APART, REDUCTION_APART, MIXED].contains(&what)
+}
+
+/// Why LDS stops in halves where it cannot be put in order.
+const MIXED: Why = "LDS a branch only some lanes take both writes and reads (or writes twice), in a group of one console wave64 on a host of 32-lane waves";
 
 /// Why a first-lane read stops in halves: the console's first lane may be
 /// in the other half, the value is not known to be the same there, and the

@@ -9,15 +9,16 @@
 //! `ds_bpermute_b32`, `v_readlane_b32`, `v_writelane_b32`,
 //! `v_readfirstlane_b32`, lane masks read as data, a whole-wave prefix sum,
 //! LDS), compute lane by lane in branches only some lanes take (where they
-//! may also write LDS, and, where only one half's lanes take them, read
-//! lane masks, first lanes and LDS), and take branches on a scalar compare. They are
-//! integer only, set every register before reading it, read only LDS that
-//! is written, and run in whole console waves of 1-D groups, so that both
-//! forms store one result each. `VICTORY_HALVES_PROGRAMS` sets how many
+//! may also read across lanes and write LDS, one inside another or not),
+//! and take branches on a scalar compare. They are integer only, set every
+//! register before reading it, read only LDS that is written, read only
+//! lanes that run (the one-wave64 form reads another as the host does,
+//! which D3D leaves undefined), and run in whole console waves of 1-D
+//! groups, so that both forms store one result each. `VICTORY_HALVES_PROGRAMS` sets how many
 //! programs a run takes (default 64) and `VICTORY_HALVES_SEED` the first
 //! seed (default 1); a difference names its seed and lists its program.
-//! `VICTORY_HALVES_TRACE=1` names each program and step as it starts, for a
-//! run that ends in a crash.
+//! `VICTORY_HALVES_TRACE=1` lists each program and names each step as it
+//! starts, for a run that ends in a crash.
 
 use std::collections::BTreeMap;
 
@@ -89,7 +90,7 @@ fn program(seed: u64) -> Program {
         lds,
         lds_written: false,
         same: [false; 9],
-        in_branch: false,
+        lanes: [0, 64],
     };
     g.w.push(0x3420_0085); // v_lshlrev_b32 v16, 5, v0
     g.init(&STATE);
@@ -117,16 +118,19 @@ struct Gen {
     /// Every thread has written its LDS dword.
     lds_written: bool,
     /// By register: it holds one value in every lane of the console wave (a
-    /// lane read, a mask's count). No DPP reads such a register: on the
-    /// Radeon iGPU of a Ryzen 9 7900X (driver 32.0.21045.29003) a DPP read of
-    /// a DPP read of such a value crashes the driver's shader compiler, in
-    /// the process, when it makes the one-wave64 form's pipeline (any of
-    /// `quad_perm`, `row_shr`, `row_mirror`, `row_share` and `row_xmask`
-    /// twice after `v_readlane_b32` or `v_readfirstlane_b32`; the module
-    /// validates, and the halves form makes its pipeline).
+    /// lane read, a mask's count), or in every lane of the branch that wrote
+    /// it, whose compiler may see the value as one. No DPP reads such a
+    /// register: on the Radeon iGPU of a Ryzen 9 7900X (driver
+    /// 32.0.21045.29003) a DPP read of a DPP read of such a value crashes
+    /// the driver's shader compiler, in the process, when it makes the
+    /// one-wave64 form's pipeline (any of `quad_perm`, `row_shr`,
+    /// `row_mirror`, `row_share` and `row_xmask` twice after
+    /// `v_readlane_b32` or `v_readfirstlane_b32`; the module validates, and
+    /// the halves form makes its pipeline).
     same: [bool; 9],
-    /// Steps are being written inside a branch only some lanes take.
-    in_branch: bool,
+    /// The console lanes that take the branches around the steps being
+    /// written (`low..high`).
+    lanes: [u32; 2],
 }
 
 impl Gen {
@@ -144,10 +148,10 @@ impl Gen {
         (!regs.is_empty()).then(|| self.r.pick(&regs))
     }
 
-    /// Notes what `d` now holds: one value in every lane or not (not after a
-    /// branch only some lanes take).
+    /// Notes what `d` now holds: one value in every lane (of its branch) or
+    /// not.
     fn wrote(&mut self, d: u8, same: bool) {
-        self.same[d as usize] = same && !self.in_branch;
+        self.same[d as usize] = same;
     }
 
     /// `regs` set from the thread id, each its own way; `v1` is the console
@@ -182,7 +186,7 @@ impl Gen {
             7 => self.write_lane(),
             8 => self.first_lane(),
             9 | 10 => self.ballot(),
-            11 | 12 => self.branch(),
+            11 | 12 => self.branch(0),
             13 => self.uniform(),
             14 | 15 if self.lds => self.lds_step(),
             14 | 15 => self.alu(),
@@ -262,14 +266,22 @@ impl Gen {
         self.wrote(d, same);
     }
 
-    /// `v_readlane_b32` of a lane named by a constant or an SGPR.
+    /// `v_readlane_b32` of a lane named by a constant or an SGPR; in a
+    /// branch, of a lane that takes it (the one-wave64 form reads a lane
+    /// that does not as the host does, which D3D leaves undefined).
     fn read_lane(&mut self) {
-        let (d, a, lane) = (self.reg(), self.reg(), self.r.below(64));
+        let (d, a) = (self.reg(), self.reg());
+        let [low, high] = self.lanes;
+        let lane = if low < high {
+            low + self.r.below(high - low)
+        } else {
+            self.r.below(64)
+        };
         if self.r.below(2) == 0 {
             self.w.extend(vop3(12, 0x360, v(a), k(lane), 0)); // v_readlane_b32 s12, a, lane
         } else {
-            self.w.push(sop1(20, 0x03, 128 + lane as u8)); // s_mov_b32 s20, lane
-            self.w.extend(vop3(12, 0x360, v(a), 20, 0)); // v_readlane_b32 s12, a, s20
+            self.w.push(sop1(24, 0x03, 128 + lane as u8)); // s_mov_b32 s24, lane
+            self.w.extend(vop3(12, 0x360, v(a), 24, 0)); // v_readlane_b32 s12, a, s24
         }
         self.w.push(vop1(d, 0x01, 12)); // v_mov_b32 d, s12
         self.wrote(d, true);
@@ -321,34 +333,46 @@ impl Gen {
     }
 
     /// A branch the lanes below a random console lane take, or the lanes
-    /// from one: inside, a lane's own arithmetic and a write of its LDS dword
-    /// once every thread has one; where only one half's lanes take it, also
-    /// lane masks, first lanes and (in a group of one wave) LDS reads.
-    fn branch(&mut self) {
+    /// from one (`depth` the branches around it): inside, a lane's own
+    /// arithmetic, DPP, lane reads, lane masks, first lanes, a write of its
+    /// LDS dword once every thread has one, LDS reads in a group of one
+    /// wave, and at the top a branch of its own. Where only one half's lanes
+    /// take it, that half runs alone; where both halves' do, the region runs
+    /// wave-wide.
+    fn branch(&mut self, depth: u32) {
         let (from, lanes) = (self.r.below(2) == 0, 1 + self.r.below(63));
-        let one_half = if from { lanes >= 32 } else { lanes <= 32 };
+        // The EXEC each branch saves: s[20:21], s[22:23] inside.
+        let saved = 20 + 2 * depth;
         // v_cmp_le_u32 (from) or v_cmp_gt_u32 (below) vcc, lanes, v10
         let op: u32 = if from { 0xC3 } else { 0xC4 };
         self.w.extend([
             vop2(10, 0x1B, k(63), 0), // v_and_b32 v10, 63, v0
             0x7C00_0000 | op << 17 | 10 << 9 | k(lanes) as u32,
-            0xBE94_246A, // s_and_saveexec_b64 s[20:21], vcc
+            0xBE80_246A | saved << 16, // s_and_saveexec_b64 s[saved:], vcc
         ]);
         let at = self.w.len();
         self.w.push(0);
-        self.in_branch = true;
+        let around = self.lanes;
+        self.lanes = if from {
+            [around[0].max(lanes), around[1]]
+        } else {
+            [around[0], around[1].min(lanes)]
+        };
         for _ in 0..1 + self.r.below(3) {
-            match self.r.below(5) {
+            match self.r.below(9) {
                 0 if self.lds_written => self.lds_write(),
-                1 if one_half => self.ballot(),
-                2 if one_half => self.first_lane(),
-                3 if one_half && self.lds_written && self.threads == 64 => self.lds_read(),
+                1 => self.ballot(),
+                2 => self.first_lane(),
+                3 if self.lds_written && self.threads == 64 => self.lds_read(),
+                4 => self.read_lane(),
+                5 => self.dpp(),
+                6 if depth == 0 => self.branch(1),
                 _ => self.alu(),
             }
         }
-        self.in_branch = false;
+        self.lanes = around;
         self.w[at] = 0xBF88_0000 | (self.w.len() - at - 1) as u32; // s_cbranch_execz past it
-        self.w.push(0xBEFE_0414); // s_mov_b64 exec, s[20:21]
+        self.w.push(0xBEFE_0400 | saved); // s_mov_b64 exec, s[saved:]
     }
 
     /// A read of the LDS dword of another thread of the console wave.
@@ -508,10 +532,13 @@ fn random_wave64_programs_in_halves_match_one_wave64() {
     let mut refused: BTreeMap<String, u32> = BTreeMap::new();
     let (mut compared, mut failed) = (0, Vec::new());
     for seed in first..first + count {
-        trace(format_args!("seed {seed}: translating"));
         let p = program(seed);
         let text = listing(&p.words)
             .unwrap_or_else(|e| panic!("seed {seed}: the program does not decode: {e}"));
+        trace(format_args!(
+            "seed {seed}: translating
+{text}"
+        ));
         let n = native(&p.words, true, p.threads, p.lds_bytes);
         let halves = match lowered(&n, true) {
             Ok(l) => shader(l),

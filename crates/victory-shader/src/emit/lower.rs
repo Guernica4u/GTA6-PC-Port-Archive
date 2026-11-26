@@ -23,6 +23,7 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 mod bvh;
 mod confine;
 mod halves;
+mod wide;
 
 type Why = &'static str;
 
@@ -77,6 +78,9 @@ pub(crate) struct Lowered {
     /// Whether the module contains the 32-lane half mask (`!31`).
     #[cfg(test)]
     pub has_half_wave_mask: bool,
+    /// Group barriers written (the halves' trades and LDS order among them).
+    #[cfg(test)]
+    pub barriers: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -104,10 +108,18 @@ enum Stop {
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
+    let mut wide = wide::Plan::default();
     loop {
-        match Lower::new(parts, &bad).run() {
+        match Lower::new(parts, &bad, &wide).run() {
             Ok(l) => return Ok(l),
+            // In halves, refused for want of a meeting: the regions where
+            // one was wanted run wave-wide next time, where values missing
+            // for want of one may not be.
+            Err(Stop::Fail(ShaderError::Unsupported { what, .. })) if wide.widen(parts, what) => {
+                bad.retain(|_, &mut why| !halves::for_want_of_a_meeting(why));
+            }
             Err(Stop::Retry(v, why)) => {
+                wide.forget();
                 if bad.insert(v, why).is_some() {
                     return Err(ShaderError::Unsupported {
                         offset: 0,
@@ -256,6 +268,10 @@ struct Lower<'a> {
     relabelled: Option<V>,
     /// Trades between halves ([`halves::Exchange`]).
     exchange: halves::Exchange,
+    /// In halves: the regions run wave-wide ([`wide::Wide`]), and the plan
+    /// that a refusal for want of a meeting asks for more of.
+    wide: wide::Wide,
+    plan: &'a wide::Plan,
     /// In halves: VGPR values the same in every lane of the console wave
     /// ([`halves::lane_uniform`]), whose first lane either half reads.
     alike: HashSet<Value>,
@@ -560,7 +576,7 @@ fn code_table_start(p: &crate::ir::Program, addresses: &[&crate::resource::Addre
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, plan: &'a wide::Plan) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -675,6 +691,7 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let wide = wide::Wide::new(x, plan);
         Lower {
             s,
             x,
@@ -720,7 +737,9 @@ impl<'a> Lower<'a> {
             halves,
             halves_refused,
             relabelled: None,
-            exchange: halves::Exchange::new(x, halves),
+            exchange: halves::Exchange::new(x, halves, &wide.inside, plan),
+            wide,
+            plan,
             alike: if halves {
                 halves::lane_uniform(x)
             } else {
@@ -1393,6 +1412,7 @@ impl<'a> Lower<'a> {
                 };
                 self.vals.insert(phi.value, val);
             }
+            self.wide_enter(b);
             self.lds_block_start(b);
             let mut i = 0;
             self.mode16 = self.round16[b];
@@ -1458,6 +1478,8 @@ impl<'a> Lower<'a> {
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
             #[cfg(test)]
             has_half_wave_mask: self.s.m.has_i32_const(!31),
+            #[cfg(test)]
+            barriers: self.s.m.written_calls("dx.op.barrier") as u32,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -1882,7 +1904,10 @@ impl<'a> Lower<'a> {
                 }
                 let bit = self.boolean(m, at);
                 self.balloting.remove(&lo);
-                let bit = bit?;
+                let mut bit = bit?;
+                if let Some(&b) = self.def_block.get(&lo) {
+                    bit = self.wide_and(b, bit, at);
+                }
                 let i32t = self.s.t.i32;
                 let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
                 let r = self
@@ -2756,10 +2781,11 @@ impl<'a> Lower<'a> {
     }
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
-        match self.x.st.guards[b][i] {
-            None => Ok(None),
-            Some(g) => Ok(Some(self.boolean(g, self.cur)?)),
-        }
+        let g = match self.x.st.guards[b][i] {
+            None => None,
+            Some(g) => Some(self.boolean(g, self.cur)?),
+        };
+        Ok(self.wide_guard(b, g))
     }
 
     /// Whether every lane outside the guard of the export at (b, i) runs
@@ -10209,6 +10235,10 @@ impl<'a> Lower<'a> {
             .insts
             .last()
             .map_or(self.x.p.blocks[b].offset, |i| i.machine.offset);
+        if let Some(t) = self.wide_exit(b).map_err(|w| unsupported(offset, w))? {
+            self.s.m.terminate(self.cur, t);
+            return Ok(());
+        }
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
                 let ok = self.count_iteration(t, pred::IULT);
@@ -10890,9 +10920,10 @@ impl<'a> Lower<'a> {
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
-            let mut incoming = Vec::new();
+            let (mut incoming, mut from) = (Vec::new(), Vec::new());
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
+                from.push(q);
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
                 let read = live.contains(&(phi.value, n));
@@ -10941,7 +10972,7 @@ impl<'a> Lower<'a> {
                 };
                 incoming.push((x, qb));
             }
-            self.s.m.set_phi(v, incoming);
+            self.wide_phi(v, b, incoming, &from);
         }
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
             self.s.m.set_phi(phi, incoming);
@@ -10949,9 +10980,10 @@ impl<'a> Lower<'a> {
         while let Some((v, b, i)) = self.pending_masks.pop() {
             let phi = &p.blocks[b].phis[i];
             let offset = p.blocks[b].offset;
-            let mut incoming = Vec::new();
+            let (mut incoming, mut from) = (Vec::new(), Vec::new());
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
+                from.push(q);
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
                 const UNTRACKED: Why = "a lane-mask join of an untracked mask";
@@ -10969,7 +11001,7 @@ impl<'a> Lower<'a> {
                 };
                 incoming.push((x, qb));
             }
-            self.s.m.set_phi(v, incoming);
+            self.wide_phi(v, b, incoming, &from);
         }
         Ok(())
     }
