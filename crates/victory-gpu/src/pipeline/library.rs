@@ -77,6 +77,8 @@ struct Shared {
     /// The same library as `state`'s, loaded from without its lock.
     loads: ID3D12PipelineLibrary1,
     state: Mutex<Library>,
+    /// The adapter directory consulted when this library opened.
+    cache: Option<PathBuf>,
 }
 
 // SAFETY: as for `Library`.
@@ -158,18 +160,6 @@ fn adapter_cache_dir(root: &Path, adapter: &DXGI_ADAPTER_DESC1) -> PathBuf {
     ))
 }
 
-fn cache_dir(root: &Path) -> Option<PathBuf> {
-    static ADAPTER: OnceLock<DXGI_ADAPTER_DESC1> = OnceLock::new();
-    let adapter = match ADAPTER.get() {
-        Some(adapter) => adapter,
-        None => {
-            let adapter = device_adapter(&crate::host::host()?.device)?;
-            ADAPTER.get_or_init(|| adapter)
-        }
-    };
-    Some(adapter_cache_dir(root, adapter))
-}
-
 fn read_cache(root: &Path, adapter: Option<&Path>) -> (Vec<u8>, Option<Vec<u8>>) {
     let read = |dir: &Path| {
         std::fs::read(dir.join(LIBRARY_FILE))
@@ -197,25 +187,40 @@ fn library() -> Option<&'static Shared> {
     static LIBRARY: OnceLock<Option<Shared>> = OnceLock::new();
     LIBRARY
         .get_or_init(|| {
-            let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
-            let (blob, prebuilt) = DIR
-                .get()
-                .map(|d| read_cache(d, cache_dir(d).as_deref()))
-                .unwrap_or_default();
-            let tag = tag(&blob);
-            let mut library = open(&device, blob);
-            // The pre-build's list, if it was saved with these bytes.
-            if let (Some(l), Some(list)) = (library.as_mut(), prebuilt)
-                && !l._blob.is_empty()
-            {
-                l.prebuilt = listed(&list, &tag);
-            }
-            if library.is_none() {
+            let device = &crate::host::host()?.device;
+            let root = DIR.get().map(PathBuf::as_path);
+            let adapter = root.and_then(|_| device_adapter(device));
+            let shared = open_cache(&device.cast().ok()?, root, adapter.as_ref());
+            if shared.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
             }
-            library.map(|l| Shared { loads: l.library.clone(), state: Mutex::new(l) })
+            shared
         })
         .as_ref()
+}
+
+fn open_cache(
+    device: &ID3D12Device1,
+    root: Option<&Path>,
+    adapter: Option<&DXGI_ADAPTER_DESC1>,
+) -> Option<Shared> {
+    let cache = root.zip(adapter).map(|(root, adapter)| adapter_cache_dir(root, adapter));
+    let (blob, prebuilt) = root
+        .map(|root| read_cache(root, cache.as_deref()))
+        .unwrap_or_default();
+    let tag = tag(&blob);
+    let mut library = open(device, blob)?;
+    // The pre-build's list, if it was saved with these bytes.
+    if let Some(list) = prebuilt
+        && !library._blob.is_empty()
+    {
+        library.prebuilt = listed(&list, &tag);
+    }
+    Some(Shared {
+        loads: library.library.clone(),
+        state: Mutex::new(library),
+        cache,
+    })
 }
 
 /// The library in `blob`, or an empty one if the host rejects the blob (an
@@ -364,8 +369,8 @@ thread_local! {
 }
 
 /// Writes the changed early list and adapter library independently once
-/// `SAVE_EVERY` has passed (or `now`). Without an adapter identity the
-/// library stays dirty for a later save, protecting the shared legacy cache.
+/// `SAVE_EVERY` has passed (or `now`). The library saves only to the adapter
+/// directory consulted when it opened.
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
@@ -397,19 +402,24 @@ pub(crate) fn save(now: bool) {
     }
 
     let Some(library) = library() else { return };
-    let cache = cache_dir(dir);
-    let (adapter, blob, prebuilt, added, prebuilt_changed) = {
+    save_library(library);
+}
+
+fn save_library(library: &Shared) {
+    // A library opened without an identity never read the adapter cache.
+    // Looking up an adapter now could overwrite that unconsulted cache.
+    let Some(adapter) = &library.cache else {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!("host pipeline library not saved: adapter unavailable at load")
+        });
+        return;
+    };
+    let (blob, prebuilt, added, prebuilt_changed) = {
         let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
         if l.added == 0 && !l.prebuilt_changed {
             return;
         }
-        let Some(adapter) = cache else {
-            static WARNED: std::sync::Once = std::sync::Once::new();
-            WARNED.call_once(|| {
-                tracing::warn!("host pipeline library not saved: adapter unavailable")
-            });
-            return;
-        };
         // SAFETY: a plain size query on a live library.
         let size = unsafe { l.library.GetSerializedSize() };
         let Some(mut bytes) = zeroed(size) else {
@@ -429,7 +439,7 @@ pub(crate) fn save(now: bool) {
                 // Kept beside the bytes it holds for (also when a run adds
                 // pipelines).
                 let prebuilt = (!l.prebuilt.is_empty()).then(|| list(&tag(&bytes), &l.prebuilt));
-                (adapter, bytes, prebuilt, added, prebuilt_changed)
+                (bytes, prebuilt, added, prebuilt_changed)
             }
             Err(e) => {
                 tracing::warn!(error = %e, "host pipeline library not serialised");
@@ -437,7 +447,7 @@ pub(crate) fn save(now: bool) {
             }
         }
     };
-    let written = write_cache(&adapter, &blob, prebuilt.as_deref());
+    let written = write_cache(adapter, &blob, prebuilt.as_deref());
     if written.is_err() {
         let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
         l.added += added;
@@ -648,32 +658,66 @@ mod tests {
         assert_eq!(read_cache(root, None), legacy);
     }
 
-    #[test]
-    fn warp_device_uses_its_dxgi_adapter() {
+    fn warp_device() -> Option<(ID3D12Device, DXGI_ADAPTER_DESC1)> {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 
         // SAFETY: the factory and adapter stay live while creating the device.
-        let (adapter, device) = unsafe {
-            let Ok(factory): windows::core::Result<IDXGIFactory4> =
-                CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))
-            else {
-                return;
-            };
-            let Ok(adapter) = factory.EnumWarpAdapter::<IDXGIAdapter1>() else {
-                return;
-            };
-            let mut device: Option<ID3D12Device> = None;
-            if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_err() {
-                return;
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+            let adapter = factory.EnumWarpAdapter::<IDXGIAdapter1>().ok()?;
+            let expected = adapter.GetDesc1().ok()?;
+            // Wine can return a hardware adapter here, even in WARP mode.
+            if expected.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+                return None;
             }
-            (adapter, device.unwrap())
-        };
+            let mut device: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
+            Some((device?, expected))
+        }
+    }
 
+    #[test]
+    fn warp_device_uses_its_dxgi_adapter() {
+        let Some((device, expected)) = warp_device() else {
+            return;
+        };
         let actual = device_adapter(&device).expect("WARP device adapter metadata");
-        // SAFETY: query the live adapter used to create the device.
-        let expected = unsafe { adapter.GetDesc1() }.unwrap();
         assert_eq!(actual.AdapterLuid, expected.AdapterLuid);
         assert_ne!(actual.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32, 0);
+    }
+
+    #[test]
+    fn a_later_adapter_lookup_cannot_replace_an_unloaded_cache() {
+        let Some((device, expected)) = warp_device() else {
+            return;
+        };
+        let device1 = device.cast().expect("WARP pipeline library device");
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let path = adapter_cache_dir(root, &expected);
+        let original = open_cache(&device1, Some(root), Some(&expected)).unwrap();
+        {
+            let mut state = original.state.lock().unwrap();
+            state.prebuilt.insert("original".into());
+            state.prebuilt_changed = true;
+        }
+        save_library(&original);
+        let old_blob = std::fs::read(path.join(LIBRARY_FILE)).unwrap();
+        let old_list = std::fs::read(path.join(PREBUILT_FILE)).unwrap();
+
+        // Fail the lookup at load time, then show DXGI can identify it again.
+        let unresolved = open_cache(&device1, Some(root), None).unwrap();
+        let recovered = device_adapter(&device).expect("later adapter lookup");
+        assert_eq!(adapter_cache_dir(root, &recovered), path);
+        {
+            let mut state = unresolved.state.lock().unwrap();
+            assert!(state.prebuilt.is_empty());
+            state.prebuilt.insert("replacement".into());
+            state.prebuilt_changed = true;
+        }
+        save_library(&unresolved);
+        assert_eq!(std::fs::read(path.join(LIBRARY_FILE)).unwrap(), old_blob);
+        assert_eq!(std::fs::read(path.join(PREBUILT_FILE)).unwrap(), old_list);
     }
 
     #[test]
