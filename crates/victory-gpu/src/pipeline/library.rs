@@ -160,7 +160,7 @@ fn adapter_cache_dir(root: &Path, adapter: &DXGI_ADAPTER_DESC1) -> PathBuf {
     ))
 }
 
-fn read_cache(root: &Path, adapter: Option<&Path>) -> (Vec<u8>, Option<Vec<u8>>) {
+fn read_cache(root: &Path, adapter: Option<&Path>) -> std::io::Result<(Vec<u8>, Option<Vec<u8>>)> {
     let read = |dir: &Path| {
         std::fs::read(dir.join(LIBRARY_FILE))
             .map(|blob| (blob, std::fs::read(dir.join(PREBUILT_FILE)).ok()))
@@ -168,9 +168,9 @@ fn read_cache(root: &Path, adapter: Option<&Path>) -> (Vec<u8>, Option<Vec<u8>>)
     // A compatible legacy library can be reused when there is no adapter
     // library yet. The legacy files are never overwritten by the new layout.
     match adapter.map(read) {
-        Some(Ok(cache)) => cache,
-        Some(Err(e)) if e.kind() != std::io::ErrorKind::NotFound => Default::default(),
-        _ => read(root).unwrap_or_default(),
+        Some(Ok(cache)) => Ok(cache),
+        Some(Err(e)) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(read(root).unwrap_or_default()),
     }
 }
 
@@ -204,10 +204,24 @@ fn open_cache(
     root: Option<&Path>,
     adapter: Option<&DXGI_ADAPTER_DESC1>,
 ) -> Option<Shared> {
-    let cache = root.zip(adapter).map(|(root, adapter)| adapter_cache_dir(root, adapter));
-    let (blob, prebuilt) = root
+    let cache = root
+        .zip(adapter)
+        .map(|(root, adapter)| adapter_cache_dir(root, adapter));
+    let loaded = root
         .map(|root| read_cache(root, cache.as_deref()))
-        .unwrap_or_default();
+        .unwrap_or_else(|| Ok(Default::default()));
+    let cache = cache.ok_or(if root.is_some() {
+        "adapter unavailable at load"
+    } else {
+        "cache directory not configured at load"
+    });
+    let (cache, (blob, prebuilt)) = match loaded {
+        Ok(data) => (cache, data),
+        Err(error) => {
+            tracing::warn!(%error, "host pipeline library could not be read");
+            (Err("adapter cache unreadable at load"), Default::default())
+        }
+    };
     let tag = tag(&blob);
     let mut library = open(device, blob)?;
     // The pre-build's list, if it was saved with these bytes.
@@ -219,11 +233,7 @@ fn open_cache(
     Some(Shared {
         loads: library.library.clone(),
         state: Mutex::new(library),
-        cache: cache.ok_or(if root.is_some() {
-            "adapter unavailable at load"
-        } else {
-            "cache directory not configured at load"
-        }),
+        cache,
     })
 }
 
@@ -638,29 +648,29 @@ mod tests {
         );
         write_cache(root, b"old library", Some("old list")).unwrap();
         let legacy = (b"old library".to_vec(), Some(b"old list".to_vec()));
-        assert_eq!(read_cache(root, Some(&nvidia)), legacy);
+        assert_eq!(read_cache(root, Some(&nvidia)).unwrap(), legacy);
 
         write_cache(&nvidia, b"nvidia library", Some("nvidia list")).unwrap();
         write_cache(&intel, b"intel library", None).unwrap();
         write_cache(&arc, b"arc library", Some("arc list")).unwrap();
         write_cache(&warp, b"warp library", Some("warp list")).unwrap();
         assert_eq!(
-            read_cache(root, Some(&nvidia)),
+            read_cache(root, Some(&nvidia)).unwrap(),
             (b"nvidia library".to_vec(), Some(b"nvidia list".to_vec()))
         );
         assert_eq!(
-            read_cache(root, Some(&intel)),
+            read_cache(root, Some(&intel)).unwrap(),
             (b"intel library".to_vec(), None)
         );
         assert_eq!(
-            read_cache(root, Some(&arc)),
+            read_cache(root, Some(&arc)).unwrap(),
             (b"arc library".to_vec(), Some(b"arc list".to_vec()))
         );
         assert_eq!(
-            read_cache(root, Some(&warp)),
+            read_cache(root, Some(&warp)).unwrap(),
             (b"warp library".to_vec(), Some(b"warp list".to_vec()))
         );
-        assert_eq!(read_cache(root, None), legacy);
+        assert_eq!(read_cache(root, None).unwrap(), legacy);
     }
 
     fn warp_device() -> Option<(ID3D12Device, DXGI_ADAPTER_DESC1)> {
@@ -729,6 +739,39 @@ mod tests {
         save_library(&unresolved);
         assert_eq!(std::fs::read(path.join(LIBRARY_FILE)).unwrap(), old_blob);
         assert_eq!(std::fs::read(path.join(PREBUILT_FILE)).unwrap(), old_list);
+    }
+
+    #[test]
+    fn an_unreadable_adapter_library_is_not_replaced_after_it_unlocks() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let Some((device, adapter)) = warp_device() else {
+            return;
+        };
+        let device = device.cast().expect("WARP pipeline library device");
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let path = adapter_cache_dir(root, &adapter);
+        write_cache(&path, b"original cache", Some("original list")).unwrap();
+        let locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(path.join(LIBRARY_FILE))
+            .unwrap();
+        let library = open_cache(&device, Some(root), Some(&adapter)).unwrap();
+        assert_eq!(
+            library.cache.as_deref(),
+            Err(&"adapter cache unreadable at load")
+        );
+        drop(locked);
+        {
+            let mut state = library.state.lock().unwrap();
+            state.prebuilt.insert("replacement".into());
+            state.prebuilt_changed = true;
+        }
+        save_library(&library);
+        assert_eq!(std::fs::read(path.join(LIBRARY_FILE)).unwrap(), b"original cache");
+        assert_eq!(std::fs::read(path.join(PREBUILT_FILE)).unwrap(), b"original list");
     }
 
     #[test]
