@@ -180,19 +180,20 @@ fn read_lane(em: &mut Emitter<'_>, destination: &Opnd, source: &Opnd, leader: &s
 /// The temporary that stands for a source moved from another lane.
 const MOVED: u16 = 60000;
 
-/// Statements that set `{prefix}{lane}` to vector register `v{register}` as console lane
-/// `partner` (an expression in `tb_from`) holds it. Both host reads run in every thread.
-fn from_lane(register: u32, prefix: &str, lane: u32, partner: &str) -> [String; 3] {
+/// DPP8, DPP16 row/quad controls, permlane16 and DS swizzle only
+/// select within one 32-lane half. Read that half's VGPR directly; reading
+/// both halves and choosing at run time needlessly doubles wave operations.
+fn from_half(register: u32, prefix: &str, lane: u32, partner: &str) -> [String; 2] {
     [
         format!("uint tb_from{lane} = {partner};"),
-        format!("uint tb_low{lane} = WaveReadLaneAt(v{register}__0, tb_from{lane} & 31u), tb_high{lane} = WaveReadLaneAt(v{register}__1, tb_from{lane} & 31u);"),
-        format!("uint {prefix}{lane} = tb_from{lane} < 32u ? tb_low{lane} : tb_high{lane};"),
+        format!("uint {prefix}{lane} = WaveReadLaneAt(v{register}__{lane}, tb_from{lane} & 31u);"),
     ]
 }
 
-/// Whether console lane `tb_from{lane}` is active.
+/// Whether the source in this same half is active.
 fn source_active(lane: u32) -> String {
-    format!("(((tb_from{lane} < 32u ? exec_lo : exec_hi) >> (tb_from{lane} & 31u)) & 1u) != 0u")
+    let exec = if lane == 0 { "exec_lo" } else { "exec_hi" };
+    format!("(({exec} >> (tb_from{lane} & 31u)) & 1u) != 0u")
 }
 
 fn dpp8(em: &mut Emitter<'_>, ins: &Insn, fetch_inactive: bool) -> Result<Vec<String>, String> {
@@ -206,7 +207,7 @@ fn dpp8(em: &mut Emitter<'_>, ins: &Insn, fetch_inactive: bool) -> Result<Vec<St
     for lane in 0..2u32 {
         let me = format!("(tb_pair + {}u)", 32 * lane);
         let partner = format!("({me} & ~7u) | (({selectors:#x}u >> (3u * ({me} & 7u))) & 7u)");
-        lines.extend(from_lane(register, "tbd_", lane, &partner));
+        lines.extend(from_half(register, "tbd_", lane, &partner));
         if !fetch_inactive {
             lines.push(format!("if (!({})) tbd_{lane} = 0u;", source_active(lane)));
         }
@@ -234,8 +235,8 @@ fn dpp16(em: &mut Emitter<'_>, ins: &Insn) -> Result<Vec<String>, String> {
         // (the lane read, whether it lies inside the row)
         let (partner, inside) = match select {
             0..=0xff => (format!("({me} & ~3u) | (({select:#x}u >> (2u * ({me} & 3u))) & 3u)"), "true".to_string()),
-            0x101..=0x10f => (format!("({me} + {count}u) & 63u"), format!("({me} & 15u) + {count}u < 16u")),
-            0x111..=0x11f => (format!("({me} - {count}u) & 63u"), format!("({me} & 15u) >= {count}u")),
+            0x101..=0x10f => (format!("({me} & ~15u) | (({me} + {count}u) & 15u)"), format!("({me} & 15u) + {count}u < 16u")),
+            0x111..=0x11f => (format!("({me} & ~15u) | (({me} - {count}u) & 15u)"), format!("({me} & 15u) >= {count}u")),
             0x121..=0x12f => (format!("({me} & ~15u) | (({me} - {count}u) & 15u)"), "true".to_string()),
             0x140 => (format!("({me} & ~15u) | (15u - ({me} & 15u))"), "true".to_string()),
             0x141 => (format!("({me} & ~7u) | (7u - ({me} & 7u))"), "true".to_string()),
@@ -243,7 +244,7 @@ fn dpp16(em: &mut Emitter<'_>, ins: &Insn) -> Result<Vec<String>, String> {
             0x160..=0x16f => (format!("{me} ^ {count}u"), "true".to_string()),
             _ => return Err(format!("paired wave64: DPP16 control {select:#x}")),
         };
-        lines.extend(from_lane(register, "tbd_", lane, &partner));
+        lines.extend(from_half(register, "tbd_", lane, &partner));
         let valid = if fetch_inactive { format!("({inside})") } else { format!("({inside}) && {}", source_active(lane)) };
         lines.push(format!("bool tbo_{lane} = {valid};"));
         lines.push(format!("if (!tbo_{lane}) tbd_{lane} = 0u;"));
@@ -269,7 +270,7 @@ fn permlane(em: &mut Emitter<'_>, ins: &Insn) -> Result<(), String> {
         let me = format!("(tb_pair + {}u)", 32 * lane);
         let selector = format!("((({me} & 8u) != 0u ? {high} : {low}) >> (4u * ({me} & 7u))) & 15u");
         let partner = format!("(({me} & ~15u){across}) | ({selector})");
-        for line in from_lane(u32::from(*from), "tbp_", lane, &partner) {
+        for line in from_half(u32::from(*from), "tbp_", lane, &partner) {
             em.line(&line);
         }
     }
@@ -300,7 +301,7 @@ fn ds_swizzle(em: &mut Emitter<'_>, ins: &Insn) -> Result<(), String> {
         } else {
             format!("({me} & ~31u) | ((({me} & {}u) | {}u) ^ {}u)", mode & 31, (mode >> 5) & 31, (mode >> 10) & 31)
         };
-        for line in from_lane(u32::from(*from), "tbs_", lane, &partner) {
+        for line in from_half(u32::from(*from), "tbs_", lane, &partner) {
             em.line(&line);
         }
         em.line(&format!("if (!({})) tbs_{lane} = 0u;", source_active(lane)));

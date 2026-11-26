@@ -84,6 +84,17 @@ PROGRAMS = {
 }
 
 
+PROGRAMS['exchange_chain'] = [
+    'v_mov_b32_e32 v10, v0', 'v_mov_b32_e32 v11, v1',
+    's_mov_b32 s30, 0x76543210', 's_mov_b32 s31, 0xfedcba98',
+] + [
+    'v_add_nc_u32 v10, v10, v11 dpp8:[1,0,3,2,5,4,7,6]',
+    'v_mov_b32_dpp v11, v10 row_shr:1 row_mask:0xf bank_mask:0xf bound_ctrl:1',
+    'v_permlanex16_b32 v10, v11, s30, s31',
+    'ds_swizzle_b32 v11, v10 offset:0x041f',
+] * 16
+
+
 def assemble(llvm_mc, lines):
     result = subprocess.run([str(llvm_mc), "-triple=amdgcn-amd-amdhsa", "-mcpu=gfx1030",
                              "-mattr=-wavefrontsize32,+wavefrontsize64", "-show-encoding"],
@@ -324,7 +335,8 @@ def inputs(rng):
 def selected():
     """Each program in one console wave per group, and some in four."""
     single = [(name, body, 64) for name, body in PROGRAMS.items()]
-    return single + [(f"{name}_x4", PROGRAMS[name], 256) for name in ("saveexec", "waterfall", "permlane", "dispatch")]
+    return single + [(f"{name}_x4", PROGRAMS[name], 256) for name in ("saveexec", "waterfall", "permlane", "dispatch",
+                           "dpp8", "row_shift", "row_masks", "swizzle", "exchange_chain")]
 
 
 def main(argv=None):

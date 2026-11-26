@@ -69,3 +69,17 @@ fn every_host_profile_receives_the_recorded_translation() {
         changed.join("\n")
     );
 }
+
+
+#[test]
+fn paired_local_exchanges_need_only_one_read_per_guest_lane() {
+    // All four instruction families select a source inside the lane's own
+    // 32-lane half. Each of these fixtures has exactly two exchange operations.
+    for name in ["dpp8", "row_shift", "row_masks", "permlane"] {
+        let (_, threads, words) = programs::PROGRAMS.iter().find(|p| p.0 == name).unwrap();
+        let hlsl = translate_paired_wave64(&program(*threads, words)).unwrap().hlsl;
+        assert_eq!(hlsl.matches("WaveReadLaneAt(").count(), 4, "{name}");
+        assert!(!hlsl.contains("tb_low"), "{name}");
+        assert!(!hlsl.contains("tb_high"), "{name}");
+    }
+}
