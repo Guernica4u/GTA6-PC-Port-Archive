@@ -1125,7 +1125,7 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     // the stand-in of the same two bytes per texel, and only where the host
     // takes that stand-in: the ladder and the copies keep their sizes, and a
     // host that renders to the format natively keeps its colours (#1952).
-    if let Some(stand_in) = crate::host::stand_in_for(d.format) {
+    if let Some(stand_in) = crate::host::stand_in_for(d.format, d.flags) {
         d.format = stand_in;
     }
     const DENY_SHADER_RESOURCE: u32 = 8;
@@ -2373,12 +2373,16 @@ mod tests {
         // It is chosen only where the host refuses the target and takes the
         // stand-in: a host that renders to 4-4-4-4 keeps its colours.
         assert_eq!(
-            crate::host::stand_in_decision(B4G4R4A4_UNORM, true, true),
+            crate::host::stand_in_decision(B4G4R4A4_UNORM, true, true, false),
             Some(B5G5R5A1_UNORM)
         );
-        assert_eq!(crate::host::stand_in_decision(B4G4R4A4_UNORM, false, true), None);
-        assert_eq!(crate::host::stand_in_decision(B4G4R4A4_UNORM, true, false), None);
-        assert_eq!(crate::host::stand_in_decision(28, true, true), None);
+        assert_eq!(crate::host::stand_in_decision(B4G4R4A4_UNORM, false, true, false), None);
+        assert_eq!(crate::host::stand_in_decision(B4G4R4A4_UNORM, true, false, false), None);
+        assert_eq!(crate::host::stand_in_decision(28, true, true, false), None);
+        // A texture written through an unordered access view keeps its
+        // format: the stand-in is not a typed-UAV format on the hosts that
+        // refuse 4-4-4-4, so it would lose the writes instead of the device.
+        assert_eq!(crate::host::stand_in_decision(B4G4R4A4_UNORM, true, true, true), None);
         // And the formats that answer for themselves still do.
         assert_eq!(pc_format(28), 28, "R8G8B8A8_UNORM is a PC format already");
         assert_eq!(pc_format(118), 20, "D32_FLOAT stands in as D32_FLOAT_S8X24");
@@ -3209,5 +3213,6 @@ mod tests {
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
     }
 }
+
 
 

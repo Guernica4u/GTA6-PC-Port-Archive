@@ -332,12 +332,24 @@ fn takes_render_target(format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORM
 /// device (#1952). AMD takes that format as a target, so the refusal is by
 /// vendor and not by format.
 /// The decision `stand_in_for` takes, without a device: the stand-in of a
-/// packed format the host refuses, when it takes the stand-in, `None`
-/// otherwise. Pure, so the cases are testable.
-pub(crate) fn stand_in_decision(format: u32, refused: bool, stand_in_taken: bool) -> Option<u32> {
+/// packed format the host refuses, when it takes the stand-in and the
+/// texture's own uses survive it, `None` otherwise. Pure, so the cases are
+/// testable.
+///
+/// A texture that is written through an unordered access view does **not**
+/// stand in: `B5G5R5A1_UNORM` is not a typed-UAV format on the hosts that
+/// refuse `B4G4R4A4_UNORM` either, so a stand-in would trade a removed
+/// device for lost writes (#1952's RTX 4060 report). There the description
+/// keeps its format and the view is refused instead.
+pub(crate) fn stand_in_decision(
+    format: u32,
+    refused: bool,
+    stand_in_taken: bool,
+    unordered_use: bool,
+) -> Option<u32> {
     const B4G4R4A4_UNORM: u32 = 115;
     const B5G5R5A1_UNORM: u32 = 86;
-    if format == B4G4R4A4_UNORM && refused && stand_in_taken {
+    if format == B4G4R4A4_UNORM && refused && stand_in_taken && !unordered_use {
         Some(B5G5R5A1_UNORM)
     } else {
         None
@@ -349,7 +361,7 @@ pub(crate) fn stand_in_decision(format: u32, refused: bool, stand_in_taken: bool
 /// query and then refuses the view removes the device (#1952): the target is
 /// made as `B5G5R5A1_UNORM` when that is refused too as a view and the host
 /// takes the stand-in, so a host that renders to the format keeps it.
-pub(crate) fn stand_in_for(format: u32) -> Option<u32> {
+pub(crate) fn stand_in_for(format: u32, flags: u32) -> Option<u32> {
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
     if format != 115 {
         return None;
@@ -357,7 +369,18 @@ pub(crate) fn stand_in_for(format: u32) -> Option<u32> {
     let host = host()?;
     let refused =
         refuses_target(host.vendor, format) || !takes_render_target(DXGI_FORMAT(format as i32));
-    stand_in_decision(format, refused, takes_render_target(DXGI_FORMAT(86)))
+    // The texture's own uses: with unordered access, a stand-in that cannot
+    // be a typed UAV would lose the writes it exists for.
+    const UNORDERED: u32 = 4;
+    let unordered_use = flags & UNORDERED != 0;
+    let stand_in = stand_in_decision(format, refused, takes_render_target(DXGI_FORMAT(86)), unordered_use);
+    if stand_in.is_none() && refused && unordered_use {
+        tracing::debug!(
+            format,
+            "a packed target stays as it is: it is written through unordered access and the stand-in cannot be a typed UAV"
+        );
+    }
+    stand_in
 }
 
 fn refuses_target(vendor: u32, format: u32) -> bool {
@@ -4240,4 +4263,5 @@ mod present_plane_tests {
         assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
     }
 }
+
 
