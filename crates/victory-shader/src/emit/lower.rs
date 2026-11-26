@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod masks;
 
 type Why = &'static str;
 
@@ -215,6 +216,12 @@ struct Lower<'a> {
     x: &'a Parts<'a>,
     bad: &'a HashMap<Value, Why>,
     lane_fail: HashMap<Value, Why>,
+    /// The mask phis registered while a tolerated mask read was evaluated:
+    /// an edge the structure cannot name gives them no lanes instead of
+    /// failing the program.
+    lenient_phis: HashSet<Value>,
+    /// Whether such an evaluation is running.
+    lenient: bool,
     vals: HashMap<Value, Val>,
     floats: HashMap<Value, V>,
     /// Values (missing in `vals`) whose low 16 bits are known: a 16-bit
@@ -682,6 +689,8 @@ impl<'a> Lower<'a> {
             x,
             bad,
             lane_fail: HashMap::new(),
+            lenient: false,
+            lenient_phis: HashSet::new(),
             vals: HashMap::new(),
             floats: HashMap::new(),
             low16: HashMap::new(),
@@ -1665,8 +1674,11 @@ impl<'a> Lower<'a> {
         }
         let is_mask = self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v);
         match self.vals.get(&v) {
-            Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
+            Some(&Val::Missing(_)) | None if is_mask => {
                 return self.mask_dword(v).map(Val::I32);
+            }
+            _ if self.lane_bits.contains_key(&v) => {
+                return self.bit_masked(v).map(Val::I32);
             }
             Some(&Val::Missing(w)) => return Err(w),
             Some(&val) => return Ok(val),
@@ -2603,6 +2615,9 @@ impl<'a> Lower<'a> {
             Atom::Phi(id) => {
                 if let Some(&v) = self.mask_phis.get(&id) {
                     return Ok(v);
+                }
+                if self.lenient {
+                    self.lenient_phis.insert(id);
                 }
                 let &(b, i) = self
                     .phi_at
@@ -3616,8 +3631,9 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
+        let narrow = matches!(dst, Some(Operand::Scalar { dwords: 1, .. }));
         if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
-            return Err(LANE_MASK);
+            return self.mask_scalar(inst, lo, narrow);
         }
         if matches!(
             name,
@@ -10940,12 +10956,19 @@ impl<'a> Lower<'a> {
                 // walks pop masks from memory): with console lanes the lane's
                 // own bit of the number, as `Atom::Opaque`.
                 let number = self.console_lanes && !self.x.native.wave64 && self.uniform_join(b);
+                let bit = self.lane_bits.get(&arg).copied();
                 let x = match (self.x.st.masks.get(&arg), self.vals.get(&arg)) {
                     (Some(&m), _) => self.boolean(m, qb).map_err(|w| unsupported(offset, w))?,
+                    // A mask the emitter has a bit for (below).
+                    (None, _) if bit.is_some() => bit.expect("a bit"),
                     (None, Some(&Val::I32(word))) if number => self.lane_bit(qb, word, None),
                     (None, _) if !self.uniform_join(b) && self.no_mask_lane_on_edge(b, &phi.args, n) => {
                         self.s.m.bool(false)
                     }
+                    // shortcut: a phi registered while a mask was read for a
+                    // mask-writing scalar op gives an unnamed edge no lanes;
+                    // other mask joins keep the refusal.
+                    (None, _) if self.lenient_phis.contains(&phi.value) => self.s.m.bool(false),
                     (None, _) => return Err(unsupported(offset, UNTRACKED)),
                 };
                 incoming.push((x, qb));
