@@ -757,8 +757,13 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         // world frame so far misses memory (98 661 pages and 33 256-MiB region
         // marks in one: the title reads 0x740000000-0x780000000, a gigabyte
         // with no copy), so with the rule above nothing is ever copied back -
-        // and the title's own memory never sees what its shaders wrote. The
-        // switch says whether that is what keeps the game from advancing.
+        // and the title's own memory never sees what its shaders wrote.
+        //
+        // Measured, and the rule above is right: both arms that set the switch
+        // (run ncb1/cb1, cb2) died before the world - 0xc0000005 reading 0x8
+        // and 0x80000003 in the title's own image. Copying back what a list
+        // computed from zeros hands the title garbage pointers, exactly as the
+        // note above says. The switch stays to show that, not to use.
         let forced = cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_ALLOW_COPYBACK");
         let withheld = if !forced && (pages + regions > 0 || withholding()) {
             writes.len() as u64
