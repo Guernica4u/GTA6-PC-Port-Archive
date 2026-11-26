@@ -104,23 +104,28 @@ pub(crate) enum C {
     /// Title threads writing a view into a shader-visible heap: time
     /// waiting for the heaps' lock (held by heap syncs and other writers).
     MirrorWaitUs,
-    /// Mirrors of a heap slot, and what each did with it: made a host view
-    /// (of those, from a texture view, from a buffer view a shader reads,
-    /// from one it writes through, and from anything else — a constant
-    /// buffer or a memory view); left a placed texture for its read; found
-    /// the record the slot already held; nulled a slot whose record names no
-    /// view of ours; passed by a slot that never held a view; and passed
-    /// over a slot past the heap.
+    /// Mirrors of a heap slot, and what each did with it: the rest of these
+    /// sum to this count, on every path `HostHeap::mirror` can take.
     MirrorCalls,
+    /// A host view made from the slot's record.
     MirrorMade,
+    /// ... of those, made from a texture view.
     MirrorTexture,
+    /// ... from a buffer view a shader reads.
     MirrorBufferRead,
+    /// ... from a buffer view a shader writes through.
     MirrorBufferWrite,
+    /// ... from anything else: a constant buffer, or a memory view.
     MirrorOther,
+    /// A placed texture left for its read mark (nothing made yet).
     MirrorDeferred,
+    /// A record the slot already held.
     MirrorCurrent,
+    /// A record naming no view of ours, over a slot that held one.
     MirrorNull,
+    /// A record naming no view of ours, over a slot that held none.
     MirrorEmpty,
+    /// A slot past the heap.
     MirrorPast,
 }
 /// One per [`C`] variant: a counter added without its slot would read past
