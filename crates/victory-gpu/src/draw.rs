@@ -2305,9 +2305,6 @@ mod tests {
         unsafe { VirtualFree(page.cast(), 0, MEM_RELEASE) };
     }
 
-    }
-
-    #[test]
     /// A draw that reads view addresses makes its list keep the table: the
     /// title may release the heap before the list runs.
     #[test]
@@ -2323,6 +2320,7 @@ mod tests {
         assert_eq!(gpu, unsafe { heap.view_addresses_buffer().unwrap().GetGPUVirtualAddress() });
         list.close();
     }
+
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
     use windows::Win32::Graphics::Direct3D::ID3DBlob;
     use windows::core::s;
