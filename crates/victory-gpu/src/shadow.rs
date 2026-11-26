@@ -425,42 +425,49 @@ impl Shadow {
             let mut seg_idx = segments.partition_point(|(at, bytes)| at + bytes.len() <= from);
             let mut at = from;
             while at < to && seg_idx < segments.len() {
-                let (taken, before) = &segments[seg_idx];
-                if *taken > at {
-                    at = (*taken).min(to);
-                    continue;
-                }
-                let seg_end = taken + before.len();
-                if at >= seg_end {
-                    seg_idx += 1;
-                    continue;
-                }
-                let n = (PIECE - (start + at) % PIECE).min(to - at).min(seg_end - at);
-                // SAFETY: inside the mapping; only the submitting thread
-                // writes it.
-                let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - taken..at - taken + n];
-                let title = &mut title[..n];
+                let piece_len = (PIECE - (start + at) % PIECE).min(to - at);
+                let piece_end = at + piece_len;
                 // A whole piece is compared once per submission, whichever
                 // declared ranges overlap it: then what the GPU wrote there
                 // went back.
-                if n == PIECE && !compared.insert(start + at) {
-                    at += n;
+                if piece_len == PIECE && !compared.insert(start + at) {
+                    at = piece_end;
                     continue;
                 }
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
-                    // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
-                    if merge_writeback(title, host, old) {
-                        let _writing = crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
+                while at < piece_end && seg_idx < segments.len() {
+                    let (taken, before) = &segments[seg_idx];
+                    if *taken >= piece_end {
+                        break;
                     }
-                    synced.push((start + at) / PAGE);
+                    if *taken > at {
+                        at = *taken;
+                    }
+                    let seg_end = taken + before.len();
+                    if at >= seg_end {
+                        seg_idx += 1;
+                        continue;
+                    }
+                    let n = (piece_end - at).min(seg_end - at);
+                    // SAFETY: inside the mapping; only the submitting thread
+                    // writes it.
+                    let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                    let old = &before[at - taken..at - taken + n];
+                    let title = &mut title[..n];
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
+                    if host != old && crate::host::read_into((start + at) as *const u8, title) {
+                        // Title memory with the GPU's bytes put in; the copy
+                        // takes the title's bytes in turn.
+                        if merge_writeback(title, host, old) {
+                            let _writing = crate::watch::writing(start + at, n);
+                            crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                            written += n;
+                        }
+                        synced.push((start + at) / PAGE);
+                    }
+                    at += n;
                 }
-                at += n;
+                at = piece_end;
             }
             give_back(title);
             // Pages made equal to title memory are current in the copy, so
@@ -1694,6 +1701,7 @@ pub(crate) mod tests {
         copy.writing(p + PAGE + 16, PAGE - 16, false);
         copy.writing(p + 128, 2 * PAGE - 256, false);
         copy.writing(p, len, false);
+        copy.writing(p, PAGE, false);
         {
             let before = copy.before.lock().unwrap();
             let segs = &before.0;
@@ -1715,6 +1723,11 @@ pub(crate) mod tests {
         assert_eq!(read(PAGE - 4), 0xbb);
         assert_eq!(read(PAGE + 4), 0xcc);
         assert_eq!(read(PAGE + 100), 0x55);
+        // A second overlapping copy_back on a split 64 KiB piece must skip it.
+        // SAFETY: a byte of our pool.
+        unsafe { title(PAGE - 4).write_volatile(0x77) };
+        assert_eq!(copy.copy_back(p, PAGE), 0);
+        assert_eq!(read(PAGE - 4), 0x77);
         unregister(p, p as u64);
     }
 }
