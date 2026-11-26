@@ -2536,25 +2536,44 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
 /// For device-removed reports: the copy of title memory whose host range
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
-    let mut all: Vec<(u64, u64, u64)> = buffers()
-        .values()
-        .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
-        .collect();
-    all.extend(
-        LOOSE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .map(|s| (s.gpu, s.start, s.len)),
-    );
-    for s in SPARSE.lock().unwrap_or_else(|e| e.into_inner()).values().flatten() {
-        all.push((s.gpu, s.start, s.len));
-        if let Some(sparse) = &s.sparse {
-            let aliases = sparse.aliases.lock().unwrap_or_else(|e| e.into_inner());
-            all.extend(aliases.iter().map(|a| (a.gpu, a.start, a.len)));
+    // Each table only if it is free: the device may be found removed by a
+    // call made while this thread holds one of them (`find_copy` and
+    // `loose` make buffers under `BUFFERS` and `LOOSE`), and the locks are
+    // not reentrant. A table in use is left out and said so.
+    fn free<T>(m: &Mutex<T>) -> Option<std::sync::MutexGuard<'_, T>> {
+        match m.try_lock() {
+            Ok(g) => Some(g),
+            Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
         }
     }
-    all.extend(windows_of_memory().values().map(|s| (s.gpu, s.start, s.len)));
+    let mut busy = Vec::new();
+    let mut all: Vec<(u64, u64, u64)> = Vec::new();
+    match free(&BUFFERS) {
+        Some(b) => all.extend(b.values().filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))),
+        None => busy.push("buffers"),
+    }
+    match free(&LOOSE) {
+        Some(l) => all.extend(l.values().map(|s| (s.gpu, s.start, s.len))),
+        None => busy.push("loose copies"),
+    }
+    match free(&SPARSE) {
+        Some(sparse) => {
+            for s in sparse.values().flatten() {
+                all.push((s.gpu, s.start, s.len));
+                if let Some(sparse) = &s.sparse
+                    && let Some(aliases) = free(&sparse.aliases)
+                {
+                    all.extend(aliases.iter().map(|a| (a.gpu, a.start, a.len)));
+                }
+            }
+        }
+        None => busy.push("sparse copies"),
+    }
+    match free(&DIRECT) {
+        Some(d) => all.extend(d.values().map(|s| (s.gpu, s.start, s.len))),
+        None => busy.push("windows"),
+    }
     let below = all.iter().filter(|c| c.0 <= va).max();
     let above = all.iter().filter(|c| c.0 > va).min();
     let mut text = match below {
@@ -2570,12 +2589,28 @@ pub(crate) fn near(va: u64) -> String {
             all.len()
         ));
     }
+    if !busy.is_empty() {
+        text.push_str(&format!(" (in use on this thread or another, not looked at: {})", busy.join(", ")));
+    }
     text
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The removed-device report looks for title memory near a faulting
+    /// address while the thread that found the removal may hold a table
+    /// (`find_copy` makes buffers under `BUFFERS`): it leaves that table out
+    /// instead of waiting on itself.
+    #[test]
+    fn near_leaves_out_a_table_this_thread_holds() {
+        let held = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
+        let text = near(0x1234_0000);
+        drop(held);
+        assert!(text.contains("not looked at: buffers"), "{text}");
+        assert!(!near(0x1234_0000).contains("not looked at"));
+    }
     use std::ops::Range;
 
     #[test]
