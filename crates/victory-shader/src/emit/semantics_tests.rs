@@ -816,14 +816,17 @@ fn mods_in(x: u32, k: usize, m: M) -> u32 {
 /// into +0, then the clamp to [0, 1], which gives +0 for NaN (DX10 clamp)
 /// and for -0. Measured on RDNA2 by the Leonida project (gfx1031 and
 /// gfx1036 for the multiplier with IEEE off and denormals flushed; the
-/// clamp's -0 and NaN on gfx1036 for f16).
+/// clamp's -0 and NaN on gfx1036 for f16). On gfx1035 a nonzero normal
+/// that underflows under div:2 keeps its sign (AnyPS5 #567).
 fn mods_out(r: u32, m: M) -> u32 {
     let mut r = r;
     if m.omod != 0 && !nan(r) {
-        r = out(fl(r) * [1.0, 2.0, 4.0, 0.5][usize::from(m.omod)]);
-        if r == 0x8000_0000 {
-            r = 0;
-        }
+        let x = d(r);
+        r = if x == 0.0 {
+            0
+        } else {
+            out64(x * [1.0, 2.0, 4.0, 0.5][usize::from(m.omod)])
+        };
     }
     if m.clamp {
         r = if nan(r) || fl(r) <= 0.0 {
@@ -2891,6 +2894,37 @@ fn output_multipliers_give_positive_zero() {
     p.extend(min_max_probes());
     p.extend(transcendental_probes());
     defect(p, OMOD);
+}
+
+/// gfx1035 (AnyPS5 #567): div:2 flushes the lowest normal binade before
+/// rounding. A zero that was already zero loses its sign.
+#[test]
+fn div2_of_the_lowest_binade_keeps_the_sign() {
+    let half = M { omod: 3, ..NONE };
+    let rows = [
+        (0x0000_0000, 0),
+        (0x8000_0000, 0),
+        (0x0080_0000, 0),
+        (0x8080_0000, 0x8000_0000),
+        (0x00FF_FFFF, 0),
+        (0x80FF_FFFF, 0x8000_0000),
+        (0x0100_0000, 0x0080_0000),
+        (0x8100_0000, 0x8080_0000),
+    ];
+    // Multiply x by one, add zero to x, and take min(x, x).
+    let body = [
+        vop3(0x108, 5, [v(1), v(2), 0], half),
+        vop3(0x103, 6, [int(0), v(1), 0], half),
+        vop3(0x10F, 7, [v(1), v(1), 0], half),
+    ]
+    .concat();
+    let inputs = rows.map(|(x, expected)| [x, 1.0f32.to_bits(), expected, OLD]);
+    assert_clean(check(&[probe(body, inputs.to_vec(), INT, |i| {
+        vec![i[2]; 3]
+    })]));
+    for (x, expected) in rows {
+        assert_eq!(mods_out(x, half), expected, "model div:2 of {x:08x}");
+    }
 }
 
 /// Denormal operands of `v_min/max/med3/min3/max3_f32` read as zeros of
