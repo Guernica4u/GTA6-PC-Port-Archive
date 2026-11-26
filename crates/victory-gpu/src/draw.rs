@@ -101,6 +101,9 @@ pub(crate) struct State {
     /// slot, end): taken [`ROOT_VIEW_RUN`] at a time, so that single slots
     /// do not break up the runs fresh tables need.
     root_run: (usize, u32, u32),
+    /// The view-stride table last kept in the host list, so that its draws
+    /// keep it once rather than once per stage ([`State::bind`]).
+    stride_table: usize,
     /// What was set straight onto the host list, for the next segment of
     /// the list ([`State::cut`]).
     fixed: Fixed,
@@ -369,6 +372,7 @@ impl State {
     pub(crate) fn host_state_lost(&mut self) {
         // No title heaps (0) differ from what the host list has, too.
         (self.host_pipeline, self.host_roots, self.host_heaps) = (0, [0; 2], [usize::MAX; 2]);
+        self.stride_table = 0;
     }
 
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
@@ -922,7 +926,12 @@ impl State {
                             not_run("view strides without a view heap");
                             return false;
                         };
-                        list.keep(table);
+                        // Kept once per table: the same table is bound again
+                        // by every draw of this pipeline.
+                        if self.stride_table != table.as_raw() as usize {
+                            self.stride_table = table.as_raw() as usize;
+                            list.keep(table);
+                        }
                         // SAFETY: an open list; the table lives while the list
                         // holds it.
                         unsafe {
@@ -2260,6 +2269,14 @@ fn expand_title_rects(from: usize, to: usize, n: usize, stride: usize, elements:
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_lost_host_state_forgets_the_kept_stride_table() {
+        let mut state = State::default();
+        state.stride_table = 0x1000;
+        state.host_state_lost();
+        assert_eq!(state.stride_table, 0);
+    }
+
     use super::*;
 
     /// A root signature that indexes the heaps directly needs one of each
