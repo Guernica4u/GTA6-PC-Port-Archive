@@ -55,7 +55,7 @@ pub fn show() -> Result<()> {
             a.name,
             a.vendor,
             a.device,
-            a.driver.as_deref().unwrap_or("unknown"),
+            driver_text(a.driver.as_deref(), wine.is_some()),
             a.dedicated_mb,
             a.shared_mb,
             if a.software { ", software" } else { "" },
@@ -174,6 +174,19 @@ fn memory() -> Option<windows_sys::Win32::System::SystemInformation::MEMORYSTATU
     (unsafe { GlobalMemoryStatusEx(&mut status) } != 0).then_some(status)
 }
 
+/// The driver version as reported. Under Wine (and Proton) DXGI makes one
+/// up ending in `65535.65535` (`32.0.65535.65535` seen on an RTX 3090): it
+/// is said to be Wine's, since the host's Linux driver is not visible here.
+fn driver_text(driver: Option<&str>, wine: bool) -> String {
+    match driver {
+        None => "unknown".to_owned(),
+        Some(v) if wine && v.ends_with(".65535.65535") => {
+            format!("{v} (Wine's placeholder, not the host driver)")
+        }
+        Some(v) => v.to_owned(),
+    }
+}
+
 /// Wine's version when running under it (Proton too): its ntdll exports
 /// `wine_get_version`.
 fn wine_version() -> Option<String> {
@@ -235,6 +248,18 @@ mod tests {
         };
         assert!(problems(&d)[0].contains("311744 of the title's descriptor slots"));
         assert!(describe(&d).contains("view heap capped, 933440 of the title's 1245184 slots"));
+    }
+
+    #[test]
+    fn wines_placeholder_driver_version_is_named() {
+        assert_eq!(
+            driver_text(Some("32.0.65535.65535"), true),
+            "32.0.65535.65535 (Wine's placeholder, not the host driver)"
+        );
+        // Outside Wine, or a real version under it, as reported.
+        assert_eq!(driver_text(Some("32.0.65535.65535"), false), "32.0.65535.65535");
+        assert_eq!(driver_text(Some("32.0.32015.2008"), true), "32.0.32015.2008");
+        assert_eq!(driver_text(None, true), "unknown");
     }
 
     #[test]
