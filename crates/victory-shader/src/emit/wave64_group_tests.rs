@@ -14,6 +14,7 @@ const EXEC: u32 = 126;
 const VCC: u32 = 106;
 const GUARD: usize = 8;
 const OUTPUTS: usize = 7;
+const WAIT_LGKM: u32 = 0xBF8C_C07F; // s_waitcnt lgkmcnt(0)
 
 const fn k(value: u32) -> u32 {
     128 + value
@@ -48,6 +49,7 @@ fn guest(threads: u32) -> NativeProgram {
     ];
     words.extend(ds(0x0D, 0, 11, 12));
     words.extend([
+        WAIT_LGKM, // finish initialization before any lane adds to the counter
         sop1(4, EXEC, 22),
         alu(0x1B, 3, k(3), 2),
         alu(0x25, 3, k(1), 3),
@@ -55,17 +57,22 @@ fn guest(threads: u32) -> NativeProgram {
         mov(4, k(0)),
         mov(13, k(1)),
         sop1(4, 20, EXEC),
-        alu(0x25, 4, v(2), 4), // loop: accumulate the lane number
     ]);
+    let loop_start = words.len();
+    words.push(alu(0x25, 4, v(2), 4)); // loop: accumulate the lane number
     words.extend(ds(0, 0, 11, 13)); // ds_add_u32: add one per participating lane
     words.extend([
+        WAIT_LGKM,            // finish this iteration's atomics before narrowing EXEC
         alu(0x25, 3, 193, 3), // decrement remaining rounds
         cmp(0xC5, k(0), 3),
         0x8000_0000 | 0x0F << 23 | EXEC << 16 | VCC << 8 | EXEC, // s_and_b64 exec, exec, vcc
-        0xBF89_FFF9,                                             // s_cbranch_execnz loop
-        sop1(4, EXEC, 20),
     ]);
+    // SOPP offsets count dwords from the instruction following the branch.
+    let back = i16::try_from(loop_start as isize - (words.len() + 1) as isize).unwrap();
+    words.push(0xBF89_0000 | u32::from(back as u16)); // s_cbranch_execnz loop
+    words.push(sop1(4, EXEC, 20));
     words.extend(ds(0x36, 5, 11, 0)); // v5: total from own wave
+    words.push(WAIT_LGKM); // v5 must be ready before the 64-thread path copies it
 
     // Different EXEC masks select a source above 32 and below 32 in each wave.
     for (threshold, shift, scalar, dest) in [(39, 3, 6, 6), (19, 2, 7, 9)] {
@@ -89,12 +96,15 @@ fn guest(threads: u32) -> NativeProgram {
     ]);
     let [op, args] = ds(0x0D, 0, 10, 4);
     words.extend([op | 8, args]);
+    words.push(WAIT_LGKM); // make every lane's write visible to its opposite half
     let [op, args] = ds(0x36, 10, 14, 0);
     words.extend([op | 8, args]);
+    words.push(WAIT_LGKM); // finish all outstanding LDS before the group barrier
 
     if threads == 128 {
         words.extend([0xBF8A_0000, alu(0x1D, 14, k(4), 11)]); // s_barrier, then other wave's LDS
         words.extend(ds(0x36, 7, 14, 0));
+        words.push(WAIT_LGKM); // peer counter ready before any output consumes v7
     } else {
         words.push(mov(7, v(5)));
     }
@@ -103,7 +113,7 @@ fn guest(threads: u32) -> NativeProgram {
         words.extend([
             0x3D << 26 | 0x02 << 18 | 8 << 6 | 2, // s_load_dwordx4 s[8:11], s[4:5]
             125 << 25 | (slot as u32 * 32),
-            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            WAIT_LGKM, // descriptor ready before the buffer store
             0xE070_1000,
             0x8002_0000 | reg << 8 | 15, // buffer_store_dword v<reg>, v15, s[8:11], 0 offen
         ]);
@@ -157,6 +167,60 @@ fn oracle(threads: u32, thread: u32) -> [u32; OUTPUTS] {
     ]
 }
 
+#[test]
+fn guest_lds_dependencies_and_branches() {
+    use crate::gfx10::{Encoding, decode};
+    for threads in [64, 128] {
+        let native = guest(threads);
+        let code = decode(&native.code).expect("decode complete synthetic guest");
+        assert_eq!(
+            code.iter().map(|i| i.words.len() * 4).sum::<usize>(),
+            native.code.len()
+        );
+        for pair in code.windows(2) {
+            if matches!(pair[0].encoding, Encoding::Ds | Encoding::Smem) {
+                assert_eq!(
+                    pair[1].words,
+                    [WAIT_LGKM],
+                    "pending LDS/SMEM at {}",
+                    pair[0].offset
+                );
+            }
+            if pair[1].name() == Some("s_barrier") {
+                assert_eq!(pair[0].words, [WAIT_LGKM], "wait before group barrier");
+            }
+        }
+        let branches: Vec<_> = code
+            .iter()
+            .filter(|i| i.name() == Some("s_cbranch_execnz"))
+            .collect();
+        assert_eq!(branches.len(), 1);
+        let branch = branches[0];
+        let delta = i32::from(branch.words[0] as i16) * 4;
+        let target = (branch.offset as i32 + 4 + delta) as usize;
+        let start = code
+            .iter()
+            .position(|i| i.offset == target)
+            .expect("branch targets an instruction boundary");
+        assert_eq!(
+            code[start].words,
+            [alu(0x25, 4, v(2), 4)],
+            "loop accumulation"
+        );
+        assert_eq!(code[start + 1].name(), Some("ds_add_u32"));
+        assert_eq!(
+            code.iter()
+                .filter(|i| i.name() == Some("s_barrier"))
+                .count(),
+            usize::from(threads == 128)
+        );
+        eprintln!(
+            "{threads} threads: branch {} -> {target} ({delta} bytes from next PC), all LDS/SMEM producers waited, barrier audited",
+            branch.offset
+        );
+    }
+}
+
 fn translate(native: &NativeProgram, _: &Host) -> Result<HostShader, ShaderError> {
     let bytes = dxbc::build(&[]);
     let container = dxbc::Container::parse(&bytes)?;
@@ -188,10 +252,32 @@ fn debug_warnings(queue: &ID3D12InfoQueue) -> Vec<String> {
 }
 
 fn run(threads: u32) {
-    static DEBUG: std::sync::Once = std::sync::Once::new();
-    // SAFETY: These opt-in tests run in isolation and enable the debug layer
-    // before creating the first device in the test process.
-    DEBUG.call_once(|| unsafe {
+    // Hold the parent's shared hardware lock throughout the child's lifetime,
+    // including when other GPU tests run with --include-ignored.
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let test = format!("emit::wave64_group_tests::wave64_2688_group_{threads}");
+    const CHILD: &str = "VICTORY_WAVE64_2688_CHILD";
+    if std::env::var(CHILD).as_deref() != Ok(test.as_str()) {
+        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                &test,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, &test)
+            .status()
+            .expect("start isolated GPU validation test");
+        assert!(status.success(), "isolated {test}: {status}");
+        return;
+    }
+
+    // SAFETY: The fresh child selects exactly this one test. No device has
+    // been created in this process before enabling GPU-based validation.
+    unsafe {
         let mut debug: Option<ID3D12Debug> = None;
         D3D12GetDebugInterface(&mut debug).expect("D3D12 Graphics Tools");
         let debug = debug.expect("D3D12 debug interface");
@@ -200,8 +286,12 @@ fn run(threads: u32) {
             .cast::<ID3D12Debug1>()
             .unwrap()
             .SetEnableGPUBasedValidation(true);
-    });
-    let host = Host::new(false).expect("hardware D3D12 adapter");
+    }
+    // Host::new honors VICTORY_WARP; the child inherits it unchanged.
+    let host = Host::new(false).expect("selected D3D12 adapter");
+    let queue: ID3D12InfoQueue = host.device.cast().expect("D3D12 info queue");
+    let warnings = debug_warnings(&queue);
+    assert!(warnings.is_empty(), "D3D12 initialization: {warnings:#?}");
     let mut caps = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
     // SAFETY: The feature query writes only into the matching D3D12 description.
     unsafe {
@@ -213,10 +303,17 @@ fn run(threads: u32) {
             )
             .expect("wave capabilities");
     }
-    assert_eq!((caps.WaveLaneCountMin, caps.WaveLaneCountMax), (32, 32));
-    let queue: ID3D12InfoQueue = host.device.cast().expect("D3D12 info queue");
-    // SAFETY: The queue belongs to this test's device.
-    unsafe { queue.ClearStoredMessages() };
+    if !caps.WaveOps.as_bool() || (caps.WaveLaneCountMin, caps.WaveLaneCountMax) != (32, 32) {
+        eprintln!(
+            "SKIP {test}: requires exclusively wave32; WaveOps={}, lanes=({}, {}), VICTORY_WARP={:?}",
+            caps.WaveOps.as_bool(),
+            caps.WaveLaneCountMin,
+            caps.WaveLaneCountMax,
+            std::env::var_os("VICTORY_WARP")
+        );
+        return;
+    }
+    eprintln!("{test}: exclusively wave32, GPU-based validation enabled before first device");
     let mut shader = translate(&guest(threads), &host).expect("translate synthetic wave64");
     validator::Validator::load(validator::Validator::default_path().as_deref())
         .expect("DXIL validator")
@@ -241,35 +338,61 @@ fn run(threads: u32) {
                 groups: [1, 1, 1],
             },
         )
-        .expect("dispatch and readback");
+        .unwrap_or_else(|error| {
+            panic!(
+                "dispatch and readback: {error}; D3D12 validation: {:#?}",
+                debug_warnings(&queue)
+            )
+        });
     let warnings = debug_warnings(&queue);
-    assert!(warnings.is_empty(), "D3D12 validation: {warnings:#?}");
+    let mut failures = warnings.clone();
     assert_eq!(out.len(), OUTPUTS);
     for (slot, words) in out.iter().enumerate() {
         assert_eq!(words.len(), threads as usize + GUARD);
-        for thread in 0..threads {
-            assert_eq!(
-                words[thread as usize],
-                oracle(threads, thread)[slot],
-                "UAV {slot}, thread {thread}"
-            );
+        let mismatches: Vec<_> = (0..threads)
+            .filter_map(|thread| {
+                let got = words[thread as usize];
+                let expected = oracle(threads, thread)[slot];
+                (got != expected).then_some((thread, got, expected))
+            })
+            .collect();
+        if let Some((thread, got, expected)) = mismatches.first() {
+            failures.push(format!(
+                "UAV {slot}, thread {thread}: got {got}, expected {expected} ({} mismatches)",
+                mismatches.len()
+            ));
         }
-        assert_eq!(&words[threads as usize..], &[0; GUARD], "UAV {slot} guard");
+        let guards_ok = words[threads as usize..] == [0; GUARD];
+        if !guards_ok {
+            failures.push(format!(
+                "UAV {slot} guard: {:?}",
+                &words[threads as usize..]
+            ));
+        }
+        eprintln!(
+            "UAV {slot}: {threads} lanes checked, {} mismatches, {GUARD} canaries intact={guards_ok}",
+            mismatches.len()
+        );
     }
+    eprintln!("D3D12 warnings/errors: {warnings:#?}");
+    assert!(
+        failures.is_empty(),
+        "readback/validation failures: {failures:#?}"
+    );
     eprintln!(
         "{threads} guest threads: {OUTPUTS} UAVs match CPU, guards intact, no D3D12 warnings/errors"
     );
 }
 
-// Select only these tests so GPU validation is enabled before device creation.
+// Known-red regressions stay opt-in until the backend fix for #2688 lands.
 #[test]
-#[ignore = "requires a wave32 GPU, Graphics Tools, and DXIL validator"]
+#[ignore = "known regression: fails until #2688 is fixed; requires exclusively wave32, Graphics Tools, and DXIL validator"]
 fn wave64_2688_group_64() {
     run(64);
 }
 
 #[test]
-#[ignore = "requires a wave32 GPU, Graphics Tools, and DXIL validator"]
+#[ignore = "known regression: fails until #2688 is fixed; requires exclusively wave32, Graphics Tools, and DXIL validator"]
 fn wave64_2688_group_128() {
     run(128);
 }
