@@ -3422,7 +3422,7 @@ fn v_cmp_class_f32_matches_rdna2() {
             "{backend}: v_cmp_class_f32_sdwa(-word0({:#010x}), {:#05x}) = {got}, want {want}",
             inp[0], inp[1],
         );
-}
+    });
 }
 
 #[test]
@@ -3478,6 +3478,7 @@ fn v_cmp_f_and_t_64bit_match_rdna2() {
 }
 }
 
+#[test]
 fn v_cndmask_b32_with_untracked_mask_selects_per_lane() {
     let total_threads = 32u32;
     let mut words = Vec::new();

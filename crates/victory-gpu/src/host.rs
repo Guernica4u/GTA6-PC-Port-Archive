@@ -693,7 +693,6 @@ pub(crate) mod tests {
         assert_eq!(list.twin_use(&depth, crate::twin::TWIN, true), Some(false));
     }
 
-    #[test]
     /// A texture a list sampled is uploaded again for draws after a copy
     /// of the list rewrote its memory.
     #[test]

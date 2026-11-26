@@ -1814,7 +1814,6 @@ pub(crate) mod tests {
         assert_eq!(bits[w], 0, "the sink bit is cleared too");
     }
 
-    #[test]
     /// A copy that holds its first page only in part: after a marked
     /// copy-back puts the shaders' bytes into title memory, the page is
     /// guarded again, so the next submission's marked writes there go back.
@@ -1842,7 +1841,6 @@ pub(crate) mod tests {
         unregister(p, start as u64);
     }
 
-    #[test]
     /// Unmapping another mapping of an armed page leaves the copy's mapping
     /// guarded and clean: the shaders' marked writes still go back, and a
     /// title write to the surviving mapping still saves the page's old bytes
@@ -1887,7 +1885,6 @@ pub(crate) mod tests {
         unregister(a, a as u64);
     }
 
-    #[test]
     /// A marked copy-back advances the snapshot of the declared range over
     /// the same page with the copy, so that range's copy-back does not put
     /// the title's bytes it took back over a title write made since.

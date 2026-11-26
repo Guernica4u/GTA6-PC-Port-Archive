@@ -21,13 +21,16 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
 }
 
 fn build_with(words: &[u32], buffers: bool, wave_ops: bool) -> HostShader {
-
-    build_expecting(words, buffers, 1)
+    build_full(words, buffers, wave_ops, 1)
 }
 
 /// Like [`build`], with an expected `nonuniform_handles` count (0 for a
 /// uniform `image_get_resinfo`).
 fn build_expecting(words: &[u32], buffers: bool, nonuniform_handles: u32) -> HostShader {
+    build_full(words, buffers, false, nonuniform_handles)
+}
+
+fn build_full(words: &[u32], buffers: bool, wave_ops: bool, nonuniform_handles: u32) -> HostShader {
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -84,13 +87,10 @@ fn build_expecting(words: &[u32], buffers: bool, nonuniform_handles: u32) -> Hos
         view_marks: false,
     })
     .expect("lower");
-    // One access with each lane's own heap index, no wave operation unless
-    // another read stays uniform.
-    assert_eq!(lowered.nonuniform_handles, 1);
-    assert_eq!(lowered.wave_ops, wave_ops);
-
+    // Each lane's own heap index (none for a uniform read), no wave
+    // operation unless another read stays uniform.
     assert_eq!(lowered.nonuniform_handles, nonuniform_handles);
-    assert!(!lowered.wave_ops);
+    assert_eq!(lowered.wave_ops, wave_ops);
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,

@@ -885,7 +885,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
                     .get(&other)
                     .is_some_and(|links| links.iter().any(|p| g.holders.contains_key(p)))
             {
-                open(&mut g, other);
+                open_runs(&mut g, &[other]);
             }
         }
     }
