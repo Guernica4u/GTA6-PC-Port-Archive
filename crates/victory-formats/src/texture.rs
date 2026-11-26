@@ -1113,7 +1113,7 @@ mod tests {
         let thin = Layout::new(&Desc {
             dimension: Dimension::Tex3d,
             depth: 64,
-            swizzle: Swizzle::SW_64KB_D_X,
+            swizzle: Swizzle::SW_64KB_Z_X,
             ..desc(16, 16, 4, 4, Swizzle::SW_64KB_S)
         })
         .unwrap();
