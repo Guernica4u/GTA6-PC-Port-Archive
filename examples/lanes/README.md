@@ -171,3 +171,5 @@ all other guard words must match; stand-ins are disabled.
 ```sh
 python tuxbox.py verify --only lanes-compute-root-recovery --output build/lanes-compute-root-recovery.json
 ```
+
+The optional `lanes-texture-upload-batch` suite reads back 64 independent 256×256 R8 placed textures after five CPU updates (20 MiB checked per run). To compare the sequential and experimental parallel detile paths, run `python tuxbox.py verify --only lanes-texture-upload-batch` with `TUXBOX_TEXTURE_UPLOAD_JOBS=1` and `4` respectively. Set `TUXBOX_TEXTURE_UPLOAD_PROFILE=1 TUXBOX_LOG=1 WINEDEBUG=-all,+debugstr` to capture per-batch detile time. The workload is not a retail frame-time benchmark.

@@ -26,7 +26,7 @@ BASE_SUITES = ("cpu", "xmem", "xapu", "xgameruntime", "xcrdapi", "graphics", "gr
                "d3d12-heaps", "d3d12-placement", "d3d12-copy-resource", "d3d12-draw", "d3d12-stream", "d3d12-frame-events",
                "d3d12-guids", "d3d12-signatures", "xg-provider")
 OPTIONAL_PROVIDERS = {"dxc-utils": "dxc-utils/dxcompiler.dll", "xg": "xg/xg_xs.dll"}
-SUITES = (*BASE_SUITES, "d3d12-mesh", *OPTIONAL_PROVIDERS)
+SUITES = (*BASE_SUITES, "d3d12-mesh", "lanes-texture-upload-batch", *OPTIONAL_PROVIDERS)
 # The scenarios of `lanes.exe --selftest`, one gate each.
 LANES_SCENARIOS = ("labels", "cross-queue", "compute-frame", "skipped-command", "copy-memory", "shared-texture",
                    "indirect-dispatch", "gpu-indirect-dispatch",
@@ -945,6 +945,13 @@ def verify(host, output, adapter, selected=None, samples=1):
                 host.env.pop("TUXBOX_DESCRIPTOR_HEAP_LIMIT", None)
             else:
                 host.env["TUXBOX_DESCRIPTOR_HEAP_LIMIT"] = saved_limit
+        if "lanes-texture-upload-batch" in selected:
+            check("lanes-texture-upload-batch", "lanes/lanes.exe",
+                  ["--selftest", "texture-upload-batch", *gpu_args, "--report"],
+                  rf"lanes-selftest PASS pci={pci} scenario=texture-upload-batch passed=1",
+                  providers={"lanes/xmem.dll": memory_symbols, "lanes/GameInput.dll": ("#1",),
+                             "lanes/d3d12_xs.dll": ("D3D12XboxCreateDevice",)},
+                  config="lanes/MicrosoftGame.config", device_factory="xbox")
         if "lanes-benchmark" in selected:
             # Console shaders are only translated on the Proton backend, so the
             # pipeline readings exist there alone.
@@ -1067,6 +1074,7 @@ GATE_LABELS = {
     "lanes-selftest-compute-frame": "Compute queue frame submission",
     "lanes-selftest-skipped-command": "A skipped command leaving its list and fence write intact",
     "lanes-selftest-copy-memory": "CopyMemoryToMemoryX direction and contents",
+    "lanes-texture-upload-batch": "Five full 64-texture CPU uploads with byte-exact GPU readback",
     "lanes-selftest-shared-texture": "A waiting queue reading a texture another queue writes",
     "lanes-selftest-indirect-dispatch": "ExecuteIndirect matching a direct dispatch",
     "lanes-selftest-direct-copy-wait": "A direct queue waiting before and after a buffer copy",

@@ -2088,6 +2088,57 @@ void descriptor_reclaim(ID3D12Device* device) {
     verify_outputs(next_idx, "fail-closed OOM control");
 }
 
+// Opt-in: identical placed textures receive new CPU bytes between reads.
+void texture_upload_batch(ID3D12Device* device) {
+    constexpr UINT count = 64, width = 256, height = 256, pitch = 256;
+    constexpr UINT64 bytes = UINT64(pitch) * height, spacing = 4 * bytes;
+    Memory memory(count * spacing);
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Format = DXGI_FORMAT_R8_UNORM;
+    desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x105);
+    std::vector<ComPtr<ID3D12Resource>> textures(count);
+    for (UINT i = 0; i < count; ++i) {
+        check(method<Place>(device, device_place)(device, memory.address(i * spacing), &desc,
+              D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&textures[i])), "place upload batch texture");
+    }
+    auto readback = buffer(device, D3D12_HEAP_TYPE_READBACK, count * bytes, D3D12_RESOURCE_STATE_COPY_DEST);
+    Queue direct(device, D3D12_COMMAND_LIST_TYPE_DIRECT);
+    for (UINT cycle = 0; cycle < 5; ++cycle) {
+        if (cycle) direct.reopen();
+        for (UINT i = 0; i < count; ++i) {
+            const BYTE value = static_cast<BYTE>(1 + i + 71 * cycle);
+            std::memset(memory.base + i * spacing, value, bytes);
+            D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
+            src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            src.pResource = textures[i].Get();
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dst.pResource = readback.Get();
+            dst.PlacedFootprint = {i * bytes, {DXGI_FORMAT_R8_UNORM, width, height, 1, pitch}};
+            method<frame_abi::Copy>(direct.list.Get(), slot_copy_texture)(
+                direct.list.Get(), &dst, 0, 0, 0, &src, nullptr, 0);
+        }
+        direct.submit();
+        direct.finish("texture upload batch");
+        D3D12_RANGE range{0, static_cast<SIZE_T>(count * bytes)}, empty{};
+        void* mapped{};
+        check(readback->Map(0, &range, &mapped), "map upload batch");
+        auto data = static_cast<const BYTE*>(mapped);
+        bool match = true;
+        for (UINT i = 0; i < count; ++i) {
+            const BYTE value = static_cast<BYTE>(1 + i + 71 * cycle);
+            for (UINT64 j = 0; j < bytes; ++j) match &= data[i * bytes + j] == value;
+        }
+        readback->Unmap(0, &empty);
+        if (!match) throw std::runtime_error("upload batch texture bytes differ");
+    }
+}
+
 struct Scenario {
     const wchar_t* name;
     void (*run)(ID3D12Device*);
@@ -2100,6 +2151,7 @@ constexpr Scenario scenarios[] = {
     {L"copy-memory", copy_memory},
     {L"direct-copy-wait", direct_copy_wait},
     {L"shared-texture", shared_texture},
+    {L"texture-upload-batch", texture_upload_batch},
     {L"indirect-dispatch", indirect_dispatch},
     {L"gpu-indirect-dispatch", gpu_indirect_dispatch},
     {L"dispatch-wait", dispatch_wait},
@@ -2163,7 +2215,7 @@ std::string narrow(const wchar_t* text) {
 }
 
 const wchar_t* const selftest_scenarios[] = {L"labels",            L"cross-queue",      L"compute-frame",
-                                             L"skipped-command",   L"copy-memory",      L"direct-copy-wait", L"shared-texture",
+                                             L"skipped-command",   L"copy-memory",      L"direct-copy-wait", L"shared-texture", L"texture-upload-batch",
                                              L"indirect-dispatch", L"gpu-indirect-dispatch",
                                              L"dispatch-wait", L"texture-readback", L"ray-tracing-builder",
                                              L"thread-dimensions", L"descriptor-reclaim",
@@ -2182,7 +2234,7 @@ std::string run_selftest(const wchar_t* requested, const wchar_t* adapter) {
         if (!all && std::wcscmp(requested, scenario.name)) continue;
         // This one writes nothing until the launcher's compiler has translated it,
         // and mesh-samplers needs its mesh program's translation prepared first.
-        if (all && (!std::wcscmp(scenario.name, L"wave64-shader") || !std::wcsncmp(scenario.name, L"mesh-sampler", 12)))
+        if (all && (!std::wcscmp(scenario.name, L"wave64-shader") || !std::wcsncmp(scenario.name, L"mesh-sampler", 12) || !std::wcscmp(scenario.name, L"texture-upload-batch")))
             continue;
         const auto name = narrow(scenario.name);
         try {

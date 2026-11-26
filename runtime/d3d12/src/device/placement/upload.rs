@@ -138,6 +138,69 @@ impl Drop for Transfer {
     }
 }
 
+// Only CPU detiling is parallel. Each worker writes a disjoint mapped
+// footprint; command recording and submission stay on the original thread.
+static DETILE_JOBS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("TUXBOX_TEXTURE_UPLOAD_JOBS").ok()
+        .and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).clamp(1, 4)
+});
+
+fn detile_batch(output: &mut [u8], changes: &[Change], offsets: &[u64]) -> Result<()> {
+    fn group(output: &mut [u8], changes: &[Change], offsets: &[u64], base: u64) -> Result<()> {
+        for (change, &offset) in changes.iter().zip(offsets) {
+            let start = usize::try_from(offset.checked_sub(base).ok_or(E_INVALIDARG)?).map_err(|_| E_INVALIDARG)?;
+            let bytes = usize::try_from(change.texture.mips[change.level].bytes).map_err(|_| E_INVALIDARG)?;
+            let end = start.checked_add(bytes).ok_or(E_INVALIDARG)?;
+            change.detile(output.get_mut(start..end).ok_or(E_INVALIDARG)?)?;
+        }
+        Ok(())
+    }
+    let bytes = output.len();
+    let requested = if bytes >= 4 << 20 { (*DETILE_JOBS).min(changes.len()).max(1) } else { 1 };
+    let per_job = changes.len().div_ceil(requested).max(1);
+    let jobs = changes.len().div_ceil(per_job).max(1);
+    static PROFILE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("TUXBOX_TEXTURE_UPLOAD_PROFILE").is_some_and(|v| v == "1")
+    });
+    let start = (*PROFILE).then(std::time::Instant::now);
+    if jobs <= 1 {
+        group(output, changes, offsets, 0)?;
+    } else {
+        std::thread::scope(|scope| -> Result<()> {
+            let mut workers = Vec::new();
+            let mut remaining = output;
+            let mut base = 0u64;
+            for (index, group_changes) in changes.chunks(per_job).enumerate() {
+                let first = index * per_job;
+                let end = first + group_changes.len();
+                let group_offsets = &offsets[first..end];
+                let next = offsets.get(end).copied().unwrap_or(bytes as u64);
+                let length = usize::try_from(next.checked_sub(base).ok_or(E_INVALIDARG)?).map_err(|_| E_INVALIDARG)?;
+                if length > remaining.len() { return Err(E_INVALIDARG.into()); }
+                let (slice, rest) = remaining.split_at_mut(length);
+                remaining = rest;
+                let group_base = base;
+                base = next;
+                if end == changes.len() {
+                    group(slice, group_changes, group_offsets, group_base)?;
+                } else {
+                    workers.push(std::thread::Builder::new().spawn_scoped(scope, move || {
+                        group(slice, group_changes, group_offsets, group_base)
+                    }).map_err(|_| E_OUTOFMEMORY)?);
+                }
+            }
+            for worker in workers {
+                worker.join().map_err(|_| E_FAIL)??;
+            }
+            Ok(())
+        })?;
+    }
+    if let Some(start) = start {
+        crate::diagnostics::log(&format!("texture detile batch bytes={bytes} jobs={jobs} us={}", start.elapsed().as_micros()));
+    }
+    Ok(())
+}
+
 impl Upload {
     fn record(device: &ID3D12Device, changes: &[Change]) -> Result<Self> {
         let alignment = u64::from(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
@@ -188,11 +251,10 @@ impl Upload {
         // list has not been executed and the pointer is scoped to the mapping.
         let output = unsafe { core::slice::from_raw_parts_mut(mapped.cast::<u8>(), size) };
         let mut destinations = Vec::new();
-        let result: Result<()> = changes
+        let result: Result<()> = detile_batch(output, changes, &offsets).and_then(|_| changes
             .iter()
             .zip(offsets)
             .try_for_each(|(change, offset)| {
-                change.detile(&mut output[offset as usize..])?;
                 let texture = &change.texture;
                 let mut footprint = texture.mips[change.level].footprint;
                 footprint.Offset = offset;
@@ -221,7 +283,7 @@ impl Upload {
                     destinations.push(texture.native.clone());
                 }
                 Ok(())
-            });
+            }));
         unsafe {
             buffer.Unmap(0, None);
         }

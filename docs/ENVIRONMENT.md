@@ -93,3 +93,8 @@ All are off by default. Capture variables write the game's data to disk, so don'
 ## Build and test tools
 
 `TUXBOX_XSHADER` selects the shader compiler for launcher preparation and `DXC` selects the DirectX Shader Compiler. `TUXBOX_BLESS_PROFILES`, `TUXBOX_ORACLE_*`, `TUXBOX_TEST_*` and the probe and replay variables in `tools/` belong to individual checks. `TUXBOX_PROVIDER`, `TUXBOX_SHADER_SESSION` and `TUXBOX_WINE_*` are internal; don't set them.
+
+### Experimental CPU texture uploads
+
+- `TUXBOX_TEXTURE_UPLOAD_JOBS`: default 1, clamped to 1–4. Larger batches (at least 4 MiB) can detile independent footprints in parallel; the submitting thread still records and submits every GPU command. Smaller batches stay sequential.
+- `TUXBOX_TEXTURE_UPLOAD_PROFILE=1`: log aggregate detile bytes, worker count and elapsed microseconds when diagnostic logging is enabled. No title addresses or content are logged.
