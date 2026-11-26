@@ -559,6 +559,14 @@ fn skip_assert_at(at: usize, code: i32, left: &std::sync::atomic::AtomicUsize) -
     if code != EXCEPTION_BREAKPOINT {
         return false;
     }
+    // The switch is off by default and the budget usually runs out: say so
+    // before the byte read and the module lookup, which together are the
+    // expensive part of an exception that is not ours to skip. `take_budget`
+    // re-checks atomically at the end, so this cannot spend a budget that is
+    // not there.
+    if left.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        return false;
+    }
     // SAFETY: the CPU fetched the instruction at `at`, so its byte is
     // readable.
     if unsafe { (at as *const u8).read() } != 0xcc {
