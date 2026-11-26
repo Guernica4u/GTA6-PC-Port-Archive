@@ -706,6 +706,7 @@ dependencies = [
 name = "victory-hle"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "miniz_oxide",
  "opus-pure",
  "tempfile",
