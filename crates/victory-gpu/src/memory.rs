@@ -102,6 +102,10 @@ struct Layout {
     /// time through this instead of asking once per copy (~4,700 in the
     /// world, nearly all clean).
     by_bit: Vec<(u32, u32)>,
+    /// Copies with no tracker bit (memory that is not tracked, or the bit
+    /// pool was full): they are never clean, so [`prepare`] asks for them
+    /// every time, as `clean_bit(None)` did.
+    untracked: Vec<u32>,
     /// The tracker words `by_bit` spans.
     first_word: usize,
     last_word: usize,
@@ -545,11 +549,14 @@ impl Shared {
         let out = unsafe { std::slice::from_raw_parts_mut(self.data as *mut u32, TABLE_DWORDS) };
         let (_, blocks, owner) = write_table(&ranges, &slots, self.null, out);
         tracing::debug!(copies = ranges.len(), blocks = blocks.len() - 1, "title memory page table");
-        let mut by_bit: Vec<(u32, u32)> = named
-            .iter()
-            .enumerate()
-            .filter_map(|(i, c)| c.dirty_bit().map(|b| (b, i as u32)))
-            .collect();
+        let mut by_bit: Vec<(u32, u32)> = Vec::new();
+        let mut untracked: Vec<u32> = Vec::new();
+        for (i, c) in named.iter().enumerate() {
+            match c.dirty_bit() {
+                Some(b) => by_bit.push((b, i as u32)),
+                None => untracked.push(i as u32),
+            }
+        }
         by_bit.sort_unstable();
         let (first_word, last_word) = match (by_bit.first(), by_bit.last()) {
             (Some((first, _)), Some((last, _))) => ((*first as usize) / 64, (*last as usize) / 64),
@@ -557,6 +564,7 @@ impl Shared {
         };
         self.layout = Arc::new(Layout {
             by_bit,
+            untracked,
             first_word,
             last_word,
             copies: named,
@@ -591,6 +599,9 @@ fn dirty_indices(
     dirty: impl Fn(usize) -> u64,
 ) -> Vec<u32> {
     let mut out = Vec::new();
+    if by_bit.is_empty() {
+        return out;
+    }
     let mut by_bit = by_bit.iter().copied();
     let mut next = by_bit.next();
     for word in first_word..=last_word {
@@ -631,6 +642,12 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
     // without touching them (the table names every copy, ~4,700 in the
     // world): the tracker is scanned a word at a time through [`dirty_indices`].
     for l in layout.iter() {
+        // Untracked copies are never clean: always asked for.
+        for &i in &l.untracked {
+            let c = &l.copies[i as usize];
+            let (start, len) = c.range();
+            add(c, start as usize, len as usize);
+        }
         for i in dirty_indices(
             &l.by_bit,
             l.first_word,
@@ -857,6 +874,7 @@ mod tests {
         let l = Layout {
             copies: Vec::new(),
             by_bit: Vec::new(),
+            untracked: Vec::new(),
             first_word: 0,
             last_word: 0,
             blocks: vec![usize::MAX, 0],
@@ -915,7 +933,7 @@ mod tests {
             [0, 2],
             "foreign bits skipped"
         );
-        // No tracked copies at all.
+        // No tracked copies at all: no word is read, even a dirty one.
         assert!(dirty_indices(&[], 0, 0, |_| u64::MAX).is_empty());
     }
 
