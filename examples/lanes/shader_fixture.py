@@ -115,6 +115,67 @@ def recovered_root_shader():
     return stage_container(0x50060, image(7, first + second, user, used), [(b"PSV0", psv)])
 
 
+BINDLESS_INDEX = 80
+BINDLESS_EXPECTED = 0x7AB1E002
+
+
+def bindless_compute_shader():
+    """Direct-indexed raw UAV store at a guest index outside the paged limit."""
+    code = [0xbe8403ff, BINDLESS_INDEX, 0x8f048504,
+            0xf4080205, 0x08000000, 0xbf8cc07f,
+            0x7e0002ff, BINDLESS_EXPECTED, 0xe0700000, 0x80020000, 0xbf810000]
+    info = bytearray(48)
+    info[24] = 5
+    struct.pack_into("<3I", info, 36, 64, 1, 1)
+    root = pack([2, 0, 24, 0, 24, 0x400])
+    return stage_container(0x50066, image(7, code, [(5, 0, 1, 0, 10)]), [
+        (b"SFI0", struct.pack("<Q", 1 << 25)),
+        (b"PSV0", pack([48]) + info + pack([0])),
+        (b"RTS0", root),
+    ])
+
+
+# The `bindless-sampler` program, checked with `llvm-mc -mcpu=gfx1030 -show-encoding`.
+# It samples the heap texture at one guest index with a linear clamp sampler
+# built from literal words, which no root declares, and stores the value through
+# the heap UAV at another. Both indices are past the paged limit of the test.
+BINDLESS_TEXTURE, BINDLESS_OUTPUT = 90, 85
+
+
+def bindless_sampler_shader():
+    """Direct-indexed sample with a literal sampler, stored through a direct-indexed UAV."""
+    code = [
+        0xB0100000 | BINDLESS_TEXTURE,  # s_movk_i32 s16, the texture's heap index
+        0x8F008510,                     # s_lshl_b32 s0, s16, 5
+        0xF40C0101, 0x00000000,         # s_load_dwordx8 s[4:11], s[2:3], s0
+        0xB0110000 | BINDLESS_OUTPUT,   # s_movk_i32 s17, the UAV's heap index
+        0x8F018511,                     # s_lshl_b32 s1, s17, 5
+        0xF4080301, 0x02000000,         # s_load_dwordx4 s[12:15], s[2:3], s1
+        0xB0140092,                     # s_movk_i32 s20, 0x92      sampler word 0: clamp in U, V and W
+        0xBE9503FF, 0x00C00000,         # s_mov_b32 s21, 0xc00000   word 1: max LOD 12
+        0xBE9603FF, 0x18500000,         # s_mov_b32 s22, 0x18500000 word 2: linear min, mag and mip filters
+        0xBE970380,                     # s_mov_b32 s23, 0          word 3: border colour
+        0x7E0802FF, 0x3EC00000,         # v_mov_b32 v4, 0.375       u
+        0x7E0A02F0,                     # v_mov_b32 v5, 0.5         v
+        0xBF8CC07F,                     # s_waitcnt lgkmcnt(0)
+        0xF09C0108, 0x00A10704,         # image_sample_lz v7, v[4:5], s[4:11], s[20:23] dmask:0x1 dim:2D
+        0xBF8C3F70,                     # s_waitcnt vmcnt(0)
+        0xE0700000, 0x80030700,         # buffer_store_dword v7, off, s[12:15], 0
+        0xBF810000,                     # s_endpgm
+    ]
+    info = bytearray(48)
+    info[24] = 5
+    struct.pack_into("<3I", info, 36, 64, 1, 1)
+    root = pack([2, 0, 24, 0, 24, 0x400])
+    # FSSM user data: class 5, the resource heap base in s2. Used resources and
+    # PSV: one inlined static sampler, register 0.
+    return stage_container(0x50066, image(7, code, [(5, 0, 1, 0, 2)], [(0x401, 0, 0, 0, 0)]), [
+        (b"SFI0", struct.pack("<Q", 1 << 25)),
+        (b"PSV0", pack([48]) + info + pack([1, 16, 1, 0, 0, 0])),
+        (b"RTS0", root),
+    ])
+
+
 def declaration(name, data):
     values = ",".join(str(byte) for byte in data)
     return (f"constexpr unsigned char {name}[] = {{{values}}};\n"
@@ -128,6 +189,10 @@ def header():
             + declaration("xbox_shader", shader()) + declaration("wave_shader", wave_shader())
             + f"constexpr unsigned wave_shader_expected[] = {{{words}}};\n"
             + declaration("recovered_root_shader", recovered_root_shader())
+            + declaration("bindless_compute_shader", bindless_compute_shader())
+            + f"constexpr unsigned bindless_index = {BINDLESS_INDEX};\nconstexpr unsigned bindless_expected = {BINDLESS_EXPECTED:#x};\n"
+            + declaration("bindless_sampler_shader", bindless_sampler_shader())
+            + f"constexpr unsigned bindless_texture = {BINDLESS_TEXTURE}, bindless_output = {BINDLESS_OUTPUT};\n"
             + declaration("root_shader", root_shader(0x40)) + declaration("root_refused_shader", root_shader(0xA0))
             + f"constexpr unsigned root_shader_expected = {ROOT_EXPECTED:#x};\n")
 
