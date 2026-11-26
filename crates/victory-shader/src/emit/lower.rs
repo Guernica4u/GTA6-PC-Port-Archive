@@ -2175,6 +2175,24 @@ impl<'a> Lower<'a> {
         self.as_float(r)
     }
 
+    /// A 32-bit denormal as the console's flush leaves a multiplied result:
+    /// **+0**, the sign dropped (the console's MAD flushes the product it
+    /// rounded, and the flush is not sign-preserving). Zeros pass through.
+    fn flush_denormal_to_positive_zero(&mut self, f: V) -> V {
+        let c = self.cur;
+        let x = self.as_int(f);
+        let exp = self.s.m.i32(0x7F80_0000);
+        let mant = self.s.m.i32(0x007F_FFFF);
+        let zero = self.s.m.i32(0);
+        let e = self.s.m.bin(c, Bin::And, x, exp);
+        let m = self.s.m.bin(c, Bin::And, x, mant);
+        let no_exp = self.s.m.cmp(c, pred::EQ, e, zero);
+        let has_mant = self.s.m.cmp(c, pred::NE, m, zero);
+        let den = self.s.m.bin(c, Bin::And, no_exp, has_mant);
+        let r = self.s.m.select(c, den, zero, x);
+        self.as_float(r)
+    }
+
     /// The hardware's maximum (`max`) or minimum of two floats: as DXIL's
     /// FMax/FMin, but of the operands with denormals read as zeros and with
     /// -0 ordered below +0 (RDNA2 ISA, `v_max_f32`), where the compare and
@@ -6272,6 +6290,7 @@ impl<'a> Lower<'a> {
                     "v_fmac_f32" => self.fmad(a, bb, acc),
                     "v_mac_f32" => {
                         let m = self.s.m.bin(c, Bin::Mul, a, bb);
+                        let m = self.flush_denormal_to_positive_zero(m);
                         self.s.m.bin(c, Bin::Add, m, acc)
                     }
                     _ => {
@@ -6286,7 +6305,8 @@ impl<'a> Lower<'a> {
                 let m = if name == "v_mad_legacy_f32" {
                     self.legacy_mul(a, bb)
                 } else {
-                    self.s.m.bin(c, Bin::Mul, a, bb)
+                    let m = self.s.m.bin(c, Bin::Mul, a, bb);
+                    self.flush_denormal_to_positive_zero(m)
                 };
                 let r = self.s.m.bin(c, Bin::Add, m, cc);
                 float(self, r)
