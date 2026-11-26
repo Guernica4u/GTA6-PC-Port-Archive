@@ -185,17 +185,30 @@ fn saved_code(inst: &Inst) -> u8 {
     }
 }
 
-/// The lane `l` reads with DPP, whether it reads 0 instead, and whether it
-/// writes; `None` for patterns not modelled.
-fn dpp_lane(d: Dpp, l: u32) -> Option<(u32, bool, bool)> {
+/// The lane `l` reads with DPP under `exec`, whether it reads 0 instead,
+/// and whether it writes; `None` for patterns not modelled. The rules for
+/// a source the EXEC bit leaves out are the RDNA2 ISA reference guide's
+/// DPP16/DPP8 word: FI reads an inactive lane; without FI the BOUND_CTRL
+/// bit decides — the destination keeps its value (DPP16, BC=0) or the
+/// read is 0 (BC=1) —, and DPP8 reads 0. An active lane must not fold the
+/// inactive source's value into a constant.
+fn dpp_lane(d: Dpp, l: u32, exec: u64) -> Option<(u32, bool, bool)> {
+    let active = |lane: u32| exec >> lane & 1 == 1;
     match d {
-        Dpp::Lanes { sel, .. } => Some(((l & !7) | (sel >> (3 * (l & 7)) & 7), false, true)),
+        Dpp::Lanes { sel, fi } => {
+            let src = (l & !7) | (sel >> (3 * (l & 7)) & 7);
+            Some(if fi || active(src) {
+                (src, false, true)
+            } else {
+                (src, true, true)
+            })
+        }
         Dpp::Row {
             ctrl,
             row_mask,
             bank_mask,
             bound_ctrl,
-            ..
+            fi,
         } => {
             let (row, pos, n) = (l & !15, l & 15, u32::from(ctrl & 15));
             let enabled = row_mask >> (l >> 4 & 3) & 1 != 0 && bank_mask >> (l >> 2 & 3) & 1 != 0;
@@ -210,7 +223,8 @@ fn dpp_lane(d: Dpp, l: u32) -> Option<(u32, bool, bool)> {
                 0x160..=0x16F => (l ^ n, true),
                 _ => return None,
             };
-            match (inside, bound_ctrl) {
+            let fetched = inside && (fi || active(src));
+            match (fetched, bound_ctrl) {
                 (true, _) => Some((src, false, enabled)),
                 (false, true) => Some((l, true, enabled)),
                 (false, false) => Some((l, false, false)),
@@ -485,6 +499,14 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> (HashMap<Value, Shape>, 
         let mut writes = exec;
         let fetched: Option<Vec<Sym>> = match (v.dpp, &src0) {
             (Some(d), Some(s)) => {
+                // A narrowed EXEC is refused by name, not simulated: the
+                // lanes the set names are defined (every lane ran at the
+                // section's entry, and only a constant lane set narrows it
+                // since), but what the translated shader reads of them is
+                // not proven — a narrowed-EXEC DPP witness dispatched the
+                // wrong lanes (hardware report in the pull request). The
+                // section keeps refusing it until the emitted fixed-lane
+                // reads are proven.
                 if exec != all {
                     vec.insert(dst, vec![Sym::Unknown; wave as usize]);
                     unknown.get_or_insert(
@@ -495,7 +517,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> (HashMap<Value, Shape>, 
                 let mut f = Vec::with_capacity(wave as usize);
                 let mut ok = true;
                 for l in 0..wave {
-                    match dpp_lane(d, l) {
+                    match dpp_lane(d, l, exec) {
                         Some((src, zero, on)) if src < wave => {
                             f.push(if zero { Sym::K(0) } else { s[src as usize] });
                             if !on {
@@ -860,8 +882,8 @@ mod tests {
             bound_ctrl: true,
             fi: false,
         };
-        assert_eq!(dpp_lane(shr, 16), Some((16, true, true)));
-        assert_eq!(dpp_lane(shr, 17), Some((16, false, true)));
+        assert_eq!(dpp_lane(shr, 16, u64::MAX), Some((16, true, true)));
+        assert_eq!(dpp_lane(shr, 17, u64::MAX), Some((16, false, true)));
         // row_mirror: lane 3 reads lane 12.
         let mirror = Dpp::Row {
             ctrl: 0x140,
@@ -870,13 +892,13 @@ mod tests {
             bound_ctrl: true,
             fi: false,
         };
-        assert_eq!(dpp_lane(mirror, 3), Some((12, false, true)));
+        assert_eq!(dpp_lane(mirror, 3, u64::MAX), Some((12, false, true)));
         // dpp8 [1,0,3,2,5,4,7,6] swaps neighbours.
         let swap = Dpp::Lanes {
             sel: 1 | 3 << 6 | 2 << 9 | 5 << 12 | 4 << 15 | 7 << 18 | 6 << 21,
             fi: false,
         };
-        assert_eq!(dpp_lane(swap, 8), Some((9, false, true)));
+        assert_eq!(dpp_lane(swap, 8, u64::MAX), Some((9, false, true)));
     }
 
     #[test]
@@ -1051,6 +1073,89 @@ mod tests {
         let sec = &sections(&p, 0)[&0];
         assert_eq!(sec.shapes.get(&v2_val), Some(&Shape::K(7)));
         assert_eq!(sec.shapes.get(&v3_val), Some(&Shape::K(7)));
+    }
+
+    /// A DPP step over a lane set the section named by a constant (prefix
+    /// scans narrow EXEC that way) stays refused by name: the lanes are
+    /// defined, but the translated fixed-lane reads of them are not
+    /// proven, and a witness dispatched the wrong lanes.
+    #[test]
+    fn dpp_over_a_lane_set_the_section_names_stays_refused() {
+        // s_or_saveexec s0, -1; v_mov_b32 v1, 7; s_mov_b32 exec, -2;
+        // v_mov_b32 v2, v1 dpp16 quad-perm sel 0xE4 (identity);
+        // s_mov_b32 exec, s0.
+        for (wave64, saveexec, mov_exec) in [(true, 0x25, 0x04), (false, 0x3D, 0x03)] {
+            let section = |narrow: bool| {
+                let mut w = vec![sop1(0, saveexec, 193), vop1(1, 0x01, 135)];
+                if narrow {
+                    w.push(sop1(EXEC, mov_exec, 194));
+                }
+                w.extend([
+                    vop1(2, 0x01, 0xFA),
+                    dpp16(1, 0xE4, 0xF, 0xF, false),
+                    sop1(EXEC, mov_exec, 0),
+                ]);
+                let p = build(&w, wave64);
+                let value = p.blocks[0].insts[if narrow { 3 } else { 2 }]
+                    .write(Reg::V(2))
+                    .unwrap();
+                let sec = &sections(&p, 0)[&0];
+                (sec.unknown, sec.shapes.get(&value).copied())
+            };
+            // All lanes active: one constant shape.
+            let (unknown, shape) = section(false);
+            assert_eq!(unknown, None);
+            assert_eq!(shape, Some(Shape::K(7)));
+            // Lane 0 left out: refused by the section's named kind.
+            let (unknown, _shape) = section(true);
+            assert_eq!(
+                unknown,
+                Some(
+                    "a whole-wave section step the simulation does not follow: a DPP step over lanes it has not named"
+                )
+            );
+        }
+    }
+
+    /// A DPP source EXEC leaves out arrives by the RDNA2 ISA guide's
+    /// DPP16/DPP8 rules, asserted on the lane the set leaves out
+    /// (lane 0 in wave32, lanes 0 and 32 in wave64): FI reads it;
+    /// without FI, DPP16 keeps the destination or zeroes as BOUND_CTRL
+    /// says, DPP8 zeroes; an active source is read regardless.
+    #[test]
+    fn a_dpp_source_exec_leaves_out_arrives_by_the_isa_flags() {
+        for (wave, out) in [(32u32, vec![0u32]), (64, vec![0, 32])] {
+            let all = if wave == 64 { u64::MAX } else { u64::from(u32::MAX) };
+            let exec = all & out.iter().fold(u64::MAX, |m, l| m & !(1u64 << l));
+            // quad_perm:[0,0,0,0] (every lane reads its quad's lane 0)
+            // and the identity permutation.
+            let quad = |ctrl: u16, bound_ctrl: bool, fi: bool| Dpp::Row {
+                ctrl,
+                row_mask: 0xF,
+                bank_mask: 0xF,
+                bound_ctrl,
+                fi,
+            };
+            let quad0 = |bound_ctrl: bool, fi: bool| quad(0x00, bound_ctrl, fi);
+            // 0: every lane selects lane 0 of its group; 0xfac688: itself.
+            let dpp8 = |sel: u32, fi: bool| Dpp::Lanes { sel, fi };
+            for l in out {
+                // An active source is read with and without the flags;
+                // the identity permutation reads the lane itself.
+                assert_eq!(dpp_lane(quad(0xE4, false, false), l + 1, all), Some((l + 1, false, true)));
+                assert_eq!(dpp_lane(quad(0xE4, true, true), l + 1, all), Some((l + 1, false, true)));
+                assert_eq!(dpp_lane(dpp8(0xfac688, false), l + 1, all), Some((l + 1, false, true)));
+                // The lane the set leaves out: FI reads it.
+                assert_eq!(dpp_lane(quad0(false, true), l, exec), Some((l, false, true)));
+                assert_eq!(dpp_lane(dpp8(0xfac688, true), l, exec), Some((l, false, true)));
+                // Without FI, DPP16 keeps the destination (BOUND_CTRL clear)
+                // or zeroes (set) with the write off or on.
+                assert_eq!(dpp_lane(quad0(false, false), l, exec), Some((l, false, false)));
+                assert_eq!(dpp_lane(quad0(true, false), l, exec), Some((l, true, true)));
+                // DPP8 zeroes it.
+                assert_eq!(dpp_lane(dpp8(0, false), l, exec), Some((l, true, true)));
+            }
+        }
     }
 
     /// A section whose every step the simulation follows leaves no
