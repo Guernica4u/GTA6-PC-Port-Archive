@@ -1392,6 +1392,12 @@ impl Host {
         } = data;
         // Block until the GPU submission has finished.
         self.wait_for(fence_value);
+        // The GPU is done with the staging buffers it used to read texture
+        // uploads from: recycle them now so the next execute sees a clean
+        // pool and refresh_all compares hashes against the final post-GPU
+        // state of title memory (not an intermediate one that may have been
+        // read while the previous submission was still in flight).
+        crate::texture::recycle();
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
         // submission, however many dispatches declared it (the world's

@@ -209,6 +209,10 @@ fn pump(held: &mut Holding, why: Why) {
 
     // We run multiple pump passes: each flush of copy_back may write
     // bottom-of-pipe values that unblock work held by other queues.
+    // Back-pressure: at most one GPU submission is in flight at any point.
+    // Within a pass, `run` calls copy_back(previous) before execute(next),
+    // so depth never exceeds 1. Between passes the between-pass flush waits
+    // for the last submission before the next pass begins.
     let mut pumped = crate::hold::Pumped::default();
     loop {
         {

@@ -201,7 +201,9 @@ pub(crate) fn uploads(
 ) -> Option<Uploads> {
     static LIST: Mutex<Holder> = Mutex::new(Holder(None));
     let mut guard = LIST.lock().unwrap_or_else(|e| e.into_inner());
-    crate::texture::recycle();
+    // texture::recycle() is now called from Host::copy_back once the GPU
+    // fence fires, so staging buffers and chunk space are always recycled
+    // before this execute's uploads run (and before refresh_all hashes).
     match &guard.0 {
         // Closed by the last submission, which has run.
         Some(list) => list.reset(),
