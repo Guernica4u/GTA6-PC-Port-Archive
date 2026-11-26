@@ -216,11 +216,21 @@ pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u3
     // SAFETY: an open list; our root signature, pipeline and buffers, and
     // a title buffer's copy the caller's list holds.
     unsafe {
-        // Earlier shader writes (the title's argument passes) first.
-        l.ResourceBarrier(&[
-            uav_barrier(),
-            transition(&out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-        ]);
+        // Earlier shader writes (the title's argument passes) first. The
+        // barrier is global (it names no resource: `bound` has the title
+        // buffer's GPU address, not the buffer), so it orders every
+        // unordered-access write in the list - 2 600 indirect commands a frame
+        // in the world, each of one record.
+        // `VICTORY_NO_BARRIERS=1` (diagnostics) drops it as well: with
+        // `VICTORY_ONE_BARRIER` it is the ceiling of what the two global
+        // barriers cost together.
+        let none = crate::switch::on("VICTORY_NO_BARRIERS");
+        let entering = transition(&out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if none {
+            l.ResourceBarrier(&[entering]);
+        } else {
+            l.ResourceBarrier(&[uav_barrier(), entering]);
+        }
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
         l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
@@ -229,10 +239,18 @@ pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u3
         l.SetComputeRootUnorderedAccessView(3, out.GetGPUVirtualAddress());
         // One group walks every record.
         l.Dispatch(records.min(1), 1, 1);
-        l.ResourceBarrier(&[
-            uav_barrier(),
-            transition(&out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
-        ]);
+        // The transition out of unordered access already flushes this
+        // buffer's writes before the indirect read, so a second global
+        // unordered-access barrier orders nothing this command's own record
+        // needs - it makes every other unordered-access write in the list
+        // visible again, once per indirect command. `VICTORY_ONE_BARRIER=1`
+        // (diagnostics) leaves only the transition: the A/B for the cost.
+        let leaving = transition(&out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+        if none || crate::switch::on("VICTORY_ONE_BARRIER") {
+            l.ResourceBarrier(&[leaving]);
+        } else {
+            l.ResourceBarrier(&[uav_barrier(), leaving]);
+        }
     }
     Some(out)
 }
