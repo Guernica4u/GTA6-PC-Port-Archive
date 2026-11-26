@@ -1024,7 +1024,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_ne!(maps[0].dirty, maps[1].dirty, "a bitmap per list");
         fill(memory[0] + 16, 0x100);
         fill(memory[1] + PAGE, 0x200);
-        host.execute(&[&lists[0], &lists[1]]);
+        let run_lists_0 = [&lists[0], &lists[1]];
+        let (_, _ex_data) = host.execute(&run_lists_0);
+        host.copy_back(&run_lists_0, _ex_data);
         assert_eq!(read(), [0x100, 0x101, 0x102, 0x103, 0x200, 0x201, 0x202, 0x203]);
         let pairs = (pair_of(OURS, &a).unwrap(), pair_of(OURS, &b).unwrap());
         assert!(pairs.0 >= 1 << 18 && pairs.1 >= 1 << 18, "past the dynamic slots");
@@ -1036,7 +1038,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         record([memory[2] + 32, memory[0] + 16]);
         fill(memory[2] + 32, 0x300);
         fill(memory[0] + 16, 0x400);
-        host.execute(&[&lists[0], &lists[1]]);
+        let run_lists_1 = [&lists[0], &lists[1]];
+        let (_, _ex_data) = host.execute(&run_lists_1);
+        host.copy_back(&run_lists_1, _ex_data);
         assert_eq!(read(), [0x300, 0x301, 0x302, 0x303, 0x400, 0x401, 0x402, 0x403]);
         assert_eq!((pair_of(OURS, &a).unwrap(), pair_of(OURS, &b).unwrap()), pairs, "views kept");
         assert!(pair_of(OURS, &c).is_some());
@@ -1128,7 +1132,9 @@ void main() {
                 list.list.Dispatch(1, 1, 1);
             }
             list.close();
-            host.execute(&[&list]);
+            let (_, _ex_data) = host.execute(&[&list]);
+
+            host.copy_back(&[&list], _ex_data);
             list.reset();
         };
         let write = |value: u32, miss: bool| {

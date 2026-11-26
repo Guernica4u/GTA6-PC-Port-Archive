@@ -539,7 +539,9 @@ fn dump_one(
         read
     };
     list.close();
-    host.execute(&[&list]);
+    let (_, _ex_data) = host.execute(&[&list]);
+
+    host.copy_back(&[&list], _ex_data);
     let Some((buffer, footprint)) = read else { return };
     let f = footprint.Footprint;
     let mut data = std::ptr::null_mut();

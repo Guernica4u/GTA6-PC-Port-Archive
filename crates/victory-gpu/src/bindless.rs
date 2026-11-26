@@ -686,7 +686,9 @@ void main(uint3 id : SV_DispatchThreadID) {
             list.close();
             // The title writes after recording, before submitting.
             write(base, texel);
-            host.execute(&[&list]);
+            let (_, _ex_data) = host.execute(&[&list]);
+
+            host.copy_back(&[&list], _ex_data);
             let words = out.read_host(dst_bytes as u64, 64);
             for (i, &v) in words.iter().enumerate() {
                 assert_eq!(v, base + i as u32 + u32::from(texel), "round {round}, dword {i}");

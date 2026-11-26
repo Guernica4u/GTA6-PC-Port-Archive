@@ -1,8 +1,5 @@
 //! The host GPU: one D3D12 device and direct queue (decision 0007), and a
 //! window to present on.
-//!
-//! shortcut: every submission is waited for, so CPU and GPU never overlap;
-//! overlap them with per-submission fences once more than clears run.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -46,6 +43,8 @@ pub(crate) struct Host {
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
+    /// The last fence value submitted but not yet waited for; 0 if none.
+    pending_fence: Mutex<u64>,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -82,6 +81,10 @@ static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
 /// frame-rate line.
 static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
+/// Inside copy-back: time the CPU spent blocked waiting for the GPU fence
+/// to signal (microseconds), since the last frame-rate line.
+static COPY_BACK_WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Of the preparing: title memory copies (microseconds, bytes) and texture
 /// refreshes (microseconds, bytes hashed), since the last frame-rate line.
@@ -253,6 +256,7 @@ fn create() -> windows::core::Result<Host> {
             queue,
             fence,
             submitted: Mutex::new(0),
+            pending_fence: Mutex::new(0),
             event,
             rtvs,
             rtv_size,
@@ -630,12 +634,14 @@ pub(crate) mod tests {
         assert!(list.scratch(u64::MAX).is_none());
         assert!(list.scratch(SCRATCH_CHUNK + 1).is_some());
         list.close();
-        host.execute(&[&list]);
+        let (_, data) = host.execute(&[&list]);
+        host.copy_back(&[&list], data);
         list.reset();
         assert_eq!(list.scratch(96 << 10).unwrap(), large);
         assert_eq!(list.scratch.lock().unwrap().chunks.len(), 2);
         list.close();
-        host.execute(&[&list]);
+        let (_, data) = host.execute(&[&list]);
+        host.copy_back(&[&list], data);
         list.reset();
         assert_eq!(list.scratch(512).unwrap(), first);
         list.close();
@@ -1152,8 +1158,28 @@ impl Host {
         }
     }
 
-    /// Runs closed lists and waits for them.
-    pub(crate) fn execute(&self, runs: &[&HostList]) {
+    /// Waits for the submission with fence value `value` to complete.
+    /// Does nothing if `value == 0`.
+    pub(crate) fn wait_for(&self, value: u64) {
+        if value == 0 {
+            return;
+        }
+        // SAFETY: fence and event are ours.
+        unsafe {
+            if self.fence.GetCompletedValue() < value {
+                self.fence
+                    .SetEventOnCompletion(value, self.event)
+                    .expect("fence SetEventOnCompletion");
+                let elapsed = std::time::Instant::now();
+                WaitForSingleObject(self.event, INFINITE);
+                COPY_BACK_WAIT_US.fetch_add(elapsed.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Runs closed lists. Returns the fence value signalled; the caller
+    /// must call `copy_back` before reading anything the GPU wrote.
+    pub(crate) fn execute(&self, runs: &[&HostList]) -> (u64, SubmissionData) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -1274,15 +1300,12 @@ impl Host {
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
-                let waited = self
+                let signalled = self
                     .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
-                    }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                    .Signal(&self.fence, *submitted);
+                match signalled {
+                    Ok(()) => {}
+                    Err(e) => tracing::warn!(error = %e, "host submission signal failed"),
                 }
             }
             #[cfg(feature = "diagnostics")]
@@ -1331,6 +1354,44 @@ impl Host {
                 removed_during(runs, removed_in)
             ));
         }
+        let fence_value = *submitted;
+        // Store the fence value so copy_back can wait for it.
+        *self.pending_fence.lock().unwrap_or_else(|e| e.into_inner()) = fence_value;
+        #[cfg(feature = "diagnostics")]
+        let submission_number = fence_value;
+        (
+            fence_value,
+            SubmissionData {
+                batch,
+                heaps,
+                fence_value,
+                #[cfg(feature = "diagnostics")]
+                submission_number,
+                #[cfg(feature = "diagnostics")]
+                traced,
+            },
+        )
+    }
+
+    /// Copies shader-written ranges back into title memory after the GPU
+    /// submission with `data.fence_value` has completed. Must be called
+    /// exactly once per `execute` call, with the same `runs` slice.
+    pub(crate) fn copy_back(&self, runs: &[&HostList], data: SubmissionData) {
+        // Hold the submission lock for the duration: copy_back modifies
+        // global state (shadow copies, withholding flags) that must not
+        // race with another copy_back or execute call.
+        let _submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let SubmissionData {
+            batch,
+            heaps,
+            fence_value,
+            #[cfg(feature = "diagnostics")]
+            submission_number,
+            #[cfg(feature = "diagnostics")]
+            traced,
+        } = data;
+        // Block until the GPU submission has finished.
+        self.wait_for(fence_value);
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
         // submission, however many dispatches declared it (the world's
@@ -1432,8 +1493,6 @@ impl Host {
         // (the dumps submit lists of their own).
         #[cfg(feature = "diagnostics")]
         if traced {
-            let sub = *submitted;
-            drop(submitted);
             let mut targets: Vec<(usize, String)> = Vec::new();
             for r in runs {
                 for t in r.targets.lock().unwrap_or_else(|e| e.into_inner()).iter() {
@@ -1442,7 +1501,7 @@ impl Host {
                     }
                 }
             }
-            crate::capture::dump_submission(sub, &targets);
+            crate::capture::dump_submission(submission_number, &targets);
         }
     }
 
@@ -2393,6 +2452,18 @@ impl HostList {
 ///
 /// A copy's range brought up to date is not copied again in the submission
 /// until a step writes title memory: every list of a world submission using
+/// Data returned by [`Host::execute`] that must be passed to
+/// [`Host::copy_back`] once the GPU submission has completed.
+pub(crate) struct SubmissionData {
+    batch: Batch,
+    heaps: Vec<std::sync::Arc<crate::bindless::Viewed>>,
+    fence_value: u64,
+    #[cfg(feature = "diagnostics")]
+    submission_number: u64,
+    #[cfg(feature = "diagnostics")]
+    traced: bool,
+}
+
 /// title memory asks for every copy whole. What the title's threads write
 /// meanwhile is for later submissions (on the console it would race the
 /// GPU).
@@ -3060,6 +3131,7 @@ impl Meter {
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
         });
+        let gpu_wait = COPY_BACK_WAIT_US.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames;
         let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
             PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
@@ -3075,8 +3147,8 @@ impl Meter {
             let root_views = crate::draw::take_root_view_slots() as f64 / report_frames;
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
-                 {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
-                 GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
+                 {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu_wait:.1} waiting GPU; \
+                 {gpu:.1} on the GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame",
                 making = crate::pipeline::making()
@@ -3468,7 +3540,8 @@ impl Host {
                 (capture, probe)
             };
             p.copy.close();
-            self.execute(&[&p.copy]);
+            let (_, data) = self.execute(&[&p.copy]);
+            self.copy_back(&[&p.copy], data);
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 // Tests inspect the completed copy before flip-discard Present
@@ -4000,7 +4073,8 @@ mod withholding {
         }
         list.defer_missed(|| true);
         list.close();
-        host.execute(&[&list]);
+        let (_, data) = host.execute(&[&list]);
+        host.copy_back(&[&list], data);
         // SAFETY: bytes of our pools.
         let title = |k: usize, at: usize| unsafe { ((pools[k] + at) as *const u8).read_volatile() };
         let copy = |k: usize, at: usize| {
@@ -4068,7 +4142,8 @@ mod present_plane_tests {
         let scene = make_plane(32, 32, &[1.0, 0.0, 0.0, 1.0]);
         let overlay = make_plane(64, 64, &[0.0, 0.0, 128.0 / 255.0, 128.0 / 255.0]);
         list.close();
-        host.execute(&[&list]);
+        let (_, data) = host.execute(&[&list]);
+        host.copy_back(&[&list], data);
         let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
         assert!(
             host.present(&[(&scene, state)], 1).is_some(),

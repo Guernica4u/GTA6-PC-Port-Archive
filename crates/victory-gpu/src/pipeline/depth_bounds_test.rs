@@ -224,7 +224,8 @@ fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: O
     };
     let submit = || {
         assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
-        host.execute(&[commands]);
+        let (_, _ex_data) = host.execute(&[commands]);
+        host.copy_back(&[commands], _ex_data);
     };
     // SAFETY: the list is open; the depth buffer is in DEPTH_WRITE.
     unsafe { l.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.5, 0, None) };

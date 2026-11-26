@@ -634,7 +634,9 @@ mod tests {
         }
         list.close();
         let recorded = issued();
-        host.execute(&[&list]);
+        let (_, _ex_data) = host.execute(&[&list]);
+
+        host.copy_back(&[&list], _ex_data);
         // The GPU runs the prelude, then the list.
         let mut run = issued();
         run.extend(recorded);

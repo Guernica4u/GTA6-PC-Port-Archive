@@ -2929,7 +2929,9 @@ mod tests {
             );
         }
         back.close();
-        host.execute(&[&back]);
+        let (_, _ex_data) = host.execute(&[&back]);
+
+        host.copy_back(&[&back], _ex_data);
         let mut mapped = std::ptr::null_mut();
         // SAFETY: the copy finished (execute waits); the buffer is 1024 bytes.
         let read = unsafe {

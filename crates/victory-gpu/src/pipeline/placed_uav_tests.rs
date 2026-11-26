@@ -194,7 +194,9 @@ fn placed_uav_dispatch_writes_its_texture() {
     let (readback, footprint) =
         crate::capture::read_back(&host.device, &list.list, &texture).unwrap();
     list.close();
-    host.execute(&[&list]);
+    let (_, _ex_data) = host.execute(&[&list]);
+
+    host.copy_back(&[&list], _ex_data);
 
     // SAFETY: read the two RGBA32_FLOAT texels after the synchronous submission.
     let texels = unsafe {

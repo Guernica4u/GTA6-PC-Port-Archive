@@ -204,24 +204,69 @@ fn pump(held: &mut Holding, why: Why) {
     let fence = |f: usize| crate::fence::value(f as This);
     let started = std::time::Instant::now();
     let mut ran = std::time::Duration::ZERO;
-    let mut run = |_: usize, segments: Vec<std::sync::Arc<crate::host::HostList>>| {
-        let lists: Vec<&crate::host::HostList> = segments.iter().map(|s| &**s).collect();
-        let at = std::time::Instant::now();
-        host.execute(&lists);
-        ran += at.elapsed();
-        drop(lists);
-        segments.into_iter().for_each(crate::list::recycle);
-    };
-    let mut signal = |f: usize, value: u64| {
-        crate::fence::set(f as This, value);
-        crate::fence::let_go(f as This);
-    };
-    let pumped = held.pump(&mut crate::hold::World {
-        read: &read,
-        fence: &fence,
-        run: &mut run,
-        signal: &mut signal,
-    });
+    // Holds the previous execution's data until copy_back is called.
+    let mut previous: Option<(Vec<std::sync::Arc<crate::host::HostList>>, crate::host::SubmissionData)> = None;
+
+    // We run multiple pump passes: each flush of copy_back may write
+    // bottom-of-pipe values that unblock work held by other queues.
+    let mut pumped = crate::hold::Pumped::default();
+    loop {
+        {
+            let mut run = |_: usize, segments: Vec<std::sync::Arc<crate::host::HostList>>| {
+                // Copy back the previous submission before preparing this one.
+                // The GPU runs the previous submission while the CPU prepares this one.
+                if let Some((prev_arcs, data)) = previous.take() {
+                    let prev_lists: Vec<&crate::host::HostList> = prev_arcs.iter().map(|s| &**s).collect();
+                    host.copy_back(&prev_lists, data);
+                    drop(prev_lists);
+                    prev_arcs.into_iter().for_each(crate::list::recycle);
+                }
+                let lists: Vec<&crate::host::HostList> = segments.iter().map(|s| &**s).collect();
+                let at = std::time::Instant::now();
+                let (_, data) = host.execute(&lists);
+                ran += at.elapsed();
+                drop(lists);
+                // Defer copy_back until the next iteration so the GPU can run
+                // while the CPU prepares the next submission.
+                previous = Some((segments, data));
+            };
+            let mut signal = |f: usize, value: u64| {
+                crate::fence::set(f as This, value);
+                crate::fence::let_go(f as This);
+            };
+            let more = held.pump(&mut crate::hold::World {
+                read: &read,
+                fence: &fence,
+                run: &mut run,
+                signal: &mut signal,
+            });
+            pumped.pieces += more.pieces;
+            pumped.segments += more.segments;
+            pumped.unknown += more.unknown;
+            pumped.waited.extend(more.waited);
+            if more.segments == 0 {
+                break;
+            }
+        }
+        // `run` is out of scope here; flush copy_back so bottom-of-pipe
+        // writes are visible before the next pump pass checks waits.
+        if let Some((prev_arcs, data)) = previous.take() {
+            let prev_lists: Vec<&crate::host::HostList> = prev_arcs.iter().map(|s| &**s).collect();
+            host.copy_back(&prev_lists, data);
+            drop(prev_lists);
+            prev_arcs.into_iter().for_each(crate::list::recycle);
+        }
+        if held.is_empty() {
+            break;
+        }
+    }
+    // Final flush of any remaining pending copy_back.
+    if let Some((prev_arcs, data)) = previous.take() {
+        let prev_lists: Vec<&crate::host::HostList> = prev_arcs.iter().map(|s| &**s).collect();
+        host.copy_back(&prev_lists, data);
+        drop(prev_lists);
+        prev_arcs.into_iter().for_each(crate::list::recycle);
+    }
     if pumped.segments > 0 || pumped.unknown > 0 {
         let mut a = account();
         a.pump += started.elapsed().saturating_sub(ran);
@@ -810,7 +855,9 @@ mod tests {
             );
         }
         list.close();
-        host.execute(&[&list]);
+        let (fence_value, data) = host.execute(&[&list]);
+        host.copy_back(&[&list], data);
+        let _ = fence_value;
         assert_eq!(primary.state.load(Ordering::Relaxed), TARGET);
 
         let planes = resources.each_ref().map(|resource| Plane {

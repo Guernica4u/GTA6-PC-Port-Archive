@@ -302,7 +302,8 @@ mod tests {
                 out = Some(clamped);
             }
             list.close();
-            host.execute(&[&list]);
+            let (_, _ex_data) = host.execute(&[&list]);
+            host.copy_back(&[&list], _ex_data);
             for at in 0..all {
                 assert_eq!(data.add(at).read_volatile(), words[at % words.len()], "the title's copy as written");
             }
@@ -386,7 +387,9 @@ mod tests {
                 })
                 .collect();
             let order = if a_first { [0, 1] } else { [1, 0] };
-            host.execute(&[&lists[order[0]], &lists[order[1]]]);
+            let run_lists = [&lists[order[0]], &lists[order[1]]];
+            let (_, _ex_data) = host.execute(&run_lists);
+            host.copy_back(&run_lists, _ex_data);
             let mut run = issued();
             run.extend(order.iter().flat_map(|&i| recorded[i].1.clone()));
             let mut states: std::collections::HashMap<usize, u32> =

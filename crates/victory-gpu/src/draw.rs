@@ -2206,7 +2206,9 @@ void main() {
         readable(&list, &used(ResourceType::Uav), &view, true);
         dispatch_marked_uav(&list, heap_host, &shader, 0, 0, 0, 0xDEAD_BEEF);
         list.close();
-        host.execute(&[&list]);
+        let (_, _ex_data) = host.execute(&[&list]);
+
+        host.copy_back(&[&list], _ex_data);
 
         assert_eq!(host.log_messages(), None);
         // SAFETY: bytes inside our page.
@@ -2248,7 +2250,9 @@ void main() {
         list.defer_copy((p + 0x2000) as *mut u8, cpu_val.as_ptr(), cpu_val.len());
         dispatch_marked_uav(&list, heap_host, &shader, 0, 0, 0, 0xDEAD_BEEF);
         list.close();
-        host.execute(&[&list]);
+        let (_, _ex_data) = host.execute(&[&list]);
+
+        host.copy_back(&[&list], _ex_data);
 
         assert_eq!(host.log_messages(), None);
         // SAFETY: bytes inside our page.
@@ -2319,7 +2323,9 @@ void main() {
         dispatch_marked_uav(&list, heap_host, &shader, 0, 0, 0, 0x1234_5678);
         dispatch_marked_uav(&list, heap_host, &shader, 0, 0, 0x80, 0x9ABC_DEF0);
         list.close();
-        host.execute(&[&list]);
+        let (_, _ex_data) = host.execute(&[&list]);
+
+        host.copy_back(&[&list], _ex_data);
 
         assert_eq!(host.log_messages(), None);
         // SAFETY: bytes inside our 2-page pool.
@@ -2364,7 +2370,9 @@ void main() {
         readable(&list, &used(ResourceType::Uav), &view2, true);
         dispatch_marked_uav(&list, heap_host, &shader, 1, 1, 0, 0x3333_3333);
         list.close();
-        host.execute(&[&list]);
+        let (_, _ex_data) = host.execute(&[&list]);
+
+        host.copy_back(&[&list], _ex_data);
 
         assert_eq!(host.log_messages(), None);
         // SAFETY: bytes inside our page.
@@ -2403,7 +2411,9 @@ void main() {
         assert_eq!(offset, 4096);
         dispatch_marked_uav(&list, heap_host, &shader, index, index, offset, 0xBEEF_CAFE);
         list.close();
-        host.execute(&[&list]);
+        let (_, _ex_data) = host.execute(&[&list]);
+
+        host.copy_back(&[&list], _ex_data);
 
         assert_eq!(host.log_messages(), None);
         // SAFETY: bytes inside our 2-page pool.
@@ -2598,7 +2608,9 @@ uint ps() : SV_Target { return 1; }
             l.CopyTextureRegion(&to, 0, 0, 0, &from, None);
         }
         list.close();
-        host.execute(&[&list]);
+        let (_, _ex_data) = host.execute(&[&list]);
+
+        host.copy_back(&[&list], _ex_data);
         (0..64 * 64)
             .map(|i| {
                 // SAFETY: inside the mapped buffer, by the footprint.
@@ -2695,7 +2707,9 @@ uint ps() : SV_Target { return 1; }
                     unsafe { (at as *mut u32).write(value) };
                 }
             }
-            host.execute(&[&list]);
+            let (_, _ex_data) = host.execute(&[&list]);
+
+            host.copy_back(&[&list], _ex_data);
             assert_eq!(out.read_host(dst_bytes as u64, 16), want, "round {round}");
         }
     }
@@ -2871,7 +2885,9 @@ void main(uint3 id : SV_DispatchThreadID) {
             readable(&list, &used(ResourceType::Srv), &view, false);
             run(&list, &slots, &read, 1, Some(&out), (read_size / 8, read_size / 8));
             list.close();
-            host.execute(&[&list]);
+            let (_, _ex_data) = host.execute(&[&list]);
+
+            host.copy_back(&[&list], _ex_data);
             let copied = crate::texture::ALIAS_COPIES.load(Ordering::Relaxed) > copies;
             assert_eq!(copied, !shared, "round {round}: a copy only where not shared");
             let n = read_size as usize;
@@ -2915,7 +2931,9 @@ void main(uint3 id : SV_DispatchThreadID) {
                 list.close();
             }
             let before = crate::texture::uploads(object);
-            host.execute(&[&lists[0], &lists[1]]);
+            let run_lists_a = [&lists[0], &lists[1]];
+            let (_, _ex_data) = host.execute(&run_lists_a);
+            host.copy_back(&run_lists_a, _ex_data);
             // SAFETY: inside the mapped output.
             let texel = unsafe { (data as *const [f32; 4]).read() };
             (crate::texture::uploads(object) - before, texel[0])
@@ -2962,7 +2980,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         // SAFETY: the texture's memory, 256-byte rows of 64 texels.
         let write = |byte: u8| unsafe { std::ptr::write_bytes(address as *mut u8, byte, 64 * 64 * 4) };
         write(0x40);
-        host.execute(&[&reading()]);
+        let reading_list_0 = reading();
+        let (_, _ex_data) = host.execute(&[&reading_list_0]);
+        host.copy_back(&[&reading_list_0], _ex_data);
         assert!((texel() - 64.0 / 255.0).abs() < 1e-6, "uploaded: {}", texel());
         // The title writes the memory again and a list reading the texture
         // is recorded: its upload is due.
@@ -2973,8 +2993,12 @@ void main(uint3 id : SV_DispatchThreadID) {
         let copying = host.new_list().unwrap();
         crate::texture::host_writes(&copying, object);
         copying.close();
-        host.execute(&[&copying]);
-        host.execute(&[&late]);
+        let (_, _ex_data) = host.execute(&[&copying]);
+
+        host.copy_back(&[&copying], _ex_data);
+        let (_, _ex_data) = host.execute(&[&late]);
+
+        host.copy_back(&[&late], _ex_data);
         assert!(
             (texel() - 64.0 / 255.0).abs() < 1e-6,
             "the host's texels kept, not title memory uploaded over them: {}",
@@ -3013,12 +3037,16 @@ void main(uint3 id : SV_DispatchThreadID) {
         let list = record();
         assert!(crate::resource::give_up_now(object), "fed from title memory");
         assert!(crate::resource::made_copy(object).is_none(), "its title texture let go");
-        host.execute(&[&list]);
+        let (_, _ex_data) = host.execute(&[&list]);
+
+        host.copy_back(&[&list], _ex_data);
         assert!((texel() - 64.0 / 255.0).abs() < 1e-6, "the recorded list read it");
         // SAFETY: inside the mapped output.
         unsafe { std::ptr::write_bytes(data, 0, 16) };
         let list = record();
-        host.execute(&[&list]);
+        let (_, _ex_data) = host.execute(&[&list]);
+
+        host.copy_back(&[&list], _ex_data);
         assert!((texel() - 64.0 / 255.0).abs() < 1e-6, "made again with its bytes");
         assert_eq!(crate::texture::uploads(object), 1, "uploaded into the new one");
     }
@@ -3055,7 +3083,9 @@ void main(uint3 id : SV_DispatchThreadID) {
                 list
             })
             .collect();
-        host.execute(&[&lists[0], &lists[1]]);
+        let run_lists_b = [&lists[0], &lists[1]];
+        let (_, _ex_data) = host.execute(&run_lists_b);
+        host.copy_back(&run_lists_b, _ex_data);
         for (k, (_, data)) in outs.iter().enumerate() {
             // SAFETY: inside the mapped output.
             let texel = unsafe { (*data as *const [f32; 4]).read() };
@@ -3089,7 +3119,9 @@ void main(uint3 id : SV_DispatchThreadID) {
             run(&list, &slots, &read, 0, Some(&out), (8, 8));
             list.close();
             let before = crate::texture::uploads(object);
-            host.execute(&[&list]);
+            let (_, _ex_data) = host.execute(&[&list]);
+
+            host.copy_back(&[&list], _ex_data);
             // SAFETY: inside the mapped output.
             let texel = unsafe { (data as *const [f32; 4]).read() };
             (crate::texture::uploads(object) - before, texel[0])
@@ -3132,7 +3164,9 @@ void main(uint3 id : SV_DispatchThreadID) {
             run(&list, &slots, &read, 0, Some(&out), (8, 8));
             list.close();
             let before = crate::texture::copied(object);
-            host.execute(&[&list]);
+            let (_, _ex_data) = host.execute(&[&list]);
+
+            host.copy_back(&[&list], _ex_data);
             // SAFETY: inside the mapped output.
             let texel = unsafe { (data as *const [f32; 4]).read() };
             (crate::texture::copied(object) - before, texel[0])
@@ -3236,7 +3270,9 @@ void main(uint3 id : SV_DispatchThreadID) {
             list.list.CopyTextureRegion(&to(f[1]), 0, 0, 0, &at(&copy.texture, 1), None);
         }
         list.close();
-        host.execute(&[&list]);
+        let (_, _ex_data) = host.execute(&[&list]);
+
+        host.copy_back(&[&list], _ex_data);
         // The title's float for 16-bit value u (its 1/65535 is 0x37800080).
         let float = |u: u32| (u as f32 * f32::from_bits(0x3780_0080)).to_bits();
         for (x, y) in [(0usize, 0usize), (5, 0), (63, 2), (17, 40), (63, 63)] {
@@ -3296,7 +3332,9 @@ void main(uint3 id : SV_DispatchThreadID) {
             list.list.CopyTextureRegion(&to(g[1]), 0, 0, 0, &at(&twin.planes[1].texture, 0), None);
         }
         list.close();
-        host.execute(&[&list]);
+        let (_, _ex_data) = host.execute(&[&list]);
+
+        host.copy_back(&[&list], _ex_data);
         for (x, y) in [(0usize, 0usize), (63, 63)] {
             // SAFETY: inside the mapped buffer, by the footprints.
             let (half, byte) = unsafe {
@@ -3482,7 +3520,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         // SAFETY: open command list with compute pipeline and roots bound.
         unsafe { list.list.Dispatch(1, 1, 1) };
         list.close();
-        host.execute(&[&list]);
+        let (_, _ex_data) = host.execute(&[&list]);
+
+        host.copy_back(&[&list], _ex_data);
 
         assert_eq!(
             host.log_messages(),
@@ -3562,7 +3602,9 @@ void main(uint3 id : SV_DispatchThreadID) {
             readable(&list, &used(ResourceType::Srv), &shader, false);
             run(&list, &slots, &read, 1, Some(&out), (8, 8));
             list.close();
-            host.execute(&[&list]);
+            let (_, _ex_data) = host.execute(&[&list]);
+
+            host.copy_back(&[&list], _ex_data);
             // SAFETY: inside the mapped output: texel (7, 2) of the read.
             let got = unsafe { (data.add((2 * 64 + 7) * 16) as *const [f32; 4]).read() };
             assert_eq!(got, want, "round {round}");
@@ -3715,7 +3757,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         readable(&list, &used(ResourceType::Srv), &srv2, false);
         run(&list, &slots, &read, 3, Some(&out), (1, 1));
         list.close();
-        host.execute(&[&list]);
+        let (_, _ex_data) = host.execute(&[&list]);
+
+        host.copy_back(&[&list], _ex_data);
 
         for (x, y) in [(0usize, 0usize), (3, 5), (7, 7)] {
             // SAFETY: inside the mapped output buffer.
@@ -3896,7 +3940,9 @@ void main(uint3 id : SV_DispatchThreadID) {
                 list.list.Dispatch(1, 1, 1);
             }
             list.close();
-            host.execute(&[&list]);
+            let (_, _ex_data) = host.execute(&[&list]);
+
+            host.copy_back(&[&list], _ex_data);
 
             for texel in 0..4usize {
                 // SAFETY: inside the mapped output buffer.
