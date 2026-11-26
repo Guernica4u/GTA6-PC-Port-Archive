@@ -179,21 +179,37 @@ pub(crate) fn sync_heaps() {
         };
         let step = u64::from(step);
         for (from, to) in written.take(start as usize, usize::MAX) {
-            // By page: one with nothing mapped (the title unmaps heap pages
-            // too) holds no records.
+            // By region, not by page: one `VirtualQuery` walk answers which
+            // pages are readable (committed and not guarded), instead of one
+            // kernel read per 64 KiB page. A page with nothing mapped (the
+            // title unmaps heap pages too) holds no records.
+            use windows_sys::Win32::System::Memory::{
+                MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+            };
             let page_size = crate::watch::PAGE;
-            for page in (from & !(page_size - 1)..to).step_by(page_size) {
-                let (page, end) = (page.max(from), (page + page_size).min(to));
-                if !crate::host::read_into(page as *const u8, &mut [0u8; 4]) {
-                    continue;
+            let mut at = from & !(page_size - 1);
+            while at < to {
+                // SAFETY: plain data filled in by the query.
+                let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                // SAFETY: a valid out pointer of the right size.
+                if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0 {
+                    break;
                 }
-                let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(
-                    crate::copystat::C::SyncSlots,
-                    last.min(u64::from(heap.desc.count)).saturating_sub(first),
-                );
-                host.sync_slots(first as u32, last.min(u64::from(heap.desc.count)) as u32, start, step);
+                let next = (info.BaseAddress as usize + info.RegionSize).max(at + 1).min(to);
+                // ReadProcessMemory reads guarded pages' neighbours fine but
+                // fails on PAGE_NOACCESS/PAGE_GUARD: the same pages a kernel
+                // read of 4 bytes would fail on.
+                if info.State == MEM_COMMIT && info.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 {
+                    let (page, end) = (at.max(from), next.min(to));
+                    let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(
+                        crate::copystat::C::SyncSlots,
+                        last.min(u64::from(heap.desc.count)).saturating_sub(first),
+                    );
+                    host.sync_slots(first as u32, last.min(u64::from(heap.desc.count)) as u32, start, step);
+                }
+                at = next;
             }
         }
     }
@@ -828,6 +844,68 @@ static FUNCTIONS: Table<24> = {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    /// The heap-sync page probe: per-page kernel reads vs one VirtualQuery
+    /// walk over the same range, same answer, and the timing difference.
+    #[test]
+    fn a_region_walk_classifies_pages_like_per_page_reads() {
+        use windows_sys::Win32::System::Memory::{
+            MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_GUARD, PAGE_NOACCESS,
+            PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualProtect, VirtualQuery,
+        };
+        let page = crate::watch::PAGE;
+        let mb = 256;
+        // SAFETY: a fresh allocation, freed by the test.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), mb << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert!(base != 0);
+        // A guarded page in the middle must read as unreadable both ways.
+        let mut ignored = 0;
+        // SAFETY: our allocation.
+        unsafe { VirtualProtect((base + (mb << 19)) as *const _, page, PAGE_GUARD | PAGE_READWRITE, &mut ignored) };
+        let (from, to) = (base, base + (mb << 20));
+        // Old: one kernel read per page.
+        let readable_old = |from: usize, to: usize| -> Vec<usize> {
+            let mut out = Vec::new();
+            let mut at = from & !(page - 1);
+            while at < to {
+                if crate::host::read_into(at as *const u8, &mut [0u8; 4]) {
+                    out.push(at);
+                }
+                at += page;
+            }
+            out
+        };
+        // New: one VirtualQuery walk.
+        let readable_new = |from: usize, to: usize| -> Vec<usize> {
+            let mut out = Vec::new();
+            let mut at = from & !(page - 1);
+            while at < to {
+                // SAFETY: plain data filled in by the query.
+                let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                // SAFETY: a valid out pointer of the right size.
+                if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0 {
+                    break;
+                }
+                let next = (info.BaseAddress as usize + info.RegionSize).max(at + 1).min(to);
+                if info.State == MEM_COMMIT && info.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 {
+                    out.extend((at..next).step_by(page));
+                }
+                at = next;
+            }
+            out
+        };
+        let t0 = std::time::Instant::now();
+        let old = readable_old(from, to);
+        let t_old = t0.elapsed();
+        let t0 = std::time::Instant::now();
+        let new = readable_new(from, to);
+        let t_new = t0.elapsed();
+        assert_eq!(old, new, "same pages readable");
+        assert_eq!(old.len(), mb * 16 - 1, "the guarded page is out");
+        eprintln!("{mb} MB, {} pages: per-page reads {t_old:?}, region walk {t_new:?}", old.len());
+        // SAFETY: freeing our allocation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
     /// Work to run while `make_read` makes the textures of a read slot (the
     /// slot), outside the heaps' lock.
     pub(crate) static WHILE_MAKING: std::sync::Mutex<Option<(u32, Work)>> = std::sync::Mutex::new(None);
