@@ -33,8 +33,9 @@
 //! shortcut: a system call writing into a guarded block fails; the known
 //! ones (file reads, DirectStorage) open their blocks first. Memory freed
 //! and allocated again while a tracker holds it is not seen, unless the
-//! runtime frees it (`XMemFreeDefault`) or allocates it (`XMemVirtualAlloc`):
-//! both report it as remapped.
+//! runtime frees it (`XMemFreeDefault`, of its 32-bit blocks) or allocates
+//! it (`XMemVirtualAlloc`): both report it as remapped. Memory no tracker
+//! holds (the C heap's) keeps no remap state at all.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -115,9 +116,10 @@ struct Saved {
     /// Pages of those runs that are not armed any more.
     unarmed: BTreeSet<usize>,
     bytes: std::collections::HashMap<usize, Box<[u8]>>,
-    /// Pages unmapped or remapped since a copy took them or ended a
-    /// submission: pending copy-backs must not write stale bytes back there.
-    remapped: BTreeSet<usize>,
+    /// Pages unmapped or remapped mapped to the epoch at which they were
+    /// remapped. Pending copy-backs check this against their snapshot/refresh
+    /// epoch to skip only remaps that occurred after the write was prepared.
+    remapped: std::collections::HashMap<usize, u64>,
 }
 
 impl Saved {
@@ -162,15 +164,15 @@ impl Changed {
         saved.remapped.remove(&page);
     }
 
-    /// Page `page` was unmapped or remapped: drop any armed/saved pre-write
-    /// snapshot and record it so pending declared copy-backs skip it.
-    fn remapped(&self, page: usize) {
+    /// Page `page` was unmapped or remapped at `epoch`: drop any armed/saved pre-write
+    /// snapshot and record the remap epoch so pending declared copy-backs skip it.
+    fn remapped(&self, page: usize, epoch: u64) {
         let mut saved = self.1.lock().unwrap_or_else(|e| e.into_inner());
         if saved.armed(page) {
             saved.unarmed.insert(page);
         }
         saved.bytes.remove(&page);
-        saved.remapped.insert(page);
+        saved.remapped.insert(page, epoch);
     }
 
     /// Page `page` is about to change for the first time since it was
@@ -559,13 +561,18 @@ impl Tracked {
     }
 
     /// The caller made pages (page numbers) of its copy equal to title
-    /// memory itself (what shaders wrote went back): taken and guarded.
+    /// memory itself (what shaders wrote went back): taken and guarded,
+    /// skipping pages unmapped or remapped after `since_epoch`.
     ///
     /// Locks `MAPPING` non-reentrantly; must not be called while holding a
     /// [`Remapping`] guard.
-    pub(crate) fn taken(&self, pages: &[usize]) {
+    pub(crate) fn taken(&self, pages: &[usize], since_epoch: u64) {
         let _remap = MAPPING.lock().unwrap_or_else(|e| e.into_inner());
-        let pages: Vec<usize> = pages.iter().copied().filter(|&p| !self.was_remapped(p)).collect();
+        let pages: Vec<usize> = pages
+            .iter()
+            .copied()
+            .filter(|&p| !self.was_remapped_since(p, since_epoch))
+            .collect();
         if pages.is_empty() {
             return;
         }
@@ -614,7 +621,11 @@ impl Tracked {
     pub(crate) fn arm(&self, from: usize, to: usize) {
         let (from, to) = (from.max(self.start), to.min(self.end));
         if from < to {
-            self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).arm(from / PAGE, to.div_ceil(PAGE));
+            self.changed
+                .1
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .arm(from / PAGE, to.div_ceil(PAGE));
         }
     }
 
@@ -636,15 +647,22 @@ impl Tracked {
         saved.remapped.clear();
     }
 
-    /// Whether `page` (a page number) was unmapped or remapped since it was
-    /// taken or the previous submission finished.
-    pub(crate) fn was_remapped(&self, page: usize) -> bool {
+    /// Whether `page` (a page number) was unmapped or remapped since `since_epoch`.
+    pub(crate) fn was_remapped_since(&self, page: usize, since_epoch: u64) -> bool {
         self.changed
             .1
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remapped
-            .contains(&page)
+            .get(&page)
+            .is_some_and(|&epoch| epoch > since_epoch)
+    }
+
+    /// Whether `page` (a page number) was unmapped or remapped since it was
+    /// taken or the previous submission finished.
+    #[cfg(test)]
+    pub(crate) fn was_remapped(&self, page: usize) -> bool {
+        self.was_remapped_since(page, 0)
     }
 
     /// The bytes page `page` (a page number) held when it was first written
@@ -883,10 +901,17 @@ impl Drop for Remapping {
     }
 }
 
+static REMAP_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+/// The current remap generation counter.
+pub(crate) fn current_epoch() -> u64 {
+    REMAP_EPOCH.load(Ordering::Acquire)
+}
+
 /// Runs `write` to copy bytes back into `[at, at + len)` while holding
 /// [`MAPPING`] so a concurrent remap cannot race between the remap check and
 /// the copy-back write. Returns `false` if any page in `[at, at + len)` was
-/// already remapped.
+/// remapped since `since_epoch`.
 ///
 /// Locks `MAPPING` non-reentrantly; must not be called while holding a
 /// [`Remapping`] guard.
@@ -894,12 +919,13 @@ pub(crate) fn write_back(
     tracked: Option<&Tracked>,
     at: usize,
     len: usize,
+    since_epoch: u64,
     write: impl FnOnce(),
 ) -> bool {
     let _remap = MAPPING.lock().unwrap_or_else(|e| e.into_inner());
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     if let Some(t) = tracked
-        && (first..last).any(|p| t.was_remapped(p))
+        && (first..last).any(|p| t.was_remapped_since(p, since_epoch))
     {
         return false;
     }
@@ -912,13 +938,14 @@ pub(crate) fn write_back(
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
     let _remap = title_memory_remapping();
+    let epoch = REMAP_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
     // What it showed is gone already: nothing to keep.
     changed(&mut g, first, last, false);
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders {
-            c.remapped(page);
+            c.remapped(page, epoch);
         }
     }
     // What it showed is not what it shows now: its links go, both ways.
@@ -1523,7 +1550,7 @@ pub(crate) mod tests {
         assert!(t.changed(a / PAGE));
         assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
         assert!(t.changed(a / PAGE), "take must leave the page changed");
-        t.taken(&[a / PAGE]);
+        t.taken(&[a / PAGE], 0);
         assert!(t.changed(a / PAGE), "taken must leave the page changed");
         // SAFETY: the second view of the page, kept open by `write`.
         unsafe { (b as *mut u32).write_volatile(0x1234) };

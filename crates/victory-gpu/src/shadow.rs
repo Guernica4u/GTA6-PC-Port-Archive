@@ -17,6 +17,7 @@
 //! (`crate::bindless`).
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -78,9 +79,11 @@ pub(crate) struct Shadow {
     /// title memory there is older than the copy.
     pending: Mutex<std::collections::HashSet<(usize, usize)>>,
     /// The copy's bytes before the submission ran where its shaders write:
-    /// what the GPU wrote differs. Disjoint segments (offset, bytes) in
+    /// what the GPU wrote differs. Disjoint segments (offset, bytes, epoch) in
     /// order, and the 64 KiB pieces (by title address) already compared.
     before: Mutex<Snapshot>,
+    /// The epoch at which this copy's title memory was last refreshed or updated.
+    refreshed_epoch: AtomicU64,
     /// Its first bit in the buffer views' written-pages bitmap, one per
     /// 64 KiB title page it touches (tracked memory only): writes through
     /// views of it are marked there ([`Shadow::mark_entry`]).
@@ -92,8 +95,8 @@ pub(crate) struct Shadow {
     slice: Option<Slice>,
 }
 
-/// Snapshot segments (offset, bytes) and the pieces compared.
-type Snapshot = (Vec<(usize, Vec<u8>)>, std::collections::HashSet<usize>);
+/// Snapshot segments (offset, bytes, epoch) and the pieces compared.
+type Snapshot = (Vec<(usize, Vec<u8>, u64)>, std::collections::HashSet<usize>);
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
@@ -227,14 +230,15 @@ impl Shadow {
         }
         #[cfg(test)]
         tests::before_copy_back_write();
-        if !crate::watch::write_back(self.tracked.as_ref(), from, n, || {
+        let epoch = self.refreshed_epoch.load(Ordering::Acquire);
+        if !crate::watch::write_back(self.tracked.as_ref(), from, n, epoch, || {
             crate::host::write_mapped(from as *mut u8, host.as_ptr(), n);
         }) {
             return 0;
         }
         // Our write is not the title's: the copy holds the page as it is.
         if let Some(t) = &self.tracked {
-            t.taken(&[page / PAGE]);
+            t.taken(&[page / PAGE], epoch);
         }
         n
     }
@@ -264,6 +268,7 @@ impl Shadow {
             tracked,
             pending: Mutex::default(),
             before: Mutex::default(),
+            refreshed_epoch: AtomicU64::new(crate::watch::current_epoch()),
             marks,
             base: slice.map_or(0, |s| s.offset),
             slice,
@@ -343,17 +348,18 @@ impl Shadow {
         let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let segments = &mut before.0;
+        let epoch = crate::watch::current_epoch();
         // The segments the range overlaps or touches.
-        let first = segments.partition_point(|(at, bytes)| at + bytes.len() < from);
-        let last = first + segments[first..].iter().take_while(|(at, _)| *at <= to).count();
-        if let [(at, bytes)] = &segments[first..last]
+        let first = segments.partition_point(|(at, bytes, _)| at + bytes.len() < from);
+        let last = first + segments[first..].iter().take_while(|(at, _, _)| *at <= to).count();
+        if let [(at, bytes, _)] = &segments[first..last]
             && *at <= from
             && to <= at + bytes.len()
         {
             return;
         }
         let start = segments.get(first).filter(|_| first < last).map_or(from, |s| s.0.min(from));
-        let end = segments[first..last].last().map_or(to, |(at, bytes)| (at + bytes.len()).max(to));
+        let end = segments[first..last].last().map_or(to, |(at, bytes, _)| (at + bytes.len()).max(to));
         #[cfg(feature = "diagnostics")]
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SnapshotUs);
         #[cfg(feature = "diagnostics")]
@@ -363,14 +369,14 @@ impl Shadow {
         // Parts newly covered from the copy, the rest as it was taken.
         let mut grown = pooled(end - start);
         let mut at = start;
-        for (taken, bytes) in segments.drain(first..last) {
+        for (taken, bytes, _) in segments.drain(first..last) {
             grown.extend_from_slice(host(at, taken));
             grown.extend_from_slice(&bytes);
             at = taken + bytes.len();
             give_back(bytes);
         }
         grown.extend_from_slice(host(at, end));
-        segments.insert(first, (start, grown));
+        segments.insert(first, (start, grown, epoch));
     }
 
     /// `[address, address + len)` expanded outward to 64 KiB page
@@ -414,10 +420,13 @@ impl Shadow {
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = segments.iter().find(|(at, bytes)| *at <= from && to <= at + bytes.len())
+        if let Some((taken, before, snapshot_epoch)) = segments
+            .iter()
+            .find(|(at, bytes, _)| *at <= from && to <= at + bytes.len())
             && back
             && from < to
         {
+            let snapshot_epoch = *snapshot_epoch;
             let before = &before[from - taken..to - taken];
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::CompareUs);
@@ -444,7 +453,7 @@ impl Shadow {
                 if self
                     .tracked
                     .as_ref()
-                    .is_some_and(|t| t.was_remapped((start + at) / PAGE))
+                    .is_some_and(|t| t.was_remapped_since((start + at) / PAGE, snapshot_epoch))
                 {
                     at += n;
                     continue;
@@ -457,7 +466,7 @@ impl Shadow {
                     if merge_writeback(title, host, old) {
                         #[cfg(test)]
                         tests::before_copy_back_write();
-                        if crate::watch::write_back(self.tracked.as_ref(), start + at, n, || {
+                        if crate::watch::write_back(self.tracked.as_ref(), start + at, n, snapshot_epoch, || {
                             crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                         }) {
                             written += n;
@@ -466,7 +475,7 @@ impl Shadow {
                     } else if self
                         .tracked
                         .as_ref()
-                        .is_none_or(|t| !t.was_remapped((start + at) / PAGE))
+                        .is_none_or(|t| !t.was_remapped_since((start + at) / PAGE, snapshot_epoch))
                     {
                         synced.push((start + at) / PAGE);
                     }
@@ -479,7 +488,7 @@ impl Shadow {
             let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
             if let Some(t) = &self.tracked {
                 let whole: Vec<usize> = synced.into_iter().filter(|p| (first..last).contains(p)).collect();
-                t.taken(&whole);
+                t.taken(&whole, snapshot_epoch);
             }
         }
         // Every submitted step that declared the range is done with it (one
@@ -488,7 +497,7 @@ impl Shadow {
         pending.remove(&(address, address + len));
         if pending.is_empty() {
             compared.clear();
-            for (_, bytes) in segments.drain(..) {
+            for (_, bytes, _) in segments.drain(..) {
                 give_back(bytes);
             }
             if let Some(t) = &self.tracked {
@@ -520,6 +529,7 @@ impl Shadow {
         }
         // Our own write below must not save the page for this copy again.
         t.unarm(page / PAGE);
+        let arm_epoch = self.refreshed_epoch.load(Ordering::Acquire);
         let saved = t.saved(page / PAGE);
         if saved.is_none() && t.changed(page / PAGE) {
             #[cfg(feature = "diagnostics")]
@@ -545,17 +555,17 @@ impl Shadow {
         #[cfg(test)]
         tests::before_copy_back_write();
         if let Some(bytes) = written {
-            if !crate::watch::write_back(Some(t), from, n, || {
+            if !crate::watch::write_back(Some(t), from, n, arm_epoch, || {
                 crate::host::write_mapped(from as *mut u8, bytes, n);
             }) {
                 return 0;
             }
-        } else if t.was_remapped(page / PAGE) {
+        } else if t.was_remapped_since(page / PAGE, arm_epoch) {
             return 0;
         }
         // Equal to title memory now: taken, unless it holds the page in part.
         if from == page && to == page + PAGE {
-            t.taken(&[page / PAGE]);
+            t.taken(&[page / PAGE], arm_epoch);
         }
         written.map_or(0, |_| n)
     }
@@ -576,6 +586,7 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        self.refreshed_epoch.store(crate::watch::current_epoch(), Ordering::Release);
         if self.clean() {
             return 0;
         }
@@ -646,7 +657,7 @@ impl Shadow {
         let mut sync_before = |a: usize, b: usize| {
             let Some(before) = &mut before else { return };
             let (a, b) = (a - start, b - start);
-            for (at, bytes) in before.0.iter_mut() {
+            for (at, bytes, _) in before.0.iter_mut() {
                 let (s, e) = ((*at).max(a), (*at + bytes.len()).min(b));
                 if s < e {
                     // SAFETY: inside the mapping.
@@ -1481,7 +1492,7 @@ pub(crate) mod tests {
             return; // no host GPU here
         };
         copy.update(p, len);
-        let bytes = |s: &Shadow| s.before.lock().unwrap().0.iter().map(|(_, b)| b.len()).sum::<usize>();
+        let bytes = |s: &Shadow| s.before.lock().unwrap().0.iter().map(|(_, b, _)| b.len()).sum::<usize>();
         copy.writing(p + 16, 64, false);
         copy.writing(p + 3 * PAGE, 100, false);
         assert_eq!(bytes(&copy), 164, "two segments");
@@ -1992,6 +2003,36 @@ pub(crate) mod tests {
         // SAFETY: our pool.
         let title = unsafe { (p as *const u8).read_volatile() };
         assert_eq!(title, 0x22);
+        unregister(p, p as u64);
+        crate::watch::tests::free(p);
+    }
+
+    /// A prior remap (before submission S1 starts) must not drop valid
+    /// partial-page unmarked GPU copy-backs in S1.
+    #[test]
+    fn unmarked_partial_page_copy_back_after_prior_remap_keeps_gpu_bytes() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            return;
+        };
+        copy.update(p, len);
+        // Remap happens BEFORE S1 starts, then title initializes [p + 0x1000, p + 0x2000).
+        crate::watch::title_memory_remapped(p, PAGE);
+        // SAFETY: our pool.
+        unsafe { ((p + 0x1000) as *mut u8).write_bytes(0x11, 0x1000) };
+        // S1: unmarked declared partial-page UAV (no remap occurs during S1).
+        copy.update(p + 0x1000, 0x1000);
+        copy.writing(p + 0x1000, 0x1000, false);
+        copy.write_host((p + 0x1000) as u64, &[0xCC]);
+        let written = copy.copy_back(p + 0x1000, 0x1000);
+        assert_eq!(written, 4096, "partial-page copy-back must succeed after prior remap");
+        // SAFETY: our pool.
+        let got = unsafe { ((p + 0x1000) as *const u8).read_volatile() };
+        assert_eq!(got, 0xCC, "GPU bytes must land in title memory");
         unregister(p, p as u64);
         crate::watch::tests::free(p);
     }
