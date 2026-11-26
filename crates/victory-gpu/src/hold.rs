@@ -83,8 +83,8 @@ pub(crate) struct Pumped {
     pub(crate) waited: Vec<(usize, Duration)>,
     /// Waits with a comparison we do not know (taken as holding).
     pub(crate) unknown: u32,
-    /// Some queue's head was still waiting: the pump's own answer, so the
-    /// caller need not read the same waits again to ask.
+    /// Some queue still holds work after the pump: the same answer
+    /// `Held::blocked` gives, without reading a word to get it.
     pub(crate) blocked: bool,
 }
 
@@ -178,7 +178,6 @@ impl<S> Held<S> {
                             }
                             if !ok {
                                 *fresh = false;
-                                done.blocked = true;
                             } else if !*fresh {
                                 done.waited.push((*queue, since.elapsed()));
                             }
@@ -229,6 +228,11 @@ impl<S> Held<S> {
             }
         }
         self.queues.retain(|(_, items)| !items.is_empty());
+        // Whether anything is still held, exactly: any queue with anything
+        // left, a fence wait included, and a queue drained in an earlier
+        // pass of this same pump is gone. Set here, not when a head is found
+        // waiting, so it cannot go stale within one pump.
+        done.blocked = !self.queues.is_empty();
         done
     }
 
@@ -388,6 +392,29 @@ mod tests {
         });
         assert!(p.blocked, "both queues are still held");
         assert_eq!(reads.get(), 2, "one read per word, not per wait");
+
+        // A queue drained within the same pump leaves nothing held, however
+        // many passes it took.
+        let mut held = Held::default();
+        held.push(2, Item::Segment("a", vec![ge(0x100, 0)]));
+        held.push(3, Item::Segment("b", vec![]));
+        let p = held.pump(&mut World {
+            read: &read,
+            fence: &fence,
+            run: &mut run,
+            signal: &mut signal,
+        });
+        assert!(!p.blocked, "everything ran: nothing is held");
+
+        // A fence wait still holding counts, though it reads no memory.
+        held.push(2, Item::FenceWait(5, 9));
+        let p = held.pump(&mut World {
+            read: &read,
+            fence: &fence,
+            run: &mut run,
+            signal: &mut signal,
+        });
+        assert!(p.blocked, "a fence wait still holding is held work");
     }
 
     /// A list's second segment waits for a value the other queue writes
