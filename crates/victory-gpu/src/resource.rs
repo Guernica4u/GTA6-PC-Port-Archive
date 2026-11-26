@@ -278,12 +278,31 @@ pub(crate) fn family(format: u32) -> u32 {
         (97, 99),
     ];
     match format {
+        67 => 39,
         87 => 90,
         88 => 92,
         f => FAMILIES
             .iter()
             .find(|&&(first, last)| (first..=last).contains(&f))
             .map_or(f, |&(first, _)| first),
+    }
+}
+
+/// The member formats that belong to the family of `format` (or `[format]` if standalone).
+pub(crate) fn family_members(format: u32) -> Vec<u32> {
+    const FAMILIES: [(u32, u32); 22] = [
+        (1, 4), (5, 8), (9, 14), (15, 18), (19, 22), (23, 25), (27, 32),
+        (33, 38), (39, 43), (44, 47), (48, 52), (53, 59), (60, 64),
+        (70, 72), (73, 75), (76, 78), (79, 81), (82, 84), (90, 91),
+        (92, 93), (94, 96), (97, 99),
+    ];
+    match format {
+        87 => vec![87, 90, 91],
+        88 => vec![88, 92, 93],
+        f => match FAMILIES.iter().find(|&&(first, last)| (first..=last).contains(&f)) {
+            Some(&(first, last)) => (first..=last).collect(),
+            None => vec![f],
+        },
     }
 }
 
@@ -1140,6 +1159,31 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
+    const RENDER_TARGET: u32 = 1;
+    let typeless = family(d.format) == d.format && family(d.format + 1) == d.format;
+    if !typeless {
+        if family_members(d.format).len() == 1 {
+            d.flags &= !(RENDER_TARGET | UNORDERED);
+        } else {
+            use windows::Win32::Graphics::Direct3D12::{
+                D3D12_FORMAT_SUPPORT1_RENDER_TARGET,
+                D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW,
+            };
+            let (s1, _) = format_support(d.format);
+            if d.flags & RENDER_TARGET != 0
+                && s1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 as u32 == 0
+            {
+                d.flags &= !RENDER_TARGET;
+            }
+            if d.flags & UNORDERED != 0
+                && !family_members(d.format).iter().any(|&f| {
+                    format_support(f).0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 as u32 != 0
+                })
+            {
+                d.flags &= !UNORDERED;
+            }
+        }
+    }
     Some(d)
 }
 
@@ -1224,9 +1268,8 @@ fn shared_texture(
 ) -> Option<std::sync::Arc<HostTexture>> {
     let d = host_desc(desc)?;
     let key = memory_key(address, desc);
-    let mut map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
-    let map = map.get_or_insert_with(Default::default);
-    let live = key.and_then(|k| map.get(&k)?.upgrade());
+    let mut memory = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let live = key.and_then(|k| memory.get_or_insert_with(Default::default).get(&k)?.upgrade());
     if let Some(t) = &live
         && takes(t, &d)
     {
@@ -1238,6 +1281,38 @@ fn shared_texture(
         }
         return live;
     }
+    if live.is_none()
+        && let Some(k) = key
+    {
+        let other = {
+            let at = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
+            at.get(&address).and_then(|list| {
+                list.iter().copied().find(|&r| {
+                    let rd = &resource(r as This).desc;
+                    memory_key(address, rd) == Some(k)
+                        && host_desc(rd).is_some_and(|h| h.flags & USES & !d.flags != 0)
+                })
+            })
+        };
+        if let Some(r) = other {
+            drop(memory);
+            let _ = resource(r as This).host();
+            memory = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+            let live = key.and_then(|k| memory.as_ref()?.get(&k)?.upgrade());
+            if let Some(t) = &live
+                && takes(t, &d)
+            {
+                SHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let Some(host) = crate::host::host() {
+                    // SAFETY: a plain query on a host description (same layout).
+                    let info = unsafe { host.device.GetResourceAllocationInfo(0, &[std::ptr::from_ref(&d).cast::<windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC>().read_unaligned()]) };
+                    SAVED.fetch_add(info.SizeInBytes, std::sync::atomic::Ordering::Relaxed);
+                }
+                return live;
+            }
+        }
+    }
+    let map = memory.get_or_insert_with(Default::default);
     // Host textures are made on first use, in any order: the new one takes
     // the uses of every title texture of the memory, so none replaces it.
     let mut d = d;
@@ -1248,31 +1323,8 @@ fn shared_texture(
                 d.flags |= host_desc(&r.desc).map_or(0, |h| h.flags & USES);
             }
         }
-        use windows::Win32::Graphics::Direct3D12::{
-            D3D12_FORMAT_SUPPORT1_RENDER_TARGET,
-            D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW,
-        };
-        const RENDER_TARGET: u32 = 1;
-        let (s1, _) = format_support(d.format);
-        let need_rtv = d.flags & RENDER_TARGET != 0
-            && s1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 as u32 == 0;
-        let need_uav = d.flags & UNORDERED != 0
-            && s1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 as u32 == 0;
-        if need_rtv || need_uav {
-            for r in at.get(&address).into_iter().flatten().map(|&r| resource(r as This)) {
-                if memory_key(address, &r.desc) == Some(k) {
-                    let rf = pc_format(r.desc.format);
-                    let (rs1, _) = format_support(rf);
-                    let rtv_ok = d.flags & RENDER_TARGET == 0
-                        || rs1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 as u32 != 0;
-                    let uav_ok = d.flags & UNORDERED == 0
-                        || rs1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 as u32 != 0;
-                    if rtv_ok && uav_ok {
-                        d.format = rf;
-                        break;
-                    }
-                }
-            }
+        if let Some(h) = host_desc(&d) {
+            d.flags = h.flags;
         }
     }
     // shortcut: title textures of a replaced host texture keep it (placed
@@ -1303,26 +1355,7 @@ fn takes(t: &HostTexture, d: &ResourceDesc) -> bool {
     // SAFETY: a live resource.
     let td = unsafe { t.texture.GetDesc() };
     let (flags, own) = (td.Flags.0 as u32, td.Format.0 as u32);
-    let mut needed = d.flags & USES & !flags;
-    if needed != 0 {
-        use windows::Win32::Graphics::Direct3D12::{
-            D3D12_FORMAT_SUPPORT1_RENDER_TARGET,
-            D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW,
-        };
-        const RENDER_TARGET: u32 = 1;
-        let (s1, _) = format_support(d.format);
-        if needed & RENDER_TARGET != 0
-            && s1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 as u32 == 0
-        {
-            needed &= !RENDER_TARGET;
-        }
-        if needed & UNORDERED != 0
-            && s1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 as u32 == 0
-        {
-            needed &= !UNORDERED;
-        }
-    }
-    needed == 0
+    d.flags & USES & !flags == 0
         && (family(d.format) == family(own)
             || t.castable.iter().any(|&c| family(c) == family(d.format)))
 }
@@ -1352,24 +1385,15 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     use windows::core::Interface;
     const RENDER_TARGET: u32 = 1;
     let host = crate::host::host()?;
-    let d = *d;
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
-    let mut clear_value = (!clear.is_null()).then(|| {
+    let clear_value = (!clear.is_null() && d.flags & (RENDER_TARGET | DEPTH) != 0).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = pc_format(value[0]);
         value
     });
-    if let Some(v) = clear_value.as_mut() {
-        if v[0] != d.format {
-            v[0] = d.format;
-        }
-    }
-    if d.flags & (RENDER_TARGET | DEPTH) == 0 {
-        clear_value = None;
-    }
-    let mut clear_value = clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast::<D3D12_CLEAR_VALUE>());
+    let clear_value = clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast::<D3D12_CLEAR_VALUE>());
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
@@ -1379,7 +1403,7 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     let mut initial = crate::host::legal_for(d.flags, crate::host::texture_state(state));
     // In a heap of textures if it fits there (`crate::placement`).
     // SAFETY: the description has the host layout (checked size).
-    let plain = unsafe { std::ptr::from_ref(&d).cast::<D3D12_RESOURCE_DESC>().read_unaligned() };
+    let plain = unsafe { std::ptr::from_ref(d).cast::<D3D12_RESOURCE_DESC>().read_unaligned() };
     let mut placement = None;
     if clear_value.is_none()
         && crate::placement::fits(&host.device, &plain)
@@ -1453,36 +1477,13 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     }
     if texture.is_none() {
         castable_formats.clear();
-        let mut d = d;
-        let typeless = family(d.format) == d.format && family(d.format + 1) == d.format;
-        if !typeless {
-            let (s1, _) = format_support(d.format);
-            use windows::Win32::Graphics::Direct3D12::{
-                D3D12_FORMAT_SUPPORT1_RENDER_TARGET,
-                D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW,
-            };
-            if d.flags & RENDER_TARGET != 0
-                && s1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 as u32 == 0
-            {
-                d.flags &= !RENDER_TARGET;
-            }
-            if d.flags & UNORDERED != 0
-                && s1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 as u32 == 0
-            {
-                d.flags &= !UNORDERED;
-            }
-            if d.flags & (RENDER_TARGET | DEPTH) == 0 {
-                clear_value = None;
-            }
-            initial = crate::host::legal_for(d.flags, initial);
-        }
         // SAFETY: the description has the host layout (checked size, same
         // fields); the out pointer is ours.
         let made = unsafe {
             host.device.CreateCommittedResource(
                 &heap,
                 D3D12_HEAP_FLAG_NONE,
-                std::ptr::from_ref(&d).cast(),
+                std::ptr::from_ref(d).cast(),
                 D3D12_RESOURCE_STATES(initial as i32),
                 clear_value,
                 &mut texture,
@@ -2614,10 +2615,22 @@ mod tests {
         let tex = |format, flags| ResourceDesc { flags, ..texture(64, 64, format, 1) };
         for (format, flags) in [(67, 5), (67, 4), (86, 5), (115, 1)] {
             let clear = [format, 0, 0, 0, 0];
-            let d = host_desc(&tex(format, flags)).expect("host_desc");
-            // standalone host texture creation drops unsupported RTV/UAV flags without changing the format or element size
+            let orig_tex = tex(format, flags);
+            let d = host_desc(&orig_tex).expect("host_desc");
+            // host_desc drops unsupported RENDER_TARGET and UNORDERED flags on standalone formats while preserving d.format
+            assert_eq!(d.flags & (1 | 4), 0);
             assert_eq!(d.format, pc_format(format));
             assert_eq!(element(d.format), element(format));
+
+            // bytes-per-texel footprint row pitch and total bytes unchanged
+            let fp_host = footprint(&d).expect("footprint host");
+            assert!(fp_host.size > 0 && fp_host.alignment > 0);
+            assert!(fp_host.alignment >= 256);
+
+            let (sub_orig, _, _) = subresource(&orig_tex, 0).expect("subresource orig");
+            let (sub_host, _, _) = subresource(&d, 0).expect("subresource host");
+            assert_eq!(sub_orig.row_pitch, sub_host.row_pitch);
+            assert_eq!(sub_orig.bytes(), sub_host.bytes());
 
             let ht = make_texture(&d, 0, clear.as_ptr().cast())
                 .unwrap_or_else(|| panic!("format {format} flags {flags}"));
@@ -2670,7 +2683,18 @@ mod tests {
             }
             let (bpp, _) = element(format).expect("element");
             assert_eq!(row_size_in_bytes, 64 * bpp);
+            assert_eq!(layout.Footprint.RowPitch, sub_orig.row_pitch);
+            assert_eq!(total_bytes, sub_orig.bytes().expect("bytes"));
         }
+
+        let tex_rgba8 = host_desc(&ResourceDesc { flags: 0, ..texture(64, 64, 28, 1) }).expect("host_desc");
+        let ht_rgba8 = make_texture(&tex_rgba8, 0, std::ptr::null()).expect("make_texture");
+        let ht_test = HostTexture::new(ht_rgba8.texture.clone(), 0, vec![28, 87]);
+        let view_27 = ResourceDesc { flags: 0, ..texture(64, 64, 27, 1) };
+        let view_90 = ResourceDesc { flags: 0, ..texture(64, 64, 90, 1) };
+        assert!(takes(&ht_test, &view_27), "takes must match family 27 placed view");
+        assert!(takes(&ht_test, &view_90), "takes must match cross-family 90 placed view");
+
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
