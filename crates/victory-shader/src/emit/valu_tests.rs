@@ -1904,6 +1904,44 @@ fn mad_i64_i32_sign_extends_literal_addend() {
     );
 }
 
+
+/// Check both words against CPU integer arithmetic, including dynamic
+/// operands whose signed and unsigned products differ. No game shaders.
+#[test]
+fn mad_literal_addends_match_cpu_in_both_words() {
+    let cases = [
+        [0, 0, 0, 0],
+        [10, 10, 0, 0],
+        [(-100_000i32) as u32, 100_000, 0, 0],
+        [i32::MIN as u32, i32::MAX as u32, 0, 0],
+        [u32::MAX, u32::MAX, 0, 0],
+        [i32::MIN as u32, 2, 0, 0],
+    ];
+    for literal in [0xffff_ff9c, 0x8000_0000, 0x7fff_ffff] {
+        for (op, signed) in [(0x177, true), (0x176, false)] {
+            for word in 0..2u8 {
+                // VOP3B v_mad_* v[5:6], s6, v1, v2, literal.
+                let [a, b] = vop3(op, 5, vgpr(1), vgpr(2), 255);
+                let shader =
+                    build_valu_cs(&[a | 6 << 8, b, literal, vop1(0x001, 0, vgpr(5 + word))]);
+                run_cases(&shader, &cases, |backend, _, [a, b, ..], got| {
+                    let expected = if signed {
+                        (i128::from(a as i32) * i128::from(b as i32) + i128::from(literal as i32))
+                            as u64
+                    } else {
+                        (u128::from(a) * u128::from(b) + u128::from(literal)) as u64
+                    };
+                    let want = (expected >> (32 * word)) as u32;
+                    assert_eq!(
+                        got, want,
+                        "{backend}: signed={signed}, literal={literal:#x}, word={word}, inputs=({a:#x},{b:#x})"
+                    );
+                });
+            }
+        }
+    }
+}
+
 #[test]
 fn bfe_signed_and_unsigned_match_rdna2() {
     // v_bfe_i32 v0, v1, v2, v3 (VOP3 opcode 0x149)
