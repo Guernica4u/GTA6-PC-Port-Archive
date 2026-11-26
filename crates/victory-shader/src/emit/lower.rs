@@ -21,6 +21,8 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+#[cfg(test)]
+mod image_store_tests;
 
 type Why = &'static str;
 
@@ -4626,7 +4628,11 @@ impl<'a> Lower<'a> {
     /// and whether a signed one, from the view-stride table; `None` if the
     /// handle's heap index is not known.
     fn integer_view(&mut self, h: V) -> Option<(V, V)> {
-        let index = *self.s.view_index.get(&h)?;
+        let index = *self
+            .s
+            .view_index
+            .get(&h)
+            .or_else(|| self.s.texture_uav_index.get(&h))?;
         let word = self.view_word(index);
         let c = self.cur;
         let zero = self.s.m.i32(0);
@@ -8394,8 +8400,9 @@ impl<'a> Lower<'a> {
         if name.starts_with("image_bvh") {
             return self.bvh(inst, b, i);
         }
+        let raw_dmask = *dmask;
         // A load or sample with no channel enabled returns the first.
-        let dmask = if *dmask == 0 { &1 } else { dmask };
+        let dmask = if raw_dmask == 0 { &1 } else { dmask };
         let site = (b, i);
         let guard = self.guard(b, i)?;
         let c = self.cur;
@@ -8584,13 +8591,15 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if store {
-            if name != "image_store" {
+            if name.contains("_mip") {
                 return Err("an image store to a mip level");
             }
-            // shortcut: stores are taken to write all four channels of a
-            // float format (the console converts by the view's format).
-            if *dmask != 0xF {
-                return Err("an image store of some channels");
+            if name != "image_store" {
+                return Err("a packed image store");
+            }
+            // RDNA2 `image_store` with dmask=0 writes nothing.
+            if raw_dmask == 0 {
+                return Ok(());
             }
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
@@ -8600,31 +8609,99 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image store data");
             };
-            let mut vals = Vec::new();
-            for k in 0..4u8 {
-                // d16: two f16 channels per VGPR, low half first.
-                let r = if *d16 { k / 2 } else { k };
+            let h = self.handle(site, src, false, props)?;
+            // For `d16` on integer texture views (flagged in the view-stride
+            // table), store zero-/sign-extended 16-bit integers through an
+            // integer-typed handle (`textureStore.i32`) instead of converting
+            // as f16 through `textureStore.f32`.
+            let integer = if *d16 { self.integer_view(h) } else { None };
+            // DXIL typed UAV `textureStore` requires write mask 0xF and
+            // non-undef values for all four channels; RDNA2 `image_store`
+            // packs only the `dmask`-enabled channels in ascending bit order
+            // (and with `d16`, two 16-bit channels per VGPR, low half first).
+            // Hardware ignores channels past the bound UAV format's width.
+            let mut vals_f = [self.s.m.f32(0); 4];
+            let mut vals_i = [self.s.m.i32(0); 4];
+            let mut slot = 0u8;
+            for k in 0..4usize {
+                if raw_dmask & (1 << k) == 0 {
+                    continue;
+                }
+                let r = if *d16 { slot / 2 } else { slot };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
-                vals.push(if *d16 {
+                vals_f[k] = if *d16 {
+                    let c = self.cur;
                     let mut x = self.i32_of(v)?;
-                    if k % 2 == 1 {
+                    if slot % 2 == 1 {
                         let k16 = self.s.m.i32(16);
-                        x = self.s.m.bin(self.cur, Bin::LShr, x, k16);
+                        x = self.s.m.bin(c, Bin::LShr, x, k16);
                     }
                     let f32t = self.s.t.f32;
-                    self.s
-                        .op(self.cur, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x])
+                    let f = self
+                        .s
+                        .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
+                    if let Some((_, signed)) = integer {
+                        let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
+                        let zero_ext = self.s.m.bin(c, Bin::And, x, low);
+                        let up = self.s.m.bin(c, Bin::Shl, x, k16);
+                        let sign_ext = self.s.m.bin(c, Bin::AShr, up, k16);
+                        vals_i[k] = self.s.m.select(c, signed, sign_ext, zero_ext);
+                    }
+                    f
                 } else {
                     self.float_of(v)?
-                });
+                };
+                slot += 1;
             }
-            let h = self.handle(site, src, false, props)?;
+            let void = self.s.t.void;
+            if let Some((int, _)) = integer {
+                let h_int = self.handle(site, src, false, (kind | 0x1000, 0x405))?;
+                let c = self.cur;
+                let one = self.s.m.bool(true);
+                let not_int = self.s.m.bin(c, Bin::Xor, int, one);
+                let int_guard = match guard {
+                    Some(g) => Some(self.s.m.bin(c, Bin::And, g, int)),
+                    None => Some(int),
+                };
+                let flt_guard = match guard {
+                    Some(g) => Some(self.s.m.bin(c, Bin::And, g, not_int)),
+                    None => Some(not_int),
+                };
+                let at = self.begin_guarded(int_guard);
+                let mut args = vec![h_int];
+                args.extend(&cs);
+                args.extend(vals_i);
+                args.push(self.s.m.i8(0xF));
+                self.s.op(
+                    self.cur,
+                    "textureStore.i32",
+                    Attr::NoUnwind,
+                    void,
+                    67,
+                    &args,
+                );
+                self.end_guarded(at, &[]);
+                let at = self.begin_guarded(flt_guard);
+                let mut args = vec![h];
+                args.extend(cs);
+                args.extend(vals_f);
+                args.push(self.s.m.i8(0xF));
+                self.s.op(
+                    self.cur,
+                    "textureStore.f32",
+                    Attr::NoUnwind,
+                    void,
+                    67,
+                    &args,
+                );
+                self.end_guarded(at, &[]);
+                return Ok(());
+            }
             let at = self.begin_guarded(guard);
             let mut args = vec![h];
             args.extend(cs);
-            args.extend(vals);
+            args.extend(vals_f);
             args.push(self.s.m.i8(0xF));
-            let void = self.s.t.void;
             self.s.op(
                 self.cur,
                 "textureStore.f32",
@@ -10926,7 +11003,7 @@ mod tests {
     };
     use crate::{io, ir, resource, structure};
 
-    const S_ENDPGM: u32 = 0xBF81_0000;
+    pub(super) const S_ENDPGM: u32 = 0xBF81_0000;
 
     /// A program's constant table starts after its instructions, unless a
     /// load at a fixed offset reads below that.
@@ -10989,7 +11066,7 @@ mod tests {
 
     /// Lowers a compute program with the root parameters `layout` (in user
     /// SGPRs from s0 on) and the used resources `used`.
-    fn lower_with(
+    pub(super) fn lower_with(
         words: &[u32],
         layout: Vec<RootParam>,
         used: Vec<UsedResource>,
