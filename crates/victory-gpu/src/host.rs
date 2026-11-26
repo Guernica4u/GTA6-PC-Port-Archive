@@ -236,6 +236,10 @@ fn create() -> windows::core::Result<Host> {
         let cpu_view_size =
             device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         tracing::info!("host D3D12 device ready");
+        // The view heap size before anything translates: the probe below
+        // translates a shader, which would otherwise fix the translator's
+        // clamp at `HEAP_VIEWS_MAX` (the heaps then fail on NVIDIA).
+        heap_views_on(&device);
         // The console fuses its multiply-adds (`v_fma_f32`, `v_fmac_f32`,
         // `v_fma_mix*`); the lowering's DXIL `FMad` is fused only where the
         // host chooses (the RX 6700 XT does, WARP does not).
@@ -300,26 +304,45 @@ pub(crate) fn on_warp() -> bool {
 /// [`HEAP_VIEWS_MAX`]: victory_shader::emit::HEAP_VIEWS_MAX
 /// [`HEAP_VIEWS_PORTABLE`]: victory_shader::emit::HEAP_VIEWS_PORTABLE
 pub(crate) fn heap_views() -> u32 {
-    static VIEWS: OnceLock<u32> = OnceLock::new();
-    *VIEWS.get_or_init(|| {
-        use victory_shader::emit::{HEAP_VIEWS_MAX, HEAP_VIEWS_PORTABLE};
-        let takes = if takes_view_heap(HEAP_VIEWS_MAX) {
-            HEAP_VIEWS_MAX
-        } else {
-            HEAP_VIEWS_PORTABLE
-        };
-        let views = victory_shader::emit::set_heap_views(takes);
-        if views > takes {
-            tracing::warn!(
-                views,
-                takes,
-                "shaders translated before the view heap size was known: their indices can pass the host's heaps"
-            );
-        } else if views != HEAP_VIEWS_MAX {
-            tracing::info!(views, "the host caps view heaps: shader heap indices clamped below it");
-        }
-        views
-    })
+    use victory_shader::emit::HEAP_VIEWS_MAX;
+    *HEAP_VIEWS.get_or_init(|| fix_heap_views(takes_view_heap(HEAP_VIEWS_MAX)))
+}
+
+/// [`heap_views`], asking `device` (the host's, from [`create`]) if the size
+/// is not fixed yet.
+fn heap_views_on(device: &ID3D12Device) -> u32 {
+    use victory_shader::emit::HEAP_VIEWS_MAX;
+    *HEAP_VIEWS.get_or_init(|| fix_heap_views(device_takes(device, HEAP_VIEWS_MAX)))
+}
+
+static HEAP_VIEWS: OnceLock<u32> = OnceLock::new();
+
+/// Tells the translator the view heap size: [`HEAP_VIEWS_MAX`] where the
+/// host takes a heap that large (`takes_max`), else [`HEAP_VIEWS_PORTABLE`].
+///
+/// [`HEAP_VIEWS_MAX`]: victory_shader::emit::HEAP_VIEWS_MAX
+/// [`HEAP_VIEWS_PORTABLE`]: victory_shader::emit::HEAP_VIEWS_PORTABLE
+fn fix_heap_views(takes_max: bool) -> u32 {
+    use victory_shader::emit::{HEAP_VIEWS_MAX, HEAP_VIEWS_PORTABLE};
+    let takes = if takes_max {
+        HEAP_VIEWS_MAX
+    } else {
+        HEAP_VIEWS_PORTABLE
+    };
+    let views = victory_shader::emit::set_heap_views(takes);
+    if views > takes {
+        tracing::warn!(
+            views,
+            takes,
+            "shaders translated before the view heap size was known: their indices can pass the host's heaps"
+        );
+    } else if views != HEAP_VIEWS_MAX {
+        tracing::info!(
+            views,
+            "the host caps view heaps: shader heap indices clamped below it"
+        );
+    }
+    views
 }
 
 /// Whether the host device's adapter (WARP or the default one, as
@@ -327,8 +350,8 @@ pub(crate) fn heap_views() -> u32 {
 /// Without a device, yes: nothing draws then, and the heap size only keys
 /// the translations.
 fn takes_view_heap(count: u32) -> bool {
-    // SAFETY: plain device and heap creation with valid out pointers (the
-    // host's device itself where it is made: one device per adapter).
+    // SAFETY: plain device creation with a valid out pointer (the host's
+    // device itself where it is made: one device per adapter).
     unsafe {
         let mut device: Option<ID3D12Device> = None;
         let made = if on_warp() {
@@ -336,9 +359,16 @@ fn takes_view_heap(count: u32) -> bool {
         } else {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)
         };
-        let Some(device) = device.filter(|_| made.is_ok()) else {
-            return true;
-        };
+        device
+            .filter(|_| made.is_ok())
+            .is_none_or(|d| device_takes(&d, count))
+    }
+}
+
+/// Whether `device` makes a shader-visible view heap of `count` slots.
+fn device_takes(device: &ID3D12Device, count: u32) -> bool {
+    // SAFETY: plain heap creation with a valid description.
+    unsafe {
         device
             .CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
