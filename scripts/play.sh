@@ -20,9 +20,11 @@
 # The executable must lie beside the package's files (its folder is the title's G:).
 set -euo pipefail
 
+# Paths are the caller's: made whole here, before the folder changes below. (Links are kept as
+# they are given: the folder the executable is named in is the title's G:.)
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-home=${VICTORY_LINUX_HOME:-$HOME/.local/share/victory-linux}
-proton=${PROTON_FILES:-/usr/share/steam/compatibilitytools.d/proton-cachyos-slr/files}
+home=$(realpath -ms "${VICTORY_LINUX_HOME:-$HOME/.local/share/victory-linux}")
+proton=$(realpath -ms "${PROTON_FILES:-/usr/share/steam/compatibilitytools.d/proton-cachyos-slr/files}")
 
 exe='' build=diag safe=0 rays=0 seconds=0 mem_max='' more=()
 while (($#)); do
@@ -41,6 +43,7 @@ done
 victory=$root/target/x86_64-pc-windows-msvc/$build/victory.exe
 [[ -f $victory ]] || { echo "No $victory. Build it first: cargo xwin build --locked --profile diag -p victory --features diagnostics --target x86_64-pc-windows-msvc"; exit 1; }
 [[ -f $exe ]] || { echo "No executable '$exe'."; exit 1; }
+exe=$(realpath -s "$exe")
 [[ -x $proton/bin/wine ]] || { echo "No Wine in $proton (PROTON_FILES)."; exit 1; }
 [[ -d $home/pfx/drive_c ]] || { echo "No prefix in $home/pfx (see the head of this script)."; exit 1; }
 
@@ -94,6 +97,6 @@ cd "$root" # victory.toml is looked for here
 # Into a file, not a pipe: Wine's services outlive the title and would hold a pipe open.
 : >"$log"
 "${scope[@]}" env "${wine[@]}" "${settings[@]}" "${more[@]}" \
-    "$proton/bin/wine" "$victory" run "$(windows "$(realpath -s "$exe")")" --execute >"$log" 2>&1 </dev/null &
+    "$proton/bin/wine" "$victory" run "$(windows "$exe")" --execute >"$log" 2>&1 </dev/null &
 tail --pid=$! -f "$log"
 wait $!
