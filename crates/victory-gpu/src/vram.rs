@@ -357,6 +357,179 @@ void main() {
         assert_eq!(reads.1.bytes(), second);
     }
 
+    /// Read kernels for the measurement below: `seq` walks its own 64 bytes
+    /// of the copy, `rnd` takes eight pseudo-random 64-byte lines of it.
+    const BENCH: &str = r#"
+#define RS "RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT), RootConstants(num32BitConstants=1, b0), SRV(t0), UAV(u0)"
+ByteAddressBuffer src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+cbuffer Size : register(b0) { uint lines; };
+[RootSignature(RS)]
+[numthreads(256, 1, 1)]
+void seq(uint3 id : SV_DispatchThreadID) {
+    uint4 v = src.Load4(id.x * 16);
+    if ((v.x ^ v.y ^ v.z ^ v.w) == 0x9e3779b9u) {
+        dst.Store(0, id.x);
+    }
+}
+[RootSignature(RS)]
+[numthreads(256, 1, 1)]
+void rnd(uint3 id : SV_DispatchThreadID) {
+    uint h = id.x * 747796405u + 2891336453u;
+    h = h * 1664525u + 1013904223u;
+    uint4 v = src.Load4(((h >> 8) % (lines * 4)) * 16);
+    if ((v.x ^ v.y ^ v.z ^ v.w) == 0x9e3779b9u) {
+        dst.Store(0, id.x);
+    }
+}
+"#;
+
+    /// The test's two kernels, compiled once.
+    fn bench_pipelines() -> Option<(ID3D12RootSignature, [ID3D12PipelineState; 2])> {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::core::s;
+        let host = host()?;
+        let mut blobs: [Option<ID3DBlob>; 2] = [None, None];
+        for (i, entry) in ["seq", "rnd"].into_iter().enumerate() {
+            let name = std::ffi::CString::new(entry).ok()?;
+            let mut code = None;
+            // SAFETY: the source lives through the call; out pointers ours.
+            let made = unsafe {
+                D3DCompile(
+                    BENCH.as_ptr().cast(),
+                    BENCH.len(),
+                    s!("bench"),
+                    None,
+                    None,
+                    windows::core::PCSTR(name.as_ptr().cast()),
+                    s!("cs_5_1"),
+                    0,
+                    0,
+                    &mut code,
+                    None,
+                )
+            };
+            made.ok()?;
+            blobs[i] = code;
+        }
+        // SAFETY: the blobs' own bytes; the root signature is in them.
+        unsafe {
+            let bytes = |b: &ID3DBlob| {
+                std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize())
+            };
+            let first = blobs[0].as_ref()?;
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes(first)).ok()?;
+            let pipe = |b: &ID3DBlob| {
+                host.device
+                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&root),
+                        CS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: bytes(b).as_ptr().cast(),
+                            BytecodeLength: bytes(b).len(),
+                        },
+                        ..Default::default()
+                    })
+                    .ok()
+            };
+            let first = pipe(blobs[0].as_ref()?)?;
+            let second = pipe(blobs[1].as_ref()?)?;
+            Some((root, [first, second]))
+        }
+    }
+
+    /// What reading a copy costs where it lives: a stride-1 scan and a
+    /// random line a thread, over the same 128 MiB, once in video
+    /// memory and once in the system memory `shadow`'s copies are in today.
+    ///
+    /// Not an assertion: the ratio is the machine's (and a card with resize
+    /// BAR flatters the system-memory side). It is here because it answers, in
+    /// seconds and without the title, whether putting these copies in video
+    /// memory is worth the integration - the one experiment so far
+    /// (`VICTORY_COPIES_IN_VIDEO_MEMORY`) used a BAR window and measured
+    /// worse, which says nothing either way.
+    ///
+    ///     cargo test -p victory-gpu --release the_read_cost -- --nocapture
+    #[test]
+    fn the_read_cost_of_a_copy_where_it_lives() {
+        const SIZE: u64 = 128 << 20;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let Some((root, psos)) = bench_pipelines() else {
+            return; // no shader compiler here
+        };
+        let lines = (SIZE / 64) as u32;
+        // One 16-byte read a thread: 256 threads a group.
+        let groups = (SIZE / 16 / 256) as u32;
+        let Some(video) = VramCopy::new(SIZE) else { return };
+        let Some((system, system_data)) = host.shared_buffer(SIZE) else { return };
+        // SAFETY: a live buffer.
+        let system_gpu = unsafe { system.GetGPUVirtualAddress() };
+        // What a kernel writes if it reads a sentinel: nothing, in practice,
+        // so the timing is of the reads alone.
+        let Some((out, out_data)) = host.shared_buffer(4096) else { return };
+        // SAFETY: a live buffer.
+        let out_gpu = unsafe { out.GetGPUVirtualAddress() };
+        let pattern: Vec<u8> = (0..SIZE as usize).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        // SAFETY: our mapped copy of `SIZE` bytes, written before it is read.
+        unsafe { std::ptr::copy_nonoverlapping(pattern.as_ptr(), system_data, SIZE as usize) };
+
+        // The upload is not part of a read's cost, so it runs once, before
+        // the timed lists (the integration's own uploads are incremental).
+        {
+            let Ok(list) = host.new_list() else { return };
+            if video.upload(&list, 0, &pattern).is_none() {
+                return;
+            }
+            list.close();
+            host.execute(&[&list]);
+        }
+
+        // Ten dispatches a list: one is 0.3 ms of reads and as much again of
+        // submission, and the ratio wanted is the reads'.
+        const REPS: usize = 10;
+        let time = |src: u64, kernel: usize| -> f64 {
+            let mut best = f64::INFINITY;
+            for _ in 0..3 {
+                let Ok(list) = host.new_list() else { return 0.0 };
+                // SAFETY: an open list; our pipeline and buffers.
+                unsafe {
+                    let l = &list.list;
+                    l.SetComputeRootSignature(&root);
+                    l.SetPipelineState(&psos[kernel]);
+                    l.SetComputeRoot32BitConstant(0, lines, 0);
+                    l.SetComputeRootShaderResourceView(1, src);
+                    l.SetComputeRootUnorderedAccessView(2, out_gpu);
+                    for _ in 0..REPS {
+                        l.Dispatch(groups, 1, 1);
+                    }
+                }
+                list.close();
+                let started = std::time::Instant::now();
+                host.execute(&[&list]);
+                best = best.min(started.elapsed().as_secs_f64() * 1000.0);
+            }
+            best / REPS as f64
+        };
+        let (seq_video, seq_system) = (time(video.gpu(), 0), time(system_gpu, 0));
+        let (rnd_video, rnd_system) = (time(video.gpu(), 1), time(system_gpu, 1));
+        // SAFETY: our mapped output, read after the lists ran.
+        let sink = unsafe { std::slice::from_raw_parts(out_data.cast::<u32>(), 4) };
+        println!("\n  {:>14} {:>10} {:>10} {:>8}", "128 MiB read", "video", "system", "ratio");
+        println!(
+            "  {:>14} {seq_video:>8.3}ms {seq_system:>8.3}ms {:>7.2}x",
+            "stride-1 scan",
+            seq_system / seq_video.max(1e-9)
+        );
+        println!(
+            "  {:>14} {rnd_video:>8.3}ms {rnd_system:>8.3}ms {:>7.2}x",
+            "random lines",
+            rnd_system / rnd_video.max(1e-9)
+        );
+        println!("  (sentinel hits: {sink:?})\n");
+    }
+
     /// A range that does not fit the copy is refused, and nothing is
     /// recorded for it.
     #[test]
