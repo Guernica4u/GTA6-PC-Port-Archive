@@ -9,6 +9,20 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+};
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK,
+    LockFileEx, OPEN_ALWAYS,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::IO::OVERLAPPED;
+
 static NEXT_STAGING: AtomicU64 = AtomicU64::new(0);
 
 /// The digest sidecar published beside `path`: comparing it against the
@@ -18,6 +32,66 @@ static NEXT_STAGING: AtomicU64 = AtomicU64::new(0);
 fn sidecar(path: &Path) -> std::path::PathBuf {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("image");
     path.with_file_name(format!(".{name}.blake3"))
+}
+
+/// An exclusive lock on the lock file beside the published path, held for
+/// the guard's life: closing the handle releases it, so a crashed publisher
+/// does not leave the cache locked.
+#[cfg(windows)]
+struct PublishLock(HANDLE);
+#[cfg(windows)]
+impl Drop for PublishLock {
+    fn drop(&mut self) {
+        // SAFETY: our handle.
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+/// Locks the publishers of `path` against each other.
+#[cfg(windows)]
+fn publish_lock(path: &Path) -> std::io::Result<PublishLock> {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("image");
+    let lock_path = path.with_file_name(format!(".{name}.lock"));
+    let wide: Vec<u16> = lock_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: a valid path, null security attributes, no template.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a zeroed OVERLAPPED is valid; unused on a synchronous handle.
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid handle.
+    if unsafe {
+        LockFileEx(
+            handle,
+            LOCKFILE_EXCLUSIVE_LOCK,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    } == 0
+    {
+        let error = std::io::Error::last_os_error();
+        // SAFETY: our handle.
+        unsafe { CloseHandle(handle) };
+        return Err(error);
+    }
+    Ok(PublishLock(handle))
 }
 
 /// Writes `bytes` to `path` unless it is already there, using a staging file
@@ -44,11 +118,15 @@ pub fn write_if_changed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .and_then(|name| name.to_str())
         .unwrap_or("image");
     let sequence = NEXT_STAGING.fetch_add(1, Ordering::Relaxed);
-    let staging = path.with_file_name(format!(
-        ".{name}.{}.{sequence}.tmp",
-        std::process::id()
-    ));
+    let staging = path.with_file_name(format!(".{name}.{}.{sequence}.tmp", std::process::id()));
     std::fs::write(&staging, bytes)?;
+    // Serialize publishers, and order the sidecar around the rename: it is
+    // removed before the rename and written after it, so a sidecar on disk
+    // always describes the file on disk. A crash in between leaves no
+    // sidecar, and the next boot falls back to reading the image.
+    #[cfg(windows)]
+    let _lock = publish_lock(path)?;
+    let _ = std::fs::remove_file(sidecar(path));
     if let Err(error) = std::fs::rename(&staging, path) {
         let _ = std::fs::remove_file(&staging);
         return Err(error);
@@ -82,7 +160,13 @@ mod tests {
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.path() != path && entry.path() != sidecar(&path))
+            .filter(|entry| {
+                let p = entry.path();
+                let name = path.file_name().unwrap().to_str().unwrap();
+                p != path
+                    && p != sidecar(&path)
+                    && p != path.with_file_name(format!(".{name}.lock"))
+            })
             .collect();
         assert!(
             leftovers.is_empty(),
@@ -148,6 +232,48 @@ mod tests {
         }
         let old = t0.elapsed() / 5;
         eprintln!("64 MB cache hit: sidecar path {hit:?}, old read+compare {old:?}");
+    }
+
+    /// Many interleaved publishers of alternating contents: whenever a
+    /// sidecar exists, it describes the file on disk (the remove-before-
+    /// rename / write-after ordering under the lock).
+    #[test]
+    fn concurrent_publishers_keep_the_sidecar_matching_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.bin");
+        let a = vec![1u8; 4096];
+        let b = vec![2u8; 4096];
+        let mut handles = Vec::new();
+        for t in 0..4u32 {
+            let (path, a, b) = (path.clone(), a.clone(), b.clone());
+            handles.push(std::thread::spawn(move || {
+                for i in 0..50u32 {
+                    let bytes = if (i + t) % 2 == 0 { &a } else { &b };
+                    write_if_changed(&path, bytes).unwrap();
+                    // If the file did not change across the check, a sidecar
+                    // present at the same time must describe it.
+                    let before = std::fs::read(&path).unwrap();
+                    if let Ok(d) = std::fs::read(sidecar(&path)) {
+                        let after = std::fs::read(&path).unwrap();
+                        if before == after {
+                            assert_eq!(
+                                d,
+                                blake3::hash(&before).as_bytes(),
+                                "sidecar matches the file"
+                            );
+                        }
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let on_disk = std::fs::read(&path).unwrap();
+        assert_eq!(
+            std::fs::read(sidecar(&path)).unwrap(),
+            blake3::hash(&on_disk).as_bytes()
+        );
     }
 
     #[test]
