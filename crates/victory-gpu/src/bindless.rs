@@ -794,7 +794,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         let out = crate::shadow::find(dst_ptr as u64, 256).expect("the output's host copy");
         let hulls = heap_host.viewed.ranges();
         assert!(
-            hulls.iter().any(|(s, a, len, uav)| !*uav
+            hulls.iter().any(|(s, a, len, uav, _)| !*uav
                 && Arc::ptr_eq(s, &cb_copy)
                 && *a == cb_at
                 && *len == 1024),
