@@ -12,15 +12,37 @@ impl Lower<'_> {
         let singleton = matches!(&self.x.native.io, StageIo::Cs(cs) if cs.threads == [1, 1, 1]);
         let has_wave_width =
             self.mask_data == MaskData::Console && (singleton || self.s.wave_size.is_some());
-        if !has_wave_width && let Some(mask) = self.x.st.mask_bits(lo, (lo != hi).then_some(hi)) {
+        let fallback_mask = self.x.st.mask_bits(lo, (lo != hi).then_some(hi));
+        if !has_wave_width && let Some(mask) = fallback_mask {
             return self.boolean(mask, at);
         }
-        self.check_vcc_joins(lo, hi)?;
-        let low = self.vcc_word(lo)?;
+        if let Err(err) = self.check_vcc_joins(lo, hi) {
+            if let Some(mask) = fallback_mask {
+                return self.boolean(mask, at);
+            }
+            return Err(err);
+        }
+        let low = match self.vcc_word(lo) {
+            Ok(v) => v,
+            Err(err) => {
+                if let Some(mask) = fallback_mask {
+                    return self.boolean(mask, at);
+                }
+                return Err(err);
+            }
+        };
         let bits = if hi == lo {
             low
         } else {
-            let high = self.vcc_word(hi)?;
+            let high = match self.vcc_word(hi) {
+                Ok(v) => v,
+                Err(err) => {
+                    if let Some(mask) = fallback_mask {
+                        return self.boolean(mask, at);
+                    }
+                    return Err(err);
+                }
+            };
             self.s.m.bin(at, Bin::Or, low, high)
         };
         let zero = self.s.m.i32(0);

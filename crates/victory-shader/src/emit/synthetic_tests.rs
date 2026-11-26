@@ -1428,3 +1428,37 @@ fn pixel_vcc_fallback_preserves_a_dead_descriptor_field() {
         "{error:?}"
     );
 }
+
+#[test]
+fn compute_shader_vcc_branch_translates_cleanly() {
+    let words = [
+        0x7E00_0280u32, // v_mov_b32 v0, 0
+        0x7D84_0280,    // v_cmp_eq_u32 vcc, 0, v0
+        0xBF86_0001,    // s_cbranch_vccz -> exit
+        0x7E00_02C1,    // v_mov_b32 v0, -1
+        0xBF81_0000,    // exit: s_endpgm
+    ];
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: Vec::new(),
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 0,
+            threads: [64, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let l = lowered(&native).expect("compute shader with VCC branch should translate");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut l.dxil.clone()).expect("DXIL validation failed");
+    }
+}

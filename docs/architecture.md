@@ -94,10 +94,10 @@ represents EXEC as a per-lane boolean. Vector instructions keep a guard
 only where a lane can reach them with its EXEC bit clear. Branches on
 VCC zero or nonzero use one decision for the guest wave. Scalar writes
 supply the register bits directly. When a vector comparison supplies them,
-the compiler can reconstruct the mask at the comparison before EXEC changes. `victory_shader::range::build`
-runs both, again where a bound on the index of a register-relative move
-(`v_movrel*`) is proven on the per-lane form, so the move names only the
-registers it can reach. `victory_shader::resource`
+the compiler can reconstruct the mask at the comparison before EXEC changes.
+`victory_shader::range::build` runs both, again where a bound on the index
+of a register-relative move (`v_movrel*`) is proven on the per-lane form,
+so the move names only the registers it can reach. `victory_shader::resource`
 traces each descriptor and scalar memory address to the root parameter it
 comes from (table, heap, root descriptor or constant). A descriptor a
 waterfall loop reads from the first lane (`v_readfirstlane_b32`) is traced
