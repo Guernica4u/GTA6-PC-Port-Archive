@@ -211,6 +211,8 @@ mod diff_tests;
 mod flow_tests;
 #[cfg(all(test, windows))]
 mod halves_tests;
+#[cfg(all(test, windows))]
+mod halves_random_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
