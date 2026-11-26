@@ -708,6 +708,16 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
             );
             written += 1;
         }
+        // Said once per frame for the few first pages: what the title has
+        // registered there (or that it never registered anything).
+        #[cfg(feature = "diagnostics")]
+        for &at in missed.iter().take(4) {
+            tracing::debug!(
+                page = format_args!("{at:#x}"),
+                what = %crate::shadow::describe(at),
+                "title memory a shader read with no copy"
+            );
+        }
         stats(|s| {
             s.written += written;
             s.withheld += withheld;

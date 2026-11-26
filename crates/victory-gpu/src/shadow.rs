@@ -1024,10 +1024,36 @@ pub(crate) fn unregister(resource: usize, start: u64) {
     }
 }
 
+/// What is known about title address `address`: the registered buffer that
+/// holds it (and whether a copy of it was made), or where the nearest
+/// registered buffers are. A shader read title memory with no copy
+/// (`crate::memory` counts those); this says whether the title registered any
+/// buffer there at all, which tells "we never mirrored this allocation" from
+/// "the copy went away".
+#[cfg(feature = "diagnostics")]
+pub(crate) fn describe(address: u64) -> String {
+    let map = buffers();
+    if let Some(((start, _), e)) = map.range(..=(address, usize::MAX)).rev().find(|(_, e)| e.end > address) {
+        return format!(
+            "inside title buffer {start:#x}+{:#x}, copy {}",
+            e.end - start,
+            if e.shadow.is_some() { "made" } else { "not made" }
+        );
+    }
+    let below = map
+        .range(..(address, usize::MAX))
+        .next_back()
+        .map(|((s, _), e)| format!("{s:#x}+{:#x}", e.end - s));
+    let above = map
+        .range((address, 0)..)
+        .next()
+        .map(|((s, _), e)| format!("{s:#x}+{:#x}", e.end - s));
+    format!("no registered title buffer at {address:#x}; nearest below {below:?}, above {above:?}")
+}
+
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
-pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    let end = address.checked_add(len.max(1))?;
+pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {    let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
     let key = map
         .range(..=(address, usize::MAX))
