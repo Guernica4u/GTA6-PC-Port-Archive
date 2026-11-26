@@ -85,7 +85,8 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`).
     let options = victory_shader::emit::Options { view_marks: true };
-    let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
+    let translate =
+        |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
         None => (translate(container), false),
@@ -175,8 +176,10 @@ fn cached(
 }
 
 const MAGIC: &[u8; 4] = b"VSH1";
-/// A container that does not translate: the reason follows.
-const REFUSED: &[u8; 4] = b"VSHE";
+/// A container that does not translate: a length, digest and the reason
+/// follow. The length and digest make a torn or partially overwritten entry a
+/// miss instead of a cached refusal with an empty or truncated reason.
+const REFUSED: &[u8; 4] = b"VSF2";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -217,7 +220,14 @@ fn root_type(code: u32) -> RootType {
 fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
     let s = match translation {
         Ok(s) => s,
-        Err(reason) => return [REFUSED.as_slice(), reason.as_bytes()].concat(),
+        Err(reason) => {
+            let bytes = reason.as_bytes();
+            let mut out = REFUSED.to_vec();
+            out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(blake3::hash(bytes).as_bytes());
+            out.extend_from_slice(bytes);
+            return out;
+        }
     };
     // Every field by name: a field added to `HostShader` must be added here
     // (and to `decode`).
@@ -306,10 +316,17 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
             Some(self.take(n)?.to_vec())
         }
     }
-    if let Some(reason) = bytes.strip_prefix(REFUSED) {
+    let mut r = Reader(bytes);
+    if r.take(4)? == REFUSED {
+        let length = r.word()? as usize;
+        let digest = r.take(32)?;
+        let reason = r.take(length)?;
+        if !r.0.is_empty() || digest != blake3::hash(reason).as_bytes() {
+            return None;
+        }
         return Some(Err(String::from_utf8(reason.to_vec()).ok()?));
     }
-    let mut r = Reader(bytes);
+    r = Reader(bytes);
     if r.take(4)? != MAGIC {
         return None;
     }
@@ -450,8 +467,25 @@ mod tests {
         };
         let refused = (Err("unsupported".to_owned()), false);
         assert_eq!(cached(&cache, &build, b"other", fail), refused);
-        assert_eq!(cached(&cache, &build, b"other", fail), (refused.0, true));
+        assert_eq!(
+            cached(&cache, &build, b"other", fail),
+            (refused.0.clone(), true)
+        );
         assert_eq!(fails.load(Ordering::Relaxed), 1);
+
+        let path = walk(dir.path())
+            .into_iter()
+            .find(|path| std::fs::read(path).is_ok_and(|bytes| bytes.starts_with(REFUSED)))
+            .expect("cached refusal entry");
+        std::fs::write(&path, &encode(&Err("unsupported".to_owned()))[..8]).unwrap();
+        assert_eq!(
+            cached(&cache, &build, b"other", fail),
+            (Err("unsupported".to_owned()), false),
+            "a truncated refusal is retranslated, not returned as a cache hit"
+        );
+        assert_eq!(fails.load(Ordering::Relaxed), 2);
+        assert_eq!(cached(&cache, &build, b"other", fail), (refused.0, true));
+        assert_eq!(fails.load(Ordering::Relaxed), 2);
     }
 
     /// A translation whose entry cannot be written (the cache folder is
@@ -521,7 +555,14 @@ mod tests {
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
         let refusal = Err("GFX10 code at 0x10: x is not supported".to_owned());
-        assert_eq!(decode(&encode(&refusal)), Some(refusal));
-        assert_eq!(decode(&[b"VSHE".as_slice(), &[0xff]].concat()), None);
+        let encoded = encode(&refusal);
+        assert_eq!(decode(&encoded), Some(refusal.clone()));
+        for end in [4, 8, encoded.len() - 1] {
+            assert_eq!(decode(&encoded[..end]), None, "truncated refusal at {end}");
+        }
+        let mut damaged = encoded.clone();
+        damaged[40] ^= 1;
+        assert_eq!(decode(&damaged), None, "same-length refusal corruption");
+        assert_eq!(decode(&[b"VSF2".as_slice(), &[0xff]].concat()), None);
     }
 }
