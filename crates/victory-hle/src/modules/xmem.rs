@@ -1461,6 +1461,30 @@ mod tests {
                 runs(&pages, 0, 4 * PAGE).map(|r| r.iter().map(|&(_, n)| n).collect::<Vec<_>>()),
                 Some(vec![4])
             );
+            // Mapping new physical pages over half a live range, through the
+            // module and not the host: the first half must not move, and a
+            // remap that did nothing leaves the old bytes in the second half
+            // and fails here. The new pages are fresh, so they do not hold
+            // what the old ones did.
+            let new_pages = allocate(2);
+            assert_eq!(
+                XMemMapPhysicalPages(at(2).cast(), 2, new_pages.as_ptr()),
+                at(2).cast(),
+                "a mapped range takes new physical pages over half of it"
+            );
+            assert_eq!(at(0).read(), 0x11, "the half that was not remapped");
+            assert_eq!(at(1).read(), 0x22);
+            assert_ne!(
+                (at(2).read(), at(3).read()),
+                (0x33, 0x44),
+                "the remapped half still reads the pages it had"
+            );
+            // What is written through the new mapping reads back through it.
+            at(2).write(0x99);
+            at(3).write(0xaa);
+            assert_eq!((at(2).read(), at(3).read()), (0x99, 0xaa));
+            assert_eq!(XMemFreePhysicalPages(2, new_pages.as_ptr()), 1);
+
             // And the reservation is released with its views, which is the
             // part the host call alone cannot do: the page table is shared by
             // the whole process, so the test gives back what it took.
