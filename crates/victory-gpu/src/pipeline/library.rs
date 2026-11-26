@@ -323,6 +323,23 @@ fn write_early_list(dir: &std::path::Path, used: &[String]) -> std::io::Result<(
     write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes())
 }
 
+fn write_full_save(
+    dir: &std::path::Path,
+    blob: &[u8],
+    prebuilt: Option<&str>,
+    used: &[String],
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    write_atomically(&dir.join(LIBRARY_FILE), blob)?;
+    // Write the matching prebuilt manifest right after `host-pipelines.bin`
+    // so a transient failure on `early-pipelines.txt` never leaves the binary
+    // paired with a stale manifest tag after an `EarlyOnly` retry.
+    if let Some(list) = prebuilt {
+        write_atomically(&dir.join(PREBUILT_FILE), list.as_bytes())?;
+    }
+    write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes())
+}
+
 /// Writes the library and/or the early list if pipelines were added or first
 /// used since the last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
@@ -386,13 +403,7 @@ pub(crate) fn save(now: bool) {
         }
         return;
     };
-    let written = std::fs::create_dir_all(dir)
-        .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
-        .and_then(|()| match &prebuilt {
-            Some(list) => write_atomically(&dir.join(PREBUILT_FILE), list.as_bytes()),
-            None => Ok(()),
-        });
+    let written = write_full_save(dir, &blob, prebuilt.as_deref(), &used);
     let (created, distinct) = created();
     let (shaders_cached, shaders_translated) = crate::shader_cache::counts();
     match written {
@@ -908,5 +919,31 @@ mod tests {
         );
         assert!(!dir.path().join(LIBRARY_FILE).exists());
         assert!(!dir.path().join(PREBUILT_FILE).exists());
+    }
+
+    #[test]
+    fn write_full_save_updates_prebuilt_manifest_before_early_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let used = vec!["pipe-a".to_owned()];
+        // Block replacing `early-pipelines.txt` so the full save fails on the
+        // early-list write after writing the new binary.
+        std::fs::create_dir(dir.path().join(EARLY_FILE)).unwrap();
+        let err = write_full_save(dir.path(), b"new-blob", Some("tag-new\npipe-a\n"), &used);
+        assert!(err.is_err());
+        assert_eq!(
+            std::fs::read(dir.path().join(LIBRARY_FILE)).unwrap(),
+            b"new-blob"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(PREBUILT_FILE)).unwrap(),
+            "tag-new\npipe-a\n"
+        );
+        // Once the early-list blocker clears, an early-only retry finishes cleanly.
+        std::fs::remove_dir(dir.path().join(EARLY_FILE)).unwrap();
+        write_early_list(dir.path(), &used).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(EARLY_FILE)).unwrap(),
+            "pipe-a"
+        );
     }
 }
