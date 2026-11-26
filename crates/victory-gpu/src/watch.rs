@@ -891,6 +891,28 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
 /// to a page the title address no longer shows.
 static BESIDE_VIEWS: std::sync::RwLock<BTreeMap<usize, usize>> = std::sync::RwLock::new(BTreeMap::new());
 
+// A bit remembers that a 2 MiB region has ever had a writable section view.
+// Collisions and stale bits only lead to a lookup. A clear bit lets an
+// ordinary CRT copy go straight to its native operation. Even during
+// registration the native destination still faults on a protected page.
+const REGION_SHIFT: u32 = 21;
+static BESIDE_REGIONS: [std::sync::atomic::AtomicU64; 1024] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 1024];
+
+fn region_bit(region: usize) -> (&'static std::sync::atomic::AtomicU64, u64) {
+    (&BESIDE_REGIONS[(region / 64) % BESIDE_REGIONS.len()], 1u64 << (region % 64))
+}
+
+fn ordinary_destination(at: usize, len: usize) -> bool {
+    debug_assert!(len > 0);
+    let first = at >> REGION_SHIFT;
+    if at.saturating_add(len - 1) >> REGION_SHIFT != first {
+        return false;
+    }
+    let (word, mask) = region_bit(first);
+    word.load(std::sync::atomic::Ordering::Relaxed) & mask == 0
+}
+
 /// The runtime mapped a section's page at title address `at` (a 64 KiB
 /// page); `ours` shows the same page, writable, at an address of our own.
 ///
@@ -898,6 +920,8 @@ static BESIDE_VIEWS: std::sync::RwLock<BTreeMap<usize, usize>> = std::sync::RwLo
 /// Both page-aligned views must show the same physical page. The second
 /// must stay writable until the runtime unregisters the first before unmapping.
 pub unsafe fn title_memory_beside(at: usize, ours: usize) {
+    let (word, mask) = region_bit(at >> REGION_SHIFT);
+    word.fetch_or(mask, std::sync::atomic::Ordering::Relaxed);
     BESIDE_VIEWS.write().unwrap_or_else(|e| e.into_inner()).insert(at / PAGE, ours);
 }
 
@@ -931,6 +955,13 @@ fn bulk_chunk(at: usize, write: impl FnOnce(*mut u8)) -> bool {
 }
 
 fn bulk_write(mut at: usize, len: usize, write: impl Fn(*mut u8, usize, usize)) {
+    if len == 0 {
+        return;
+    }
+    if ordinary_destination(at, len) {
+        write(at as *mut u8, 0, len);
+        return;
+    }
     let mut offset = 0;
     while offset < len {
         let count = (PAGE - at % PAGE).min(len - offset);
@@ -1466,6 +1497,19 @@ pub(crate) mod tests {
             title_memory_remapped(b, PAGE);
             // SAFETY: this test owns the alias and its tracking has ended.
             unsafe { UnmapViewOfFile(alias) };
+        });
+    }
+
+    #[test]
+    fn crt_fast_check_keeps_registered_pages_and_straddling_ranges() {
+        with_crt_views(1, 1, |a, _| {
+            assert!(!ordinary_destination(a, PAGE));
+            let next = ((a >> REGION_SHIFT) + 1) << REGION_SHIFT;
+            assert!(!ordinary_destination(next - 1, 2));
+            title_memory_beside_gone(a, PAGE);
+            // A remembered region can outlive its view. The locked lookup
+            // still falls back to a native write and cannot use a stale pointer.
+            assert!(!bulk_chunk(a, |_| panic!("unregistered view used")));
         });
     }
 
