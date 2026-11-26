@@ -593,9 +593,15 @@ impl State {
         const DEPTH_WRITE: u32 = 0x10;
         for &t in &self.targets {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
+            // The draws that render to a target are among its writers in
+            // the dumps (`crate::capture`).
+            #[cfg(feature = "diagnostics")]
+            crate::capture::note_target_by(list, t as This, &p.name);
         }
         if self.depth != 0 {
             crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE);
+            #[cfg(feature = "diagnostics")]
+            crate::capture::note_target_by(list, self.depth as This, &p.name);
         }
         // A depth copy of ours (`crate::twin`) ran a compute pipeline.
         if list.take_rebind() {

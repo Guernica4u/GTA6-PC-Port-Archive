@@ -308,6 +308,16 @@ pub(crate) fn note_target(list: &crate::host::HostList, resource: crate::object:
         return;
     }
     let by = WRITER.with(|w| w.borrow().clone());
+    note_target_by(list, resource, &by);
+}
+
+/// As [`note_target`], with the writer named: a draw that renders to
+/// `resource` (pipeline `by`).
+pub(crate) fn note_target_by(list: &crate::host::HostList, resource: crate::object::This, by: &str) {
+    if resource.is_null() || !dump_on() {
+        return;
+    }
+    let by = by.to_owned();
     // Lists are recorded ahead of the frame that submits them.
     list.note_target(resource as usize, &by);
     if !listed(crate::queue::presented() + 1) {
@@ -508,9 +518,11 @@ pub(crate) fn snapshot(
 /// With `VICTORY_DUMP_AFTER` (see [`after_wanted`]): title texture
 /// `resource`, which pipeline `by` just wrote, read back in `list` right
 /// after the command (see [`snapshot`]; `state` is where it goes back to)
-/// and saved once the list has run, as `frame-<n>-after-<k>-...` (`k` counts
-/// these dumps in the order they were recorded): what that command left
-/// there, before anything later in the frame writes it. 2D textures only.
+/// and saved once the list has run, as `frame-<n>-after-<k>-...` (`n` the
+/// frame whose submission ran it, as in the per-submission dumps; `k`
+/// counts these dumps in the order they were recorded): what that command
+/// left there, before anything later in the frame writes it. 2D textures
+/// only.
 pub(crate) fn dump_after(list: &crate::host::HostList, resource: crate::object::This, state: u32, by: &str) {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     static AFTER: AtomicU64 = AtomicU64::new(0);
@@ -524,10 +536,13 @@ pub(crate) fn dump_after(list: &crate::host::HostList, resource: crate::object::
         tracing::info!(?resource, by, "not dumped after its command: a depth texture with a writable twin");
         return;
     };
-    let stem = format!("frame-{}-after-{:04}", crate::queue::presented() + 1, AFTER.fetch_add(1, Relaxed));
+    let k = AFTER.fetch_add(1, Relaxed);
     let by = writers_label(&[by.to_owned()]);
     let resource = resource as usize;
+    // Lists are recorded ahead of the frame that submits them: named when
+    // the list has run.
     list.defer_after(move || {
+        let stem = format!("frame-{}-after-{k:04}", crate::queue::presented() + 1);
         save_target(&stem, resource as crate::object::This, &by, &shot.desc, &shot.buffer, &shot.footprint);
     });
 }
