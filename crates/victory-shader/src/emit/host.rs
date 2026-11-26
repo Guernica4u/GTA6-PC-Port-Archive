@@ -16,7 +16,7 @@ use crate::dxbc::{Container, FourCC};
 
 pub struct Host {
     device: ID3D12Device,
-    queue: OnceLock<Result<ID3D12CommandQueue, String>>,
+    queue: OnceLock<ID3D12CommandQueue>,
     warp: bool,
 }
 
@@ -261,10 +261,14 @@ impl Host {
     }
 
     fn queue(&self) -> Result<&ID3D12CommandQueue, String> {
-        self.queue
-            .get_or_init(|| create_queue(&self.device))
-            .as_ref()
-            .map_err(Clone::clone)
+        if let Some(queue) = self.queue.get() {
+            return Ok(queue);
+        }
+        // Cache successes only. A transient creation error (or one while the
+        // device was removed) must not stick for this host's lifetime.
+        let queue = create_queue(&self.device)?;
+        let _ = self.queue.set(queue); // another thread may have won the race
+        Ok(self.queue.get().expect("queue just set"))
     }
 
     fn lock_warp(&self) -> Option<MutexGuard<'static, ()>> {
@@ -285,7 +289,7 @@ impl Host {
     fn new_for(warp: bool) -> Result<Self, String> {
         let pair = shared(warp)?;
         let queue = OnceLock::new();
-        queue.set(Ok(pair.queue.clone())).expect("fresh queue cell");
+        queue.set(pair.queue.clone()).expect("fresh queue cell");
         Ok(Host {
             device: pair.device,
             queue,
@@ -2210,12 +2214,21 @@ mod tests {
     fn parallel_hardware_dispatches_on_shared_queue() {
         let first = match Host::new_for(false) {
             Ok(host) => host,
-            Err(e) => {
-                if let Err(device) = create_device(false) {
-                    eprintln!("no hardware SM 6.6 adapter ({device}); skipped");
-                    return;
+            Err(shared) => {
+                // `shared()` makes the device before the queue. When the
+                // device can still be made, this is a queue failure: report
+                // it rather than hiding it behind an unrelated skip. Only
+                // skip when no SM 6.6 device can be made either, printing
+                // both errors so the original failure stays visible.
+                match create_device(false) {
+                    Err(device) => {
+                        eprintln!(
+                            "no hardware SM 6.6 adapter ({device}); skipped; shared queue: {shared}"
+                        );
+                        return;
+                    }
+                    Ok(_) => panic!("hardware device made, shared queue failed: {shared}"),
                 }
-                panic!("hardware device made, shared queue failed: {e}");
             }
         };
         let second = Host::new_for(false).expect("second hardware Host::new");
