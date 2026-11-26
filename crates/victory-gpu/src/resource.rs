@@ -989,6 +989,11 @@ impl Drop for HostTexture {
         if let Some(p) = self.placement.take() {
             crate::placement::free(self.texture.clone(), p);
         }
+        // Its tiles likewise go back once nothing else holds the texture
+        // and their mappings have run.
+        if let Some(tiled) = self.tiled.take() {
+            crate::tiles::free(self.texture.clone(), tiled);
+        }
         TEXTURES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         TEXTURE_BYTES.fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
         if *self.used.get_mut() {
@@ -2558,6 +2563,50 @@ mod tests {
         assert_eq!(slot::<Release>(target, 0x10)(target), 0);
         assert!(t.upgrade().is_none(), "freed with its title texture");
         assert_eq!(slot::<Release>(read, 0x10)(read), 0);
+        assert_eq!(slot::<Release>(h, 0x10)(h), 0);
+    }
+
+    /// Levels on demand (`crate::tiles`): a host copy recorded into a list
+    /// gives the texture's levels tiles when the list's submission is
+    /// prepared, not when it is recorded: a list dropped unrun leaves no
+    /// mapping queued (one queued for a texture that then went, its heap
+    /// with it, faulted the host GPU), and a submission made before it
+    /// sees no level with what the tiles' last owner left. Found by
+    /// fuzeofficlal's review.
+    #[cfg(windows)]
+    #[test]
+    fn a_host_write_gives_tiles_at_submission_not_when_recorded() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let h = heap(8 << 20);
+        let mut out = null;
+        // BC1 (71) 2048x2048, twelve levels: 2.7 MB, past the floor.
+        assert_eq!(create_placed(null, h, 0, &texture(2048, 2048, 71, 12), 0, null.cast(), &RESOURCE_IIDS[0], &mut out), S_OK);
+        crate::tiles::FORCED.with(|f| f.set(true));
+        let copy = host_copy(out);
+        crate::tiles::FORCED.with(|f| f.set(false));
+        let copy = copy.expect("a host texture");
+        if let Some(tiled) = &copy.tiled {
+            let every = tiled.every_level();
+            let list = host.new_list().unwrap();
+            crate::texture::host_writes(&list, out);
+            assert_eq!(tiled.without(every), every, "recorded: no level given tiles yet");
+            assert_eq!(tiled.given_bytes(), 0);
+            list.close();
+            drop(list);
+            assert_eq!(tiled.given_bytes(), 0, "dropped unrun: none given");
+            let list = host.new_list().unwrap();
+            crate::texture::host_writes(&list, out);
+            assert_eq!(tiled.given_bytes(), 0);
+            list.close();
+            host.execute(&[&list]);
+            assert!(tiled.whole(), "submitted: every level has tiles");
+            assert!(copy.host_written.load(std::sync::atomic::Ordering::Relaxed));
+        }
+        drop(copy);
+        assert_eq!(slot::<Release>(out, 0x10)(out), 0);
         assert_eq!(slot::<Release>(h, 0x10)(h), 0);
     }
 
