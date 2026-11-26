@@ -77,8 +77,8 @@ struct Shared {
     /// The same library as `state`'s, loaded from without its lock.
     loads: ID3D12PipelineLibrary1,
     state: Mutex<Library>,
-    /// The adapter directory consulted when this library opened.
-    cache: Option<PathBuf>,
+    /// The adapter directory consulted at load, or why none was consulted.
+    cache: Result<PathBuf, &'static str>,
 }
 
 // SAFETY: as for `Library`.
@@ -219,7 +219,11 @@ fn open_cache(
     Some(Shared {
         loads: library.library.clone(),
         state: Mutex::new(library),
-        cache,
+        cache: cache.ok_or(if root.is_some() {
+            "adapter unavailable at load"
+        } else {
+            "cache directory not configured at load"
+        }),
     })
 }
 
@@ -408,12 +412,13 @@ pub(crate) fn save(now: bool) {
 fn save_library(library: &Shared) {
     // A library opened without an identity never read the adapter cache.
     // Looking up an adapter now could overwrite that unconsulted cache.
-    let Some(adapter) = &library.cache else {
-        static WARNED: std::sync::Once = std::sync::Once::new();
-        WARNED.call_once(|| {
-            tracing::warn!("host pipeline library not saved: adapter unavailable at load")
-        });
-        return;
+    let adapter = match &library.cache {
+        Ok(adapter) => adapter,
+        Err(reason) => {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| tracing::warn!(reason = *reason, "host pipeline library not saved"));
+            return;
+        }
     };
     let (blob, prebuilt, added, prebuilt_changed) = {
         let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -707,6 +712,12 @@ mod tests {
 
         // Fail the lookup at load time, then show DXGI can identify it again.
         let unresolved = open_cache(&device1, Some(root), None).unwrap();
+        assert_eq!(unresolved.cache.as_deref(), Err(&"adapter unavailable at load"));
+        let unconfigured = open_cache(&device1, None, Some(&expected)).unwrap();
+        assert_eq!(
+            unconfigured.cache.as_deref(),
+            Err(&"cache directory not configured at load")
+        );
         let recovered = device_adapter(&device).expect("later adapter lookup");
         assert_eq!(adapter_cache_dir(root, &recovered), path);
         {
