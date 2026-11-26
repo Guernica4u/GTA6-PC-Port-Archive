@@ -18,239 +18,6 @@ use crate::native::{
 use crate::resource::{Role, Source};
 use crate::{dxbc, io, ir, resource, structure};
 
-mod comparison {
-    use std::ffi::c_void;
-    use std::mem::ManuallyDrop;
-
-    use windows::Win32::Graphics::Direct3D12::*;
-    use windows::Win32::Graphics::Dxgi::Common::{
-        DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_TYPELESS, DXGI_SAMPLE_DESC,
-    };
-    use windows::core::{Interface, Result};
-
-    const ONE_SAMPLE: DXGI_SAMPLE_DESC = DXGI_SAMPLE_DESC {
-        Count: 1,
-        Quality: 0,
-    };
-
-    // The general test host's RGBA texture does not support comparison on
-    // all devices. Use an R32_FLOAT SRV with the host's compute pipeline.
-    pub(super) fn dispatch(
-        device: &ID3D12Device,
-        root: &ID3D12RootSignature,
-        pso: &ID3D12PipelineState,
-        user_data: &[u32],
-    ) -> Result<Vec<u32>> {
-        let direct = D3D12_COMMAND_LIST_TYPE_DIRECT;
-        // SAFETY: `device`, `root`, and `pso` are valid live D3D12 objects; all
-        // mapped/placed descriptors and command-list resources stay alive until
-        // the fence wait completes.
-        unsafe {
-            let queue_desc = D3D12_COMMAND_QUEUE_DESC {
-                Type: direct,
-                ..Default::default()
-            };
-            let queue: ID3D12CommandQueue = device.CreateCommandQueue(&queue_desc)?;
-            let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(direct)?;
-            let list: ID3D12GraphicsCommandList =
-                device.CreateCommandList(0, direct, &allocator, pso)?;
-            let texture = resource(
-                device,
-                D3D12_HEAP_TYPE_DEFAULT,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                D3D12_RESOURCE_DESC {
-                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-                    Width: 2,
-                    Height: 1,
-                    DepthOrArraySize: 1,
-                    MipLevels: 1,
-                    Format: DXGI_FORMAT_R32_FLOAT,
-                    SampleDesc: ONE_SAMPLE,
-                    ..Default::default()
-                },
-            )?;
-            let texels = [0.25f32, 0.75];
-            let row_pitch = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
-            let upload = resource(
-                device,
-                D3D12_HEAP_TYPE_UPLOAD,
-                D3D12_RESOURCE_STATE_GENERIC_READ,
-                buffer(u64::from(row_pitch)),
-            )?;
-            let mut mapped = std::ptr::null_mut::<c_void>();
-            upload.Map(0, None, Some(&mut mapped))?;
-            mapped.cast::<[f32; 2]>().write(texels);
-            upload.Unmap(0, None);
-            let mut src = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: ManuallyDrop::new(Some(upload.clone())),
-                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                        Offset: 0,
-                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                            Format: DXGI_FORMAT_R32_FLOAT,
-                            Width: 2,
-                            Height: 1,
-                            Depth: 1,
-                            RowPitch: row_pitch,
-                        },
-                    },
-                },
-            };
-            let mut dst = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: ManuallyDrop::new(Some(texture.clone())),
-                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    SubresourceIndex: 0,
-                },
-            };
-            list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
-            ManuallyDrop::drop(&mut src.pResource);
-            ManuallyDrop::drop(&mut dst.pResource);
-            transition(
-                &list,
-                &texture,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-            );
-
-            let output = resource(
-                device,
-                D3D12_HEAP_TYPE_DEFAULT,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_DESC {
-                    Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                    ..buffer(8)
-                },
-            )?;
-            let readback = resource(
-                device,
-                D3D12_HEAP_TYPE_READBACK,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                buffer(8),
-            )?;
-            let heap_desc = D3D12_DESCRIPTOR_HEAP_DESC {
-                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: 2,
-                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                NodeMask: 0,
-            };
-            let heap: ID3D12DescriptorHeap = device.CreateDescriptorHeap(&heap_desc)?;
-            let srv = heap.GetCPUDescriptorHandleForHeapStart();
-            let stride = device.GetDescriptorHandleIncrementSize(heap_desc.Type) as usize;
-            let uav = D3D12_CPU_DESCRIPTOR_HANDLE {
-                ptr: srv.ptr + stride,
-            };
-            device.CreateShaderResourceView(&texture, None, srv);
-            device.CreateUnorderedAccessView(
-                &output,
-                None,
-                Some(&D3D12_UNORDERED_ACCESS_VIEW_DESC {
-                    Format: DXGI_FORMAT_R32_TYPELESS,
-                    ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
-                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
-                        Buffer: D3D12_BUFFER_UAV {
-                            NumElements: 2,
-                            Flags: D3D12_BUFFER_UAV_FLAG_RAW,
-                            ..Default::default()
-                        },
-                    },
-                }),
-                uav,
-            );
-            list.SetDescriptorHeaps(&[Some(heap.clone())]);
-            list.SetComputeRootSignature(root);
-            list.SetComputeRoot32BitConstants(
-                0,
-                user_data.len() as u32,
-                user_data.as_ptr().cast(),
-                0,
-            );
-            list.Dispatch(1, 1, 1);
-            transition(
-                &list,
-                &output,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            );
-            list.CopyResource(&readback, &output);
-            list.Close()?;
-            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
-            queue.ExecuteCommandLists(&[Some(list.cast()?)]);
-            queue.Signal(&fence, 1)?;
-            fence.SetEventOnCompletion(1, Default::default())?;
-            readback.Map(0, None, Some(&mut mapped))?;
-            let words = mapped.cast::<[u32; 2]>().read().to_vec();
-            readback.Unmap(0, None);
-            Ok(words)
-        }
-    }
-
-    fn buffer(width: u64) -> D3D12_RESOURCE_DESC {
-        D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: width,
-            Height: 1,
-            DepthOrArraySize: 1,
-            MipLevels: 1,
-            SampleDesc: ONE_SAMPLE,
-            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-            ..Default::default()
-        }
-    }
-
-    fn resource(
-        device: &ID3D12Device,
-        kind: D3D12_HEAP_TYPE,
-        state: D3D12_RESOURCE_STATES,
-        desc: D3D12_RESOURCE_DESC,
-    ) -> Result<ID3D12Resource> {
-        let mut resource = None;
-        // SAFETY: `device` is a valid D3D12 device and `desc` describes a valid committed resource.
-        unsafe {
-            device.CreateCommittedResource(
-                &D3D12_HEAP_PROPERTIES {
-                    Type: kind,
-                    CreationNodeMask: 1,
-                    VisibleNodeMask: 1,
-                    ..Default::default()
-                },
-                D3D12_HEAP_FLAG_NONE,
-                &desc,
-                state,
-                None,
-                &mut resource,
-            )?;
-        }
-        Ok(resource.expect("committed resource"))
-    }
-
-    fn transition(
-        list: &ID3D12GraphicsCommandList,
-        resource: &ID3D12Resource,
-        before: D3D12_RESOURCE_STATES,
-        after: D3D12_RESOURCE_STATES,
-    ) {
-        let mut barrier = D3D12_RESOURCE_BARRIER {
-            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-            Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
-                    pResource: ManuallyDrop::new(Some(resource.clone())),
-                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                    StateBefore: before,
-                    StateAfter: after,
-                }),
-            },
-        };
-        // SAFETY: `list` and `resource` are valid D3D12 objects and `barrier` holds a Transition variant.
-        unsafe {
-            list.ResourceBarrier(std::slice::from_ref(&barrier));
-            ManuallyDrop::drop(&mut (*barrier.Anonymous.Transition).pResource);
-        }
-    }
-}
-
 /// User data: s0 the heap index of a structured buffer (a root constant),
 /// s1 the resource heap, s2 a table with a raw UAV. Each lane stores dword
 /// 1 of element `lane` to dword `lane` of the UAV.
@@ -904,9 +671,14 @@ fn build_sampler_test(words: &[u32], check_sources: impl FnOnce(&[&Source])) -> 
 
 fn run_sampler_test(shader: &HostShader, cases: &[(u32, &[f32])], comparison: bool) {
     // At u = 1.25, wrap reads the first texel and clamp reads the second.
-    let texels = [[0.25, 0.0, 0.0, 1.0], [0.75, 0.0, 0.0, 1.0]];
+    let rgba = [[0.25, 0.0, 0.0, 1.0], [0.75, 0.0, 0.0, 1.0]];
+    let r32 = [0.25, 0.75];
     let views = [
-        View::Texture(2, 1, &texels),
+        if comparison {
+            View::FloatTexture(2, 1, &r32)
+        } else {
+            View::Texture(2, 1, &rgba)
+        },
         View::RawUav(cases[0].1.len() as u32),
     ];
     let _one = super::valu_tests::ONE_AT_A_TIME
@@ -932,11 +704,8 @@ fn run_sampler_test(shader: &HostShader, cases: &[(u32, &[f32])], comparison: bo
                     other => panic!("unexpected user data {other:?}"),
                 };
             }
-            let words = if comparison {
-                comparison::dispatch(&host.device, &root, &pso, &ud)
-                    .unwrap_or_else(|e| panic!("{label}: comparison dispatch failed: {e}"))
-            } else {
-                host.dispatch(
+            let words = host
+                .dispatch(
                     &root,
                     &pso,
                     &Dispatch {
@@ -947,8 +716,7 @@ fn run_sampler_test(shader: &HostShader, cases: &[(u32, &[f32])], comparison: bo
                     },
                 )
                 .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"))
-                .swap_remove(0)
-            };
+                .swap_remove(0);
             let got: Vec<_> = words.into_iter().map(f32::from_bits).collect();
             assert_eq!(got, want, "{label}, choice {choice}");
         }

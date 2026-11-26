@@ -5543,7 +5543,7 @@ impl<'a> Lower<'a> {
 
     fn immediate_sampler_phi(&mut self, src: &Source, comparison: bool) -> Result<Option<V>, Why> {
         let mut samplers = Vec::new();
-        let Some(selector) = self.sampler_selector(src, &mut samplers, &mut HashSet::new())? else {
+        let Some(selector) = self.sampler_selector(src, &mut samplers)? else {
             return Ok(None);
         };
         if samplers.is_empty() {
@@ -5567,7 +5567,6 @@ impl<'a> Lower<'a> {
         &self,
         src: &Source,
         samplers: &mut Vec<[u32; 4]>,
-        active: &mut HashSet<*const Source>,
     ) -> Result<Option<SamplerSelector>, Why> {
         const WHY: Why = "a descriptor chosen by control flow";
         match src {
@@ -5583,10 +5582,6 @@ impl<'a> Lower<'a> {
                 Ok(Some(SamplerSelector::Slot(slot as u32)))
             }
             Source::Phi { block, args } => {
-                let key = std::ptr::from_ref(src);
-                if !active.insert(key) {
-                    return Err(WHY);
-                }
                 let join = self.block[*block].ok_or(WHY)?;
                 let mut incoming = Vec::new();
                 for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
@@ -5599,14 +5594,13 @@ impl<'a> Lower<'a> {
                         // Keep the CFG edge without counting its sampler.
                         SamplerSelector::Slot(0)
                     } else {
-                        let Some(value) = self.sampler_selector(arg, samplers, active)? else {
+                        let Some(value) = self.sampler_selector(arg, samplers)? else {
                             return Ok(None);
                         };
                         value
                     };
                     incoming.push((value, at));
                 }
-                active.remove(&key);
                 Ok(Some(if incoming.is_empty() {
                     SamplerSelector::Slot(0)
                 } else {
