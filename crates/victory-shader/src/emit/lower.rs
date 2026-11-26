@@ -4255,11 +4255,11 @@ impl<'a> Lower<'a> {
     /// the code also reads as numbers: the console compiler computes sizes
     /// from descriptor bits (an image's width, height, depth, levels; a
     /// buffer's record count) instead of querying them. Those fields are
-    /// rebuilt from the host view's dimensions in the GFX10 layout (image
+    /// rebuilt from the host's view's dimensions in the GFX10 layout (image
     /// dword 1 bits 30-31 and dword 2 bits 0-13 width - 1, dword 2 bits
     /// 14-29 height - 1, dword 3 identity swizzle, last level at 16, type at
     /// 28, dword 4 depth or layers - 1; buffer dword 2 the record count).
-    // shortcut: the base level reads 0 (the host view starts at its own
+    // shortcut: the base level reads 0 (the host's view starts at its own
     // level 0, so sizes the code shifts by it come out right) and the other
     // dwords (addresses, formats, tiling) have no host value: reading them
     // stops the program.
@@ -5333,7 +5333,7 @@ impl<'a> Lower<'a> {
 
     /// The stride an access by element takes, from the used-resource
     /// record. Whether the record is missing or names none (the FSPX parser
-    /// leaves unread strides at zero), the element size is the host view's,
+    /// leaves unread strides at zero), the element size is the host's view's,
     /// known only at runtime — the access is refused, its error separate
     /// from the unknown ones so runs can tell them apart.
     fn index_stride(&self, used: Option<&UsedResource>) -> Result<u32, Why> {
