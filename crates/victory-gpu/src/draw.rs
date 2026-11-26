@@ -536,7 +536,7 @@ impl State {
             return false;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
-            crate::pipeline::dropped_into(self.pipeline as This, &self.targets);
+            self.not_made(false);
             return false;
         };
         if p.compute || p.mesh != mesh {
@@ -604,7 +604,35 @@ impl State {
             unsafe { l.SetPipelineState(&p.pso) };
             (self.host_pipeline, self.host_roots[1]) = (p.pso.as_raw() as usize, 0);
         }
+        crate::feeds::ran(&self.targets, self.depth);
         true
+    }
+
+    /// A draw (`compute` false) or dispatch dropped for want of its host
+    /// pipeline: what it would have written, its targets and the unordered
+    /// views its code names through tables, goes to
+    /// [`crate::pipeline::dropped_into`] if the pipeline is being made.
+    fn not_made(&self, compute: bool) {
+        let this = self.pipeline as This;
+        if !crate::pipeline::being_made(this) {
+            return;
+        }
+        let mut writes = Vec::new();
+        if !compute {
+            writes.extend_from_slice(&self.targets);
+            writes.extend((self.depth != 0).then_some(self.depth));
+        }
+        let uavs = crate::pipeline::used(this)
+            .filter(|u| u.kind == ResourceType::Uav && u.root == RootType::Table);
+        for u in uavs {
+            if let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot))
+                && let Some(View::Unordered(resource, _, _)) =
+                    crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+            {
+                writes.push(resource);
+            }
+        }
+        crate::pipeline::dropped_into(this, &writes);
     }
 
     /// A descriptor a shader reads through a table: its host slot made if
@@ -618,6 +646,7 @@ impl State {
         // What its shaders write is withheld only if the program uses title
         // memory and a list using it misses (`crate::memory::withholding`).
         let _writer = list.writer_uses_memory(p.stages.iter().any(|s| s.memory.is_some()));
+        crate::feeds::begin();
         let l = &list.list;
         // A depth copy of ours (`crate::twin`) since the last one ran a
         // compute pipeline.
@@ -1106,6 +1135,7 @@ impl State {
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
+            self.not_made(true);
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "dispatch");
@@ -1121,6 +1151,7 @@ impl State {
             dropped(list, self.pipeline, "dispatch");
             return;
         }
+        crate::feeds::ran(&[], 0);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
@@ -1733,9 +1764,7 @@ impl State {
         // reads. Same order as the `is_skipped` check above, for the same
         // reason.
         if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
-            if kind != DISPATCH {
-                crate::pipeline::dropped_into(self.pipeline as This, &self.targets);
-            }
+            self.not_made(kind == DISPATCH);
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             why("no host pipeline");
@@ -1783,7 +1812,13 @@ impl State {
             }
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => self.bind(list, p, true),
+                Some(p) if p.compute => {
+                    let bound = self.bind(list, p, true);
+                    if bound {
+                        crate::feeds::ran(&[], 0);
+                    }
+                    bound
+                }
                 _ => false,
             },
             _ => false,
@@ -1888,6 +1923,17 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
 fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
+    // What the frame's pass reads and writes (`crate::feeds`), by the title
+    // resource its descriptor names.
+    match (view, u.kind) {
+        (View::Shader(resource, _), ResourceType::Srv) if marked => {
+            crate::feeds::view(*resource, false)
+        }
+        (View::Unordered(resource, _, _), ResourceType::Uav) if marked => {
+            crate::feeds::view(*resource, true)
+        }
+        _ => {}
+    }
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;

@@ -30,6 +30,8 @@ mod draw;
 pub mod dxgi;
 #[cfg(windows)]
 pub mod external;
+#[cfg(windows)]
+mod feeds;
 pub mod fence;
 pub mod frame;
 mod hold;

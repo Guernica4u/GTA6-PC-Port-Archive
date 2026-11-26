@@ -590,14 +590,18 @@ extern "system" fn present(
 /// made left one of its `planes` unwritten, so it holds an older frame and
 /// the window keeps the last one shown, for a while ([`crate::shown`]).
 /// Logs where a run of held frames starts and ends, and a hold given up.
+/// The pipelines of the frame's dropped passes the planes read go first
+/// ([`crate::feeds`]).
 #[cfg(windows)]
 fn holds(frame: u64, planes: &[Plane]) -> bool {
     use crate::shown::Frame;
-    let images = planes
+    let images: Vec<usize> = planes
         .iter()
         .filter(|plane| plane.count != 0 && !plane.resources.is_null())
         // SAFETY: the plane lists `count` resources.
-        .map(|plane| unsafe { *plane.resources } as usize);
+        .map(|plane| unsafe { *plane.resources } as usize)
+        .collect();
+    crate::pipeline::hurry_feeders(&crate::feeds::presented(&images));
     match crate::shown::frame(images) {
         Frame::Show => false,
         Frame::ShowAgain { held } => {

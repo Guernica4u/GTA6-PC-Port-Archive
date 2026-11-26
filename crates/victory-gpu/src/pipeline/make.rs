@@ -89,6 +89,11 @@ impl Pending {
         }
     }
 
+    /// The shader containers it is made from.
+    pub(crate) fn shaders(&self) -> &[Arc<Shader>] {
+        &self.shaders
+    }
+
     fn make(&self) {
         self.made.get_or_init(|| {
             let (started, cpu) = (Instant::now(), super::thread_cpu());
@@ -224,23 +229,31 @@ fn start(p: &Arc<Pending>, now: bool) {
 }
 
 /// Puts `p`, queued for a draw, at the head of the workers' queue if no
-/// worker has it yet: a draw into an image the title presents was dropped
-/// for it (`crate::shown`), and the frame's other new pipelines (~1,900 in
-/// Grand Theft Auto VI's first world frame) can wait behind it.
-pub(crate) fn hurry(p: &Arc<Pending>) {
-    if hurried(p) {
-        tracing::info!(shaders = ?p.shaders, "made first: a presented image waits for it");
+/// worker has it yet; whether it did. A draw into an image the title
+/// presents, or into what such a draw reads, was dropped for it
+/// (`crate::shown`, `crate::feeds`), and the frame's other new pipelines
+/// (~1,900 in Grand Theft Auto VI's first world frame) can wait behind it.
+pub(crate) fn hurry(p: &Arc<Pending>) -> bool {
+    let first = hurried(p);
+    if first {
+        super::library::note_hurried(&p.key);
         queue(p.clone(), Place::First);
     }
+    first
 }
 
-/// Whether `p` goes to the head of the queue now: queued, not made, not
-/// taken by a worker, and not put there before.
-fn hurried(p: &Pending) -> bool {
+/// Whether `p` would go to the head of the queue now: queued, not made,
+/// not taken by a worker, and not put there before.
+pub(crate) fn may_hurry(p: &Pending) -> bool {
     p.made.get().is_none()
         && p.queued.load(Ordering::Relaxed)
         && !p.taken.load(Ordering::Relaxed)
-        && !p.first.swap(true, Ordering::Relaxed)
+        && !p.first.load(Ordering::Relaxed)
+}
+
+/// As [`may_hurry`], and marks it put there.
+fn hurried(p: &Pending) -> bool {
+    may_hurry(p) && !p.first.swap(true, Ordering::Relaxed)
 }
 
 /// Which queue `p` goes into now (true: the one draws wait for), if any.
@@ -254,12 +267,14 @@ fn enqueue(p: &Pending, now: bool) -> Option<bool> {
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
-/// run drew with it (during loading, so the world's first frames find it).
+/// run drew with it (during loading, so the world's first frames find it),
+/// ahead of the other early starts if a presented image waited for it then
+/// (`hurry`).
 pub(crate) fn early(p: &Arc<Pending>) {
     super::library::note_created(&p.key);
     if p.made.get().is_none() && !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
-        start(p, false);
+        start(p, super::library::wanted_first(&p.key));
     }
 }
 
@@ -496,6 +511,7 @@ mod tests {
             hash: "0123456789abcdef".into(),
             container: Vec::new(),
             translated: OnceLock::new(),
+            used: OnceLock::new(),
         });
         let cold = Arc::new(Pending::new(vec![shader.clone()], None, &hashes));
         let warm = Arc::new(Pending::new(vec![shader.clone()], None, &hashes));
