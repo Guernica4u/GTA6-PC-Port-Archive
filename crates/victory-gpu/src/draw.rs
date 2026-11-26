@@ -3490,8 +3490,9 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// bridged by a copy at the read.
     #[test]
     fn a_texture_written_in_one_format_reads_in_another_through_a_placed_view() {
-        let Some(host) = crate::host::host() else {
-            return; // no host GPU here
+        // (Castable formats: the R9G9B9E5 view shares the R32_UINT texture.)
+        let Some(host) = crate::host::host().filter(|h| h.agility_runtime()) else {
+            return; // no host GPU here, or one without castable formats
         };
         let slots = Slots::new(4);
         let read = compile_cs(READ);
@@ -4036,7 +4037,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         use victory_shader::native::{ComputeIo, HwStage, NativeProgram, RootParam, StageIo};
         use victory_shader::{Container, io, ir, resource, structure};
 
-        let Some(host) = crate::host::host() else {
+        let Some(host) = crate::host::host().filter(|h| h.agility_runtime()) else {
             return;
         };
         let _ = host.log_messages();
