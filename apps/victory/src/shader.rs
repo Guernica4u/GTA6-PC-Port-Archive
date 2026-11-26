@@ -119,6 +119,7 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool, effects: bool) -> R
     let paths = crate::default_paths(paths)?;
     let mut t = Totals::default();
     let mut packs = Vec::new();
+    let mut effect_databases = 0;
     for root in &paths {
         for entry in scan_shader_files(root, true, |path| {
             eprintln!("skipping large file {}", path.display());
@@ -128,7 +129,7 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool, effects: bool) -> R
                 continue;
             };
             if effects {
-                list_effects(path, &data);
+                effect_databases += list_effects(path, &data);
                 continue;
             }
             if data.starts_with(shaderpack::MAGIC) {
@@ -248,6 +249,10 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool, effects: bool) -> R
             }
             t.files_with_shaders += usize::from(found_here > 0);
         }
+    }
+    if effects {
+        println!("shader effect databases found: {effect_databases}");
+        return Ok(());
     }
     println!(
         "containers found       {} (in {} files)",
@@ -370,8 +375,10 @@ fn list_pack(path: &Path, data: &[u8], t: &Totals, verbose: bool) {
 
 /// Effect -> technique -> pass -> shaders (name, container hash, the
 /// engine's hash) and the state each pass sets, for every database in `data`.
-fn list_effects(path: &std::path::Path, data: &[u8]) {
-    for db in sgd5::databases(data) {
+fn list_effects(path: &std::path::Path, data: &[u8]) -> usize {
+    let databases = sgd5::databases(data);
+    let count = databases.len();
+    for db in databases {
         let passes: usize = (db.effects.iter())
             .flat_map(|e| &e.techniques)
             .map(|t| t.passes.len())
@@ -420,6 +427,7 @@ fn list_effects(path: &std::path::Path, data: &[u8]) {
             }
         }
     }
+    count
 }
 
 fn format_instruction(i: &Instruction, wave64: bool) -> String {
