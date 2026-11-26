@@ -84,6 +84,26 @@ PROGRAMS = {
 }
 
 
+# Dependent, in-place integer operations under sparse EXEC, including
+# scalar inputs, wrapping arithmetic and a masked row exchange.
+PROGRAMS['direct_alu_chain'] = [
+    'v_mov_b32_e32 v10, v0', 'v_mov_b32_e32 v11, v1',
+    's_mov_b32 s30, 0x12345678',
+] + [
+    'v_add_nc_u32_e32 v10, s30, v10',
+    'v_sub_nc_u32_e32 v11, v10, v11',
+    'v_subrev_nc_u32_e32 v10, v11, v10',
+    'v_not_b32_e32 v11, v11',
+    'v_xor_b32_e32 v10, v10, v11',
+    'v_lshlrev_b32_e32 v10, 5, v10',
+    'v_lshrrev_b32_e32 v11, v1, v11',
+    'v_or_b32_e32 v11, v10, v11',
+    'v_and_b32_e32 v10, 0x7fffffff, v10',
+    'v_add_nc_u32 v10, v10, v11 dpp8:[1,0,3,2,5,4,7,6]',
+    'v_mov_b32_dpp v11, v10 row_shr:1 row_mask:0xa bank_mask:0x5 bound_ctrl:1',
+] * 8
+
+
 def assemble(llvm_mc, lines):
     result = subprocess.run([str(llvm_mc), "-triple=amdgcn-amd-amdhsa", "-mcpu=gfx1030",
                              "-mattr=-wavefrontsize32,+wavefrontsize64", "-show-encoding"],
@@ -266,7 +286,9 @@ def step(w, text):
             if not (rows >> (l >> 4)) & (banks >> (l & 3)) & 1 or not (valid or zero): continue
             a = first[source] if valid else 0
         x = [o[l] for o in others]
-        results[l] = {'v_mov_b32': lambda: a, 'v_add_nc_u32': lambda: a + x[0], 'v_and_b32': lambda: a & x[0],
+        results[l] = {'v_mov_b32': lambda: a, 'v_add_nc_u32': lambda: a + x[0],
+                      'v_sub_nc_u32': lambda: a - x[0], 'v_subrev_nc_u32': lambda: x[0] - a,
+                      'v_not_b32': lambda: ~a, 'v_and_b32': lambda: a & x[0],
                       'v_or_b32': lambda: a | x[0], 'v_xor_b32': lambda: a ^ x[0], 'v_max_u32': lambda: max(a, x[0]),
                       'v_lshlrev_b32': lambda: x[0] << (a & 31), 'v_lshrrev_b32': lambda: x[0] >> (a & 31),
                       'v_cndmask_b32': lambda: x[0] if (select >> l) & 1 else a,
@@ -324,7 +346,7 @@ def inputs(rng):
 def selected():
     """Each program in one console wave per group, and some in four."""
     single = [(name, body, 64) for name, body in PROGRAMS.items()]
-    return single + [(f"{name}_x4", PROGRAMS[name], 256) for name in ("saveexec", "waterfall", "permlane", "dispatch")]
+    return single + [(f"{name}_x4", PROGRAMS[name], 256) for name in ("saveexec", "waterfall", "permlane", "dispatch", "direct_alu_chain", "row_masks")]
 
 
 def main(argv=None):

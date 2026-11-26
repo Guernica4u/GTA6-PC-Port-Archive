@@ -90,3 +90,13 @@ fn group_shared_accesses_are_checked_against_the_declared_size() {
     }
     assert!(checked > 0, "no host profile translated the shared-memory program");
 }
+
+#[test]
+fn paired_simple_alu_writes_lane_registers_directly() {
+    // v_mov_b32_e32 v10, v0; v_add_nc_u32 v10, v10, v11; s_endpgm.
+    let words = [0x7e140300, 0x4a14170a, 0xbf810000];
+    let hlsl = translate_paired_wave64(&program(64, &words)).unwrap().hlsl;
+    assert!(hlsl.contains("v10__0 = v0__0;"), "{hlsl}");
+    assert!(hlsl.contains("v10__1 = v0__1;"));
+    assert!(!hlsl.contains("uint tbx_exec_lo"));
+}

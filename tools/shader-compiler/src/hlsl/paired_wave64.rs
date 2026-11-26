@@ -314,6 +314,91 @@ fn ds_swizzle(em: &mut Emitter<'_>, ins: &Insn) -> Result<(), String> {
     Ok(())
 }
 
+
+/// Inline only the small integer ALU subset whose emitted body is a single
+/// predicated VGPR assignment. Both lanes have distinct storage, and no
+/// scalar or mask is written. Anything outside this closed expression grammar
+/// keeps the generic shadow-register path.
+fn direct_alu_expr(rhs: &str, lane: u32, moved: bool) -> Option<String> {
+    if !rhs.is_ascii() || rhs.contains("++") || rhs.contains("--") {
+        return None;
+    }
+    let bytes = rhs.as_bytes();
+    let mut out = String::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        let start = at;
+        if bytes[at].is_ascii_alphanumeric() || bytes[at] == b'_' {
+            while at < bytes.len() && (bytes[at].is_ascii_alphanumeric() || bytes[at] == b'_') {
+                at += 1;
+            }
+            let word = &rhs[start..at];
+            if is_vector_register(word) {
+                let _ = write!(out, "{word}__{lane}");
+            } else if moved && word == "tb_s60000" {
+                let _ = write!(out, "tbd_{lane}");
+            } else if word.strip_prefix('s').is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit())) {
+                out.push_str(word);
+            } else {
+                let literal = word.strip_suffix('u').unwrap_or(word);
+                let valid = if let Some(hex) = literal.strip_prefix("0x") {
+                    !hex.is_empty() && hex.bytes().all(|c| c.is_ascii_hexdigit())
+                } else {
+                    !literal.is_empty() && literal.bytes().all(|c| c.is_ascii_digit())
+                };
+                if !valid {
+                    return None;
+                }
+                out.push_str(word);
+            }
+        } else {
+            if !matches!(bytes[at], b' ' | b'\t' | b'(' | b')' | b'+' | b'-'
+                | b'*' | b'&' | b'|' | b'^' | b'~' | b'<' | b'>') {
+                return None;
+            }
+            out.push(bytes[at] as char);
+            at += 1;
+        }
+    }
+    Some(out)
+}
+
+fn direct_alu(em: &mut Emitter<'_>, ins: &Insn, code: &str, moved: Option<&[String]>, gated: bool) -> bool {
+    if !matches!(ins.mnemonic.as_str(), "v_mov_b32" | "v_add_nc_u32" | "v_sub_nc_u32"
+        | "v_subrev_nc_u32" | "v_and_b32" | "v_or_b32" | "v_xor_b32" | "v_not_b32"
+        | "v_lshlrev_b32" | "v_lshrrev_b32") {
+        return false;
+    }
+    let [Opnd::Vgpr(dst)] = ins.dst.as_slice() else { return false };
+    let mut lines = code.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with("//"));
+    let Some(statement) = lines.next() else { return false };
+    if lines.next().is_some() { return false; }
+    let prefix = format!("if (exec_lo & 1u) v{dst} = ");
+    let Some(rhs) = statement.strip_prefix(&prefix).and_then(|s| s.strip_suffix(';')) else { return false };
+    let Some(first) = direct_alu_expr(rhs, 0, moved.is_some()) else { return false };
+    let Some(second) = direct_alu_expr(rhs, 1, moved.is_some()) else { return false };
+    for (word, _) in identifiers(code) {
+        if is_vector_register(word) {
+            em.regs.insert(word.to_string());
+        }
+    }
+    if let Some(reads) = moved {
+        em.line("{");
+        for line in reads {
+            em.line(line);
+        }
+    }
+    for (lane, rhs) in [first, second].iter().enumerate() {
+        let active = lane_bit("exec_lo", "exec_hi", lane as u32);
+        let gate = if gated { format!(" & tbw_{lane}") } else { String::new() };
+        em.line(&format!("if ({active}{gate}) v{dst}__{lane} = {rhs};"));
+    }
+    if moved.is_some() {
+        em.line("}");
+    }
+    true
+}
+
 pub(super) fn emit(em: &mut Emitter<'_>, idx: usize, ins: &Insn, is_ps: bool, br: Option<usize>) -> Result<(), String> {
     let m = ins.mnemonic.as_str();
     if !per_lane(ins.enc) {
@@ -441,6 +526,9 @@ pub(super) fn emit(em: &mut Emitter<'_>, idx: usize, ins: &Insn, is_ps: bool, br
             return Err(format!("paired wave64: {m} writes {word} outside a known mask"));
         }
     }
+    if written.is_empty() && direct_alu(em, ins, &code, moved.as_deref(), gated) {
+        return Ok(());
+    }
     let vectors: BTreeSet<&str> = identifiers(&code).map(|(word, _)| word).filter(|w| is_vector_register(w)).collect();
     let mut shadowed = read.clone();
     for words in &written {
@@ -497,3 +585,7 @@ pub(super) fn emit(em: &mut Emitter<'_>, idx: usize, ins: &Insn, is_ps: bool, br
     em.line("}");
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "../tests/hlsl/paired_direct_alu.rs"]
+mod direct_alu_tests;
