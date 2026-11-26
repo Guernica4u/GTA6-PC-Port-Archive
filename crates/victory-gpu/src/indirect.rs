@@ -933,6 +933,20 @@ void main() { title.Store(at, value); }
         assert_eq!(out[0], [100, 1, 0], "a record as it is");
     }
 
+    /// Mesh grids with more than one group along y or z (the case reported
+    /// on #3197 with #2996: `(3, 2, 4)` read back as 24 groups clamped on
+    /// its own, 3 in a window): a window keeps the single clamp's mesh
+    /// rule, whatever that rule is, word for word.
+    #[test]
+    fn windowed_mesh_grids_are_the_single_clamps() {
+        let a: Vec<u32> = [[3, 2, 4], [2, 3, 5], [65_535, 1, 1], [257, 256, 1], [3, 0, 4], [1, 1, 1]].concat();
+        let steps: Vec<Step> = (0..6).map(|i| Step::Draw(0, 12 * i, 10, 1)).collect();
+        let Some(out) = same(&[a], &steps) else {
+            return; // no host GPU here
+        };
+        assert_eq!(out[5], [1, 1, 1]);
+    }
+
     /// A budget spent before the window opens stays spent: its draws all
     /// run empty, as they do clamped one by one.
     #[test]
