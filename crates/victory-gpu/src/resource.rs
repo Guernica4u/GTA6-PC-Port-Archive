@@ -782,6 +782,10 @@ struct Resource {
     /// given up by [`evict`]); `Some(None)`: the host refused it.
     #[cfg(windows)]
     host: std::sync::Mutex<Option<Option<std::sync::Arc<HostTexture>>>>,
+    /// The host had no memory for it ([`OUT_OF_MEMORY`]): not asked again
+    /// before this [`now_ms`] (0: never).
+    #[cfg(windows)]
+    refused_until: std::sync::atomic::AtomicU64,
     /// The creation's initial state and clear value, for the host texture.
     #[cfg(windows)]
     made_with: (u32, Option<[u32; 5]>),
@@ -1291,6 +1295,24 @@ fn current(this: This) -> bool {
         .is_none_or(|live| std::sync::Arc::ptr_eq(&live, &h))
 }
 
+#[cfg(windows)]
+thread_local! {
+    /// The last way [`make_texture`] tried on this thread was refused for
+    /// want of memory (`E_OUTOFMEMORY`).
+    static OUT_OF_MEMORY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(all(windows, test))]
+thread_local! {
+    /// The error the next committed texture [`make_texture`] makes fails with.
+    static FAIL_NEXT: std::cell::Cell<Option<windows::core::HRESULT>> = const { std::cell::Cell::new(None) };
+}
+
+/// How long a texture the host had no memory for waits before it is asked
+/// for again ([`Resource::host`]).
+#[cfg(windows)]
+const RETRY_MS: u64 = 500;
+
 /// A host texture of host description `d` in GPU memory, castable to
 /// [`castable`]'s formats (colour textures, through the enhanced-barrier
 /// creation; it starts in the common state) where the host takes that.
@@ -1404,7 +1426,16 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
                 &mut texture,
             )
         };
+        #[cfg(test)]
+        let made = match FAIL_NEXT.take() {
+            Some(code) => {
+                texture = None;
+                Err(code.into())
+            }
+            None => made,
+        };
         if let Err(e) = made {
+            OUT_OF_MEMORY.set(e.code() == windows::Win32::Foundation::E_OUTOFMEMORY);
             tracing::warn!(error = %e, desc = ?d, "no host texture");
         }
     }
@@ -1477,14 +1508,26 @@ impl Resource {
     /// textures made on first use").
     #[cfg(windows)]
     fn host(&self) -> Option<std::sync::Arc<HostTexture>> {
+        use std::sync::atomic::Ordering::Relaxed;
         if let Some(made) = self.host.lock().unwrap_or_else(|e| e.into_inner()).clone() {
             return made;
+        }
+        if now_ms() < self.refused_until.load(Relaxed) {
+            return None;
         }
         // Made without the lock held (`shared_texture` takes the memory
         // maps, which `evict` holds while it takes this lock).
         let (state, clear) = self.made_with;
         let clear = clear.as_ref().map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast());
+        OUT_OF_MEMORY.set(false);
         let made = shared_texture(self.data() as u64, &self.desc, state, clear);
+        // The host had no memory for it: not noted as refused, so it is made
+        // once the host may have room (evictions, other textures let go);
+        // noted, it had no host texture for the rest of the run.
+        if made.is_none() && OUT_OF_MEMORY.take() {
+            self.refused_until.store(now_ms().saturating_add(RETRY_MS), Relaxed);
+            return None;
+        }
         // A texture made meanwhile by another thread is the memory's too.
         self.host.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(made).clone()
     }
@@ -1753,6 +1796,8 @@ fn hand_out_resource(
         backing,
         #[cfg(windows)]
         host: std::sync::Mutex::new(None),
+        #[cfg(windows)]
+        refused_until: std::sync::atomic::AtomicU64::new(0),
         // The clear value names the format too: format, then color or
         // depth and stencil (5 words), kept for when the texture is made.
         #[cfg(windows)]
@@ -2410,6 +2455,39 @@ mod tests {
             assert_eq!(slot::<Release>(r, 0x10)(r), 0);
         }
         assert_eq!(slot::<Release>(h, 0x10)(h), 0);
+    }
+
+    /// A texture the host had no memory for is made once the wait is over
+    /// (it had no host texture for the rest of the run); one the host
+    /// refused for another reason stays refused.
+    #[cfg(windows)]
+    #[test]
+    fn a_texture_refused_for_want_of_memory_is_made_later() {
+        use windows::Win32::Foundation::{E_INVALIDARG, E_OUTOFMEMORY};
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        // Depth with a clear value: committed (no heap, no castable formats),
+        // the creation the failure is injected in.
+        const D32_FLOAT: u32 = 40;
+        let clear = [D32_FLOAT, 1.0f32.to_bits(), 0, 0, 0];
+        let desc = ResourceDesc { flags: DEPTH, ..texture(64, 64, D32_FLOAT, 1) };
+        for (error, again) in [(E_OUTOFMEMORY, true), (E_INVALIDARG, false)] {
+            let mut out = null;
+            assert_eq!(
+                create_committed(null, &PROPERTIES, 0, &desc, 0, clear.as_ptr().cast(), &RESOURCE_IIDS[0], &mut out),
+                S_OK
+            );
+            FAIL_NEXT.set(Some(error));
+            assert!(host_copy(out).is_none(), "{error:?}");
+            assert_eq!(FAIL_NEXT.get(), None, "the failure was not injected");
+            // Not asked again before its time.
+            assert!(host_copy(out).is_none(), "{error:?}");
+            std::thread::sleep(std::time::Duration::from_millis(RETRY_MS + 100));
+            assert_eq!(host_copy(out).is_some(), again, "{error:?}");
+            assert_eq!(slot::<Release>(out, 0x10)(out), 0);
+        }
     }
 
     /// Host textures the GPU writes (render target, depth, unordered access)
