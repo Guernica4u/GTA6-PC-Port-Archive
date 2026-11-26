@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use victory_shader::emit::host::{self, Host};
 use victory_shader::emit::{self, validator::Validator};
 use victory_shader::structure::{self, Atom, LaneExit};
@@ -74,6 +74,7 @@ struct Tally {
     /// With `--list`: one line per program and outcome.
     list: bool,
     lines: Vec<String>,
+    dump_error: Option<(PathBuf, std::io::Error)>,
 }
 
 impl Tally {
@@ -134,6 +135,9 @@ impl Tally {
             *self.exports.entry(k).or_default() += n;
         }
         self.lines.extend(other.lines);
+        if self.dump_error.is_none() {
+            self.dump_error = other.dump_error;
+        }
         for (reason, (n, example)) in other.failed {
             self.failed.entry(reason).or_insert((0, example)).0 += n;
         }
@@ -313,6 +317,9 @@ pub fn run(
     failed.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
     for (reason, (n, example)) in failed {
         println!("  {n:>7}  {reason}  (e.g. {example})");
+    }
+    if let Some((path, error)) = t.dump_error {
+        return Err(error).with_context(|| format!("writing DXIL dump {}", path.display()));
     }
     Ok(())
 }
@@ -623,10 +630,14 @@ fn check(
     }
     // `VICTORY_EMIT_DUMP` with `--list`: every emitted shader as a file.
     if t.list
-        && let Ok(dir) = std::env::var("VICTORY_EMIT_DUMP")
+        && let Some(dir) = std::env::var_os("VICTORY_EMIT_DUMP")
     {
         let path = Path::new(&dir).join(dump_filename(&label(), program_index));
-        let _ = std::fs::write(path, &shader.dxil);
+        if let Err(error) = std::fs::write(&path, &shader.dxil)
+            && t.dump_error.is_none()
+        {
+            t.dump_error = Some((path, error));
+        }
     }
     if let Some((h, stub_ps)) = &checks.host {
         let made = match shader.stage {
