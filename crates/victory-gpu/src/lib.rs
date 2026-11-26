@@ -20,6 +20,8 @@
 mod adapter;
 #[cfg(windows)]
 mod bindless;
+#[cfg(windows)]
+mod bound;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
