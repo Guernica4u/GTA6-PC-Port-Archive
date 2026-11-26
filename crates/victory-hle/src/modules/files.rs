@@ -143,12 +143,15 @@ fn verbatim(root: &[u16], tail: &[u16]) -> Vec<u16> {
             _ => parts.push(part),
         }
     }
-    for part in parts {
-        out.push(backslash);
-        out.extend_from_slice(part);
-    }
-    if out.last() == Some(&u16::from(b':')) {
-        out.push(backslash);
+    if parts.is_empty() {
+        if out.last() == Some(&u16::from(b':')) {
+            out.push(backslash);
+        }
+    } else {
+        for part in parts {
+            out.push(backslash);
+            out.extend_from_slice(part);
+        }
     }
     out
 }
@@ -1046,16 +1049,20 @@ mod tests {
             join(r"\\server\share", &VERBATIM, "/a/b"),
             r"\\?\UNC\server\share\a\b"
         );
-        assert_eq!(
-            join(r"\\?\C:\game", &VERBATIM, r"\a\b"),
-            r"\\?\C:\game\a\b"
-        );
+        assert_eq!(join(r"\\?\C:\game", &VERBATIM, r"\a\b"), r"\\?\C:\game\a\b");
         assert_eq!(join(r"D:\", &VERBATIM, r"\a\b"), r"\\?\D:\a\b");
         assert_eq!(join(r"D:\", &VERBATIM, "/a/b"), r"\\?\D:\a\b");
         assert_eq!(join(r"D:\", &VERBATIM, ""), r"\\?\D:\");
         assert_eq!(join(r"D:\", &[], r"\a\b"), r"D:\a\b");
         assert_eq!(join(r"D:\", &[], ""), r"D:\");
         assert_eq!(join(r"D:\", &[], "a"), r"D:\a");
+        let v = |root: &str, tail: &str| {
+            let r: Vec<u16> = root.encode_utf16().collect();
+            let t: Vec<u16> = tail.encode_utf16().collect();
+            String::from_utf16_lossy(&verbatim(&r, &t))
+        };
+        assert_eq!(v(r"D:\", ""), r"\\?\D:\");
+        assert_eq!(v(r"C:\game", "/stream:"), r"\\?\C:\game\stream:");
     }
 
     #[test]
