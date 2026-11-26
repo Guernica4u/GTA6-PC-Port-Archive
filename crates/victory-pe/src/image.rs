@@ -370,7 +370,9 @@ fn parse_exports(file: &PeFile64<'_>, image_base: u64) -> Result<Vec<ExportInfo>
             let (rva, forward) = match e.target() {
                 // The generic iterator adds the image base to an address.
                 ReadTarget::Address { address } => {
-                    (Some(address.wrapping_sub(image_base) as u32), None)
+                    let rva = address.checked_sub(image_base).and_then(|a| u32::try_from(a).ok())
+                        .ok_or_else(|| PeError::Malformed(format!("export address {address:#x} outside image_base {image_base:#x}")))?;
+                    (Some(rva), None)
                 }
                 ReadTarget::Reexport { library, name } => {
                     let symbol = match name {
