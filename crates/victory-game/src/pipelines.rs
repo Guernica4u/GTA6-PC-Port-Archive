@@ -496,7 +496,7 @@ fn stencil_writes(c: &[u8; DEPTH]) -> bool {
         let pass_writes = f[2] != 1 && f[3] != 1 && (!depth_enabled || c[2] != 1);
         fail_writes || depth_fail_writes || pass_writes
     };
-    c[3] == 1 && c[5] != 0 && (face(&c[6..10]) || face(&c[10..14]))
+    c[3] != 0 && c[5] != 0 && (face(&c[6..10]) || face(&c[10..14]))
 }
 
 /// The engine's D3D12 rasteriser description of a compact one.
@@ -725,20 +725,36 @@ mod tests {
         ];
 
         for (depth_enable, depth_func, face, expected) in cases {
-            for face_start in [6, 10] {
-                let mut c = [0u8; DEPTH];
-                c[..6].copy_from_slice(&[depth_enable, 0, depth_func, 1, 0xFF, WRITE_MASK]);
-                c[6..10].copy_from_slice(&[KEEP, KEEP, KEEP, ALWAYS]);
-                c[10..14].copy_from_slice(&[KEEP, KEEP, KEEP, ALWAYS]);
-                c[face_start..face_start + 4].copy_from_slice(&face);
+            for stencil_enable in [1u8, 2, u8::MAX] {
+                for face_start in [6, 10] {
+                    let mut c = [0u8; DEPTH];
+                    c[..6].copy_from_slice(&[
+                        depth_enable,
+                        0,
+                        depth_func,
+                        stencil_enable,
+                        0xFF,
+                        WRITE_MASK,
+                    ]);
+                    c[6..10].copy_from_slice(&[KEEP, KEEP, KEEP, ALWAYS]);
+                    c[10..14].copy_from_slice(&[KEEP, KEEP, KEEP, ALWAYS]);
+                    c[face_start..face_start + 4].copy_from_slice(&face);
 
-                assert_eq!(
-                    depth_stencil_desc(&c)[0x11],
-                    expected,
-                    "face at {face_start}: {face:?}, depth enable {depth_enable}, depth func {depth_func}"
-                );
+                    assert_eq!(
+                        depth_stencil_desc(&c)[0x11],
+                        expected,
+                        "face at {face_start}: {face:?}, depth enable {depth_enable}, depth func {depth_func}, stencil enable {stencil_enable}"
+                    );
+                }
             }
         }
+
+        // StencilEnable == 0 clears the write mask even with a reachable op.
+        let mut disabled = [0u8; DEPTH];
+        disabled[..6].copy_from_slice(&[1, 0, LESS, 0, 0xFF, WRITE_MASK]);
+        disabled[6..10].copy_from_slice(&[KEEP, KEEP, REPLACE, LESS]);
+        disabled[10..14].copy_from_slice(&[KEEP, KEEP, REPLACE, LESS]);
+        assert_eq!(depth_stencil_desc(&disabled)[0x11], 0);
     }
 
     #[test]
