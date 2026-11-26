@@ -157,17 +157,41 @@ impl Changed {
 
     /// Page `page` is about to change for the first time since it was
     /// taken: its bytes now, if armed for it.
-    fn save(&self, page: usize) {
+    ///
+    /// `whole` is the page's new content, where the write covers it whole
+    /// and the caller holds it ([`Incoming`]): the page's bytes are those
+    /// the moment the write lands, so the snapshot is the caller's buffer
+    /// copied instead of the page read back through the kernel — a
+    /// `ReadProcessMemory` of 64 KiB (a kernel transition, 8-12 µs) and a
+    /// 64 KiB zeroing for a read the write makes pointless. Pages a write
+    /// covers only partly (the two ends of every copy) are still read back,
+    /// so the read is spared, not replaced.
+    fn save(&self, page: usize, whole: Option<*const u8>) {
         let mut saved = self.1.lock().unwrap_or_else(|e| e.into_inner());
         if !saved.armed(page) || saved.bytes.contains_key(&page) {
             return;
         }
-        let mut bytes = vec![0u8; PAGE].into_boxed_slice();
-        if crate::host::read_into((page * PAGE) as *const u8, &mut bytes) {
-            saved.bytes.insert(page, bytes);
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::SavedPages, 1);
-        }
+        let bytes = match whole {
+            Some(src) => {
+                // SAFETY: the caller hands us `PAGE` readable bytes at `src`:
+                // the range it is about to copy in, which lies over this page
+                // whole (`Incoming::whole_page`).
+                let src = unsafe { std::slice::from_raw_parts(src, PAGE) };
+                let mut bytes = Vec::with_capacity(PAGE);
+                bytes.extend_from_slice(src);
+                bytes.into_boxed_slice()
+            }
+            None => {
+                let mut bytes = vec![0u8; PAGE].into_boxed_slice();
+                if !crate::host::read_into((page * PAGE) as *const u8, &mut bytes) {
+                    return;
+                }
+                bytes
+            }
+        };
+        saved.bytes.insert(page, bytes);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::SavedPages, 1);
     }
 }
 
@@ -707,11 +731,47 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
     taken
 }
 
+/// Bytes a caller is about to write into title memory `[at, at + len)`,
+/// held at `src` (the same length): what [`Changed::save`] snapshots a page
+/// from instead of reading the page back.
+#[derive(Clone, Copy)]
+struct Incoming {
+    at: usize,
+    len: usize,
+    src: *const u8,
+}
+
+impl Incoming {
+    /// Where `page`'s whole new content is, when this write covers the page
+    /// whole (`None`: it lands in the page partly, or the page is outside
+    /// the write).
+    fn whole_page(&self, page: usize) -> Option<*const u8> {
+        let start = page * PAGE;
+        (start >= self.at && start + PAGE <= self.at.saturating_add(self.len))
+            // SAFETY: inside the caller's buffer, whose length is `len`.
+            .then(|| unsafe { self.src.add(start - self.at) })
+    }
+}
+
+/// What marking pages changed does with the trackers' saved bytes.
+#[derive(Clone, Copy)]
+enum Keep {
+    /// Nothing: what they held is not to be kept (a remap, the end of a
+    /// write that already saved).
+    Nothing,
+    /// Each armed page's bytes, read back out of the process before the
+    /// write lands.
+    ReadBack,
+    /// Each armed page's bytes, taken from the bytes the caller is about to
+    /// copy in where they cover the page whole.
+    From(Incoming),
+}
+
 /// Pages `[first, last)` changed, and so the pages showing the same memory
 /// elsewhere: gives write access back where we guarded them and marks them
 /// in every tracker holding them. True if one of `[first, last)` was
 /// guarded.
-fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
+fn changed(g: &mut Guards, first: usize, last: usize, keep: Keep) -> bool {
     let guarded = g.protected.range(first..last).next().is_some();
     let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
     #[cfg(feature = "diagnostics")]
@@ -722,9 +782,9 @@ fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
     // Every page's bytes are saved before any is opened: once a page is
     // open, a write by another thread lands without a fault, and a save
     // after it would keep that write as the page's old bytes.
-    mark_changed(g, first, last, save);
+    mark_changed(g, first, last, keep);
     for &page in &others {
-        mark_changed(g, page, page + 1, save);
+        mark_changed(g, page, page + 1, keep);
     }
     open_guarded(g, first, last);
     for page in others {
@@ -742,9 +802,14 @@ fn open_guarded(g: &mut Guards, first: usize, last: usize) {
 }
 
 /// Marks `[first, last)` changed in the trackers holding its pages. With
-/// `save`, before the write lands: trackers armed for a page they had taken
-/// keep its bytes.
-fn mark_changed(g: &mut Guards, first: usize, last: usize, save: bool) {
+/// [`Keep::ReadBack`] or [`Keep::From`], before the write lands: trackers
+/// armed for a page they had taken keep its bytes, read back out of the
+/// process or taken from the bytes the caller is about to copy in.
+///
+/// The pages marked are the runtime's own — a [`Tracked`] range only covers
+/// pages [`runtime_pages`] accepted, so they are mapped — which is what lets
+/// the caller's bytes stand in for the page.
+fn mark_changed(g: &mut Guards, first: usize, last: usize, keep: Keep) {
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders {
             let first_write = {
@@ -752,8 +817,12 @@ fn mark_changed(g: &mut Guards, first: usize, last: usize, save: bool) {
                 set_dirty(c.2, true);
                 set.insert(page)
             };
-            if first_write && save {
-                c.save(page);
+            if first_write {
+                match keep {
+                    Keep::Nothing => {}
+                    Keep::ReadBack => c.save(page, None),
+                    Keep::From(incoming) => c.save(page, incoming.whole_page(page)),
+                }
             }
         }
         #[cfg(feature = "diagnostics")]
@@ -789,7 +858,7 @@ impl Drop for Writing {
         if let Some(i) = g.busy.iter().position(|&r| r == (self.first, self.last)) {
             g.busy.swap_remove(i);
         }
-        changed(&mut g, self.first, self.last, false);
+        changed(&mut g, self.first, self.last, Keep::Nothing);
     }
 }
 
@@ -804,7 +873,21 @@ pub fn writing(at: usize, len: usize) -> Writing {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
     g.busy.push((first, last));
-    changed(&mut g, first, last, true);
+    changed(&mut g, first, last, Keep::ReadBack);
+    Writing { first, last }
+}
+
+/// [`writing`] where the caller holds the bytes it is about to put there
+/// (`src`, `len` bytes, copied to `at`): a page the copy covers whole is
+/// snapshotted from them instead of read back out of the process.
+///
+/// SAFETY: `src` is readable for `len` bytes, and `[at, at + len)` is
+/// memory the caller writes once this returns, before anything else runs.
+pub unsafe fn writing_from(at: usize, len: usize, src: *const u8) -> Writing {
+    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    let mut g = guards();
+    g.busy.push((first, last));
+    changed(&mut g, first, last, Keep::From(Incoming { at, len, src }));
     Writing { first, last }
 }
 
@@ -814,7 +897,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
     // What it showed is gone already: nothing to keep.
-    changed(&mut g, first, last, false);
+    changed(&mut g, first, last, Keep::Nothing);
     // What it showed is not what it shows now: its links go, both ways.
     let stale: Vec<usize> = g.alias_of.range(first..last).map(|(&p, _)| p).collect();
     for page in stale {
@@ -880,7 +963,7 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
     if others.iter().any(|&o| g.protected.contains(&(o / PAGE)))
         && protect(&mut g, &[page]).is_empty()
     {
-        changed(&mut g, page, page + 1, false);
+        changed(&mut g, page, page + 1, Keep::Nothing);
     }
 }
 
@@ -909,7 +992,7 @@ fn install() {
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
         let mut g = guards();
-        if changed(&mut g, at / PAGE, at / PAGE + 1, true) {
+        if changed(&mut g, at / PAGE, at / PAGE + 1, Keep::ReadBack) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             return EXCEPTION_CONTINUE_EXECUTION;
@@ -1154,6 +1237,91 @@ pub(crate) mod tests {
         write(2, 5);
         assert_eq!(saved(2), None, "disarmed");
         drop(t);
+        free(p);
+    }
+
+    /// A copy into title memory hands the tracker the bytes it is about to
+    /// write: a page it covers whole keeps those as the page's old bytes,
+    /// where a page it covers in part keeps what was there before it, read
+    /// back (the copy has not landed yet when the page is saved).
+    #[test]
+    fn a_copy_saves_the_bytes_it_is_about_to_write() {
+        const KNOWN: u8 = 0xAB;
+        let p = pool(4);
+        let t = track(p, 4 * PAGE, true).expect("pool memory is tracked");
+        let all = || t.take(p, p + 4 * PAGE);
+        // SAFETY: bytes of our pool; a guarded page faults into the handler,
+        // which saves it first where it is armed.
+        let write = |at: usize, value: u8| unsafe { ((p + at) as *mut u8).write_volatile(value) };
+        all();
+        // Page 2's byte 8 before anything is armed: nothing to keep yet.
+        write(2 * PAGE + 8, KNOWN);
+        all();
+        t.arm(p, p + 3 * PAGE);
+        // A copy of two whole pages and 100 bytes into the third: pages 0
+        // and 1 are covered whole, page 2 only in part.
+        let len = 2 * PAGE + 100;
+        let src: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        // SAFETY: `src` holds `len` bytes and the destination is written
+        // next, exactly as the copy the tracker is told about would.
+        let writing = unsafe { writing_from(p, len, src.as_ptr()) };
+        // SAFETY: the same `len` bytes, into the destination it names.
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), p as *mut u8, len) };
+        drop(writing);
+        let taken = |page: usize| t.saved(p / PAGE + page).expect("kept");
+        assert_eq!(&taken(0)[..], &src[..PAGE], "page 0 keeps the copy's bytes");
+        assert_eq!(&taken(1)[..], &src[PAGE..2 * PAGE], "page 1 too");
+        let third = taken(2);
+        assert_eq!(
+            third[8], KNOWN,
+            "page 2 keeps what was there before the copy"
+        );
+        assert_eq!(&third[0..8], &[0; 8], "and the rest of it as it was");
+        assert_eq!(&third[100..], &[0; PAGE - 100], "up to the copy's start");
+        drop(t);
+        free(p);
+    }
+
+    /// What a copy into title memory saves per page by handing over the
+    /// bytes it is about to write: the page read back out of the process
+    /// (`ReadProcessMemory`, which is what it cost) against the same page
+    /// taken from the caller's buffer.
+    ///
+    /// `cargo test --release -p victory-gpu --lib --locked -- --exact
+    /// --ignored --nocapture
+    /// watch::tests::a_copy_saves_a_page_without_reading_it_back`
+    #[test]
+    #[ignore = "timing"]
+    fn a_copy_saves_a_page_without_reading_it_back() {
+        const PAGES: usize = 64;
+        const ROUNDS: u32 = 20;
+        let p = pool(PAGES);
+        let first = p / PAGE;
+        // What a copy would put there.
+        let src = vec![0xA5u8; PAGES * PAGE];
+        for (name, from_copy) in [("read back", false), ("from the copy", true)] {
+            let c = Changed(
+                Mutex::new(BTreeSet::new()),
+                Mutex::new(Saved::default()),
+                None,
+                false,
+            );
+            c.1.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .arm(first, first + PAGES);
+            let start = std::time::Instant::now();
+            for _ in 0..ROUNDS {
+                for page in first..first + PAGES {
+                    c.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.clear();
+                    // SAFETY: `src` holds a page for every page of the pool.
+                    let whole =
+                        from_copy.then(|| unsafe { src.as_ptr().add((page - first) * PAGE) });
+                    c.save(page, whole);
+                }
+            }
+            let each = start.elapsed().as_nanos() as f64 / f64::from(ROUNDS * PAGES as u32);
+            println!("{name}: {each:.0} ns per page");
+        }
         free(p);
     }
 

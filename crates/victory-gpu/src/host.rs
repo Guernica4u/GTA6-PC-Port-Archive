@@ -2493,7 +2493,11 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         return;
     }
     // The kernel writes the destination: it must not be guarded meanwhile.
-    let _writing = title_dst.then(|| crate::watch::writing(dst as usize, len));
+    // `src` holds what the destination is about to be, so a page this copy
+    // covers whole is snapshotted from it instead of being read back.
+    // SAFETY: `src` is readable for `len` bytes (the copy reads it) and the
+    // destination is written next, before anything else runs.
+    let _writing = title_dst.then(|| unsafe { crate::watch::writing_from(dst as usize, len, src) });
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
     let whole = read(src, dst, len);
