@@ -847,3 +847,23 @@ The issue #39 log contains 262 failed driver allocation attempts and
 131 host import failure messages, not a confirmed VRAM exhaustion or
 a proven fault in these provider call sites. The opt-in trace is intended
 to distinguish those possibilities in a subsequent authorized run.
+
+
+### Investigating compute loop guards after a device loss
+
+Compare the exact same recorded requests against two xshader builds without
+executing title programs or modifying a cache:
+
+```sh
+python tools/audit_shader_guards.py REQUESTS --baseline OLD_XSHADER --candidate NEW_XSHADER --json guard-summary.json
+```
+
+This reports the number of compute translations with the generic structured
+loop guard (65,536) or block dispatcher guard (1,000,000), including newly
+admitted compute programs. It also counts dispatchers without that generic
+guard, not necessarily unbounded loops. Both emitters use private digest-verified
+copies of each input, with the original request mode (including `.wave32`).
+Use `--select` with an exact local worklist, or `--include-keys` for local
+per-request attribution. The default report omits request keys and paths.
+These are static emitted sites, not executed iterations, timing or evidence
+that a particular loop caused a GPU fault. Keep per-request reports private.
