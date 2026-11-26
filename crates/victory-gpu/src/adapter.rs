@@ -321,6 +321,41 @@ mod tests {
         assert!(report.contains("software"), "{report}");
     }
 
+    /// The tests above build their `Facts`; this one runs the real
+    /// enumeration, which is what the choice meets on a machine with a
+    /// discrete GPU, an integrated one and indirect display adapters. It
+    /// asserts what holds on any host: every adapter is named in the report,
+    /// and nothing that cannot run the title is ever chosen. A host with no
+    /// DXGI adapter skips.
+    #[test]
+    fn the_real_enumeration_names_every_adapter_and_never_chooses_software() {
+        let found = enumerate();
+        if found.is_empty() {
+            eprintln!("no DXGI adapter; skipped");
+            return;
+        }
+        let facts: Vec<Facts> = found.into_iter().map(|(_, f)| f).collect();
+        let text = report(&facts);
+        for f in &facts {
+            assert!(text.contains(&f.name), "the report does not name {}: {text}", f.name);
+        }
+        match choose(&facts) {
+            Some(i) => {
+                let f = &facts[i];
+                assert!(!f.software, "a software adapter was chosen: {text}");
+                assert!(f.runs_the_title(), "the chosen adapter cannot run the title: {text}");
+                eprintln!("chose {} of {}: {}", i, facts.len(), f.name);
+            }
+            None => {
+                assert!(
+                    !facts.iter().any(Facts::runs_the_title),
+                    "an adapter that can run the title was passed over: {text}"
+                );
+                eprintln!("nothing usable among {} adapters", facts.len());
+            }
+        }
+    }
+
     #[test]
     fn nothing_usable_gives_none_and_the_report_names_every_adapter() {
         let mut display_only = facts("MuMu Virtual Display Adapter", 2, 0, 0, false);
