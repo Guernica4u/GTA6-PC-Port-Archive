@@ -488,7 +488,22 @@ impl Shadow {
     // shortcut: a page the title wrote that was not armed (a write through
     // the heap's views no list declared) keeps the title's bytes, losing
     // the shaders' there (counted).
+    #[cfg(test)]
     pub(crate) fn copy_back_marked(&self, page: usize) -> usize {
+        let mut title = pooled(PAGE);
+        title.resize(PAGE, 0);
+        let mut synced = Vec::new();
+        let n = self.copy_back_marked_with(page, &mut title, &mut synced);
+        give_back(title);
+        if !synced.is_empty()
+            && let Some(t) = &self.tracked
+        {
+            t.taken(&synced);
+        }
+        n
+    }
+
+    fn copy_back_marked_with(&self, page: usize, title_buf: &mut [u8], synced: &mut Vec<usize>) -> usize {
         let Some(t) = &self.tracked else {
             return 0;
         };
@@ -506,19 +521,19 @@ impl Shadow {
             return 0;
         }
         let n = to - from;
-        // SAFETY: inside the mapping; only the submitting thread writes it.
+        // SAFETY: inside the mapping; only one thread accesses a given page.
         let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), n) };
-        let mut title = vec![0u8; n];
-        if !crate::host::read_into(from as *const u8, &mut title) {
+        let title = &mut title_buf[..n];
+        if !crate::host::read_into(from as *const u8, title) {
             return 0;
         }
         let written = match &saved {
             // The title's bytes are the copy's from before: what differs is
             // the shaders'.
-            None => (*host != title[..]).then_some(host.as_ptr()),
+            None => (*host != *title).then_some(host.as_ptr()),
             Some(before) => {
                 let before = &before[from - page..to - page];
-                merge_writeback(&mut title, host, before).then_some(title.as_ptr())
+                merge_writeback(title, host, before).then_some(title.as_ptr())
             }
         };
         if let Some(bytes) = written {
@@ -527,7 +542,7 @@ impl Shadow {
         }
         // Equal to title memory now: taken, unless it holds the page in part.
         if from == page && to == page + PAGE {
-            t.taken(&[page / PAGE]);
+            synced.push(page / PAGE);
         }
         written.map_or(0, |_| n)
     }
@@ -946,22 +961,110 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         let m = marks();
         marked.iter().filter_map(|&n| page_of(&m, n)).collect()
     };
-    for (copy, page) in pages {
-        if withheld
-            .iter()
-            .any(|(c, a, n)| Arc::ptr_eq(c, &copy) && *a < page + PAGE && page < a + n)
-        {
-            continue;
-        }
-        let written = copy.copy_back_marked(page);
-        #[cfg(feature = "diagnostics")]
-        {
-            crate::copystat::add(crate::copystat::C::MarkedPages, 1);
-            crate::copystat::add(crate::copystat::C::MarkedBytes, written as u64);
-        }
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = written;
+    let mut work: Vec<(Arc<Shadow>, usize)> = pages
+        .into_iter()
+        .filter(|(copy, page)| {
+            !withheld
+                .iter()
+                .any(|(c, a, n)| Arc::ptr_eq(c, copy) && *a < page + PAGE && *page < a + n)
+        })
+        .collect();
+    if work.is_empty() {
+        return;
     }
+    work.sort_unstable_by_key(|&(_, p)| p);
+    let mut unique: Vec<(Arc<Shadow>, usize)> = Vec::with_capacity(work.len());
+    let mut dups: Vec<(Arc<Shadow>, usize)> = Vec::new();
+    for item in work {
+        if unique.last().is_some_and(|&(_, p)| p == item.1) {
+            dups.push(item);
+        } else {
+            unique.push(item);
+        }
+    }
+    let process = |items: &[(Arc<Shadow>, usize)]| {
+        let mut title = pooled(PAGE);
+        title.resize(PAGE, 0);
+        let mut synced: std::collections::HashMap<usize, (Arc<Shadow>, Vec<usize>)> = std::collections::HashMap::new();
+        let (mut count, mut bytes) = (0u64, 0u64);
+        for (copy, page) in items {
+            let key = Arc::as_ptr(copy) as usize;
+            let entry = synced.entry(key).or_insert_with(|| (copy.clone(), Vec::new()));
+            let written = copy.copy_back_marked_with(*page, &mut title, &mut entry.1);
+            count += 1;
+            bytes += written as u64;
+        }
+        give_back(title);
+        (count, bytes, synced)
+    };
+    let threads = if unique.len() >= 16 {
+        std::thread::available_parallelism()
+            .map_or(4, |n| n.get() / 2)
+            .clamp(1, 8)
+            .min(unique.len() / 8)
+            .max(1)
+    } else {
+        1
+    };
+    let mut all_synced: std::collections::HashMap<usize, (Arc<Shadow>, Vec<usize>)> = std::collections::HashMap::new();
+    let (mut total_pages, mut total_bytes) = (0u64, 0u64);
+    if threads < 2 {
+        let (c, b, s) = process(&unique);
+        total_pages += c;
+        total_bytes += b;
+        all_synced = s;
+    } else {
+        let chunk_size = unique.len().div_ceil(threads);
+        let mut chunks = unique.chunks(chunk_size);
+        let first = chunks.next().unwrap_or(&[]);
+        let results: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = chunks.map(|chunk| scope.spawn(|| process(chunk))).collect();
+            let first_res = process(first);
+            let mut out = Vec::with_capacity(handles.len() + 1);
+            out.push(first_res);
+            for h in handles {
+                out.push(h.join().expect("copy_back_marks worker"));
+            }
+            out
+        });
+        for (c, b, s) in results {
+            total_pages += c;
+            total_bytes += b;
+            for (k, (copy, mut list)) in s {
+                all_synced
+                    .entry(k)
+                    .or_insert_with(|| (copy, Vec::new()))
+                    .1
+                    .append(&mut list);
+            }
+        }
+    }
+    if !dups.is_empty() {
+        let (c, b, s) = process(&dups);
+        total_pages += c;
+        total_bytes += b;
+        for (k, (copy, mut list)) in s {
+            all_synced
+                .entry(k)
+                .or_insert_with(|| (copy, Vec::new()))
+                .1
+                .append(&mut list);
+        }
+    }
+    for (_, (copy, list)) in all_synced {
+        if !list.is_empty()
+            && let Some(t) = &copy.tracked
+        {
+            t.taken(&list);
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        crate::copystat::add(crate::copystat::C::MarkedPages, total_pages);
+        crate::copystat::add(crate::copystat::C::MarkedBytes, total_bytes);
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = (total_pages, total_bytes);
 }
 
 struct Entry {
@@ -1656,5 +1759,36 @@ pub(crate) mod tests {
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+    }
+
+    /// Parallel `copy_back_marks` across >= 16 pages copies back every marked
+    /// page and re-arms the tracker's guards.
+    #[test]
+    fn parallel_marked_pages_go_back_and_retake_guards() {
+        const PAGES: usize = 20;
+        let p = crate::watch::tests::pool(PAGES);
+        let len = PAGES * PAGE;
+        register(p, p as u64, len as u64);
+        let (Some(copy), Some(b)) = (find(p as u64, len as u64), bitmap(false)) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let base = copy.marks.expect("tracked memory gets mark bits") as usize;
+        copy.update(p, len);
+        copy.writing(p, len, true);
+        let bits = b.data as *mut u32;
+        for i in 0..PAGES {
+            copy.write_host((p + i * PAGE + 12) as u64, &[(0x40 + i) as u8]);
+            // SAFETY: a dword of the mapped bitmap.
+            unsafe { *bits.add((base + i) / 32) |= 1 << ((base + i) % 32) };
+        }
+        copy_back_marks(&[], false);
+        for i in 0..PAGES {
+            // SAFETY: bytes of our pool.
+            let got = unsafe { ((p + i * PAGE + 12) as *const u8).read_volatile() };
+            assert_eq!(got, (0x40 + i) as u8);
+        }
+        assert!(copy.clean(), "all copied-back pages must be guarded again");
+        unregister(p, p as u64);
     }
 }
