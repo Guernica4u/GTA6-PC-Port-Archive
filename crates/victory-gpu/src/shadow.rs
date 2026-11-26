@@ -1528,13 +1528,13 @@ pub(crate) mod tests {
 
     /// Pages shaders marked (`copy_back_marks`, `victory_shader::emit`
     /// "Write marks") go back by the bytes the GPU changed. The title writes
-    /// two marked pages after the copy took them. Both writers' bytes stay
-    /// on the first page. The second overlaps a withheld range and keeps
-    /// the title's bytes. The bits are cleared.
+    /// pages after the copy took them. Both writers' bytes stay on an
+    /// eligible marked page. An unmarked page and a marked page overlapping
+    /// a withheld range both keep the title's bytes. The bits are cleared.
     #[test]
     fn marked_pages_go_back_by_the_bytes_the_gpu_changed() {
-        let p = crate::watch::tests::pool(3);
-        let len = 3 * PAGE;
+        let p = crate::watch::tests::pool(4);
+        let len = 4 * PAGE;
         register(p, p as u64, len as u64);
         let (Some(copy), Some(b)) = (find(p as u64, len as u64), bitmap(false)) else {
             unregister(p, p as u64);
@@ -1545,32 +1545,35 @@ pub(crate) mod tests {
         copy.update(p, len);
         copy.writing(p, len, true);
         assert!(copy.before.lock().unwrap().0.is_empty(), "no snapshot");
-        // The shaders write a byte in each page; the title writes pages 1
-        // and 2 meanwhile.
+        // The shaders write a byte in each page; the title writes pages
+        // 1 through 3 meanwhile.
         copy.write_host((p + 10) as u64, &[0xaa]);
         copy.write_host((p + PAGE + 20) as u64, &[0xbb]);
         copy.write_host((p + 2 * PAGE + 30) as u64, &[0xcc]);
+        copy.write_host((p + 3 * PAGE + 30) as u64, &[0xdd]);
         let title = |at: usize| (p + at) as *mut u8;
         // SAFETY: (title writes and reads below) bytes of our pool.
         unsafe {
             title(PAGE + 40).write_volatile(0x11);
             title(2 * PAGE + 50).write_volatile(0x22);
+            title(3 * PAGE + 50).write_volatile(0x33);
         }
-        // The shaders marked all three pages, but page 2 overlaps a withheld range.
+        // Page 2 is unmarked and page 3 is marked but withheld.
         let bits = b.data as *mut u32;
-        for n in [base, base + 1, base + 2] {
+        for n in [base, base + 1, base + 3] {
             // SAFETY: a dword of the mapped bitmap.
             unsafe { *bits.add(n / 32) |= 1 << (n % 32) };
         }
-        let withheld = Withheld::new([(Arc::as_ptr(&copy) as usize, p + 2 * PAGE, p + 2 * PAGE + 1)]);
+        let withheld = Withheld::new([(Arc::as_ptr(&copy) as usize, p + 3 * PAGE, p + 3 * PAGE + 1)]);
         copy_back_marks(&withheld, false);
         // SAFETY: bytes of our pool.
         let read = |at: usize| unsafe { title(at).read_volatile() };
         assert_eq!(read(10), 0xaa, "the shader's byte, page 0");
         assert_eq!((read(PAGE + 20), read(PAGE + 40)), (0xbb, 0x11), "both writers' bytes, page 1");
-        assert_eq!((read(2 * PAGE + 30), read(2 * PAGE + 50)), (0, 0x22), "page 2 withheld");
+        assert_eq!((read(2 * PAGE + 30), read(2 * PAGE + 50)), (0, 0x22), "page 2 unmarked");
+        assert_eq!((read(3 * PAGE + 30), read(3 * PAGE + 50)), (0, 0x33), "page 3 withheld");
         // SAFETY: dwords of the mapped bitmap.
-        let left: u32 = (base / 32..=(base + 2) / 32).map(|w| unsafe { *bits.add(w) }).fold(0, |a, w| a | w);
+        let left: u32 = (base / 32..=(base + 3) / 32).map(|w| unsafe { *bits.add(w) }).fold(0, |a, w| a | w);
         assert_eq!(left, 0, "bits cleared");
         assert_eq!(copy.copy_back(p, len), 0, "nothing kept to compare");
         unregister(p, p as u64);
