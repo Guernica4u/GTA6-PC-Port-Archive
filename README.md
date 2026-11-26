@@ -143,6 +143,12 @@ RTX 5070 12 GB with a Ryzen 7 9800X3D, in the prologue:
     keep running: skipping them too (all 1,052 shaders of fxceless pull request
     465's rule) left their outputs as garbage, rainbow glitter everywhere. Needs
     the `diag` build (the skip list is a diagnostics switch).
+    An update (2026-11-27): with `VICTORY_FIRSTLANE_OWN=1` the three builder
+    programs that failed to translate (`39321a95223001ed`, `77360df21e12ea43`,
+    `9fc111d3be79364f`, "a first-lane read where not every lane runs")
+    translate, and the builder runs (`pipelines=53`) on an RTX 4070 under
+    Linux/GE-Proton; `docs/rt-on-nvidia.md` has the settings, the cache trap
+    (pre-translate, clear `pipelines/host-pipelines.bin`) and the cost.
 15. **The intro video no longer flickers** (`crates/victory-gpu/src/texture.rs`).
     The movie's planes (linear, one-level R8 textures in a ring of three) were
     written by the decoder through another view of the same memory, judged
