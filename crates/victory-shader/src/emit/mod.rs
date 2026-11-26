@@ -385,6 +385,16 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 
 /// [`translate`] made as `options` say.
 pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, ShaderError> {
+    #[cfg(feature = "diagnostics")]
+    let mut phases = std::time::Instant::now();
+    #[cfg(feature = "diagnostics")]
+    let mut marks = Vec::new();
+    #[cfg(feature = "diagnostics")]
+    let mark = |what: &'static str, phases: &mut std::time::Instant, marks: &mut Vec<(&'static str, u128)>| {
+        let now = std::time::Instant::now();
+        marks.push((what, now.duration_since(*phases).as_micros()));
+        *phases = now;
+    };
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -404,11 +414,34 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
         })?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
+    #[cfg(feature = "diagnostics")]
+    mark("range", &mut phases, &mut marks);
     let (p, st) = crate::range::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    #[cfg(feature = "diagnostics")]
+    mark("resource", &mut phases, &mut marks);
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
+    #[cfg(feature = "diagnostics")]
+    mark("io", &mut phases, &mut marks);
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit_with(&c, &native, &p, &st, &io, &res, options)
+    #[cfg(feature = "diagnostics")]
+    mark("emit-start", &mut phases, &mut marks);
+    let out = emit_with(&c, &native, &p, &st, &io, &res, options);
+    #[cfg(feature = "diagnostics")]
+    {
+        mark("emit", &mut phases, &mut marks);
+        let phases: String = marks
+            .iter()
+            .map(|(what, us)| format!("{what}={us}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!(
+            "shader phases (us): stage={:?} blocks={} {phases}",
+            native.stage,
+            p.blocks.len()
+        );
+    }
+    out
 }
 
 /// Emits a program whose earlier stages already ran, without write marks.

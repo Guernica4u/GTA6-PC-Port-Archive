@@ -235,6 +235,16 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
 /// 1/65535; scale it if a title's 16-bit depth biased draws show acne.
 pub(crate) fn pc_format(format: u32) -> u32 {
     match format {
+        // 16-bit packed colour. The console renders and writes these, and
+        // the host cannot: `CreateCommittedResource` refuses them with
+        // ALLOW_RENDER_TARGET or ALLOW_UNORDERED_ACCESS ("must be created
+        // with a format that ... can be used as a render target"), and a
+        // typed unordered view of one removes the device
+        // (`DXGI_ERROR_INVALID_CALL`, B5G5R5A1_UNORM seen doing it). They
+        // widen to BGRA8, which keeps the channel order and is supported
+        // for every use; the values lose the console's 5 or 4 bits a
+        // channel, not the picture's layout.
+        85 | 86 | 115 => 87,
         118 => 20,
         119 => 21,
         120 => 22,

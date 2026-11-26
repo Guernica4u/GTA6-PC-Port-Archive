@@ -679,7 +679,19 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         // not the console's: it does not go into title memory, where it broke
         // the title's own data (garbage pointers in title threads, run c1),
         // nor while any list using title memory misses ([`withholding`]).
-        let withheld = if pages + regions > 0 || withholding() { writes.len() as u64 } else { 0 };
+        //
+        // `VICTORY_ALLOW_COPYBACK=1` (diagnostics) copies back anyway. Every
+        // world frame so far misses memory (98 661 pages and 33 256-MiB region
+        // marks in one: the title reads 0x740000000-0x780000000, a gigabyte
+        // with no copy), so with the rule above nothing is ever copied back -
+        // and the title's own memory never sees what its shaders wrote. The
+        // switch says whether that is what keeps the game from advancing.
+        let forced = cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_ALLOW_COPYBACK");
+        let withheld = if !forced && (pages + regions > 0 || withholding()) {
+            writes.len() as u64
+        } else {
+            0
+        };
         if withheld > 0 {
             for &(_, at) in &writes {
                 drop_withheld(at as usize, 1 << 16);
@@ -695,6 +707,16 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 "title memory page written back"
             );
             written += 1;
+        }
+        // Said once per frame for the few first pages: what the title has
+        // registered there (or that it never registered anything).
+        #[cfg(feature = "diagnostics")]
+        for &at in missed.iter().take(4) {
+            tracing::debug!(
+                page = format_args!("{at:#x}"),
+                what = %crate::shadow::describe(at),
+                "title memory a shader read with no copy"
+            );
         }
         stats(|s| {
             s.written += written;

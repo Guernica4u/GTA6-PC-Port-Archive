@@ -483,6 +483,13 @@ fn translate(
     t: &mut Tally,
     checks: &mut Checks,
 ) {
+    // Diagnostics: `VICTORY_ONLY=@0x<offset>` translates just that container,
+    // so one program's failures can be read in order.
+    if let Ok(only) = std::env::var("VICTORY_ONLY")
+        && !source.label().contains(&only)
+    {
+        return;
+    }
     let example = || format!("{}{}", path.display(), source.label());
     let Some(bytes) = source.bytes() else {
         return t.fail("corrupt record".into(), example);
@@ -576,7 +583,7 @@ fn translate(
                         }
                         Err(ShaderError::Unsupported { offset, what }) => t
                             .fail(format!("emit: {what}"), || {
-                                format!("{} at {offset:#x}", label())
+                                format!("{} at {offset:#x} {}", label(), instruction_at(&program, offset))
                             }),
                         Err(e) => t.fail(format!("emit: {e}"), label),
                     }
@@ -850,6 +857,19 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The instruction at machine offset `offset`, as `name` and its raw fields:
+/// a refusal that points at an offset should also say which opcode it is.
+fn instruction_at(p: &victory_shader::ir::Program, offset: usize) -> String {
+    for b in &p.blocks {
+        for i in &b.insts {
+            if i.machine.offset == offset {
+                return format!("[{} {:?}]", i.name(), i.fields);
+            }
+        }
+    }
+    String::new()
 }
 
 #[cfg(test)]

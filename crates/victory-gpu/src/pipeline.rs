@@ -106,6 +106,33 @@ impl Shader {
     }
 }
 
+/// Diagnostics: `VICTORY_DUMP_SHADER` names shader hashes (or `all`);
+/// their translated DXIL is written to `%TEMP%\victory-<hash>.dxil`, which
+/// `dxc -dumpbin` reads. For the shaders a frame spends its time in: the
+/// pipeline log gives the hash, this gives the code.
+#[cfg(feature = "diagnostics")]
+fn dump(hash: &str, dxil: &[u8]) {
+    static NAMES: OnceLock<Option<Vec<String>>> = OnceLock::new();
+    let names = NAMES.get_or_init(|| {
+        let value = std::env::var("VICTORY_DUMP_SHADER").ok()?;
+        let list: Vec<String> = value
+            .split(',')
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty())
+            .collect();
+        (!list.is_empty()).then_some(list)
+    });
+    let Some(names) = names else { return };
+    if !names.iter().any(|n| n == "all" || n == hash) {
+        return;
+    }
+    let path = std::env::temp_dir().join(format!("victory-{hash}.dxil"));
+    match std::fs::write(&path, dxil) {
+        Ok(()) => tracing::info!(shader = hash, bytes = dxil.len(), path = %path.display(), "shader dumped"),
+        Err(e) => tracing::warn!(shader = hash, error = %e, "shader not dumped"),
+    }
+}
+
 /// A translated shader and the console resources its code reads.
 #[cfg(windows)]
 pub(crate) struct Translated {
@@ -124,10 +151,15 @@ impl Shader {
                 let (done, cached) = translate(&self.container);
                 let ms = started.elapsed().as_millis() as u64;
                 let (user_ms, kernel_ms) = thread_cpu_since(cpu);
+                #[cfg(feature = "diagnostics")]
+                if let Ok(t) = &done {
+                    dump(&self.hash, &t.host.dxil);
+                }
                 match &done {
                     Ok(t) => tracing::info!(
                         stage = self.stage,
                         hash = %self.hash,
+                        thread = std::thread::current().name().unwrap_or("unnamed"),
                         user_data = t.host.user_data.len(),
                         samplers = t.host.samplers.len(),
                         cached,
