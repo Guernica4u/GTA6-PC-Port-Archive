@@ -1345,6 +1345,7 @@ void main() {
         crate::shadow::register(p, p as u64, PAGE as u64);
         let _copy = crate::shadow::find(p as u64, PAGE as u64).unwrap();
         // Ensure any prior test's miss withholding is cleared for this frame.
+        FRAMES.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
         note_submission(false);
         let list = host.new_list().unwrap();
         let map = bind(&list, OURS).expect("a page table");
