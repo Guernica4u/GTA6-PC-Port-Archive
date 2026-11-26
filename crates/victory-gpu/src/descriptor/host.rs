@@ -2499,11 +2499,18 @@ mod tests {
 
     /// A sampler heap past the D3D12 limit is capped, not lost, and keeps
     /// dynamic slots for tables reaching past what it holds (#65).
+    ///
+    /// The oversized request must come back as a *heap*, not `None`: that
+    /// return is the bug this guards. Skipping when there is no device is
+    /// done by asking for the host first, so that on a machine with one, a
+    /// regression here fails instead of quietly passing.
     #[test]
     fn large_sampler_heap_is_capped() {
-        let Some(heap) = HostHeap::new(true, 4 * victory_shader::emit::HEAP_SAMPLERS) else {
+        if crate::host::host().is_none() {
             return; // no host GPU
-        };
+        }
+        let heap = HostHeap::new(true, 4 * victory_shader::emit::HEAP_SAMPLERS)
+            .expect("an oversized sampler heap is capped, not dropped");
         let count = victory_shader::emit::HEAP_SAMPLERS - SAMPLER_DYNAMIC;
         assert_eq!(heap.count(), count);
         // SAFETY: a live heap.
