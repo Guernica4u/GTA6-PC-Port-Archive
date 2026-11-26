@@ -58,8 +58,8 @@ pub fn use_pipeline_cache(dir: PathBuf) {
 }
 
 /// Whether `dir` is a library directory this wrote: a name that is 16
-/// lowercase hex digits (a [`victory_shader::SOURCE_HASH`]) holding
-/// [`LIBRARY_FILE`].
+/// lowercase hex digits (a [`victory_shader::SOURCE_HASH`]) holding a
+/// library.
 fn is_translation(dir: &Path) -> bool {
     let ours = dir
         .file_name()
@@ -70,7 +70,16 @@ fn is_translation(dir: &Path) -> bool {
                     .bytes()
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         });
-    ours && dir.is_dir() && dir.join(LIBRARY_FILE).is_file()
+    ours && dir.is_dir() && library_in(dir)
+}
+
+/// Whether `dir` holds a library: [`LIBRARY_FILE`], or its first shard where
+/// the library is split (`#1653` puts one file per shard, `host-pipelines.NN.bin`,
+/// in the same directory). Both are checked so that the two changes read the
+/// same directories whichever of them lands first - the names are written out
+/// because `shard_file` does not exist without the split.
+fn library_in(dir: &Path) -> bool {
+    dir.join(LIBRARY_FILE).is_file() || dir.join("host-pipelines.00.bin").is_file()
 }
 
 /// How many translations keep a library: the one in use and the previous
@@ -918,12 +927,12 @@ mod keyed_tests {
             std::fs::create_dir_all(&at).unwrap();
             std::fs::write(at.join("sentinel"), b"keep me").unwrap();
             if own {
-                std::fs::write(at.join(LIBRARY_FILE), b"library").unwrap();
+                std::fs::write(at.join("host-pipelines.bin"), b"library").unwrap();
             }
         }
         let current = dir.join(victory_shader::SOURCE_HASH);
         std::fs::create_dir_all(&current).unwrap();
-        std::fs::write(current.join(LIBRARY_FILE), b"library").unwrap();
+        std::fs::write(current.join("host-pipelines.bin"), b"library").unwrap();
 
         assert_eq!(keyed(&dir), current);
         assert!(dir.join("backup").join("sentinel").is_file(), "a foreign directory was deleted");
