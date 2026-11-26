@@ -713,9 +713,12 @@ mod tests {
         put32(&mut body, 28, 0x1040); // address table
         put32(&mut body, 32, 0x1034); // name pointer table
         put32(&mut body, 36, 0x103C); // name ordinal table
-        put32(&mut body, 0x28, 0xFFFF_FFFF); // address = u32::MAX (valid)
+        put32(&mut body, 0x28, 0x1200); // address entry: 0x1200 < image_base 0x1_8000_0000
         put32(&mut body, 0x34, 0x1044);
-        body[0x40..0x44].copy_from_slice(b"t.dl");
+        body[0x40] = b't';
+        body[0x41] = b'.';
+        body[0x42] = b'd';
+        body[0x43] = b'l';
         body[0x44] = b'a';
         body[0x45] = b'l';
         body[0x46] = b'p';
@@ -725,8 +728,8 @@ mod tests {
 
         let info = ImageInfo::parse(&synthetic_image(&body));
         assert!(
-            info.is_ok(),
-            "export address at u32::MAX should be accepted"
+            info.is_err(),
+            "export address below image_base should be rejected"
         );
     }
 }
