@@ -587,6 +587,49 @@ mod tests {
 
     use super::*;
 
+    /// A thread waiting for the card does not hold `submitted`: another
+    /// thread takes it while the wait goes on, and the wait ends once the
+    /// card reaches the value.
+    #[test]
+    fn waiting_for_the_card_leaves_submitted_free() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+        let Some(host) = Host::new_warp() else { return };
+        // SAFETY: a fence of our own.
+        let Ok(gate) = (unsafe { host.device.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) }) else { return };
+        // Far above any value a submission reaches (FINISHED_FENCE is shared).
+        let target = 1u64 << 40;
+        // SAFETY: the card signals `target` only after the processor opens the gate.
+        unsafe {
+            host.queue.Wait(&gate, 1).unwrap();
+            host.queue.Signal(&host.fence, target).unwrap();
+        }
+        let done = AtomicBool::new(false);
+        let (taken, early) = std::thread::scope(|s| {
+            s.spawn(|| {
+                host.wait_fence(target);
+                done.store(true, Ordering::Release);
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            let early = done.load(Ordering::Acquire);
+            let started = Instant::now();
+            let mut taken = false;
+            while !taken && started.elapsed() < Duration::from_secs(1) {
+                taken = host.submitted.try_lock().is_ok();
+                std::thread::yield_now();
+            }
+            // Opened whatever happened above, so the waiter always returns.
+            // SAFETY: our fence.
+            unsafe { gate.Signal(1).unwrap() };
+            (taken, early)
+        });
+        assert!(!early, "the wait ended before the card reached the value");
+        assert!(taken, "`submitted` stayed held while a thread waited for the card");
+        assert!(done.load(Ordering::Acquire));
+        // SAFETY: a plain fence query.
+        assert!(unsafe { host.fence.GetCompletedValue() } >= target);
+    }
+
     /// A list with no work before its waits, as the title's queues meet one
     /// another halfway: each write goes as soon as the waits before it are
     /// met, and work holds the later ones back.
@@ -1171,19 +1214,36 @@ impl Host {
         !self.in_flight.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
-    /// Waits until the host GPU fence reaches at least `target`.
+    /// Waits until the host GPU fence reaches at least `target`, and finishes
+    /// the submissions up to it.
+    ///
+    /// The card is waited for on this thread's own event, without
+    /// `submitted`: held through the wait, it kept every other thread's
+    /// submission (and the preparation that overlaps the card) waiting for
+    /// as long as the card ran, and lists reset on the title's recording
+    /// threads come here (#163: 12% of the submitting thread contended on
+    /// it). `submitted` is taken afterwards only to finish what has run.
     pub(crate) fn wait_fence(&self, target: u64) {
         if target == 0 || FINISHED_FENCE.load(Ordering::Acquire) >= target {
             return;
         }
+        // SAFETY: a plain fence query.
+        let reached = unsafe { self.fence.GetCompletedValue() } >= target || wait_unlocked(&self.fence, target);
+        // Finished meanwhile by the thread that held `submitted`.
+        if reached && FINISHED_FENCE.load(Ordering::Acquire) >= target {
+            return;
+        }
         let _guard = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: the fence and event are ours; guarded by `submitted`.
-        unsafe {
-            if self.fence.GetCompletedValue() < target {
-                if let Err(e) = self.fence.SetEventOnCompletion(target, self.event) {
-                    tracing::warn!(error = %e, "host fence wait failed");
-                } else {
-                    WaitForSingleObject(self.event, INFINITE);
+        if !reached {
+            // No event of this thread's own: on the shared one, as before.
+            // SAFETY: the fence and event are ours; guarded by `submitted`.
+            unsafe {
+                if self.fence.GetCompletedValue() < target {
+                    if let Err(e) = self.fence.SetEventOnCompletion(target, self.event) {
+                        tracing::warn!(error = %e, "host fence wait failed");
+                    } else {
+                        WaitForSingleObject(self.event, INFINITE);
+                    }
                 }
             }
         }
@@ -3057,6 +3117,36 @@ impl Early {
             list.cast().ok()
         }
     }
+}
+
+/// Waits on this thread's own event until `fence` reaches `value`; `false`
+/// if there is no such event or the fence would not set it.
+fn wait_unlocked(fence: &ID3D12Fence, value: u64) -> bool {
+    struct Event(HANDLE);
+    impl Drop for Event {
+        fn drop(&mut self) {
+            // SAFETY: our own event, closed once at thread exit.
+            let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.0) };
+        }
+    }
+    thread_local! {
+        // Auto-reset, and every setting of it is waited for below, so none
+        // is left over for the next wait.
+        // SAFETY: a plain event creation.
+        static EVENT: Option<Event> = unsafe { CreateEventW(None, false, false, None) }.ok().map(Event);
+    }
+    EVENT.with(|event| {
+        let Some(event) = event else { return false };
+        // SAFETY: the fence is free-threaded; the event is this thread's.
+        unsafe {
+            if let Err(e) = fence.SetEventOnCompletion(value, event.0) {
+                tracing::warn!(error = %e, "host fence wait failed");
+                return false;
+            }
+            WaitForSingleObject(event.0, INFINITE);
+        }
+        true
+    })
 }
 
 /// Runs `f` on pieces of `list`, of `least` items or more, on some threads.
