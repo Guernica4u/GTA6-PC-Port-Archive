@@ -296,13 +296,22 @@ pub fn run(
         let find = |name: &str| kept.iter().find(|(l, _)| l.contains(name));
         for (v, p) in &pairs {
             let made = match (find(v), find(p)) {
-                (Some((_, vs)), Some((_, ps))) => if vs.stage == HwStage::Ms {
-                    host.mesh_pipeline(vs, ps)
-                } else {
-                    host.pipeline(vs, ps)
+                // A mesh pair is named the same way the census names it
+                // everywhere else: the host without mesh shaders says so
+                // instead of failing to make the pipeline with an error that
+                // reads like the shaders' fault.
+                (Some((_, vs)), Some((_, ps))) => {
+                    let made = if vs.stage == HwStage::Ms {
+                        if host.mesh_shaders() {
+                            host.mesh_pipeline(vs, ps).map(|_| ()).map_err(|e| e.to_string())
+                        } else {
+                            Err("the host has no mesh shaders".to_owned())
+                        }
+                    } else {
+                        host.pipeline(vs, ps).map(|_| ()).map_err(|e| e.to_string())
+                    };
+                    made.map(|()| "pipeline created".to_owned()).unwrap_or_else(|e| e)
                 }
-                .map(|_| "pipeline created".to_owned())
-                .unwrap_or_else(|e| e),
                 _ => "not emitted".to_owned(),
             };
             println!("pair {v} + {p}: {made}");
