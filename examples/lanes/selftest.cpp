@@ -2088,6 +2088,20 @@ void descriptor_reclaim(ID3D12Device* device) {
     verify_outputs(next_idx, "fail-closed OOM control");
 }
 
+// Opt-in long-running control: repeat the full lifecycle with the same device,
+// including heap, list, queue and fence destruction between cycles.
+constexpr unsigned descriptor_soak_cycles = 8;
+void descriptor_reclaim_soak(ID3D12Device* device) {
+    for (unsigned cycle = 0; cycle < descriptor_soak_cycles; ++cycle) {
+        try {
+            descriptor_reclaim(device);
+        } catch (const std::exception& error) {
+            throw std::runtime_error("descriptor cycle " + std::to_string(cycle + 1) + ": " + error.what());
+        }
+        std::fprintf(stderr, "descriptor-reclaim-soak cycle=%u/%u ok\n", cycle + 1, descriptor_soak_cycles);
+    }
+}
+
 struct Scenario {
     const wchar_t* name;
     void (*run)(ID3D12Device*);
@@ -2107,6 +2121,7 @@ constexpr Scenario scenarios[] = {
     {L"ray-tracing-builder", ray_tracing_builder},
     {L"thread-dimensions", thread_dimensions},
     {L"descriptor-reclaim", descriptor_reclaim},
+    {L"descriptor-reclaim-soak", descriptor_reclaim_soak},
     {L"xbox-shader", xbox_shader_scenario},
     {L"wave64-shader", wave64_shader_scenario},
     {L"raster-tables", raster_tables},
@@ -2166,7 +2181,7 @@ const wchar_t* const selftest_scenarios[] = {L"labels",            L"cross-queue
                                              L"skipped-command",   L"copy-memory",      L"direct-copy-wait", L"shared-texture",
                                              L"indirect-dispatch", L"gpu-indirect-dispatch",
                                              L"dispatch-wait", L"texture-readback", L"ray-tracing-builder",
-                                             L"thread-dimensions", L"descriptor-reclaim",
+                                             L"thread-dimensions", L"descriptor-reclaim", L"descriptor-reclaim-soak",
                                              L"xbox-shader", L"wave64-shader",
                                              L"raster-tables", L"wave-alloc", L"raster-samplers", L"compute-root",
                                              L"mesh-samplers", L"mesh-sampler-single",
@@ -2182,7 +2197,7 @@ std::string run_selftest(const wchar_t* requested, const wchar_t* adapter) {
         if (!all && std::wcscmp(requested, scenario.name)) continue;
         // This one writes nothing until the launcher's compiler has translated it,
         // and mesh-samplers needs its mesh program's translation prepared first.
-        if (all && (!std::wcscmp(scenario.name, L"wave64-shader") || !std::wcsncmp(scenario.name, L"mesh-sampler", 12)))
+        if (all && (!std::wcscmp(scenario.name, L"wave64-shader") || !std::wcsncmp(scenario.name, L"mesh-sampler", 12) || !std::wcscmp(scenario.name, L"descriptor-reclaim-soak")))
             continue;
         const auto name = narrow(scenario.name);
         try {
@@ -2196,8 +2211,13 @@ std::string run_selftest(const wchar_t* requested, const wchar_t* adapter) {
         std::fprintf(stderr, "lanes-selftest %s ok\n", name.c_str());
     }
     if (!passed) throw std::runtime_error("unknown scenario " + narrow(requested));
-    return "lanes-selftest PASS pci=" + std::string(pci) + " scenario=" + narrow(requested) +
-           " passed=" + std::to_string(passed);
+    auto receipt = "lanes-selftest PASS pci=" + std::string(pci) + " scenario=" + narrow(requested) +
+                   " passed=" + std::to_string(passed);
+    // The GUI-subsystem guest's stderr is not reliably forwarded by Proton.
+    // Report the completed fixed cycle count in the same file as other receipts.
+    if (!std::wcscmp(requested, L"descriptor-reclaim-soak"))
+        receipt += " cycles=" + std::to_string(descriptor_soak_cycles);
+    return receipt;
 }
 
 std::string run_benchmark(const wchar_t* adapter) {

@@ -52,6 +52,7 @@ The game also imports Windows core API sets for services such as files, timing a
 | `ray-tracing-builder` | `XboxBvhBuilder` builds a structure with a size report, copies it and builds it again in a batch (needs ray tracing) |
 | `thread-dimensions` | Slot 80 `USE_THREAD_DIMENSIONS` (`0x20`) converts thread counts using the bound PSO's `[numthreads]` and fails closed without one |
 | `descriptor-reclaim` | Shader-visible descriptor heap reclamation across completed batches, overlapping in-flight `Reset()`, `ClearState`, evicted-slot rebinding, and unsubmitted pin exhaustion |
+| `descriptor-reclaim-soak` | Opt-in: eight complete reclamation lifecycles on one device, including teardown and recreation; omitted from `all` and default verification |
 | `xbox-shader` | A console shader's pipeline and dispatch ([shader cache](#shader-cache)) |
 | `wave64-shader` | A console shader that sums across 64-lane waves, translated while the game runs; not part of `all` |
 | `raster-tables` | A console vertex and pixel pair drawn under a root with two descriptor tables, reading through the second ([raster tables](#raster-tables)) |
@@ -171,3 +172,5 @@ all other guard words must match; stand-ins are disabled.
 ```sh
 python tuxbox.py verify --only lanes-compute-root-recovery --output build/lanes-compute-root-recovery.json
 ```
+
+To run the extended descriptor lifecycle control: `python tuxbox.py verify --only lanes-descriptor-soak --output build/lanes-descriptor-soak.json`. This checks eight complete lifecycles, not sustained retail workload coverage.

@@ -26,7 +26,7 @@ BASE_SUITES = ("cpu", "xmem", "xapu", "xgameruntime", "xcrdapi", "graphics", "gr
                "d3d12-heaps", "d3d12-placement", "d3d12-copy-resource", "d3d12-draw", "d3d12-stream", "d3d12-frame-events",
                "d3d12-guids", "d3d12-signatures", "xg-provider")
 OPTIONAL_PROVIDERS = {"dxc-utils": "dxc-utils/dxcompiler.dll", "xg": "xg/xg_xs.dll"}
-SUITES = (*BASE_SUITES, "d3d12-mesh", *OPTIONAL_PROVIDERS)
+SUITES = (*BASE_SUITES, "d3d12-mesh", "lanes-descriptor-soak", *OPTIONAL_PROVIDERS)
 # The scenarios of `lanes.exe --selftest`, one gate each.
 LANES_SCENARIOS = ("labels", "cross-queue", "compute-frame", "skipped-command", "copy-memory", "shared-texture",
                    "indirect-dispatch", "gpu-indirect-dispatch",
@@ -652,7 +652,7 @@ def verify(host, output, adapter, selected=None, samples=1):
             return dest
 
         def check(name, binary, arguments, match, expected_code=0, providers=None, config=None, device_factory=None,
-                  dependencies=(), log_check=None):
+                  dependencies=(), log_check=None, timeout=15):
             row = {"gate": name, "passed": False}
             cases.append(row)
             folder = work / str(len(cases))
@@ -687,7 +687,7 @@ def verify(host, output, adapter, selected=None, samples=1):
                     exe = launch_target(folder, "Lanes")
                 else:
                     exe = launch_target(exe, None)
-                proc = host.run(exe, [*arguments, receipt.name], timeout=15, capture=True)
+                proc = host.run(exe, [*arguments, receipt.name], timeout=timeout, capture=True)
                 text = receipt.read_text(encoding="utf-8").rstrip("\r\n") if receipt.is_file() else None
                 row.update(exit_code=proc.returncode, receipt=text)
                 row["passed"] = (proc.returncode == expected_code and
@@ -945,6 +945,28 @@ def verify(host, output, adapter, selected=None, samples=1):
                 host.env.pop("TUXBOX_DESCRIPTOR_HEAP_LIMIT", None)
             else:
                 host.env["TUXBOX_DESCRIPTOR_HEAP_LIMIT"] = saved_limit
+        if "lanes-descriptor-soak" in selected:
+            saved = {name: host.env.get(name) for name in ("TUXBOX_LOG", "WINEDEBUG", "TUXBOX_NULL_PIPELINES", "TUXBOX_DESCRIPTOR_HEAP_LIMIT")}
+            host.env.update(TUXBOX_LOG="1", WINEDEBUG="-all,+debugstr",
+                            TUXBOX_NULL_PIPELINES="0", TUXBOX_DESCRIPTOR_HEAP_LIMIT="1000000")
+            def soak_log(output):
+                if "substituted null " in output:
+                    return "descriptor soak used a stand-in pipeline"
+                return None
+            try:
+                check("lanes-descriptor-soak", "lanes/lanes.exe",
+                      ["--selftest", "descriptor-reclaim-soak", *gpu_args, "--report"],
+                      rf"lanes-selftest PASS pci={pci} scenario=descriptor-reclaim-soak passed=1 cycles=8",
+                      providers={"lanes/xmem.dll": memory_symbols, "lanes/GameInput.dll": ("#1",),
+                                 "lanes/d3d12_xs.dll": ("D3D12XboxCreateDevice",)},
+                      config="lanes/MicrosoftGame.config", device_factory="xbox",
+                      log_check=soak_log, timeout=120)
+            finally:
+                for name, value in saved.items():
+                    if value is None:
+                        host.env.pop(name, None)
+                    else:
+                        host.env[name] = value
         if "lanes-benchmark" in selected:
             # Console shaders are only translated on the Proton backend, so the
             # pipeline readings exist there alone.
@@ -1076,6 +1098,7 @@ GATE_LABELS = {
     "lanes-benchmark": "Lanes frame, submission, fence handover, copy and pipeline timings",
     "lanes-selftest-ray-tracing-builder": "Single, copied and batched builds through XboxBvhBuilder",
     "lanes-selftest-thread-dimensions": "Slot 80 thread-dimension dispatch converted using the bound PSO group size",
+    "lanes-descriptor-soak": "Eight complete descriptor reclamation lifecycles on one device",
     "lanes-selftest-descriptor-reclaim": "Shader-visible descriptor slot reclamation across completed, in-flight, ClearState, and OOM lists",
     "lanes-shader-cache-prepared": "A console shader translated before launch, loaded from the prepared cache",
     "lanes-shader-cache-compiled": "A console shader translated by the host worker while the game runs",
