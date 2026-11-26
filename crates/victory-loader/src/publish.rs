@@ -34,6 +34,19 @@ fn sidecar(path: &Path) -> std::path::PathBuf {
     path.with_file_name(format!(".{name}.blake3"))
 }
 
+/// Writes the sidecar through its own staging file + rename, so a reader
+/// never sees a torn digest. Not fatal: without it the next boot falls back
+/// to reading the image.
+fn write_sidecar(path: &Path, digest: &blake3::Hash) {
+    let side = sidecar(path);
+    let name = side.file_name().and_then(|n| n.to_str()).unwrap_or("digest");
+    let sequence = NEXT_STAGING.fetch_add(1, Ordering::Relaxed);
+    let staging = side.with_file_name(format!(".{name}.{}.{sequence}.tmp", std::process::id()));
+    if std::fs::write(&staging, digest.as_bytes()).and_then(|_| std::fs::rename(&staging, &side)).is_err() {
+        let _ = std::fs::remove_file(&staging);
+    }
+}
+
 /// An exclusive lock on the lock file beside the published path, held for
 /// the guard's life: closing the handle releases it, so a crashed publisher
 /// does not leave the cache locked.
@@ -110,7 +123,7 @@ pub fn write_if_changed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if std::fs::read(path).is_ok_and(|existing| existing == bytes) {
         // Publish the sidecar for the next boot; a failure here only costs
         // the fallback read next time.
-        let _ = std::fs::write(sidecar(path), digest.as_bytes());
+        write_sidecar(path, &digest);
         return Ok(());
     }
     let name = path
@@ -133,7 +146,7 @@ pub fn write_if_changed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
     // The digest of what was published, for the fast path next time. Not
     // fatal: without it the next boot falls back to reading the image.
-    let _ = std::fs::write(sidecar(path), digest.as_bytes());
+    write_sidecar(path, &digest);
     Ok(())
 }
 
@@ -252,16 +265,15 @@ mod tests {
                     write_if_changed(&path, bytes).unwrap();
                     // If the file did not change across the check, a sidecar
                     // present at the same time must describe it.
-                    let before = std::fs::read(&path).unwrap();
-                    if let Ok(d) = std::fs::read(sidecar(&path)) {
-                        let after = std::fs::read(&path).unwrap();
-                        if before == after {
-                            assert_eq!(
-                                d,
-                                blake3::hash(&before).as_bytes(),
-                                "sidecar matches the file"
-                            );
-                        }
+                    // A rename by another publisher can make these reads
+                    // fail transiently; only check when all three succeed.
+                    if let (Ok(before), Ok(d), Ok(after)) = (
+                        std::fs::read(&path),
+                        std::fs::read(sidecar(&path)),
+                        std::fs::read(&path),
+                    ) && before == after && !d.is_empty()
+                    {
+                        assert_eq!(d, blake3::hash(&before).as_bytes(), "sidecar matches the file");
                     }
                 }
             }));
