@@ -16,8 +16,9 @@ use crate::dxbc::{Container, FourCC};
 
 /// Whether the D3D12 host is Wine. Its WARP adapter is vkd3d-proton's, not
 /// Microsoft's rasterizer, and it fuses DXIL `FMad` where Windows WARP does
-/// not. Tests that compare host behaviour use this to keep both answers.
-#[cfg(test)]
+/// not. Shared by the host tests here and in `victory-gpu`, which enable
+/// this module through the `host` feature; neither crate needs a second
+/// copy of the ntdll export lookup.
 pub fn under_wine() -> bool {
     use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
     // SAFETY: both names are NUL terminated, and the module is checked

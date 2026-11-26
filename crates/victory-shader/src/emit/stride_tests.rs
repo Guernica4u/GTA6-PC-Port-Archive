@@ -373,7 +373,10 @@ fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
         ran += 1;
     }
     if ran == 0 {
-        eprintln!("no adapter with a {HEAP_VIEWS}-slot view heap; skipped");
+        eprintln!(
+            "a_heap_buffer_read_where_no_buffer_view_is_reads_zeros: no SM 6.6 device with a \
+             {HEAP_VIEWS}-slot view heap; skipped"
+        );
     }
 }
 

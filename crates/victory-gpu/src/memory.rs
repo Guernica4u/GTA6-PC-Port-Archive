@@ -955,7 +955,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         let (Some(host), Some(views)) = (crate::host::host(), heap()) else {
             return; // no host GPU here
         };
-        if crate::compute::under_wine() {
+        if victory_shader::emit::host::under_wine() {
             eprintln!("Wine's shader compiler has no shader model 5.1 resource arrays. Skipping.");
             return;
         }
@@ -1084,7 +1084,7 @@ void main() {
         let (Some(host), Some(views)) = (crate::host::host(), heap()) else {
             return; // no host GPU here
         };
-        if crate::compute::under_wine() {
+        if victory_shader::emit::host::under_wine() {
             eprintln!("Wine's shader compiler has no shader model 5.1 resource arrays. Skipping.");
             return;
         }

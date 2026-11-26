@@ -82,19 +82,6 @@ pub(crate) fn range(
     }
 }
 
-/// Whether the tests run under Wine (its ntdll exports `wine_get_version`),
-/// whose compiler (vkd3d-shader) has no shader model 5.1 resource arrays:
-/// a source indexing views by a value it reads does not compile there.
-#[cfg(test)]
-pub(crate) fn under_wine() -> bool {
-    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
-    // SAFETY: plain lookups in ntdll, always loaded.
-    unsafe {
-        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
-        !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
-    }
-}
-
 /// The bytes of a blob, alive as long as it is.
 pub(crate) fn bytes(blob: &ID3DBlob) -> &[u8] {
     // SAFETY: the blob's own buffer, borrowed for as long as the blob.
