@@ -53,6 +53,7 @@ The game also imports Windows core API sets for services such as files, timing a
 | `thread-dimensions` | Slot 80 `USE_THREAD_DIMENSIONS` (`0x20`) converts thread counts using the bound PSO's `[numthreads]` and fails closed without one |
 | `descriptor-reclaim` | Shader-visible descriptor heap reclamation across completed batches, overlapping in-flight `Reset()`, `ClearState`, evicted-slot rebinding, and unsubmitted pin exhaustion |
 | `xbox-shader` | A console shader's pipeline and dispatch ([shader cache](#shader-cache)) |
+| `bindless-compute`, `bindless-sampler` | Direct-indexed console compute programs through the paged resource index map ([compute roots](#compute-roots)); not part of `all` |
 | `wave64-shader` | A console shader that sums across 64-lane waves, translated while the game runs; not part of `all` |
 | `raster-tables` | A console vertex and pixel pair drawn under a root with two descriptor tables, reading through the second ([raster tables](#raster-tables)) |
 | `raster-samplers` | A console pixel program's literal linear sampler, under a root whose static sampler at that register is point-filtered ([raster tables](#raster-tables)) |
@@ -171,3 +172,5 @@ all other guard words must match; stand-ins are disabled.
 ```sh
 python tuxbox.py verify --only lanes-compute-root-recovery --output build/lanes-compute-root-recovery.json
 ```
+
+The `lanes-bindless-compute` verification suite runs two native console programs under a direct-indexed root with no parameters, each with a roomy and a constrained paged resource heap (resident limit 64 in the constrained run). `bindless-compute` stores through the heap UAV at logical slot 80. `bindless-sampler` samples the heap texture at slot 90 with a linear sampler built from literal words, which the root does not declare, and stores the value through the UAV at slot 85. Each run requires a translation made against the pipeline's root, the paged map bind and disabled stand-ins.
