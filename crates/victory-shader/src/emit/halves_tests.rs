@@ -324,11 +324,11 @@ fn the_test_programs_are_what_their_comments_say() {
             ],
         ),
         (
-            every_id(3, 2),
+            every_id([6, 6, 1]),
             &[
-                "v_lshlrev_b32 v3, 2, v2",
+                "v_mul_u32_u24 v3, lit(0x00000006), v2",
                 "v_add_nc_u32 v3, v1, v3",
-                "v_lshlrev_b32 v3, 3, v3",
+                "v_mul_u32_u24 v3, lit(0x00000006), v3",
                 "v_add_nc_u32 v2, v0, v3",
                 "v_lshlrev_b32 v16, 2, v2",
                 "v_mov_b32 v3, 1",
@@ -1018,20 +1018,23 @@ fn native_shaped(words: &[u32], [x, y, z]: [u32; 3]) -> NativeProgram {
     n
 }
 
-/// Each thread of a group `1 << sx` wide and `1 << sy` high (any depth)
-/// stores 1 at its flat id `(z << sy | y) << sx | x`, with console lanes
-/// (`v_mbcnt`): a thread id two threads share leaves another one unstored.
-fn every_id(sx: u32, sy: u32) -> Vec<u32> {
+/// Each thread of a group of `[x, y, z]` threads stores 1 at its flat id
+/// `(z * y_n + y) * x_n + x` (`x_n`, `y_n` the group's width and height),
+/// with console lanes (`v_mbcnt`): a thread id two threads share leaves
+/// another one unstored.
+fn every_id([x, y, _]: [u32; 3]) -> Vec<u32> {
     let mut w = PROLOGUE.to_vec();
     w.extend([
         0xD765_0005,
-        0x0001_00C1,              // v_mbcnt_lo_u32_b32 v5, -1, 0
-        0x3406_0400 | (128 + sy), // v_lshlrev_b32 v3, sy, v2
-        0x4A06_0701,              // v_add_nc_u32 v3, v1, v3
-        0x3406_0600 | (128 + sx), // v_lshlrev_b32 v3, sx, v3
-        0x4A04_0700,              // v_add_nc_u32 v2, v0, v3
-        0x3420_0482,              // v_lshlrev_b32 v16, 2, v2
-        0x7E06_0281,              // v_mov_b32 v3, 1
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v5, -1, 0
+        0x1606_04FF,
+        y,           // v_mul_u32_u24 v3, y, v2
+        0x4A06_0701, // v_add_nc_u32 v3, v1, v3
+        0x1606_06FF,
+        x,           // v_mul_u32_u24 v3, x, v3
+        0x4A04_0700, // v_add_nc_u32 v2, v0, v3
+        0x3420_0482, // v_lshlrev_b32 v16, 2, v2
+        0x7E06_0281, // v_mov_b32 v3, 1
     ]);
     w.extend(store(3, 0));
     w.push(S_ENDPGM);
@@ -1039,33 +1042,30 @@ fn every_id(sx: u32, sy: u32) -> Vec<u32> {
 }
 
 /// A group of several rows whose rows a 32-lane host wave may tile is
-/// refused in halves; narrower rows, and one row, are not.
+/// refused in halves; narrower rows, and one row in any depth, are not.
 #[test]
 fn groups_a_host_wave_may_tile_are_refused_in_halves() {
-    let why =
-        |shape: [u32; 3], sx, sy| match lowered(&native_shaped(&every_id(sx, sy), shape), true) {
-            Ok(_) => "translated".to_string(),
-            Err(e) => e.to_string(),
-        };
-    for (shape, sx, sy) in [
-        ([32, 2, 1], 5, 1),
-        ([64, 4, 1], 6, 2),
-        ([32, 2, 2], 5, 1),
-        ([6, 6, 1], 3, 3),
-    ] {
-        let w = why(shape, sx, sy);
+    let why = |shape: [u32; 3]| match lowered(&native_shaped(&every_id(shape), shape), true) {
+        Ok(_) => "translated".to_string(),
+        Err(e) => e.to_string(),
+    };
+    for shape in [[32, 2, 1], [64, 4, 1], [32, 2, 2], [6, 6, 1], [24, 2, 1]] {
+        let w = why(shape);
         assert!(
             w.contains("a group whose rows a 32-lane host wave may tile"),
             "{shape:?}: {w}"
         );
     }
-    for (shape, sx, sy) in [
-        ([8, 8, 1], 3, 3),
-        ([16, 2, 1], 4, 1),
-        ([4, 4, 4], 2, 2),
-        ([64, 1, 1], 6, 0),
+    for shape in [
+        [8, 8, 1],
+        [16, 2, 1],
+        [4, 4, 4],
+        [64, 1, 1],
+        [32, 1, 2],
+        [48, 1, 2],
+        [6, 1, 6],
     ] {
-        assert_eq!(why(shape, sx, sy), "translated", "{shape:?}");
+        assert_eq!(why(shape), "translated", "{shape:?}");
     }
 }
 
@@ -1081,13 +1081,17 @@ fn every_thread_keeps_its_own_id_in_halves_on_every_gpu() {
         eprintln!("no SM 6.6 hardware device; skipped");
     }
     let mut failed = Vec::new();
-    for (shape, sx, sy) in [
-        ([8, 8, 1], 3, 3),
-        ([16, 2, 1], 4, 1),
-        ([4, 4, 4], 2, 2),
-        ([64, 1, 1], 6, 0),
+    for shape in [
+        [8, 8, 1],
+        [16, 2, 1],
+        [4, 4, 4],
+        [64, 1, 1],
+        [32, 1, 2],
+        [48, 1, 2],
+        [6, 1, 6],
+        [256, 1, 4],
     ] {
-        let n = native_shaped(&every_id(sx, sy), shape);
+        let n = native_shaped(&every_id(shape), shape);
         let threads = shape.iter().product::<u32>();
         for (form, halves) in [("halves", true), ("wave64", false)] {
             let s = shader(lowered(&n, halves).expect("lowers"));

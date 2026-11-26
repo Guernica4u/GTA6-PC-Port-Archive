@@ -41,8 +41,9 @@
 //!
 //! Thread ids: the relabelling takes each host wave to hold a 32-aligned run
 //! of flat ids. Hosts fill the waves of a group of several rows with tiles
-//! when its rows are 32 threads wide or more (or not a power of two wide), so
-//! such groups are refused ([`Lower::halves_tiles`]).
+//! when its rows are 32 threads wide or more (or not a power of two wide),
+//! so such groups are refused ([`Lower::halves_tiles`]); a group of one row
+//! keeps its runs in any depth.
 //!
 //! LDS: the console compiler leaves out barriers between the lanes of one
 //! wave, and so between all of a group's threads only when the group is one
@@ -80,18 +81,27 @@ impl Lower<'_> {
         needs_wave && x.native.wave64 && x.host_wave32
     }
 
-    /// Why a program in halves cannot run: a group of several rows whose
-    /// rows are 32 threads wide or more, or not a power of two wide. A host
-    /// may then fill a wave with a tile of the group (16 x 2 threads) rather
-    /// than a run of flat ids, and the relabelling ([`Lower::relabelled_flat`])
-    /// would give two threads one id. Measured in halves on an RTX 3070 Ti and
-    /// the Radeon iGPU of a Ryzen 9 7900X: 32 x 2, 32 x 8, 64 x 4, 32 x 32 and
-    /// 32 x 2 x 2 groups store half their ids; 8 x 4, 8 x 8, 16 x 2, 16 x 4,
-    /// 16 x 16, 8 x 16, 4 x 4 x 4, 2 x 2 x 16 and 8 x 8 x 4 all of them (upstream
-    /// PR #2126 measured the same on NVIDIA, and widths that are not powers of
-    /// two, and hands each wave its ids by ticket instead).
-    pub(super) fn halves_tiles([x, y, z]: [u32; 3]) -> Option<Why> {
-        (y * z > 1 && (x >= HALF || !x.is_power_of_two()))
+    /// Why a program in halves cannot run: a group of several rows (its
+    /// height above one) whose rows are 32 threads wide or more, or not a
+    /// power of two wide. A host may then fill a wave with a tile of the
+    /// group (16 x 2 threads) rather than a run of flat ids, and the
+    /// relabelling ([`Lower::relabelled_flat`]) would give two threads one
+    /// id. Measured in halves on an RTX 3070 Ti and the Radeon iGPU of a
+    /// Ryzen 9 7900X, with the same results on both:
+    ///
+    /// - 32 x 2, 32 x 8, 64 x 2, 64 x 4, 32 x 32, 48 x 2, 24 x 2, 12 x 4,
+    ///   6 x 6 and 32 x 2 x 2 groups store only some of their ids;
+    /// - 8 x 4, 8 x 8, 16 x 2, 16 x 4, 16 x 16, 8 x 16, 4 x 4 x 4, 2 x 2 x 16,
+    ///   8 x 8 x 4, 16 x 4 x 2 and 8 x 4 x 4 store all of them;
+    /// - and so does a group of one row in any depth, whatever its width:
+    ///   32 x 1 x 2, 32 x 1 x 4, 32 x 1 x 32, 64 x 1 x 2, 64 x 1 x 4,
+    ///   128 x 1 x 2, 256 x 1 x 4, 40 x 1 x 2, 48 x 1 x 2, 96 x 1 x 2,
+    ///   24 x 1 x 4, 12 x 1 x 3 and 6 x 1 x 6.
+    ///
+    /// Upstream PR #2126 measured the tiles on NVIDIA, widths that are not
+    /// powers of two too, and hands each wave its ids by ticket instead.
+    pub(super) fn halves_tiles([x, y, _]: [u32; 3]) -> Option<Why> {
+        (y > 1 && (x >= HALF || !x.is_power_of_two()))
             .then_some("a group whose rows a 32-lane host wave may tile (wave64 on a 32-lane host)")
     }
 
