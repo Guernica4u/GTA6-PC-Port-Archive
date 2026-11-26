@@ -72,6 +72,12 @@ pub(crate) struct Lowered {
     /// Whether the module contains the 32-lane half mask (`!31`).
     #[cfg(test)]
     pub has_half_wave_mask: bool,
+    /// Wave size metadata emitted into DXIL (`None` = wave-size-agnostic).
+    #[cfg(test)]
+    pub wave_size: Option<u32>,
+    /// Whether `lds_wave32_sync` inserted DXIL barriers around LDS accesses.
+    #[cfg(test)]
+    pub lds_wave32_sync: bool,
 }
 
 pub(crate) struct Parts<'a> {
@@ -111,6 +117,34 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
             Err(Stop::Fail(e)) => return Err(e),
         }
     }
+}
+
+/// Returns `true` when every LDS access in `p` executes uniformly across the
+/// workgroup (no per-lane `EXEC` guard), so DXIL group barriers can order
+/// single-wave Wave64 LDS sharing on Wave32 hosts without forcing `WaveSize(64)`.
+fn can_sync_wave64_lds(p: &Program, x: &Parts) -> bool {
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            if !matches!(inst.fields, Fields::Ds { gds: false, .. }) {
+                continue;
+            }
+            if matches!(
+                inst.name(),
+                "ds_swizzle_b32" | "ds_bpermute_b32" | "ds_permute_b32" | "ds_nop"
+            ) {
+                continue;
+            }
+            if x.st
+                .guards
+                .get(b)
+                .and_then(|g| g.get(i))
+                .is_some_and(Option::is_some)
+            {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 const TWO_PI: f32 = std::f32::consts::TAU;
@@ -251,6 +285,10 @@ struct Lower<'a> {
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
+    /// Single-wave Wave64 compute shader with uniform LDS accesses lowered
+    /// without `WaveSize(64)` by emitting group-memory barriers around LDS ops
+    /// so Wave32-only hosts (e.g. NVIDIA) can run it safely.
+    lds_wave32_sync: bool,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword ([`packed_half`]).
     half_outputs: HashMap<u8, bool>,
@@ -599,11 +637,27 @@ impl<'a> Lower<'a> {
                 })
             };
             let wave = if x.native.wave64 { 64 } else { 32 };
-            let one_wave = cs.threads.iter().product::<u32>() <= wave;
-            if console_lanes || one_wave && s.lds_dwords > 0 {
+            let threads = cs.threads.iter().product::<u32>();
+            let one_wave = threads <= wave;
+            if console_lanes {
                 s.wave_size = Some(wave);
+            } else if one_wave && s.lds_dwords > 0 {
+                if wave == 64 && threads <= 32 {
+                    // <= 32 threads fits inside one Wave32 warp too: no WaveSize(64) needed.
+                } else if wave == 64 && can_sync_wave64_lds(p, x) {
+                    // Uniform single-wave Wave64 LDS accesses: sync with DXIL group
+                    // barriers instead of locking to WaveSize(64) so Wave32 hosts run it.
+                } else {
+                    s.wave_size = Some(wave);
+                }
             }
         }
+        let lds_wave32_sync = matches!(&x.native.io, StageIo::Cs(cs) if x.native.wave64
+            && !console_lanes
+            && cs.threads.iter().product::<u32>() > 32
+            && cs.threads.iter().product::<u32>() <= 64
+            && s.lds_dwords > 0
+            && can_sync_wave64_lds(p, x));
         let mut no_barrier = HashSet::new();
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
@@ -696,6 +750,7 @@ impl<'a> Lower<'a> {
             root_memory,
             flat: None,
             no_barrier,
+            lds_wave32_sync,
             half_outputs: half_outputs(&x.native.io),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
@@ -1412,6 +1467,10 @@ impl<'a> Lower<'a> {
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
             #[cfg(test)]
             has_half_wave_mask: self.s.m.has_i32_const(!31),
+            #[cfg(test)]
+            wave_size: self.s.wave_size,
+            #[cfg(test)]
+            lds_wave32_sync: self.lds_wave32_sync,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -3324,6 +3383,9 @@ impl<'a> Lower<'a> {
             ]
         };
         if let Some(rest) = name.strip_prefix("ds_read") {
+            if self.lds_wave32_sync {
+                self.emit_lds_barrier();
+            }
             let elements = if rest.starts_with('2') {
                 pair(name)
             } else if matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
@@ -3424,6 +3486,9 @@ impl<'a> Lower<'a> {
                 self.s.m.atomic(self.cur, Rmw::And, p, keep);
                 self.s.m.atomic(self.cur, Rmw::Or, p, set);
                 self.end_guarded(at, &[]);
+                if self.lds_wave32_sync {
+                    self.emit_lds_barrier();
+                }
                 return Ok(());
             };
             let mut stores = Vec::new();
@@ -3439,6 +3504,9 @@ impl<'a> Lower<'a> {
                 let at = self.begin_guarded(Some(g));
                 self.s.m.store(self.cur, p, x);
                 self.end_guarded(at, &[]);
+            }
+            if self.lds_wave32_sync {
+                self.emit_lds_barrier();
             }
             return Ok(());
         }
@@ -3494,7 +3562,17 @@ impl<'a> Lower<'a> {
         if let Some(reg) = dst_reg {
             self.write(inst, Reg::V(reg), r, None);
         }
+        if self.lds_wave32_sync {
+            self.emit_lds_barrier();
+        }
         Ok(())
+    }
+
+    fn emit_lds_barrier(&mut self) {
+        let mode = self.s.m.i32(1 | 8);
+        let void = self.s.t.void;
+        self.s
+            .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
     }
 
     // ---- instructions ----
@@ -12209,3 +12287,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "wave64_lds_tests.rs"]
+mod wave64_lds_tests;
