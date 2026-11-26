@@ -11763,17 +11763,19 @@ impl<'a> Lower<'a> {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
+                // Console flow: every lane arrives by every edge, so a join
+                // also takes masks that are constants or built from scalars.
+                let other = self.console_cf.then(|| self.x.st.other.get(&arg)).flatten();
                 const UNTRACKED: Why = "a lane-mask join of an untracked mask";
                 // Data joined with masks where the wave takes one edge (the BVH
                 // walks pop masks from memory): with console lanes the lane's
                 // own bit of the number, as `Atom::Opaque`.
                 let number = self.console_lanes && !self.x.native.wave64 && self.uniform_join(b);
-                // Console flow: every lane arrives by every edge, so a join
-                // also takes masks that are constants or built from scalars.
-                let other = self.console_cf.then(|| self.x.st.other.get(&arg)).flatten();
                 let x = match (self.x.st.masks.get(&arg).or(other), self.vals.get(&arg)) {
                     (Some(&m), _) => self.boolean(m, qb).map_err(|w| unsupported(offset, w))?,
-                    (None, Some(&Val::I32(word))) if number => self.lane_bit(qb, word, None).map_err(|w| unsupported(offset, w))?,
+                    (None, Some(&Val::I32(word))) if number => {
+                        self.lane_bit(qb, word, None).map_err(|w| unsupported(offset, w))?
+                    }
                     (None, _) if !self.uniform_join(b) && self.no_mask_lane_on_edge(b, &phi.args, n) => {
                         self.s.m.bool(false)
                     }
@@ -11788,7 +11790,6 @@ impl<'a> Lower<'a> {
 }
 
 #[cfg(test)]
-#[path = "lower_tests.rs"]
 mod tests;
 
 #[cfg(test)]

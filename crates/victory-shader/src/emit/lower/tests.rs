@@ -1,9 +1,4 @@
-//! Tests of `lower`, a child module of it (kept in their own file so that
-//! `lower.rs` stays under the asset policy's file-size limit).
-
-use super::{
-    Lowered, Numeric, Parts, buffer_format, code_table_start, half_shift, lower, packed_half,
-};
+use super::{Lowered, Numeric, Parts, buffer_format, code_table_start, half_shift, lower, packed_half};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -36,26 +31,14 @@ fn the_code_table_starts_after_the_instructions() {
     assert_eq!(code_table_start(&p, &[&fixed_after], 12), 12);
 }
 
-/// Whether a synthetic compute program translates with these input registers:
-/// as `emit` lowers it, in the console flow where the per-lane form asks for
-/// it ([`super::CONSOLE_FLOW`]), else per lane.
+/// Whether a synthetic compute program translates with these input registers.
 fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
-    match lowers_as(words, rsrc2, false, false) {
-        Err(crate::ShaderError::Unsupported { what, .. }) if what == super::CONSOLE_FLOW => {
-            lowers_as(words, rsrc2, true, false)
-                .or_else(|e| lowers_as(words, rsrc2, false, true).map_err(|_| e))
-        }
-        result => result,
-    }
+    lowers_as(words, rsrc2, false)
 }
 
-/// [`lowers`] in one form: the console flow, or the per-lane form only.
-fn lowers_as(
-    words: &[u32],
-    rsrc2: u32,
-    console_cf: bool,
-    per_lane_only: bool,
-) -> Result<(), crate::ShaderError> {
+/// [`lowers`], kept to the per-lane form with `per_lane_only` (what
+/// `emit` falls back to when the console flow cannot lower a program).
+fn lowers_as(words: &[u32], rsrc2: u32, per_lane_only: bool) -> Result<(), crate::ShaderError> {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -73,15 +56,10 @@ fn lowers_as(
     let st = structure::structure(&p).unwrap();
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
     let io = io::raise(&p, &native).unwrap();
-    let console = if console_cf {
-        Some(structure::structure_console(&p)?)
-    } else {
-        None
-    };
     lower(&Parts {
         native: &native,
         p: &p,
-        st: console.as_ref().unwrap_or(&st),
+        st: &st,
         io: &io,
         res: &res,
         inputs: vec![],
@@ -89,7 +67,7 @@ fn lowers_as(
         prims: vec![],
         mesh_stride: 0,
         target: super::super::Target::ANY,
-        console_cf,
+        console_cf: false,
         per_lane_only,
         view_marks: false,
     })
@@ -142,7 +120,7 @@ fn lower_wave(
         outputs: vec![],
         prims: vec![],
         mesh_stride: 0,
-        target: super::super::Target::ANY,
+        target: crate::emit::Target::ANY,
         console_cf: false,
         per_lane_only: false,
         view_marks: false,
@@ -210,11 +188,16 @@ fn vop3_conversion_modifiers_affect_the_lowering() {
         (0x0B, 1 << 8, 0, "abs"),
         (0x0B, 0, 1 << 29, "neg"),
     ] {
-        let vop1 = lower_valu(&[0x7E00_0000 | op << 9 | 0x101]).unwrap().dxil;
+        let vop1 = lower_valu(&[0x7E00_0000 | op << 9 | 0x101])
+            .unwrap()
+            .dxil;
         let vop3 = |first: u32, second: u32| {
-            lower_valu(&[0xD400_0000 | (0x180 + op) << 16 | first, 0x101 | second])
-                .unwrap()
-                .dxil
+            lower_valu(&[
+                0xD400_0000 | (0x180 + op) << 16 | first,
+                0x101 | second,
+            ])
+            .unwrap()
+            .dxil
         };
         assert_eq!(vop1, vop3(0, 0), "VOP1/VOP3 control for op {op:#x}");
         assert_ne!(
@@ -249,14 +232,8 @@ fn sums_of_absolute_differences_lower() {
 fn buffer_cache_invalidations_lower_as_no_ops() {
     // MUBUF opcode 0x071/0x072 with no data operand: the title asks the
     // host to invalidate its cached view of a buffer.
-    assert!(
-        lowers(&[0xE1C4_0000, 0, S_ENDPGM], 0).is_ok(),
-        "buffer_gl0_inv"
-    );
-    assert!(
-        lowers(&[0xE1C8_0000, 0, S_ENDPGM], 0).is_ok(),
-        "buffer_gl1_inv"
-    );
+    assert!(lowers(&[0xE1C4_0000, 0, S_ENDPGM], 0).is_ok(), "buffer_gl0_inv");
+    assert!(lowers(&[0xE1C8_0000, 0, S_ENDPGM], 0).is_ok(), "buffer_gl1_inv");
 }
 
 #[test]
@@ -300,11 +277,11 @@ fn v_cndmask_accepts_uniform_and_constant_masks() {
         0xBF06_8000u32, // s_cmp_eq_u32 s0, 0
         0x8500_80C1,    // s_cselect_b32 s0, -1, 0
         0xD501_0001,
-        0x0001_0080, // v_cndmask_b32 v1, 0, 1, s0
+        0x0001_0080,    // v_cndmask_b32 v1, 0, 1, s0
         0xD501_0002,
-        0x0201_02C1, // v_cndmask_b32 v2, 1, v1, -1
+        0x0201_02C1,    // v_cndmask_b32 v2, 1, v1, -1
         0xD834_0000,
-        0x0000_0200, // ds_write_b32 v0, v2
+        0x0000_0200,    // ds_write_b32 v0, v2
         S_ENDPGM,
     ];
     lowers(&words, 0x8001).unwrap();
@@ -948,10 +925,9 @@ fn a_scalar_result_needs_no_exec() {
         0xBEFE_0304, // s_mov_b32 exec_lo, s4
         S_ENDPGM,
     ];
-    lowers(&words, 1 << 7).expect("a lane read under an EXEC with no mask");
-    // The lane read in a branch lanes take differently asks for the console
-    // flow (#320); the per-lane form, its fallback, lowers it too.
-    lowers_as(&words, 1 << 7, false, true).expect("the per-lane form");
+    // A `v_readlane` past a per-lane branch asks for the console flow
+    // first (#439); the per-lane form is what this test is about.
+    lowers_as(&words, 1 << 7, true).expect("a lane read under an EXEC with no mask");
 }
 
 #[test]
@@ -1002,7 +978,7 @@ fn guarded_or_modified_v_mov_b32_is_not_folded_as_constant() {
     // matching the compare after the join so s6 is live.
     let mut negated = [
         0xF490_0180,
-        0, // s_memtime s[6:7]
+        0,           // s_memtime s[6:7]
         0xD581_0001,
         0x2000_00F2, // v_mov_b32_e64 v1, -(1.0)
         0xBF06_8000, // s_cmp_eq_u32 s0, 0
@@ -1294,7 +1270,7 @@ fn ds_bpermute_wave64_preserves_32_lane_half() {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
-            target: super::super::Target::ANY,
+            target: crate::emit::Target::ANY,
             console_cf: false,
             per_lane_only: false,
             view_marks: false,
@@ -1331,6 +1307,29 @@ fn ds_bpermute_refuses_gds() {
     ));
 }
 
+#[test]
+fn a_latch_branches_back_to_one_header() {
+    let words = [
+        0xBE80_0380, // s_mov_b32 s0, 0
+        0xBF82_0007, // s_branch outer
+        0x8001_8101, // latch: s_add_u32 s1, s1, 1
+        0xBF06_8301, // s_cmp_eq_u32 s1, 3
+        0xBF85_0004, // s_cbranch_scc1 outer
+        0x8000_8100, // inner: s_add_u32 s0, s0, 1
+        0xBF06_8400, // s_cmp_eq_u32 s0, 4
+        0xBF85_0003, // s_cbranch_scc1 end
+        0xBF82_FFF9, // s_branch latch
+        0xBE81_0380, // outer: s_mov_b32 s1, 0
+        0xBF82_FFFA, // s_branch inner
+        S_ENDPGM,    // end
+    ];
+    let l = lower_with(&words, vec![], vec![]).unwrap();
+    let back = &l.back_edges;
+    assert!(back.iter().all(|b| b.len() <= 1), "{back:?}");
+    // Its own latch and the outer loop's.
+    assert_eq!(back.iter().filter(|b| !b.is_empty()).count(), 2);
+}
+
 /// MIMG `op vdata, v[vaddr..], s[srsrc..srsrc+7]` on a 2D image.
 const fn mimg_2d(op: u8, dmask: u8, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
     [
@@ -1341,8 +1340,6 @@ const fn mimg_2d(op: u8, dmask: u8, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2]
 
 #[test]
 fn an_image_read_as_float_and_by_an_atomic_is_annotated_twice() {
-    use crate::native::{ResourceType, RootParam, RootType, UsedResource};
-
     // One 2D image UAV from the descriptor table at s4, loaded (four
     // float channels) and then atomically minimised in the same block.
     let mut words = vec![
@@ -1423,31 +1420,4 @@ fn an_image_read_as_float_and_by_an_atomic_is_annotated_twice() {
         "the atomic's annotation: {:x?}",
         lowered.annotations
     );
-}
-
-/// A latch that branches back to both its loop's header and the outer
-/// loop's (the shape of a first-lane table offset loop) branches back to
-/// one header only: the outer back edge leaves through a latch of its own
-/// (dxil-spirv#380).
-#[test]
-fn a_latch_branches_back_to_one_header() {
-    let words = [
-        0xBE80_0380, // s_mov_b32 s0, 0
-        0xBF82_0007, // s_branch outer
-        0x8001_8101, // latch: s_add_u32 s1, s1, 1
-        0xBF06_8301, // s_cmp_eq_u32 s1, 3
-        0xBF85_0004, // s_cbranch_scc1 outer
-        0x8000_8100, // inner: s_add_u32 s0, s0, 1
-        0xBF06_8400, // s_cmp_eq_u32 s0, 4
-        0xBF85_0003, // s_cbranch_scc1 end
-        0xBF82_FFF9, // s_branch latch
-        0xBE81_0380, // outer: s_mov_b32 s1, 0
-        0xBF82_FFFA, // s_branch inner
-        S_ENDPGM,    // end
-    ];
-    let l = lower_with(&words, vec![], vec![]).unwrap();
-    let back = &l.back_edges;
-    assert!(back.iter().all(|b| b.len() <= 1), "{back:?}");
-    // Its own latch and the outer loop's.
-    assert_eq!(back.iter().filter(|b| !b.is_empty()).count(), 2);
 }
