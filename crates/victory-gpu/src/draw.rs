@@ -1918,14 +1918,15 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
             if let Some(a) = crate::resource::alias_source(*resource as This) {
                 crate::texture::alias_copy(list, a, *resource as This);
             }
-            // One host copy for the upload and the state: looked up once
-            // (each lookup takes the resource's lock), its flags kept.
-            if let Some(copy) = crate::resource::host_copy(*resource as This) {
+            // One host copy for the upload and the state, the list's own
+            // after its first read of the texture (no lock or count the
+            // threads reading it share), its flags kept.
+            list.with_host_copy(*resource as This, |copy| {
                 if copy.title_written() {
-                    crate::texture::upload_copy(list, *resource as This, &copy);
+                    crate::texture::upload_copy(list, *resource as This, copy);
                 }
-                crate::list::ensure_held_state(list, &copy, SHADER_RESOURCE);
-            }
+                crate::list::ensure_held_state(list, copy, SHADER_RESOURCE);
+            });
             #[cfg(feature = "diagnostics")]
             if let Some(t) = crate::resource::host_resource(*resource as This) {
                 // SAFETY: a live resource.
@@ -3023,6 +3024,110 @@ void main(uint3 id : SV_DispatchThreadID) {
         host.execute(&[&list]);
         assert!((texel() - 64.0 / 255.0).abs() < 1e-6, "made again with its bytes");
         assert_eq!(crate::texture::uploads(object), 1, "uploaded into the new one");
+    }
+
+    /// A list lends the host copy it read to its next reads only while it
+    /// is still the title texture's: given up and replaced (a render target
+    /// at its memory takes more uses) or the title texture released, the
+    /// next read takes the texture's copy now. Every copy the list read
+    /// stays alive until the list is reset, after its submission: a texture
+    /// released while a list reading it is recorded and in flight is read
+    /// by it all the same.
+    #[test]
+    fn a_list_lends_a_read_copy_only_while_it_is_the_textures() {
+        use std::sync::Arc;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let slots = Slots::new(2);
+        let read = compile_cs(READ);
+        let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
+        let address = crate::watch::tests::pool(3) as u64;
+        let object = texture_at_address(address, &texture_words(64, 64, 28, 0x100, 0));
+        // SAFETY: the texture's memory, 256-byte rows of 64 texels.
+        unsafe { std::ptr::write_bytes(address as *mut u8, 0x40, 64 * 64 * 4) };
+        let list = host.new_list().unwrap();
+        let lent = |t: This| list.with_host_copy(t, Arc::clone).expect("a host copy");
+        let first = lent(object);
+        assert!(
+            Arc::ptr_eq(&lent(object), &first),
+            "the same copy lent again"
+        );
+        // Only the list holds it from here.
+        let first = {
+            let held = Arc::downgrade(&first);
+            drop(first);
+            held
+        };
+        // Given up, and a render target at the same memory replaces the
+        // memory's host texture: the next read is of the new one.
+        assert!(
+            crate::resource::give_up_now(object),
+            "fed from title memory"
+        );
+        let target = texture_at_address(address, &texture_words(64, 64, 28, 0x100, 1));
+        let replaced = crate::resource::host_copy(target).expect("a host render target");
+        assert!(
+            !Arc::ptr_eq(&replaced, &first.upgrade().expect("held by the list")),
+            "replaced"
+        );
+        let now = lent(object);
+        assert!(
+            Arc::ptr_eq(&now, &replaced),
+            "the texture's copy now, not the one lent before"
+        );
+        assert!(Arc::ptr_eq(
+            &now,
+            &crate::resource::made_copy(object).unwrap()
+        ));
+        drop((now, replaced));
+        assert!(
+            first.upgrade().is_some(),
+            "the copy read first is held until the list is reset"
+        );
+        list.close();
+        list.reset();
+        assert!(first.upgrade().is_none(), "let go at the reset");
+        crate::object::release(target);
+        crate::object::release(object);
+        // A texture read by a recorded list, then released by the title
+        // before the list runs: the list reads it all the same.
+        let released = crate::watch::PAGE as u64 + address;
+        let object = texture_at_address(released, &texture_words(64, 64, 28, 0x100, 0));
+        // SAFETY: the texture's memory, 256-byte rows of 64 texels.
+        unsafe { std::ptr::write_bytes(released as *mut u8, 0x40, 64 * 64 * 4) };
+        let mut desc = [0u32; 10];
+        desc[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        let view = View::Shader(object as usize, Some(desc));
+        slots.make(0, &view);
+        let list = host.new_list().unwrap();
+        readable(&list, &used(ResourceType::Srv), &view, false);
+        readable(&list, &used(ResourceType::Srv), &view, false);
+        run(&list, &slots, &read, 0, Some(&out), (8, 8));
+        list.close();
+        let read_copy = Arc::downgrade(&crate::resource::made_copy(object).unwrap());
+        crate::object::release(object);
+        assert!(read_copy.upgrade().is_some(), "held by the recorded list");
+        host.execute(&[&list]);
+        // SAFETY: inside the mapped output.
+        let texel = unsafe { (data as *const [f32; 4]).read() }[0];
+        assert!(
+            (texel - 64.0 / 255.0).abs() < 1e-6,
+            "the released texture read: {texel}"
+        );
+        list.reset();
+        // Another title texture made where the released one's object was
+        // (often the same address): its own copy, never the one lent for the
+        // released texture.
+        let other = texture_at_address(
+            address + 2 * crate::watch::PAGE as u64,
+            &texture_words(32, 32, 28, 0x100, 0),
+        );
+        assert!(Arc::ptr_eq(
+            &lent(other),
+            &crate::resource::made_copy(other).unwrap()
+        ));
+        crate::object::release(other);
     }
 
     /// Textures brought up in one submission share staging space (parts
