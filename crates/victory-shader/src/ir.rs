@@ -466,8 +466,7 @@ fn unspill(
     let field = |code: u8| if code < PARKED { u32::from(code) } else { 0 };
     let mov = |wide: bool, dst: u8, src: u8| 0xBE80_0000 | field(dst) << 16 | (3 + u32::from(wide)) << 8 | field(src);
     const NOP: u32 = 0xBF80_0000;
-    // Per instruction: a move (wide, dst, src) in its place, or none (a nop).
-    type Move = (bool, u8, u8);
+    // Per instruction: a move in its place, or none (a nop).
     let mut edits: Vec<(usize, Option<Move>)> = webs.iter().flat_map(|w| w.edits(&parks)).collect();
     for (i, &park) in parks.iter().enumerate() {
         let Some((save, reg, code, lane)) = park else {
@@ -510,6 +509,9 @@ fn unspill(
 /// (save, VGPR, scalar code, lane).
 type Park = (bool, u8, u8, u32);
 
+/// A scalar move put in a parked save's or restore's place: (wide, dst, src).
+type Move = (bool, u8, u8);
+
 /// A pair of scalars saved into two lanes at some sites and restored from them at others,
 /// and nothing else of those lanes' content touches (see [`site_pairs`]). Its sites, as
 /// instruction indices: each save or restore of the first lane with the one of the second.
@@ -529,7 +531,7 @@ impl WebPair {
     /// The pair moves that stand for its sites, and the no-ops that take the other halves'
     /// places: a save moves the pair where its second half is saved, a restore where its
     /// first half is restored.
-    fn edits(&self, parks: &[Option<Park>]) -> Vec<(usize, Option<(bool, u8, u8)>)> {
+    fn edits(&self, parks: &[Option<Park>]) -> Vec<(usize, Option<Move>)> {
         let code_of = |i: usize| parks[i].map_or(0, |p| p.2);
         let mut edits = Vec::new();
         for &(first, second) in &self.saves {
