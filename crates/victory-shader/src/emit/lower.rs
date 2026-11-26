@@ -5496,28 +5496,44 @@ impl<'a> Lower<'a> {
             Source::Phi { block, args }
                 if sampler && matches!(args[..], [Source::Constant(_), Source::Constant(_)]) =>
             {
-                // One of two immediate samplers, chosen by uniform control
-                // flow: what reads it runs with both, the edge taken picks
-                // the result (static samplers cannot be indexed).
-                let [a, b] = &args[..] else {
+                let [Source::Constant(a), Source::Constant(b)] = &args[..] else {
                     unreachable!()
                 };
-                let ha = self.handle(site, a, sampler, props)?;
-                let hb = self.handle(site, b, sampler, props)?;
-                let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
-                let mut incoming = Vec::new();
-                for (j, &q) in self.x.p.blocks[*block].preds.iter().enumerate() {
-                    if self.block[q].is_none() {
-                        continue;
-                    }
-                    let tail = self.tail[q].ok_or("a descriptor chosen by control flow")?;
-                    let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
-                    incoming.push((self.s.m.bool(j == 0), at));
+                let word = |words: &Vec<u32>| -> Result<[u32; 4], Why> {
+                    words
+                        .get(..4)
+                        .and_then(|w| w.try_into().ok())
+                        .ok_or("a sampler constant")
+                };
+                let (a, b) = (word(a)?, word(b)?);
+                let preds = &self.x.p.blocks[*block].preds;
+                if preds.len() != args.len() {
+                    return Err("a descriptor chosen by control flow");
                 }
-                let phi = self.s.m.phi(join, self.s.t.i1);
-                self.s.m.set_phi(phi, incoming);
-                self.s.sampler_choices.push((ha, hb, phi));
-                Ok(ha)
+                // The static samplers of the range: both registered now, so
+                // they are consecutive whatever the program used before.
+                let lo = self.samplers.len();
+                self.samplers.push(a);
+                self.samplers.push(b);
+                if props.0 & 0x8000 != 0 {
+                    for n in lo..lo + args.len() {
+                        self.s.cmp_samplers |= 1 << n;
+                    }
+                }
+                // A path phi at the join: true for the lanes that came by
+                // the second predecessor. (`reach` would name a value from
+                // one predecessor, which does not dominate the join.)
+                let cond = self.s.m.phi(*block, self.s.t.i1);
+                let (one, zero) = (self.s.m.bool(true), self.s.m.bool(false));
+                self.s
+                    .m
+                    .set_phi(cond, vec![(one, preds[1]), (zero, preds[0])]);
+                let n = self.s.m.i32(lo as u32 + 1);
+                let n0 = self.s.m.i32(lo as u32);
+                let index = self.s.m.select(self.cur, cond, n, n0);
+                Ok(self
+                    .s
+                    .sampler_range_handle(self.cur, lo as u32, lo as u32 + 1, index))
             }
             Source::Phi { block, .. } => {
                 // One handle at the join for every access the choice reaches
@@ -10949,10 +10965,14 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lowered, Numeric, Parts, buffer_format, code_table_start, half_shift, lower, packed_half};
+    use super::{
+        Lower, Lowered, Numeric, Parts, buffer_format, code_table_start, half_shift, lower,
+        packed_half,
+    };
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
+    use crate::resource::Source;
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
@@ -12236,5 +12256,69 @@ mod tests {
             lowers(&words, 0),
             Err(crate::ShaderError::Unsupported { what: "GDS", .. })
         ));
+    }
+
+    /// A sampler chosen by control flow is one static sampler range with a
+    /// per-lane index, not two handles whose uses are duplicated.
+    #[test]
+    fn branch_phi_of_static_samplers_uses_one_range_handle() {
+        let code: Vec<u8> = [S_ENDPGM].iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15 | 2 << 1,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let mut p = ir::build(&native.code, false, 256).unwrap();
+        p.blocks[0].preds = vec![0, 0];
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let parts = Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            view_marks: false,
+        };
+        let bad = std::collections::HashMap::new();
+        let mut l = Lower::new(&parts, &bad);
+        let entry = l.s.entry;
+        l.block[0] = Some(entry);
+        l.tail[0] = Some(entry);
+        let src = Source::Phi {
+            block: 0,
+            args: vec![
+                Source::Constant(vec![1, 0, 0, 0]),
+                Source::Constant(vec![2, 0, 0, 0]),
+            ],
+        };
+        let _ = l.handle((0, 0), &src, true, (14 | 0x8000, 0)).unwrap();
+        assert_eq!(l.samplers.len(), 2);
+        assert_eq!(l.s.cmp_samplers, 0b11);
+        let calls = l.s.m.call_args("dx.op.createHandleFromBinding");
+        assert_eq!(calls.len(), 1);
+        let args = &calls[0];
+        let bind: Vec<i64> =
+            l.s.m
+                .aggregate_fields(args[1])
+                .unwrap()
+                .iter()
+                .map(|&v| l.s.m.int_value(v).unwrap())
+                .collect();
+        assert_eq!(bind, [0, 1, super::super::shader::SAMPLER_SPACE as i64, 3]);
+        assert!(l.s.m.int_value(args[2]).is_none());
+        assert_eq!(l.s.m.int_value(args[3]), Some(-1));
     }
 }
