@@ -24,7 +24,9 @@ world pipelines; use the GE-Proton11-14 DLLs.
 
 Install clang-cl, lld-link and llvm-lib, make an `xwin` splat of the MSVC CRT and
 Windows SDK (`xwin --accept-license splat --output ~/.xwin`: this accepts Microsoft's
-licence), and use the pinned Rust toolchain. The splat is only a build input; no host
+licence), and use the pinned Rust toolchain, whose `rust-toolchain.toml` names the
+`x86_64-pc-windows-msvc` target (`rustup target add x86_64-pc-windows-msvc` adds it to a
+toolchain that lacks it). The splat is only a build input; no host
 or game paths belong in the repository. Point the usual target variables at it:
 
 ```sh
@@ -39,7 +41,8 @@ cargo build --profile diag -p victory --features diagnostics --target x86_64-pc-
 ```
 
 `CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER=wine` is useful when running tests by hand.
-The `wine-test` xtask below sets these variables itself.
+The `wine-test` xtask below sets these variables itself; it comes from `#1218`, which is
+not merged.
 
 ## Prefix setup
 
@@ -50,7 +53,9 @@ Make a prefix of your own, turn off crash dialogs (otherwise a crashed test leav
 export WINEPREFIX=$PWD/target/wine-prefix
 wineboot -i
 wine reg add 'HKCU\Software\Wine\WineDbg' /v ShowCrashDialog /t REG_DWORD /d 0 /f
-cp "$GE/files/lib/wine/vkd3d-proton/x86_64-windows/"{d3d12.dll,d3d12core.dll} "$WINEPREFIX/drive_c/windows/system32/"
+cp "$GE/files/lib/wine/vkd3d-proton/x86_64-windows/d3d12.dll" \
+  "$GE/files/lib/wine/vkd3d-proton/x86_64-windows/d3d12core.dll" \
+  "$WINEPREFIX/drive_c/windows/system32/"
 cp "$GE/files/lib/wine/dxvk/x86_64-windows/dxgi.dll" "$WINEPREFIX/drive_c/windows/system32/"
 export WINEDLLOVERRIDES="d3d12,d3d12core,dxgi=n"
 ```
@@ -60,17 +65,28 @@ with `--vkd3d-proton <dir>` and `--dxvk <dir>`.
 
 ## Running the title
 
-Pick the GPU with its Vulkan ICD (`VK_DRIVER_FILES`) and, for DXVK,
-`DXVK_FILTER_DEVICE_NAME`. Set `VICTORY_CACHE_DIR` and `VICTORY_DATA_DIR` to writable
-folders outside the repository. Keep the title's executable path in Wine's `Z:` form.
-For example, one headless run:
+The title's code needs AVX2 ([the README's requirements](../README.md#getting-started));
+`victory run --execute` refuses to start without it. Pick the GPU with its Vulkan ICD
+(`VK_DRIVER_FILES`) and, for DXVK, `DXVK_FILTER_DEVICE_NAME`. Set `VICTORY_CACHE_DIR` and
+`VICTORY_DATA_DIR` to writable folders outside the repository. Keep the title's
+executable path in Wine's `Z:` form, and start from a working directory outside the
+repository too: vkd3d-proton writes `vkd3d-proton.cache` there. Check the paths with
+`wine "$VICTORY_EXE" config` (it exits nonzero when one violates the asset policy), then
+run. For example, one headless run:
 
 ```sh
+mkdir -p ~/victory-run && cd ~/victory-run   # vkd3d-proton's cache lands here
+VICTORY_EXE='Z:\path\to\repo\target\x86_64-pc-windows-msvc\diag\victory.exe'
+GAME_DIR='Z:\path\to\game'
+TITLE_EXE="$GAME_DIR\\<the title's exe>"
+export VICTORY_GAME_DIR="$GAME_DIR"
+export VICTORY_CACHE_DIR='Z:\path\to\cache' VICTORY_DATA_DIR='Z:\path\to\data'
 export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json
 export DXVK_FILTER_DEVICE_NAME="RTX 5090" WINEDEBUG=-all
+wine "$VICTORY_EXE" config
 gamescope --backend headless -W 1920 -H 1080 -w 1920 -h 1080 \
   --prefer-vk-device 10de:2b85 -- \
-  sh -c 'wine "$0" run "$1" --execute' "$VICTORY_EXE" "$GAME_DIR\game_scarlett_master.exe"
+  sh -c 'wine "$0" run "$1" --execute' "$VICTORY_EXE" "$TITLE_EXE"
 ```
 
 `--prefer-vk-device` takes your GPU's PCI id; omit it if the ICD selects the right
@@ -144,12 +160,19 @@ user's `~/.wine` alone. With both DLL sets:
 cargo xtask wine-test \
   --vkd3d-proton "$GE/files/lib/wine/vkd3d-proton/x86_64-windows" \
   --dxvk "$GE/files/lib/wine/dxvk/x86_64-windows" \
-  -- -p victory-gpu --lib
+  -- -p victory-gpu --lib resource:: -- \
+  --skip resource::tests::a_list_waiting_for_another_queues_write_reads_what_it_wrote
 ```
 
-Arguments after `--` replace the defaults (`--workspace --exclude xtask --no-fail-fast`).
-The runner also builds the loader's `hle-probe` fixture for the test that cannot start
-cargo from inside Wine.
+Arguments after `--` replace the defaults (`--workspace --exclude xtask --no-fail-fast`);
+the module filter and the skip above go straight to `cargo test`. The runner also builds
+the loader's `hle-probe` fixture for the test that cannot start cargo from inside Wine.
+
+DXIL validation needs a Windows SDK's `dxil.dll`, which a Wine prefix does not have:
+point `VICTORY_DXIL` at an x64 copy in `Z:` form ([the README's Windows shader-test
+validator](../README.md#windows-shader-test-validator)). Without it `translate --validate`
+cannot load a validator and the tests that use one skip their validation; the translated
+shaders do not need it at runtime.
 
 Known Wine/vkd3d-proton gaps and the fixes to look for (states as of 2026-11-26):
 
