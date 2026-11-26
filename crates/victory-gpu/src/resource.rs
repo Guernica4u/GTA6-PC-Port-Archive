@@ -1306,6 +1306,20 @@ thread_local! {
     static OUT_OF_MEMORY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+#[cfg(windows)]
+thread_local! {
+    /// [`Resource::host`] gave nothing on this thread because the host had
+    /// no memory for the texture (now, or within the wait that follows).
+    static REFUSED_FOR_MEMORY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a host texture was asked for on this thread, since the last
+/// call, and not made for want of memory: it is asked for again later.
+#[cfg(windows)]
+pub(crate) fn take_refused_for_memory() -> bool {
+    REFUSED_FOR_MEMORY.take()
+}
+
 #[cfg(all(windows, test))]
 thread_local! {
     /// The error the next committed texture [`make_texture`] makes fails with.
@@ -1530,6 +1544,7 @@ impl Resource {
             return made;
         }
         if now_ms() < self.refused_until.load(Relaxed) {
+            REFUSED_FOR_MEMORY.set(true);
             return None;
         }
         // Made without the lock held (`shared_texture` takes the memory
@@ -1547,6 +1562,7 @@ impl Resource {
                 tracing::warn!(desc = ?self.desc, "no host texture: out of memory, asked for again later");
             }
             self.refused_until.store(now_ms().saturating_add(retry_wait(n)), Relaxed);
+            REFUSED_FOR_MEMORY.set(true);
             return None;
         }
         self.out_of_memory.store(0, Relaxed);
@@ -2533,6 +2549,55 @@ mod tests {
         wait(RETRY_MS + margin);
         assert_eq!(ask(out, E_INVALIDARG), (false, false), "refused for good");
         assert_eq!(slot::<Release>(out, 0x10)(out), 0);
+    }
+
+    /// A heap slot left null because the host had no memory for its texture
+    /// has its next read marked again: a slot shaders only read through the
+    /// heap is made then (its one read mark went on the null view). One left
+    /// null for another refusal is not.
+    #[cfg(windows)]
+    #[test]
+    fn a_slot_left_null_for_want_of_memory_is_read_again() {
+        use windows::Win32::Foundation::{E_INVALIDARG, E_OUTOFMEMORY};
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 64, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), 0);
+        let title_heap = crate::descriptor::heap(heap);
+        let host = title_heap.host().expect("a host view heap");
+        // Depth with a clear value: committed, where the failure is injected
+        // (as in `a_texture_refused_for_want_of_memory_is_made_later`).
+        const D32_FLOAT: u32 = 40;
+        const R32_FLOAT: u32 = 41;
+        let clear = [D32_FLOAT, 1.0f32.to_bits(), 0, 0, 0];
+        let desc = ResourceDesc { flags: DEPTH, ..texture(64, 64, D32_FLOAT, 1) };
+        // A 2D shader view of its one level (the union starts at word 4).
+        let view: [u32; 10] = [R32_FLOAT, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0];
+        for (index, error, again) in [(61u32, E_OUTOFMEMORY, true), (62, E_INVALIDARG, false)] {
+            let mut out = null;
+            assert_eq!(
+                create_committed(null, &PROPERTIES, 0, &desc, 0, clear.as_ptr().cast(), &RESOURCE_IIDS[0], &mut out),
+                S_OK
+            );
+            let at = title_heap.start + u64::from(index) * 32;
+            FAIL_NEXT.set(Some(error));
+            crate::descriptor::create_srv(null, out, &view, at);
+            let _ = host.mirror(index, at, true);
+            assert_eq!(FAIL_NEXT.get(), None, "the failure was not injected");
+            assert!(!host.kept(index), "{error:?}: left null");
+            assert_eq!(crate::shadow::forgotten(index), again, "{error:?}: its next read marked again");
+            if again {
+                std::thread::sleep(std::time::Duration::from_millis(RETRY_MS + RETRY_MS / 3));
+                let _ = host.mirror(index, at, true);
+                assert!(host.kept(index), "made for the read after the wait");
+            }
+        }
+        // SAFETY: a plain query.
+        assert!(unsafe { crate::host::host().unwrap().device.GetDeviceRemovedReason() }.is_ok());
     }
 
     /// Host textures the GPU writes (render target, depth, unordered access)
