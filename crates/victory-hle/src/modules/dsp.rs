@@ -164,6 +164,33 @@ pub extern "system" fn XDspActivate(
         channels,
         "audio DSP stream activated"
     );
+    let convolver = if kind == CONVOLUTION {
+        // `ir_floats` is one channel's length; a stereo IR holds one per
+        // channel (JMAN730/project-flamingo 645abbeb).
+        let stereo_ir = options & STEREO_IR != 0;
+        let len = desc.ir_floats as usize * if stereo_ir { channels as usize } else { 1 };
+        // SAFETY: `valid` checked the pointer; the title's IR holds
+        // `ir_floats` floats per IR channel and stays alive in title memory
+        // for the stream's lifetime (the console copies it here).
+        let ir = unsafe { std::slice::from_raw_parts(desc.ir, len) };
+        match Convolver::new(
+            ir,
+            desc.ir_floats as usize,
+            frames as usize,
+            channels as usize,
+            stereo_ir,
+        ) {
+            Some(convolver) => Some(convolver),
+            None => {
+                tracing::warn!(ir_floats = { desc.ir_floats }, frames, channels, options, "audio DSP convolution stream refused");
+                return E_INVALIDARG;
+            }
+        }
+    } else {
+        None
+    };
+    // Reserve the stream only once it can be made, so a refused activation
+    // does not hold a slot.
     {
         // SAFETY: a connection from `XDspConnectWithMaximumStreamLimit`.
         let dsp = unsafe { &*dsp };
@@ -173,24 +200,6 @@ pub extern "system" fn XDspActivate(
         }
         *active += 1;
     }
-    let convolver = if kind == CONVOLUTION {
-        // SAFETY: `valid` checked the pointer and length; the IR stays alive
-        // in title memory for the stream's lifetime (the console copies it
-        // here).
-        let ir = unsafe { std::slice::from_raw_parts(desc.ir, desc.ir_floats as usize) };
-        match Convolver::new(
-            ir,
-            desc.ir_floats as usize,
-            frames as usize,
-            channels as usize,
-            options & STEREO_IR != 0,
-        ) {
-            Some(convolver) => Some(convolver),
-            None => return E_INVALIDARG,
-        }
-    } else {
-        None
-    };
     let new = Box::new(Stream {
         dsp,
         frames: desc.frames,
@@ -256,6 +265,14 @@ pub extern "system" fn XDspSubmitCommand(
                 stream.deinterleaved,
                 stream.deinterleaved,
             );
+            if written {
+                // shortcut: an IR in a layout not seen yet must not blast the
+                // mix (one NaN in it makes every sample infinite). NaN and
+                // infinity become silence, the rest is held to [-1, 1].
+                for s in output.iter_mut() {
+                    *s = if s.is_finite() { s.clamp(-1.0, 1.0) } else { 0.0 };
+                }
+            }
         }
         if !written {
             // SAFETY: the title's output buffer holds one block.

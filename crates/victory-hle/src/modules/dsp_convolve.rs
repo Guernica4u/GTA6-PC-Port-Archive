@@ -131,9 +131,20 @@ impl Convolver {
         }
         let fft_len = block * 2;
         let pairs = ir_floats / 2;
-        let blocks = pairs / block;
+        let mut blocks = pairs / block;
         if blocks == 0 || ir.len() < ir_floats * if stereo_ir { channels } else { 1 } {
             return None;
+        }
+        // The title's IRs end in one partition that is not a filter: it
+        // starts with the word 0xfffface1 (not a number as a float), seen in
+        // every IR of build 1.0.2.1, 2,048 floats before `ir_floats` ends.
+        // The filter is the partitions before the first such one.
+        let ends = |at: usize| ir.get(at).is_some_and(|v| v.to_bits() == 0xffff_ace1 || !v.is_finite());
+        if let Some(first) = (0..blocks).find(|&filter| ends(filter * block * 2)) {
+            blocks = first;
+            if blocks == 0 {
+                return None;
+            }
         }
         let mut filters = Vec::new();
         for channel in 0..channels {
@@ -145,13 +156,29 @@ impl Convolver {
                 let stored = &ir[at..at + block * 2];
                 let mut spectrum = vec![Complex::default(); fft_len];
                 for (bin, pair) in stored.as_chunks::<2>().0.iter().enumerate() {
-                    spectrum[bin] = Complex::new(pair[0], pair[1]);
+                    // A stray word that is not a number would make every
+                    // output sample infinite: it counts as zero.
+                    let clean = |v: f32| if v.is_finite() { v } else { 0.0 };
+                    spectrum[bin] = Complex::new(clean(pair[0]), clean(pair[1]));
                 }
                 // Bin `block` (Nyquist) was not stored; the upper half is
                 // the conjugate mirror of the lower half.
                 for bin in 1..block {
                     spectrum[fft_len - bin] = spectrum[bin].conj();
                 }
+                // The title's partitions are windows of 2 * `block` samples
+                // a `block` apart (each one's second half is the next one's
+                // first: measured on build 1.0.2.1's IRs). The overlap-add
+                // below wants `block` samples zero-padded: keep the first
+                // half of each window, the next partition holds the rest.
+                fft(&mut spectrum, true);
+                for sample in &mut spectrum[block..] {
+                    *sample = Complex::default();
+                }
+                for sample in &mut spectrum[..block] {
+                    *sample = Complex::new(sample.re, 0.0);
+                }
+                fft(&mut spectrum, false);
                 per_block.push(spectrum);
             }
             filters.push(per_block);
@@ -400,5 +427,54 @@ mod tests {
         let short = Vec::new();
         let mut output = Vec::new();
         assert!(!convolver.process(&short, &mut output, [1.0, 1.0], false, false));
+    }
+
+    /// The IR as build 1.0.2.1 of the title hands it over: partition `k`
+    /// is the spectrum of `time[k * block..k * block + 2 * block]` (2-block
+    /// windows a block apart), and one last partition starts with the word
+    /// 0xfffface1.
+    fn title_ir(time: &[f32], block: usize) -> Vec<f32> {
+        let blocks = time.len() / block;
+        let mut out = Vec::with_capacity((blocks + 1) * block * 2);
+        for block_index in 0..blocks {
+            let mut spectrum = vec![Complex::default(); block * 2];
+            for (i, slot) in spectrum.iter_mut().enumerate() {
+                let sample = time.get(block_index * block + i).copied().unwrap_or(0.0);
+                *slot = Complex::new(sample, 0.0);
+            }
+            fft(&mut spectrum, false);
+            for value in &spectrum[..block] {
+                out.push(value.re);
+                out.push(value.im);
+            }
+        }
+        let mut trailer = vec![0.0f32; block * 2];
+        trailer[0] = f32::from_bits(0xffff_ace1);
+        out.extend(trailer);
+        out
+    }
+
+    #[test]
+    fn the_title_s_ir_layout_convolves_exactly() {
+        const BLOCK: usize = 512;
+        let ir: Vec<f32> = (0..BLOCK * 3).map(|i| ((i * 7919) % 97) as f32 / 97.0 - 0.5).collect();
+        let input: Vec<f32> = (0..BLOCK * 6).map(|i| ((i * 104_729) % 89) as f32 / 89.0 - 0.5).collect();
+        let encoded = title_ir(&ir, BLOCK);
+        let mut convolver = Convolver::new(&encoded, encoded.len(), BLOCK, 1, false).unwrap();
+        let mut output = vec![0.0f32; input.len()];
+        for (block_index, chunk) in input.chunks(BLOCK).enumerate() {
+            assert!(convolver.process(
+                chunk,
+                &mut output[block_index * BLOCK..(block_index + 1) * BLOCK],
+                [1.0, 1.0],
+                false,
+                false,
+            ));
+        }
+        let reference = direct(&input, &ir);
+        for (i, (got, want)) in output.iter().zip(&reference).enumerate() {
+            assert!(got.is_finite(), "sample {i} is not finite");
+            assert!((got - want).abs() < 2e-3, "sample {i}: {got} against {want}");
+        }
     }
 }
