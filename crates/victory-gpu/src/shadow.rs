@@ -413,7 +413,7 @@ impl Shadow {
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if back && from < to {
+        if back && from < to && !segments.is_empty() {
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::CompareUs);
             // By 64 KiB piece: the copy compared with its bytes before the
@@ -425,15 +425,56 @@ impl Shadow {
             let mut seg_idx = segments.partition_point(|(at, bytes)| at + bytes.len() <= from);
             let mut at = from;
             while at < to && seg_idx < segments.len() {
-                let piece_len = (PIECE - (start + at) % PIECE).min(to - at);
-                let piece_end = at + piece_len;
+                let piece_start = at;
+                let piece_len = (PIECE - (start + piece_start) % PIECE).min(to - piece_start);
+                let piece_end = piece_start + piece_len;
                 // A whole piece is compared once per submission, whichever
                 // declared ranges overlap it: then what the GPU wrote there
                 // went back.
-                if piece_len == PIECE && !compared.insert(start + at) {
+                if piece_len == PIECE && !compared.insert(start + piece_start) {
                     at = piece_end;
                     continue;
                 }
+                // Check if any segment inside this piece differs from its snapshot.
+                let mut any_diff = false;
+                let mut probe_idx = seg_idx;
+                let mut probe_at = piece_start;
+                while probe_at < piece_end && probe_idx < segments.len() {
+                    let (taken, before) = &segments[probe_idx];
+                    if *taken >= piece_end {
+                        break;
+                    }
+                    if *taken > probe_at {
+                        probe_at = *taken;
+                    }
+                    let seg_end = taken + before.len();
+                    if probe_at >= seg_end {
+                        probe_idx += 1;
+                        continue;
+                    }
+                    let n = (piece_end - probe_at).min(seg_end - probe_at);
+                    // SAFETY: inside the mapping; only the submitting thread writes it.
+                    let host = unsafe { std::slice::from_raw_parts(self.data.add(probe_at), n) };
+                    let old = &before[probe_at - taken..probe_at - taken + n];
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
+                    if host != old {
+                        any_diff = true;
+                        break;
+                    }
+                    probe_at += n;
+                }
+                if !any_diff {
+                    while seg_idx < segments.len() && segments[seg_idx].0 + segments[seg_idx].1.len() <= piece_end {
+                        seg_idx += 1;
+                    }
+                    at = piece_end;
+                    continue;
+                }
+                // Merge every segment in the piece so concurrent title writes
+                // in untouched sibling segments are pulled into `self.data`
+                // before `t.taken` marks the whole 64 KiB page clean.
+                let mut piece_synced = 0;
                 while at < piece_end && seg_idx < segments.len() {
                     let (taken, before) = &segments[seg_idx];
                     if *taken >= piece_end {
@@ -453,9 +494,7 @@ impl Shadow {
                     let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                     let old = &before[at - taken..at - taken + n];
                     let title = &mut title[..n];
-                    #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
-                    if host != old && crate::host::read_into((start + at) as *const u8, title) {
+                    if crate::host::read_into((start + at) as *const u8, title) {
                         // Title memory with the GPU's bytes put in; the copy
                         // takes the title's bytes in turn.
                         if merge_writeback(title, host, old) {
@@ -463,9 +502,12 @@ impl Shadow {
                             crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                             written += n;
                         }
-                        synced.push((start + at) / PAGE);
+                        piece_synced += n;
                     }
                     at += n;
+                }
+                if piece_len == PIECE && piece_synced == PIECE {
+                    synced.push((start + piece_start) / PAGE);
                 }
                 at = piece_end;
             }
@@ -1728,6 +1770,37 @@ pub(crate) mod tests {
         unsafe { title(PAGE - 4).write_volatile(0x77) };
         assert_eq!(copy.copy_back(p, PAGE), 0);
         assert_eq!(read(PAGE - 4), 0x77);
+        unregister(p, p as u64);
+    }
+
+    /// Splitting one 64 KiB page across two snapshot segments must still merge
+    /// concurrent title writes in an untouched sibling segment when another
+    /// segment in the same page differs from its snapshot.
+    #[test]
+    fn partial_page_merge_preserves_concurrent_title_writes_across_sibling_segments() {
+        let p = crate::watch::tests::pool(1);
+        register(p, p as u64, PAGE as u64);
+        let Some(copy) = find(p as u64, PAGE as u64) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        copy.update(p, PAGE);
+        copy.writing(p, PAGE / 2, false);
+        copy.writing(p, PAGE, false);
+        copy.write_host((p + 0x10) as u64, &[0xaa, 0, 0, 0]);
+        // SAFETY: dword inside our pool.
+        unsafe { ((p + 0x9000) as *mut u32).write_volatile(0xbbbb_bbbb) };
+        copy.copy_back(p, PAGE);
+        assert!(copy.clean());
+        copy.update(p, PAGE);
+        // SAFETY: dwords inside our pool.
+        let t0 = unsafe { ((p + 0x10) as *const u32).read_volatile() };
+        // SAFETY: dword inside our pool.
+        let t1 = unsafe { ((p + 0x9000) as *const u32).read_volatile() };
+        let h0 = copy.read_host((p + 0x10) as u64, 4)[0];
+        let h1 = copy.read_host((p + 0x9000) as u64, 4)[0];
+        assert_eq!((t0, t1), (0xaa, 0xbbbb_bbbb));
+        assert_eq!((h0, h1), (0xaa, 0xbbbb_bbbb));
         unregister(p, p as u64);
     }
 }
