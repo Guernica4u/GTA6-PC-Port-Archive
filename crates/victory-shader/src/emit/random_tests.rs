@@ -2,7 +2,8 @@
 //! structurisation with bounded relative moves (`range`), resource
 //! tracking, I/O and DXIL emission. Each program translates or is refused
 //! with a reason, and a program that translates translates to the same
-//! bytes again.
+//! bytes again. Half the programs are made with write marks (odd seeds),
+//! as the title's pipelines are, half without.
 //!
 //! The title translates its shaders when it creates pipelines, in its own
 //! process: a panic in any of these stages ends the title, and translation
@@ -481,12 +482,12 @@ enum Outcome {
 
 /// The stages in the order and with the inputs [`super::translate_with`]
 /// gives them.
-fn translate(native: &NativeProgram, c: &Container) -> Outcome {
+fn translate(native: &NativeProgram, c: &Container, options: super::Options) -> Outcome {
     let run = || -> Result<super::HostShader, crate::ShaderError> {
         let (p, st) = range::build(&native.patched_code(), native.wave64, native.vgprs)?;
         let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
         let io = io::raise(&p, native)?;
-        super::emit(c, native, &p, &st?, &io, &res)
+        super::emit_with(c, native, &p, &st?, &io, &res, options)
     };
     match run() {
         Ok(host) => Outcome::Translated(host),
@@ -536,7 +537,12 @@ fn random_programs_translate_or_are_refused_the_same_way_every_time() {
         let native = program(seed);
         let bytes = container(seed, native.stage);
         let c = Container::parse(&bytes).unwrap();
-        let once = || std::panic::catch_unwind(|| translate(&native, &c));
+        // Odd seeds with write marks, as the title's pipelines are made
+        // (`victory-gpu`'s shader cache), even ones without, as `translate`.
+        let options = super::Options {
+            view_marks: seed % 2 == 1,
+        };
+        let once = || std::panic::catch_unwind(|| translate(&native, &c, options));
         let why = match (once(), once()) {
             (Ok(a), Ok(b)) if a == b => {
                 translated += u32::from(matches!(a, Outcome::Translated(_)));
