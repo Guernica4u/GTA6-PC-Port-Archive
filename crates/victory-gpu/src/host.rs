@@ -1828,6 +1828,8 @@ impl HostList {
         if let Some(Some(twin)) = copy.twin.get()
             && crate::twin::route(self, &copy, twin, wanted)
         {
+            // The twin's side moved: a later draw must be ensured again.
+            self.states_generation.fetch_add(1, Ordering::Relaxed);
             return None;
         }
         let wanted = legal_state(&copy.texture, wanted);
@@ -1848,9 +1850,9 @@ impl HostList {
     /// list's first use (its prelude moves the texture there).
     fn track(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) -> Option<u32> {
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        self.states_generation.fetch_add(1, Ordering::Relaxed);
         match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
+                self.states_generation.fetch_add(1, Ordering::Relaxed);
                 copy.note_used();
                 if !self.ours.load(Ordering::Relaxed) {
                     copy.stamp();
@@ -1860,7 +1862,14 @@ impl HostList {
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
-                (before != wanted).then_some(before)
+                // Only a real move counts: an entry already at `wanted` leaves
+                // the generation alone, so a draw's targets stay ensured.
+                if before != wanted {
+                    self.states_generation.fetch_add(1, Ordering::Relaxed);
+                    Some(before)
+                } else {
+                    None
+                }
             }
         }
     }

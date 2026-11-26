@@ -613,7 +613,10 @@ impl State {
             if self.depth != 0 {
                 crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE);
             }
-            self.ensured = Some((self.targets.clone(), self.depth, generation));
+            // The generation after the loop: what the loop itself moved is
+            // now recorded, so the next draw with the same targets sees it
+            // unchanged and skips.
+            self.ensured = Some((self.targets.clone(), self.depth, list.states_generation()));
         }
         // A depth copy of ours (`crate::twin`) ran a compute pipeline.
         if list.take_rebind() {
