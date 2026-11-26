@@ -1392,18 +1392,39 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     }
     if texture.is_none() {
         castable_formats.clear();
-        // SAFETY: the description has the host layout (checked size, same
-        // fields); the out pointer is ours.
-        let made = unsafe {
-            host.device.CreateCommittedResource(
-                &heap,
-                D3D12_HEAP_FLAG_NONE,
-                std::ptr::from_ref(d).cast(),
-                D3D12_RESOURCE_STATES(initial as i32),
-                clear_value,
-                &mut texture,
-            )
-        };
+        // The ladder: what the title asked for, then without the initial
+        // state, then without the clear value, then without either. What the
+        // host refuses is often one of those two and not the description
+        // (#1758, #1755), and every rung here keeps the description's
+        // permissions: a texture made without `ALLOW_RENDER_TARGET` takes no
+        // render target view, which loses the draw further down instead of
+        // here (`Host::rtv` binds a null view for the case that does happen).
+        let mut made = Ok(());
+        for (try_state, with_clear) in [(initial, true), (0, true), (initial, false), (0, false)] {
+            // SAFETY: the description has the host layout (checked size, same
+            // fields); the out pointer is ours.
+            made = unsafe {
+                host.device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    std::ptr::from_ref(d).cast(),
+                    D3D12_RESOURCE_STATES(try_state as i32),
+                    if with_clear { clear_value } else { None },
+                    &mut texture,
+                )
+            };
+            if made.is_ok() {
+                initial = try_state;
+                break;
+            }
+            tracing::debug!(
+                error = %made.as_ref().unwrap_err(),
+                state = try_state,
+                clear = with_clear,
+                desc = ?d,
+                "a rung the host refused"
+            );
+        }
         if let Err(e) = made {
             tracing::warn!(error = %e, desc = ?d, "no host texture");
         }
