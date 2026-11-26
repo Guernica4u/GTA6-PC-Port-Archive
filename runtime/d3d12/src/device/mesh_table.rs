@@ -18,6 +18,31 @@ pub(super) fn reflected(
     pixel: Option<&[u8]>,
     node: u32,
 ) -> Result<Option<Arc<ComputeTable>>> {
+    build(device, original, mesh, pixel, node, &[])
+}
+
+/// The mesh table with `samplers` appended as static samplers of both the host
+/// root and the root the pixel stage is translated against. Used when the
+/// pixel program builds a literal sampler the title's root leaves out.
+pub(super) fn reflected_with_samplers(
+    device: &ID3D12Device,
+    original: &RootSource,
+    mesh: &[u8],
+    pixel: Option<&[u8]>,
+    node: u32,
+    samplers: &[[u32; 13]],
+) -> Result<Option<Arc<ComputeTable>>> {
+    build(device, original, mesh, pixel, node, samplers)
+}
+
+fn build(
+    device: &ID3D12Device,
+    original: &RootSource,
+    mesh: &[u8],
+    pixel: Option<&[u8]>,
+    node: u32,
+    extra: &[[u32; 13]],
+) -> Result<Option<Arc<ComputeTable>>> {
     let Ok(root) = parse_rts0(original.payload()) else {
         return Ok(None);
     };
@@ -37,7 +62,7 @@ pub(super) fn reflected(
             _ => None,
         })
         .collect();
-    if layout.replacements.is_empty() && pixel_tables.is_empty() {
+    if layout.replacements.is_empty() && pixel_tables.is_empty() && extra.is_empty() {
         return Ok(None);
     }
     let mesh_rewritten: Vec<usize> = layout.replacements.keys().copied().collect();
@@ -118,11 +143,39 @@ pub(super) fn reflected(
         let reader = reader.ok_or(E_POINTER)?;
         let mut desc = *reader.GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1)?;
         let source = desc.Anonymous.Desc_1_1;
-        if source.NumParameters as usize != root.params.len() || source.pParameters.is_null() {
+        if source.NumParameters as usize != root.params.len() {
             return Err(E_INVALIDARG.into());
         }
-        let mut params = std::slice::from_raw_parts(source.pParameters, root.params.len()).to_vec();
+        let mut params = if root.params.is_empty() {
+            Vec::new()
+        } else {
+            if source.pParameters.is_null() {
+                return Err(E_INVALIDARG.into());
+            }
+            std::slice::from_raw_parts(source.pParameters, root.params.len()).to_vec()
+        };
         let originals = params.clone();
+        // Appended static samplers join the title's own in both roots built
+        // below. The storage outlives both serializations.
+        let sampler_storage: Vec<D3D12_STATIC_SAMPLER_DESC> = if extra.is_empty() {
+            Vec::new()
+        } else {
+            let mut samplers = if source.NumStaticSamplers == 0 {
+                Vec::new()
+            } else {
+                if source.pStaticSamplers.is_null() {
+                    return Err(E_INVALIDARG.into());
+                }
+                std::slice::from_raw_parts(source.pStaticSamplers, source.NumStaticSamplers as usize)
+                    .to_vec()
+            };
+            samplers.extend(extra.iter().copied().map(super::compute_table::static_sampler));
+            samplers
+        };
+        if !sampler_storage.is_empty() {
+            desc.Anonymous.Desc_1_1.pStaticSamplers = sampler_storage.as_ptr();
+            desc.Anonymous.Desc_1_1.NumStaticSamplers = sampler_storage.len() as u32;
+        }
         let mut range_storage = vec![Vec::new(); params.len()];
         for (index, change) in layout.replacements {
             let parameter = &mut params[index];
@@ -216,8 +269,9 @@ pub(super) fn reflected(
             })
         };
         // The root the pixel program is translated against: the title's, with
-        // those tables as the program reads them.
-        let pixel_root = if pixel_storage.is_empty() {
+        // those tables as the program reads them. Appended samplers alone also
+        // need a pixel root: the guest root itself has none of them.
+        let pixel_root = if pixel_storage.is_empty() && sampler_storage.is_empty() {
             None
         } else {
             let mut for_pixel = originals.clone();

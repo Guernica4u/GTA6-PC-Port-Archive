@@ -259,6 +259,7 @@ unsafe fn create(
         super::compute_table::capture_stage_root(pixel, root);
     }
     let mut rooted = [None, None];
+    let mut mesh_pixel_prepared = false;
     // A mesh pipeline's pixel stage runs under the guest root too (its
     // parameters are unchanged by the mesh table). Translate it against that
     // root, as a vertex/pixel pair is, so its constant buffers and views use the
@@ -267,12 +268,43 @@ unsafe fn create(
     // table carries a root that follows the program instead.
     if let (Some(root), Some((pixel, _)), Some(_)) = (guest_root, original[1], original[7])
         && original[0].is_none()
-        && let Some(variant) = shader_cache::raster_with_root(
+    {
+        let variant = shader_cache::raster_with_root(
             pixel,
             pipeline.raster_table.as_ref().and_then(|table| table.pixel_root.as_ref()).unwrap_or(root).payload(),
+        );
+        // The shader can already embed the effective root; in that case there
+        // is no new variant to prepare.
+        mesh_pixel_prepared = shader_cache::prepared(variant.as_deref().unwrap_or(pixel)).is_some();
+        if mesh_pixel_prepared {
+            rooted[1] = variant;
+        }
+    }
+    // A mesh pipeline's pixel program can build a literal sampler the title's
+    // root does not hold: the console compiles the state into the program, so
+    // the root can pair with a program whose words match none of its static
+    // samplers. The root-less fallback then reads space 32765, which no mesh
+    // root carries, and the driver rejects the pipeline. Rebuild the mesh
+    // table with the unmatched states as private static samplers, in the host
+    // root and in the root the pixel stage is translated against, and keep it
+    // only when the pixel stage then translates against that root.
+    if !mesh_pixel_prepared
+        && let (Some((mesh, _)), Some(root), Some(field)) = (original[7], guest_root, root_record)
+        && original[2..7].iter().all(Option::is_none)
+        && original[0].is_none()
+        && let Some((pixel, _)) = original[1]
+        && let Ok(signature) = tuxbox_dxbc::rootsig::parse_rts0(root.payload())
+        && let Some(unmatched) = tuxbox_dxbc::inline_sampler::unmatched(pixel, 0, &signature)
+        // A failed speculative root build leaves the original fallback usable.
+        && let Ok(Some(table)) = super::mesh_table::reflected_with_samplers(
+            &device.native, root, mesh, Some(pixel), node_mask, &unmatched,
         )
+        && let Some(pixel_root) = &table.pixel_root
+        && let Some(variant) = shader_cache::raster_with_root(pixel, pixel_root.payload())
         && shader_cache::prepared(&variant).is_some()
     {
+        unsafe { field.write(table.native.as_raw()) };
+        pipeline.raster_table = Some(table);
         rooted[1] = Some(variant);
     }
     if let Some(root) = guest_root && original[0].is_some() && original[1].is_some()
