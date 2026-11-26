@@ -4090,7 +4090,7 @@ mod present_plane_tests {
                 // SAFETY: an open list and a live render target.
                 unsafe {
                     list.list
-                        .ClearRenderTargetView(host.rtv(&texture, Some(&desc)), &color, None);
+                        .ClearRenderTargetView(host.rtv(Some(&texture), Some(&desc)), &color, None);
                 }
                 list.close();
                 host.execute(&[&list]);
