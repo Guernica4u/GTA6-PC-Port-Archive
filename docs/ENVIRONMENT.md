@@ -115,7 +115,17 @@ fallback are separate calls. Stage totals sum concurrent worker wall times
 and can exceed the elapsed session time; they are not CPU time. The existing
 vkd3d-proton pipeline trace measures driver-side calls separately.
 
+On Linux, when GNU `time` is installed, `process_memory` reports the
+peak resident set size (RSS, in KiB) from child resource accounting.
+`attempts` includes launch failures and timeouts; `measured` counts
+completed measurements. A missing measurement is null, not zero.
+The maximum is per CLI invocation, not the combined memory of simultaneous
+compiles. Persistent DXC, combined descendant memory, guest/driver memory
+and VRAM are not included. Other platforms and Linux without GNU time
+retain timings without memory data. GNU time is optional, and is not
+invoked when profiling is disabled.
+
 These host measurements cover dispatched requests, not guest-side cache
-lookups, compiler discovery failures or process memory. They contain no
-shader hashes, title names or raw error text. A forcibly killed launcher may
-not finish writing its summary.
+lookups or compiler discovery. They contain no shader hashes, title names
+or raw error text. A forcibly killed launcher may not finish writing its
+summary.
