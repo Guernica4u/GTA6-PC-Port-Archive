@@ -1513,6 +1513,57 @@ pub(crate) mod tests {
         });
     }
 
+    #[test]
+    fn concurrent_crt_writes_are_visible_after_the_last_take() {
+        use std::sync::{Barrier, atomic::{AtomicUsize, Ordering}};
+        const WRITERS: usize = 4;
+        const PAGES: usize = WRITERS * 2;
+        const ROUNDS: u8 = 120;
+        with_crt_views(PAGES, PAGES, |a, _| {
+            let end = a + PAGES * PAGE;
+            let tracker = track(a, PAGES * PAGE, true).unwrap();
+            tracker.take(a, end);
+            let start = Barrier::new(WRITERS + 1);
+            let done = AtomicUsize::new(0);
+            let mut mirror = [[0u8; 64]; PAGES];
+            let mut refresh = || {
+                for (from, to) in tracker.take(a, end) {
+                    for addr in (from..to).step_by(PAGE) {
+                        // ReadProcessMemory copies a snapshot while the title can write.
+                        assert!(crate::host::read_into(addr as *const u8, &mut mirror[(addr - a) / PAGE]));
+                    }
+                }
+            };
+            std::thread::scope(|scope| {
+                for worker in 0..WRITERS {
+                    let (start, done) = (&start, &done);
+                    scope.spawn(move || {
+                        start.wait();
+                        for round in 1..=ROUNDS {
+                            let value = round + worker as u8;
+                            let src = [value; 64];
+                            // SAFETY: each writer owns its two destination pages;
+                            // the kernel reads them for the tracker.
+                            unsafe {
+                                tracked_memcpy((a + worker * PAGE) as *mut u8, src.as_ptr(), 64);
+                                tracked_memset((a + (worker + WRITERS) * PAGE) as *mut u8, i32::from(value), 64);
+                            }
+                        }
+                        done.fetch_add(1, Ordering::Release);
+                    });
+                }
+                start.wait();
+                while done.load(Ordering::Acquire) != WRITERS {
+                    refresh();
+                }
+            });
+            refresh();
+            for (page, bytes) in mirror.iter().enumerate() {
+                assert_eq!(bytes, &[ROUNDS + (page % WRITERS) as u8; 64]);
+            }
+        });
+    }
+
     /// Alternate the native and redirected paths on exactly the same section
     /// and tracker. Each round writes 4 KiB on every freshly guarded page.
     #[test]
