@@ -77,26 +77,34 @@ impl<T> Default for Graph<T> {
 }
 
 impl<T> Graph<T> {
-    /// A pass ran, reading `reads` and writing `writes`.
+    /// A pass ran, reading `reads` and writing `writes`. A null descriptor
+    /// (`0`) names no resource and is left out of both.
+    ///
+    /// A pass that wrote nothing is not noted at all: no walk back from a
+    /// presented image reaches it, so its reads would only grow `reads`
+    /// (a title that stops presenting while its pipelines are queued kept
+    /// `NOTES_MAX` passes' worth of them, none counted).
     fn ran(&mut self, reads: &[usize], writes: &[usize]) {
-        if self.notes >= NOTES_MAX {
-            return;
-        }
-        let pass = self.reads.len() as u32;
-        for &r in writes {
-            self.ran.entry(r).or_default().push(pass);
-        }
-        self.reads.push(reads.to_vec());
-        self.notes += reads.len() + writes.len();
-    }
-
-    /// A pass of `pipeline` (`what`) was dropped; it would have written
-    /// `writes`.
-    fn dropped(&mut self, pipeline: usize, what: impl FnOnce() -> T, writes: &[usize]) {
+        let writes: Vec<usize> = writes.iter().copied().filter(|&r| r != 0).collect();
         if writes.is_empty() || self.notes >= NOTES_MAX {
             return;
         }
-        for &r in writes {
+        let pass = self.reads.len() as u32;
+        for &r in &writes {
+            self.ran.entry(r).or_default().push(pass);
+        }
+        let reads: Vec<usize> = reads.iter().copied().filter(|&r| r != 0).collect();
+        self.notes += reads.len() + writes.len();
+        self.reads.push(reads);
+    }
+
+    /// A pass of `pipeline` (`what`) was dropped; it would have written
+    /// `writes` (a null descriptor names nothing).
+    fn dropped(&mut self, pipeline: usize, what: impl FnOnce() -> T, writes: &[usize]) {
+        if self.notes >= NOTES_MAX || !writes.iter().any(|&r| r != 0) {
+            return;
+        }
+        for &r in writes.iter().filter(|&&r| r != 0) {
             if self.dropped_writers.entry(r).or_default().insert(pipeline) {
                 self.notes += 1;
             }
@@ -162,10 +170,10 @@ pub(crate) fn begin() {
 }
 
 /// The pass being bound reads (or, `write`, writes) `resource` through a
-/// view.
+/// view. A null descriptor names no resource (`Graph` would ignore it).
 pub(crate) fn view(resource: usize, write: bool) {
     PASS.with_borrow_mut(|p| {
-        if p.on {
+        if p.on && resource != 0 {
             if write { &mut p.writes } else { &mut p.reads }.push(resource);
         }
     });
@@ -301,6 +309,34 @@ mod tests {
         g.ran(&[unread], &[unrelated]);
         g.dropped(9, || "unread's writer", &[unread]);
         assert!(g.feeding(&[image]).is_empty());
+    }
+
+    /// A null descriptor (`resource == 0`) names nothing: a pass binding
+    /// one joins no other pass that did, so no unrelated dropped writer
+    /// reaches the presented image through it (the reviewer's repro:
+    /// `["unrelated_dropped"]` before the fix).
+    #[test]
+    fn a_null_view_feeds_nothing() {
+        let (unrelated_tex, image) = (1, 2);
+        let mut g = Graph::default();
+        g.dropped(99, || "unrelated_dropped", &[unrelated_tex]);
+        g.ran(&[unrelated_tex], &[0]);
+        g.ran(&[0], &[image]);
+        assert!(g.feeding(&[image]).is_empty());
+        assert_eq!(g.ran.keys().copied().collect::<Vec<_>>(), [image]);
+        assert_eq!(g.reads, [Vec::<usize>::new()], "the null read is not kept");
+    }
+
+    /// A pass that wrote nothing is not noted: 10,000 of them (a title
+    /// that stops presenting while its pipelines are queued) leave no
+    /// unreachable reads behind.
+    #[test]
+    fn a_pass_that_wrote_nothing_is_not_noted() {
+        let mut g = Graph::<&str>::default();
+        for _ in 0..10_000 {
+            g.ran(&[7], &[]);
+        }
+        assert!(g.reads.is_empty() && g.notes == 0 && g.ran.is_empty());
     }
 
     /// A full frame takes no more notes.

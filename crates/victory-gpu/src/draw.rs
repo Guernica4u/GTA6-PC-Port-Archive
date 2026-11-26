@@ -617,22 +617,42 @@ impl State {
         if !crate::pipeline::being_made(this) {
             return;
         }
+        let writes = self.would_write(compute, crate::pipeline::used(this));
+        crate::pipeline::dropped_into(this, &writes);
+    }
+
+    /// What a draw (`compute` false) or dispatch would write: its targets,
+    /// its depth, and the resources its unordered views name through tables.
+    ///
+    /// Only a handle a bound heap holds is read: a title with a null root
+    /// table, no bound view heap, a stale handle from an unmapped heap, or
+    /// a table reach past the end of one names nothing, and
+    /// [`crate::descriptor::view`] would dereference an address the title
+    /// never gave us (a null table and an eight-dword offset crashed with
+    /// `0xC0000005`). A null descriptor (`resource == 0`) names nothing
+    /// either (`crate::feeds`).
+    fn would_write<'a>(
+        &self,
+        compute: bool,
+        uavs: impl Iterator<Item = &'a UsedResource>,
+    ) -> Vec<usize> {
         let mut writes = Vec::new();
         if !compute {
-            writes.extend_from_slice(&self.targets);
+            writes.extend(self.targets.iter().copied().filter(|&t| t != 0));
             writes.extend((self.depth != 0).then_some(self.depth));
         }
-        let uavs = crate::pipeline::used(this)
-            .filter(|u| u.kind == ResourceType::Uav && u.root == RootType::Table);
+        let uavs = uavs.filter(|u| u.kind == ResourceType::Uav && u.root == RootType::Table);
         for u in uavs {
             if let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot))
-                && let Some(View::Unordered(resource, _, _)) =
-                    crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+                && let Some(handle) = table.checked_add(u64::from(u.table_offset_dwords) * 4)
+                && self.heap_of(handle).is_some()
+                && let Some(View::Unordered(resource, _, _)) = crate::descriptor::view(handle)
+                && resource != 0
             {
                 writes.push(resource);
             }
         }
-        crate::pipeline::dropped_into(this, &writes);
+        writes
     }
 
     /// A descriptor a shader reads through a table: its host slot made if
@@ -2096,6 +2116,38 @@ mod tests {
         // A title sampler heap stays whatever the views are.
         assert_eq!(State::wanted([0, 0x20], true), [MEMORY_HEAP, 0x20]);
     }
+
+    /// A dropped pass reads no descriptor it cannot name: a null root table
+    /// with an eight-dword offset (the reviewer's `0xC0000005`), a stale
+    /// handle whose offset overflows, a table entry no bound heap holds, or
+    /// a UAV that is not a table's are all skipped without touching memory.
+    /// `State::default()` binds no heap, so a read would fault here.
+    #[test]
+    fn a_dropped_pass_reads_no_descriptor_it_cannot_name() {
+        let uav = |slot: u8, table_offset_dwords: u32| UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords,
+            lower_bound: 0,
+            stride: 32,
+            dwords: 4,
+            user_data: 0,
+            slot,
+        };
+        let mut state = State::default();
+        state.set_table(true, 0, 0);
+        state.set_table(true, 1, u64::MAX - 16);
+        assert!(
+            state
+                .would_write(true, [uav(0, 8), uav(1, 8)].iter())
+                .is_empty()
+        );
+        // A root descriptor is not read through the heap at all.
+        let mut descriptor = uav(0, 8);
+        descriptor.root = RootType::Descriptor;
+        assert!(state.would_write(true, [descriptor].iter()).is_empty());
+    }
+
     use crate::object::{HRESULT, S_OK};
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
     use windows::Win32::Graphics::Direct3D::ID3DBlob;
