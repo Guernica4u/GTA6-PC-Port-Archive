@@ -93,7 +93,8 @@ pub(crate) struct Shadow {
     /// Ranges (title addresses) where the copy holds what shaders wrote
     /// and title memory does not ([`Shadow::keep_writes`]): a refresh
     /// widened to whole pages stops short of them ([`Shadow::widen`]).
-    kept: Mutex<std::collections::BTreeSet<(usize, usize)>>,
+    /// Disjoint, non-adjacent ranges keyed by their start.
+    kept: Mutex<BTreeMap<usize, usize>>,
 }
 
 /// Snapshot segments (offset, bytes) and the pieces compared.
@@ -408,12 +409,28 @@ impl Shadow {
     /// from memory with no copy, `crate::memory`).
     pub(crate) fn keep_writes(&self, address: usize, len: usize) {
         if len > 0 {
-            self.kept
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert((address, address + len));
+            self.remember_kept(address, address + len);
         }
         self.copy_back_or_not(address, len, false);
+    }
+
+    /// Adds a kept range to the union. Repeated declarations of all or
+    /// part of a range do not add interval records.
+    fn remember_kept(&self, mut from: usize, mut to: usize) {
+        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((&start, &end)) = kept.range(..=from).next_back()
+            && end >= from
+        {
+            if end >= to {
+                return;
+            }
+            from = start;
+        }
+        while let Some((&start, &end)) = kept.range(from..=to).next() {
+            to = to.max(end);
+            kept.remove(&start);
+        }
+        kept.insert(from, to);
     }
 
     /// `[from, to)` (inside the buffer) grown to the 64 KiB pages it
@@ -429,25 +446,28 @@ impl Shadow {
             return (from, to);
         }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-        let mut low = (from / PAGE * PAGE).max(start);
-        let mut high = to.div_ceil(PAGE).saturating_mul(PAGE).min(end);
+        let low = (from / PAGE * PAGE).max(start);
+        let high = to.div_ceil(PAGE).saturating_mul(PAGE).min(end);
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        for &(a, e) in kept.iter() {
-            if e <= low || a >= high {
-                continue;
-            }
-            if a < from {
-                low = low.max(e.min(from));
-            }
-            if e > to {
-                high = high.min(a.max(to));
-            }
-            if a < to && e > from {
-                // Kept writes inside the range itself: as asked, no more.
-                return (from, to);
-            }
+        if kept.len() <= 1 {
+            return match kept.first_key_value() {
+                Some((_, &end)) if end <= from => (low.max(end), high),
+                Some((&start, _)) if start >= to => (low, high.min(start)),
+                Some(_) => (from, to),
+                None => (low, high),
+            };
         }
-        (low.min(from), high.max(to))
+        let before = kept.range(..from).next_back();
+        let after = kept.range(from..).next();
+        if before.is_some_and(|(_, &end)| end > from)
+            || after.is_some_and(|(&start, _)| start < to)
+        {
+            // Kept writes inside the range itself: as asked, no more.
+            return (from, to);
+        }
+        let low = before.map_or(low, |(_, &end)| low.max(end));
+        let high = after.map_or(high, |(&start, _)| high.min(start));
+        (low, high)
     }
 
     fn copy_back_or_not(&self, address: usize, len: usize, back: bool) -> usize {
@@ -1515,6 +1535,33 @@ pub(crate) mod tests {
         unsafe { ((p + 100) as *mut u8).write_volatile(9) };
         assert_eq!(copy.update(p + 64, 16), PAGE - 16, "up to the kept writes");
         assert_eq!(copy.read_host((p + PAGE - 8) as u64, 1)[0].to_le_bytes()[0], 0xee, "kept");
+        unregister(p, p as u64);
+    }
+
+    #[test]
+    fn overlapping_kept_writes_remember_their_union() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            return;
+        };
+        assert!(copy.tracked.is_some());
+
+        // Declare overlapping writes in reverse order, plus one adjacent
+        // range. They keep one contiguous region.
+        for step in (0..128).rev() {
+            copy.keep_writes(p + 1024 + step * 16, 32);
+        }
+        copy.keep_writes(p + 3088, 16);
+        copy.keep_writes(p + 2000, 8); // already covered
+        copy.keep_writes(p + 8192, 16);
+        assert_eq!(copy.widen(p + 4096, p + 4112), (p + 3104, p + 8192));
+        // Explicitly requested bytes that overlap a kept write stay narrow.
+        assert_eq!(copy.widen(p + 2000, p + 2008), (p + 2000, p + 2008));
+        assert_eq!(copy.widen(p + PAGE + 12, p + PAGE + 16), (p + PAGE, p + len));
+        assert_eq!(copy.kept.lock().unwrap().len(), 2);
         unregister(p, p as u64);
     }
 
