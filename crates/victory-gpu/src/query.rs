@@ -158,10 +158,12 @@ pub(crate) fn mark(this: This, index: u32, begin: bool) -> Option<()> {
     let mut state = heap.state.lock().unwrap_or_else(|e| e.into_inner());
     let at = state.get_mut(index as usize)?;
     match (begin, *at) {
-        (true, State::Idle) => *at = State::Open,
+        // D3D12 lets a query index be reused without a resolve in between:
+        // a begin on an ended (or already resolved) one opens it again,
+        // which is how a title that recycles indices measures itself a
+        // second time. Only an end without a begin is the title's mistake.
+        (true, State::Idle | State::Ended) => *at = State::Open,
         (false, State::Open) => *at = State::Ended,
-        // An end without a begin, or a begin on an open one: the title's
-        // own mistake, and the marks would not be what it thinks.
         _ => return None,
     }
     Some(())
@@ -181,12 +183,18 @@ pub(crate) fn resolved(this: This, first: u32, count: u32) -> Option<()> {
     if end > heap.desc.count {
         return None;
     }
+    // Every index is checked before any is reset: a range that fails part
+    // way would otherwise be left half reset, and the queries that were
+    // fine would read as never marked.
     for index in first..end {
-        let at = state.get_mut(index as usize)?;
-        if *at != State::Ended {
+        if state.get(index as usize)? != &State::Ended {
             return None;
         }
-        *at = State::Idle;
+    }
+    for index in first..end {
+        if let Some(at) = state.get_mut(index as usize) {
+            *at = State::Idle;
+        }
     }
     Some(())
 }
@@ -312,3 +320,4 @@ mod tests {
         }
     }
 }
+

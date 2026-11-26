@@ -986,7 +986,7 @@ type Target = (usize, u64, usize);
 
 /// A read-back buffer and the pieces of its resolved queries that go back
 /// into the title's memory.
-type Resolved = (ID3D12Resource, Vec<Target>);
+type Resolved = (ID3D12Resource, ID3D12QueryHeap, Vec<Target>);
 
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
@@ -1415,7 +1415,7 @@ impl Host {
         for list in runs {
             // Query results first: a bottom-of-pipe write may name the same
             // memory (a buffer the title both resolves into and advances).
-            for (readback, targets) in &list.deferred().resolves {
+            for (readback, _heap, targets) in &list.deferred().resolves {
                 let mut data = std::ptr::null_mut();
                 let end = targets
                     .iter()
@@ -1429,7 +1429,12 @@ impl Host {
                 // SAFETY: a read-back buffer the finished list resolved
                 // into; `end` is inside it (the resolve checked the
                 // title's own buffer, and the buffer was made that size).
-                if unsafe { readback.Map(0, Some(&range), Some(&mut data)) }.is_err() {
+                if let Err(e) = unsafe { readback.Map(0, Some(&range), Some(&mut data)) } {
+                    // A failure here loses the query results for this
+                    // resolve, and nothing else says so: the draws ran, so
+                    // the alternative is a silent zero in the title's
+                    // buffer. Said once per list, with the error.
+                    tracing::warn!(error = %e, "a resolved query buffer did not map: its results are lost");
                     continue;
                 }
                 for &(at, offset, bytes) in targets {
@@ -2194,9 +2199,13 @@ impl HostList {
     pub(crate) fn defer_resolve(
         &self,
         readback: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        heap: windows::Win32::Graphics::Direct3D12::ID3D12QueryHeap,
         targets: Vec<Target>,
     ) {
-        self.deferred().resolves.push((readback, targets));
+        // The heap is kept with the buffer: the title may release its own
+        // before the list runs, and `ResolveQueryData` is recorded against
+        // this object, not against the title's reference to it.
+        self.deferred().resolves.push((readback, heap, targets));
     }
 
     /// A mapped upload buffer of `size` bytes, alive until the list is
@@ -4214,3 +4223,5 @@ mod present_plane_tests {
         assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
     }
 }
+
+

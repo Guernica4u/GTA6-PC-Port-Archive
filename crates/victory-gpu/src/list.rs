@@ -1207,7 +1207,7 @@ pub(crate) extern "system" fn resolve_queries(
         let targets = (0..u64::from(count))
             .map(|i| (data as usize + (offset + i * 8) as usize, i * 8, 8usize))
             .collect();
-        list.defer_resolve(readback, targets);
+        list.defer_resolve(readback, host.clone(), targets);
         return;
     }
     let _ = (this, heap, measured);
@@ -2096,3 +2096,4 @@ mod tests {
         }
     }
 }
+
