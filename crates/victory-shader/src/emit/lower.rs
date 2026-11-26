@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
-use super::shader::{Shader, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, flags};
+use super::shader::{Shader, VIEW_INTEGER, VIEW_NORMALIZED, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
@@ -4630,20 +4630,17 @@ impl<'a> Lower<'a> {
         self.raw_dword(table, at)
     }
 
-    /// Whether the typed buffer view a handle names has an integer format,
-    /// and whether a signed one, from the view-stride table; `None` if the
-    /// handle's heap index is not known.
-    fn integer_view(&mut self, h: V) -> Option<(V, V)> {
+    /// Requested format flags of a typed view with a known heap index.
+    fn view_flags<const N: usize>(&mut self, h: V, flags: [u32; N]) -> Option<[V; N]> {
         let index = *self.s.view_index.get(&h)?;
         let word = self.view_word(index);
         let c = self.cur;
         let zero = self.s.m.i32(0);
-        let [int, signed] = [VIEW_INTEGER, VIEW_SIGNED].map(|bit| {
+        Some(flags.map(|bit| {
             let bit = self.s.m.i32(bit);
             let x = self.s.m.bin(c, Bin::And, word, bit);
             self.s.m.cmp(c, pred::NE, x, zero)
-        });
-        Some((int, signed))
+        }))
     }
 
     /// Title memory at a raw GPU address (decision 0005: the unified-memory
@@ -9654,7 +9651,7 @@ impl<'a> Lower<'a> {
                 // kind, from the view-stride table) the 16-bit integer, zero-
                 // or sign-extended (stored through the float-typed handle as
                 // loads read: see there).
-                let integer = typed_h.and_then(|h| self.integer_view(h));
+                let integer = typed_h.and_then(|h| self.view_flags(h, [VIEW_INTEGER, VIEW_SIGNED]));
                 let c = self.cur;
                 let mut wide = Vec::new();
                 for k in 0..count {
@@ -9668,7 +9665,7 @@ impl<'a> Lower<'a> {
                         .s
                         .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
                     let mut w = self.as_int(f);
-                    if let Some((int, signed)) = integer {
+                    if let Some([int, signed]) = integer {
                         let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
                         let zero_ext = self.s.m.bin(c, Bin::And, x, low);
                         let up = self.s.m.bin(c, Bin::Shl, x, k16);
@@ -9861,7 +9858,7 @@ impl<'a> Lower<'a> {
             // passes a mismatched component type (unchanged on the RX 6700
             // XT and WARP, `stride_tests`); an integer-typed second handle
             // for the slot would not rely on it.
-            let integer = typed_h.and_then(|h| self.integer_view(h));
+            let kinds = typed_h.and_then(|h| self.view_flags(h, [VIEW_INTEGER, VIEW_NORMALIZED]));
             let c = self.cur;
             let k16 = self.s.m.i32(16);
             let i32t = self.s.t.i32;
@@ -9872,7 +9869,9 @@ impl<'a> Lower<'a> {
                     let mut h = self
                         .s
                         .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
-                    if let Some((int, _)) = integer {
+                    if let Some([int, normalized]) = kinds {
+                        let rounded = self.narrow16_bits(f, false);
+                        h = self.s.m.select(c, normalized, rounded, h);
                         let bits = self.as_int(f);
                         let low = self.s.m.i32(0xFFFF);
                         let low = self.s.m.bin(c, Bin::And, bits, low);

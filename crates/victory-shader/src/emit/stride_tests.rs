@@ -744,3 +744,28 @@ fn d16_x_loads_read_r16_uint_and_r16_float_views() {
         }
     }
 }
+
+#[test]
+fn mubuf_d16_descriptor_rounding() {
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT_R16_SNORM, DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R32_FLOAT,
+    };
+    let shader = build(
+        D16_X_LOAD_WAVE32,
+        vec![param(RootType::Table, 0), param(RootType::Table, 1)],
+        vec![entry(ResourceType::Srv, 4, 0), entry(ResourceType::Uav, 4, 1)],
+        32,
+    );
+    for (label, format, size, input, expected) in [
+        ("UNORM", DXGI_FORMAT_R16_UNORM, 2, 2051u32, 0x2802u32),
+        ("SNORM", DXGI_FORMAT_R16_SNORM, 2, 0xf7fd, 0xac02),
+        ("FLOAT", DXGI_FORMAT_R32_FLOAT, 4, 2051.0f32.to_bits(), 0x6801),
+        ("UINT", DXGI_FORMAT_R16_UINT, 2, 2051, 2051),
+    ] {
+        let data = if size == 2 { vec![input | input << 16; 16] } else { vec![input; 32] };
+        let views = [View::Buffer { data: &data, stride: Stride::Format(format, size) }, View::RawUav(32)];
+        for (backend, words) in run_tables(&shader, &views, super::host::view_strides(&views)) {
+            assert_eq!(words[0].as_slice(), &[expected; 32], "{backend} {label}");
+        }
+    }
+}
