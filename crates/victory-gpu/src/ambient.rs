@@ -80,7 +80,7 @@ void main(uint3 at : SV_DispatchThreadID) {
 /// Views, used in turn: more than the passes of every list in flight.
 const SLOTS: u32 = 1024;
 
-struct Pass {
+pub(crate) struct Pass {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
     views: ID3D12DescriptorHeap,
@@ -91,6 +91,19 @@ struct Pass {
 unsafe impl Send for Pass {}
 // SAFETY: as above.
 unsafe impl Sync for Pass {}
+
+fn slot_handles(
+    cpu: D3D12_CPU_DESCRIPTOR_HANDLE,
+    gpu: D3D12_GPU_DESCRIPTOR_HANDLE,
+    slot: u32,
+    step: u32,
+) -> (D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_GPU_DESCRIPTOR_HANDLE) {
+    let bytes = u64::from(slot) * u64::from(step);
+    (
+        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu.ptr + bytes as usize },
+        D3D12_GPU_DESCRIPTOR_HANDLE { ptr: gpu.ptr + bytes },
+    )
+}
 
 fn make(device: &ID3D12Device) -> windows::core::Result<Pass> {
     let mut code: Option<ID3DBlob> = None;
@@ -170,8 +183,7 @@ pub(crate) fn replace(list: &HostList, light: This) -> bool {
     let Some(light) = crate::resource::host_resource(light) else {
         return false;
     };
-    static PASS: OnceLock<Option<Pass>> = OnceLock::new();
-    let Some(pass) = PASS
+    let Some(pass) = host.ambient
         .get_or_init(|| {
             make(&host.device)
                 .inspect_err(|e| tracing::warn!(error = %e, "no stand-in for indirect light (VICTORY_AMBIENT)"))
@@ -199,11 +211,12 @@ pub(crate) fn replace(list: &HostList, light: This) -> bool {
     // unordered-access state as the program before left it; a view in a slot
     // no list in flight reads.
     unsafe {
-        let cpu = pass.views.GetCPUDescriptorHandleForHeapStart();
-        let gpu = pass.views.GetGPUDescriptorHandleForHeapStart();
-        let at = D3D12_CPU_DESCRIPTOR_HANDLE {
-            ptr: cpu.ptr + (slot * pass.step) as usize,
-        };
+        let (at, gpu) = slot_handles(
+            pass.views.GetCPUDescriptorHandleForHeapStart(),
+            pass.views.GetGPUDescriptorHandleForHeapStart(),
+            slot,
+            pass.step,
+        );
         let view = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_UINT,
             ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
@@ -216,12 +229,7 @@ pub(crate) fn replace(list: &HostList, light: This) -> bool {
         l.SetPipelineState(&pass.pso);
         let constants = [level, 1.0f32, 0.98, 0.94];
         l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
-        l.SetComputeRootDescriptorTable(
-            1,
-            D3D12_GPU_DESCRIPTOR_HANDLE {
-                ptr: gpu.ptr + u64::from(slot * pass.step),
-            },
-        );
+        l.SetComputeRootDescriptorTable(1, gpu);
         l.Dispatch((d.Width as u32).div_ceil(8), d.Height.div_ceil(8), 1);
     }
     uav_barrier(l);
@@ -230,6 +238,18 @@ pub(crate) fn replace(list: &HostList, light: This) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cpu_and_gpu_use_the_same_descriptor_slot() {
+        use super::*;
+        let cpu = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: 256 };
+        let gpu = D3D12_GPU_DESCRIPTOR_HANDLE { ptr: 1 << 40 };
+        for slot in [0, 1, SLOTS - 1] {
+            let (c, g) = slot_handles(cpu, gpu, slot, 32);
+            assert_eq!(c.ptr - cpu.ptr, slot as usize * 32);
+            assert_eq!(g.ptr - gpu.ptr, u64::from(slot) * 32);
+        }
+    }
+
     /// Off unless a positive level is asked for.
     #[test]
     fn the_level_is_asked_for() {
