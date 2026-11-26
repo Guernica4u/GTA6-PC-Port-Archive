@@ -11,7 +11,9 @@ use anyhow::{Context, Result, bail};
 use victory_pe::{ImageInfo, ImportSymbol};
 use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW};
-use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+use windows_sys::Win32::System::Memory::{
+    MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualProtect, VirtualQuery,
+};
 
 use crate::thunks::{ImportSite, ThunkBlock, UnimplementedPolicy};
 use crate::{
@@ -187,6 +189,76 @@ fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
         .with_context(|| format!("publishing {}", path.display()))
 }
 
+/// Protects and restores whole runs of IAT slots at once: one unprotect and
+/// one restore per run of pages with one protection, instead of two per
+/// slot. Import tables can sit in sections with different protections
+/// (delay-load tables in `.didat`), so each page's protection is asked once
+/// and runs are split where it changes.
+fn write_slots(base: usize, slots: &[(u32, usize)]) -> Result<()> {
+    const PAGE: usize = 4096;
+    // The slots by the page they sit in.
+    let mut by_page: std::collections::BTreeMap<usize, Vec<(u32, usize)>> = Default::default();
+    for &(rva, address) in slots {
+        by_page
+            .entry((base + rva as usize) / PAGE)
+            .or_default()
+            .push((rva, address));
+    }
+    // Each page's current protection, asked once.
+    let mut pages: Vec<(usize, u32)> = Vec::with_capacity(by_page.len());
+    for &page in by_page.keys() {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size; the image is mapped.
+        if unsafe {
+            VirtualQuery(
+                (page * PAGE) as *const c_void,
+                &mut info,
+                size_of_val(&info),
+            )
+        } == 0
+        {
+            bail!(
+                "VirtualQuery(IAT page {page:#x}) failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        pages.push((page, info.Protect));
+    }
+    // Merge consecutive pages with the same protection into runs.
+    let mut runs: Vec<(usize, usize, u32)> = Vec::new(); // (first page, last page + 1, protect)
+    for (page, protect) in pages {
+        match runs.last_mut() {
+            Some(run) if run.2 == protect && run.1 == page => run.1 = page + 1,
+            _ => runs.push((page, page + 1, protect)),
+        }
+    }
+    for (first, end, protect) in runs {
+        let (at, len) = (first * PAGE, (end - first) * PAGE);
+        // SAFETY: the parser only yields slots inside the image.
+        if unsafe { VirtualProtect(at as *const c_void, len, PAGE_READWRITE, &mut 0) } == 0 {
+            bail!(
+                "VirtualProtect(IAT run {at:#x}..{:#x}) failed: {}",
+                at + len,
+                std::io::Error::last_os_error()
+            );
+        }
+        for (&page, slots) in by_page.range(first..end) {
+            for &(rva, address) in slots {
+                let slot = (base + rva as usize) as *mut u64;
+                debug_assert!(page * PAGE <= slot as usize && (slot as usize) < (page + 1) * PAGE);
+                // SAFETY: inside the image, in the run just made writable,
+                // 8-byte aligned by the PE format.
+                unsafe { slot.write_volatile(address as u64) };
+            }
+        }
+        let mut ignored = 0;
+        // SAFETY: restoring the protection the run had (uniform by construction).
+        unsafe { VirtualProtect(at as *const c_void, len, protect, &mut ignored) };
+    }
+    Ok(())
+}
+
 impl LoadedImage {
     pub fn base(&self) -> usize {
         self.module as usize
@@ -279,26 +351,8 @@ impl LoadedImage {
         Ok(report)
     }
 
-    /// Protects and restores each slot on its own: import tables can sit in
-    /// sections with different protections (delay-load tables in `.didat`).
     fn write_slots(&self, slots: &[(u32, usize)]) -> Result<()> {
-        for &(rva, address) in slots {
-            let slot = (self.base() + rva as usize) as *mut u64;
-            let mut old = 0;
-            // SAFETY: the parser only yields slots inside the image.
-            if unsafe { VirtualProtect(slot as *const c_void, 8, PAGE_READWRITE, &mut old) } == 0 {
-                bail!(
-                    "VirtualProtect(IAT slot {rva:#x}) failed: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-            // SAFETY: inside the image, now writable, 8-byte aligned by the PE format.
-            unsafe { slot.write_volatile(address as u64) };
-            let mut ignored = 0;
-            // SAFETY: restoring the protection we just changed.
-            unsafe { VirtualProtect(slot as *const c_void, 8, old, &mut ignored) };
-        }
-        Ok(())
+        write_slots(self.base(), slots)
     }
 
     /// Calls the image's TLS callbacks with `reason` (e.g. `DLL_PROCESS_ATTACH`).
@@ -423,5 +477,99 @@ impl LoadedImage {
         crate::threads::unmapped(self.base());
         // SAFETY: guaranteed by the caller.
         unsafe { FreeLibrary(self.module) };
+    }
+}
+
+#[cfg(test)]
+mod slots_tests {
+    use super::*;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc,
+        VirtualFree,
+    };
+
+    /// Slots across several pages are all written, each page gets its own
+    /// protection back, and a run costs one unprotect+restore per
+    /// uniform-protection run instead of two per slot.
+    #[test]
+    fn slot_runs_are_written_and_their_protection_restored() {
+        const PAGE: usize = 4096;
+        // SAFETY: a fresh allocation, freed by the test.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                16 * PAGE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READONLY,
+            )
+        } as usize;
+        assert!(base != 0);
+        // The middle page keeps a different protection: runs must split there.
+        let mut ignored = 0;
+        // SAFETY: our allocation.
+        unsafe {
+            VirtualProtect(
+                (base + PAGE) as *const c_void,
+                PAGE,
+                PAGE_READWRITE,
+                &mut ignored,
+            )
+        };
+        let slots: Vec<(u32, usize)> = (0..500u32).map(|i| (i * 8, 0x1000 + i as usize)).collect();
+        write_slots(base, &slots).unwrap();
+        for &(rva, address) in &slots {
+            // SAFETY: inside our allocation.
+            assert_eq!(
+                // SAFETY: inside our allocation.
+                unsafe { ((base + rva as usize) as *const u64).read_volatile() },
+                address as u64
+            );
+        }
+        for (page, want) in [
+            (0usize, PAGE_READONLY),
+            (1, PAGE_READWRITE),
+            (2, PAGE_READONLY),
+        ] {
+            // SAFETY: plain data filled in by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: valid out pointer.
+            unsafe {
+                VirtualQuery(
+                    (base + page * PAGE) as *const c_void,
+                    &mut info,
+                    size_of_val(&info),
+                )
+            };
+            assert_eq!(info.Protect, want, "page {page} restored");
+        }
+        // Cost: 5,000 slots in one read-write region — batched vs per-slot.
+        // SAFETY: our allocation, made writable for the bench.
+        unsafe {
+            VirtualProtect(
+                base as *const c_void,
+                16 * PAGE,
+                PAGE_READWRITE,
+                &mut ignored,
+            )
+        };
+        let many: Vec<(u32, usize)> = (0..5000u32).map(|i| (i * 8, i as usize)).collect();
+        let t0 = std::time::Instant::now();
+        write_slots(base, &many).unwrap();
+        let batched = t0.elapsed();
+        let t0 = std::time::Instant::now();
+        for &(rva, address) in &many {
+            let slot = (base + rva as usize) as *mut u64;
+            let mut old = 0;
+            // SAFETY: our allocation.
+            unsafe { VirtualProtect(slot as *const c_void, 8, PAGE_READWRITE, &mut old) };
+            // SAFETY: writable now.
+            unsafe { slot.write_volatile(address as u64) };
+            // SAFETY: restoring.
+            unsafe { VirtualProtect(slot as *const c_void, 8, old, &mut ignored) };
+        }
+        let per_slot = t0.elapsed();
+        eprintln!("5000 IAT slots: batched {batched:?}, per-slot {per_slot:?}");
+        // SAFETY: freeing our allocation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
     }
 }
