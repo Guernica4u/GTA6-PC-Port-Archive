@@ -1168,6 +1168,13 @@ void main() {
             self.method::<Execute>(at)(self.list, signature, 1, arguments, 0, std::ptr::null(), 0);
         }
 
+        /// The title's wait for the 64-bit value `value` at `address`.
+        fn wait(&self, address: u64, value: u64) {
+            // 7: equal; `wait_value`'s slot, two further on newer tables.
+            let at = if crate::list::has_newer_table(self.list) { 0x250 } else { 0x240 };
+            self.method::<extern "system" fn(crate::object::This, u64, u32, u64)>(at)(self.list, address, 7, value);
+        }
+
         fn close(&self) {
             let close = self.method::<extern "system" fn(crate::object::This) -> crate::object::HRESULT>(0x48);
             assert_eq!(close(self.list), crate::object::S_OK);
@@ -1335,9 +1342,23 @@ void main() {
         let inline = bound(after, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
         work(after, &inline, 0);
         done(after, &inline);
+        // Past a wait (met: the value is there) the list is cut again, and
+        // that piece charges a budget of its own, as pieces cut at waits did
+        // before hoisting: the next run's inline clamp runs its record.
+        let value = Box::new(5u64);
+        t.host().count_work();
+        t.wait(&raw const *value as u64, 5);
+        t.execute_indirect(draws, arguments);
+        let past = t.pieces();
+        assert!(past.len() > pieces.len(), "the wait cut the list");
+        let last = past.last().unwrap();
+        let inline = bound(last, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
+        work(last, &inline, 0);
+        done(last, &inline);
         t.close();
         t.run(host);
-        assert_eq!(hits(), 0, "the later pieces' records find the first piece's budget spent");
+        assert_eq!(hits(), 1, "before the wait the first piece's budget is spent; past it a budget of its own");
+        drop(past);
 
         // After the title's reset: a new first piece, cut again at once
         // (it holds the run's clamps itself), with a budget of its own.
@@ -1350,7 +1371,7 @@ void main() {
         done(&fresh[1], &inline);
         t.close();
         t.run(host);
-        assert_eq!(hits(), 1, "a list reset charges a budget of its own again");
+        assert_eq!(hits(), 2, "a list reset charges a budget of its own again");
         drop((pieces, fresh));
         let release = |o: crate::object::This| crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(o, 0x10)(o);
         for object in [draws, arguments] {
