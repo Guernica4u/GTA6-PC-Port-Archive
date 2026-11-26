@@ -1662,14 +1662,13 @@ fn candidates() -> Vec<Owned> {
 /// gone (indices).
 fn choose(uses: &[(u64, u64, u64)], frame: u64, now: u64, over: u64) -> Vec<usize> {
     let idle = |&(f, ms, _): &(u64, u64, u64)| frame.saturating_sub(f) >= IDLE_FRAMES && now.saturating_sub(ms) >= IDLE_MS;
-    let (mut gone, rest): (Vec<usize>, Vec<usize>) = (0..uses.len()).partition(|&i| idle(&uses[i]));
+    let (mut gone, mut rest): (Vec<usize>, Vec<usize>) = (0..uses.len()).partition(|&i| idle(&uses[i]));
     let mut over = over.saturating_sub(gone.iter().map(|&i| uses[i].2).sum());
     // The sort below is only for the least-recently-used pick; nothing to
     // free means nothing to sort.
     if over == 0 {
         return gone;
     }
-    let mut rest = rest;
     rest.sort_by_key(|&i| uses[i].1);
     for i in rest {
         if over == 0 {

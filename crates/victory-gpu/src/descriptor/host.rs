@@ -865,8 +865,8 @@ impl HostHeap {
     /// slots had its list searched each time; 62,000 slots a frame, run
     /// evict3).
     pub(crate) fn evict(&self, textures: &std::collections::HashSet<usize>) {
-        // Sorted once, so each of the ~962k kept slots asks a binary search
-        // (2-3 ns) instead of a SipHash probe (~15 ns) per pass.
+        // Sorted once per call (per heap per pass), so each of the ~962k
+        // kept slots asks a binary search instead of a SipHash probe.
         let mut gone: Vec<usize> = textures.iter().copied().collect();
         gone.sort_unstable();
         let slots: Vec<u32> = {
@@ -2468,5 +2468,46 @@ mod tests {
         // SAFETY: plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
         assert_eq!(host.log_messages(), None);
+    }
+
+    /// What the per-slot probe in [`HostHeap::evict`] costs over a heap's
+    /// whole kept list: a SipHash set probe against a binary search on the
+    /// sorted gone set.
+    ///
+    /// `cargo test --release -p victory-gpu --lib --locked -- --exact
+    /// --ignored --nocapture
+    /// descriptor::host::tests::an_evict_probe_costs`
+    #[test]
+    #[ignore = "timing"]
+    fn an_evict_probe_costs() {
+        const N: usize = 962_144;
+        // A kept slot every seventh, as a texture slot would be.
+        let kept: Vec<Option<(usize, Option<u32>)>> =
+            (0..N).map(|i| (i % 7 == 0).then_some((i.wrapping_mul(8), None))).collect();
+        let gone: std::collections::HashSet<usize> = (0..64usize).map(|i| i.wrapping_mul(8 * 977)).collect();
+        let mut sorted: Vec<usize> = gone.iter().copied().collect();
+        sorted.sort_unstable();
+        let probe = |kept: &[Option<(usize, Option<u32>)>], hit: &dyn Fn(usize) -> bool| {
+            let start = std::time::Instant::now();
+            let mut hits = 0usize;
+            for slot in kept {
+                if let Some((raw, None)) = slot
+                    && hit(*raw)
+                {
+                    hits += 1;
+                }
+            }
+            (start.elapsed(), hits)
+        };
+        let (hash, hits) = probe(&kept, &|p| gone.contains(&p));
+        let (bin, hits2) = probe(&kept, &|p| sorted.binary_search(&p).is_ok());
+        assert_eq!(hits, hits2);
+        println!(
+            "{N} kept slots: SipHash probe {:?} ({:.1} ns/slot), binary search {:?} ({:.1} ns/slot), {hits} hits",
+            hash,
+            hash.as_nanos() as f64 / N as f64,
+            bin,
+            bin.as_nanos() as f64 / N as f64,
+        );
     }
 }
