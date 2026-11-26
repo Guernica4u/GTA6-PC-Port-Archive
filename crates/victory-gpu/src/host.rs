@@ -888,6 +888,34 @@ fn timing() -> bool {
     *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_TIMING"))
 }
 
+/// How many of a long submission's commands to list (diagnostics,
+/// `VICTORY_GPU_REPORT`; 2 by default): a frame's whole cost needs more than
+/// the two longest, which is what the report gave before.
+#[cfg(feature = "diagnostics")]
+fn report_top() -> usize {
+    static TOP: OnceLock<usize> = OnceLock::new();
+    *TOP.get_or_init(|| {
+        std::env::var("VICTORY_GPU_REPORT")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(2)
+    })
+}
+
+/// The submission length that makes the report speak (`VICTORY_GPU_REPORT_MIN_MS`,
+/// 200 ms by default).
+#[cfg(feature = "diagnostics")]
+fn report_min() -> std::time::Duration {
+    static MIN: OnceLock<std::time::Duration> = OnceLock::new();
+    *MIN.get_or_init(|| {
+        let ms = std::env::var("VICTORY_GPU_REPORT_MIN_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(200.0);
+        std::time::Duration::from_secs_f64(ms / 1000.0)
+    })
+}
+
 /// Whether each command is timed (`VICTORY_GPU_STAMPS`): a timestamp before
 /// each noted command and a read-back after the list, *without* the one-list-
 /// per-submission mode `VICTORY_GPU_TIMING` turns on - that mode waits for
@@ -1326,7 +1354,7 @@ impl Host {
             // say which of its commands took it (a batch is waited for as a
             // whole, so the frame report cannot tell them apart).
             #[cfg(feature = "diagnostics")]
-            if groups.len() == 1 && started.elapsed() > std::time::Duration::from_millis(200) {
+            if groups.len() == 1 && started.elapsed() > report_min() {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 let notes: usize = runs
@@ -1340,8 +1368,9 @@ impl Host {
                     stamps = runs[0].stamps().is_some(),
                     "slow host submission"
                 );
+                let top = report_top();
                 for (n, r) in runs.iter().enumerate() {
-                    for (ms, op) in r.slowest(frequency, 2) {
+                    for (ms, op) in r.slowest(frequency, top) {
                         tracing::warn!("slow list {n} command, {ms:.1} ms: {op}");
                     }
                 }
