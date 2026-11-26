@@ -1961,7 +1961,16 @@ impl HostList {
             };
             match made() {
                 Ok(prelude) => prelude,
-                Err(e) => fail(format_args!("a host state prelude was not made ({e})")),
+                // Unlike on `main`, where a failed creation came back from
+                // `new_list` as an `Err` the callers degrade through (the
+                // title's list then runs without a host backing, with a
+                // warning), it is fatal here: a list with a state or twin to
+                // move cannot run without its prelude. On a low-RAM machine
+                // near the commit limit that creation is likely to fail for
+                // memory pressure, so the report names the likely cause.
+                Err(e) => fail(format_args!(
+                    "a host state prelude was not made ({e}): likely memory pressure"
+                )),
             }
         });
         // SAFETY: the prelude is not executing (every submission is waited
