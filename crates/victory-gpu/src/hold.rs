@@ -83,6 +83,9 @@ pub(crate) struct Pumped {
     pub(crate) waited: Vec<(usize, Duration)>,
     /// Waits with a comparison we do not know (taken as holding).
     pub(crate) unknown: u32,
+    /// Some queue's head was still waiting: the pump's own answer, so the
+    /// caller need not read the same waits again to ask.
+    pub(crate) blocked: bool,
 }
 
 /// Every queue's held work.
@@ -131,7 +134,31 @@ impl<S> Held<S> {
     }
 
     /// Runs every queue's heads that may run, until none can.
+    ///
+    /// Each wait's memory is read once per pump, not once per test: a pump
+    /// tests the same heads several times, and its caller asks whether
+    /// anything is still blocked right after, which [`Pumped::blocked`]
+    /// answers. The answers are dropped whenever work runs, because that is
+    /// what changes them; without a run only another thread can, and a stale
+    /// answer costs at most one timer tick (2 ms) of latency.
     pub(crate) fn pump(&mut self, w: &mut World<S>) -> Pumped {
+        let World {
+            read,
+            fence,
+            run,
+            signal,
+        } = w;
+        let reads = std::cell::RefCell::new(Vec::new());
+        let read = |address: u64, bytes: u8| {
+            let mut cache = reads.borrow_mut();
+            if let Some((_, _, value)) = cache.iter().find(|(a, b, _)| *a == address && *b == bytes)
+            {
+                return *value;
+            }
+            let value = read(address, bytes);
+            cache.push((address, bytes, value));
+            value
+        };
         let mut done = Pumped::default();
         loop {
             let mut moved = false;
@@ -143,7 +170,7 @@ impl<S> Held<S> {
                         Some((Item::Segment(_, waits), since, fresh)) => {
                             let mut ok = true;
                             for wait in waits.iter() {
-                                match wait.holds(w.read) {
+                                match wait.holds(&read) {
                                     Some(true) => {}
                                     Some(false) => ok = false,
                                     None => done.unknown += 1,
@@ -151,6 +178,7 @@ impl<S> Held<S> {
                             }
                             if !ok {
                                 *fresh = false;
+                                done.blocked = true;
                             } else if !*fresh {
                                 done.waited.push((*queue, since.elapsed()));
                             }
@@ -160,13 +188,14 @@ impl<S> Held<S> {
                         // it runs first.
                         Some((Item::Signal(..), ..)) => {
                             if !piece.is_empty() {
-                                (w.run)(*queue, std::mem::take(&mut piece));
+                                run(*queue, std::mem::take(&mut piece));
+                                reads.borrow_mut().clear();
                                 done.pieces += 1;
                             }
                             true
                         }
-                        Some((Item::FenceWait(fence, value), _, fresh)) => {
-                            let ok = (w.fence)(*fence) >= *value;
+                        Some((Item::FenceWait(f, value), _, fresh)) => {
+                            let ok = fence(*f) >= *value;
                             if !ok {
                                 *fresh = false;
                             }
@@ -182,12 +211,16 @@ impl<S> Held<S> {
                             piece.push(s);
                             done.segments += 1;
                         }
-                        Some(Item::Signal(fence, value)) => (w.signal)(fence, value),
+                        Some(Item::Signal(fence, value)) => {
+                            signal(fence, value);
+                            reads.borrow_mut().clear();
+                        }
                         Some(Item::FenceWait(..)) | None => {}
                     }
                 }
                 if !piece.is_empty() {
-                    (w.run)(*queue, piece);
+                    run(*queue, piece);
+                    reads.borrow_mut().clear();
                     done.pieces += 1;
                 }
             }
@@ -327,6 +360,34 @@ mod tests {
         let p = pump(&mut held, &fake);
         assert_eq!(fake.borrow().log, ["q2: a b"], "one piece");
         assert_eq!((p.pieces, p.waited.len()), (1, 0));
+    }
+
+    /// A pump reads each word once, not each wait, and says itself whether
+    /// anything is still blocked, so its caller does not read the same waits
+    /// again just to ask that.
+    #[test]
+    fn a_pump_reads_each_word_once_and_says_if_anything_is_blocked() {
+        let reads = std::cell::Cell::new(0u32);
+        let read = |a: u64, _: u8| {
+            reads.set(reads.get() + 1);
+            Some(u64::from(a == 0x100))
+        };
+        let fence = |_: usize| 0;
+        let mut run = |_: usize, _: Vec<&'static str>| {};
+        let mut signal = |_: usize, _: u64| {};
+        let mut held = Held::default();
+        // Two waits on one word in one head, and another queue held on
+        // another word.
+        held.push(2, Item::Segment("a", vec![ge(0x100, 5), ge(0x100, 6)]));
+        held.push(3, Item::Segment("b", vec![ge(0x200, 1)]));
+        let p = held.pump(&mut World {
+            read: &read,
+            fence: &fence,
+            run: &mut run,
+            signal: &mut signal,
+        });
+        assert!(p.blocked, "both queues are still held");
+        assert_eq!(reads.get(), 2, "one read per word, not per wait");
     }
 
     /// A list's second segment waits for a value the other queue writes
