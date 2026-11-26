@@ -1015,6 +1015,12 @@ struct Deferred {
     /// Buffer ranges already declared as written by shaders since the last
     /// title copy (host copy, address, bytes, marked, uses title memory).
     gpu_writes: std::collections::HashSet<(usize, usize, usize, bool, bool)>,
+    /// Whether a `Refresh`, `Heap`, or `Memory` step has been queued since
+    /// the last step that flushes `Batch` (`Copy`, `Run`, or unmarked
+    /// `GpuWrite`). While set, the next unmarked `GpuWrite` is still
+    /// recorded as a flush boundary even when its key is already in
+    /// `gpu_writes`.
+    pending_refresh: bool,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -1036,11 +1042,12 @@ struct Deferred {
 }
 
 impl Deferred {
-    /// A step may write title memory: later refreshes and GPU-write
-    /// declarations must run again after it.
+    /// A step may write title memory (and flushes pending refreshes): later
+    /// refreshes and GPU-write declarations must run again after it.
     fn title_written(&mut self) {
         self.refreshed.clear();
         self.gpu_writes.clear();
+        self.pending_refresh = false;
     }
 }
 
@@ -2093,6 +2100,7 @@ impl HostList {
             deferred
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
+            deferred.pending_refresh = true;
         }
     }
 
@@ -2100,7 +2108,9 @@ impl HostList {
     /// host copy: copied back into title memory once the list has run
     /// (`marked`: the pages they mark). Identical declarations on the same
     /// list are recorded once until a step that may write title memory
-    /// intervenes.
+    /// intervenes, except that an unmarked declaration is still recorded
+    /// once as a `Batch::flush` boundary when a `Refresh`, `Heap`, or
+    /// `Memory` step is pending.
     pub(crate) fn defer_gpu_write(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
@@ -2117,10 +2127,14 @@ impl HostList {
             marked,
             memory,
         );
-        if deferred.gpu_writes.insert(key) {
+        let flush_boundary = !marked && deferred.pending_refresh;
+        if deferred.gpu_writes.insert(key) || flush_boundary {
             deferred
                 .copies
                 .push(Step::GpuWrite(shadow.clone(), address, len, marked, memory));
+            if !marked {
+                deferred.pending_refresh = false;
+            }
         }
     }
 
@@ -2132,13 +2146,16 @@ impl HostList {
         let key = (std::sync::Arc::as_ptr(viewed) as usize, usize::MAX, 0);
         if deferred.refreshed.insert(key) {
             deferred.copies.push(Step::Heap(viewed.clone()));
+            deferred.pending_refresh = true;
         }
     }
 
     /// Shaders of the list read title memory through the page table of
     /// view heap `heap` (`crate::memory::prepare` at submission).
     pub(crate) fn defer_memory(&self, heap: usize) {
-        self.deferred().copies.push(Step::Memory(heap));
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Memory(heap));
+        deferred.pending_refresh = true;
     }
 
     /// After the list has run, before its writes go back: `check` says
@@ -4272,6 +4289,112 @@ mod gpu_write_dedup {
         crate::shadow::unregister(p, p as u64);
         drop(copy);
         crate::watch::tests::free(p);
+    }
+
+    /// A repeated unmarked `defer_gpu_write` still acts as a `batch.flush()`
+    /// boundary when a `Refresh`, `Heap`, or `Memory` step was queued since
+    /// the prior flush, so an intervening `defer_host` observes the refreshed
+    /// shadow bytes. A `marked` write does not flush the batch and must not
+    /// clear the pending-refresh guard.
+    #[test]
+    fn repeated_unmarked_write_flushes_pending_refresh_before_host_work() {
+        use crate::watch::PAGE;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let a = crate::watch::tests::pool(1);
+        let b = crate::watch::tests::pool(1);
+        // SAFETY: our pools, not guarded yet.
+        unsafe { (b as *mut u8).write_volatile(0x11) };
+        for address in [a, b] {
+            crate::shadow::register(address, address as u64, PAGE as u64);
+        }
+        let write = crate::shadow::find(a as u64, PAGE as u64).unwrap();
+        let read = crate::shadow::find(b as u64, PAGE as u64).unwrap();
+        read.update(b, PAGE);
+        assert_eq!(read.read_host(b as u64, 1)[0] & 0xff, 0x11);
+
+        {
+            let _guard = crate::watch::writing(b, 1);
+            // SAFETY: the guard opens the page for this write.
+            unsafe { (b as *mut u8).write_volatile(0x22) };
+        }
+        let list = host.new_list().unwrap();
+        write.gpu_writes(&list, a as u64, PAGE as u64, false);
+        read.refresh(&list, b as u64, PAGE as u64);
+        // A marked write does not flush `batch`, so it must not clear `pending_refresh`.
+        write.gpu_writes(&list, a as u64, PAGE as u64, true);
+        // This repeated unmarked write must still be recorded as a flush boundary.
+        write.gpu_writes(&list, a as u64, PAGE as u64, false);
+        // Once flushed, an immediate third identical unmarked write deduplicates again.
+        write.gpu_writes(&list, a as u64, PAGE as u64, false);
+        let observed = Arc::new(AtomicU32::new(0));
+        let at_host_step = observed.clone();
+        let read_at_host_step = read.clone();
+        list.defer_host(move || {
+            at_host_step.store(
+                read_at_host_step.read_host(b as u64, 1)[0] & 0xff,
+                Ordering::Relaxed,
+            );
+        });
+        list.close();
+        host.execute(&[&list]);
+        let intermediate = observed.load(Ordering::Relaxed);
+        let end = read.read_host(b as u64, 1)[0] & 0xff;
+        let recorded_steps = gpu_write_steps(&list).len();
+
+        // Also verify `defer_heap` and `defer_memory` set `pending_refresh`,
+        // while `defer_copy` and `defer` clear it alongside `gpu_writes`.
+        list.reset();
+        let viewed = Arc::new(crate::bindless::Viewed::default());
+        write.gpu_writes(&list, a as u64, PAGE as u64, false);
+        list.defer_heap(&viewed);
+        write.gpu_writes(&list, a as u64, PAGE as u64, false);
+        write.gpu_writes(&list, a as u64, PAGE as u64, false);
+        let after_heap_steps = gpu_write_steps(&list).len();
+
+        list.defer_memory(1);
+        write.gpu_writes(&list, a as u64, PAGE as u64, false);
+        write.gpu_writes(&list, a as u64, PAGE as u64, false);
+        let after_memory_steps = gpu_write_steps(&list).len();
+
+        // A pending refresh followed by `defer_copy` or `defer` clears the guard.
+        list.defer_memory(2);
+        list.defer_copy(a as *mut u8, b as *const u8, 4);
+        assert!(!list.deferred().pending_refresh);
+        list.defer_memory(3);
+        list.defer(|| {});
+        assert!(!list.deferred().pending_refresh);
+
+        list.close();
+        drop(list);
+        for address in [a, b] {
+            crate::shadow::unregister(address, address as u64);
+        }
+        drop((write, read));
+        for address in [a, b] {
+            crate::watch::tests::free(address);
+        }
+        assert_eq!(end, 0x22, "the final flush happened");
+        assert_eq!(
+            intermediate, 0x22,
+            "host step must observe the shadow refreshed by the repeated unmarked write"
+        );
+        assert_eq!(
+            recorded_steps, 3,
+            "first unmarked + marked + flushing repeated unmarked (third unmarked deduped)"
+        );
+        assert_eq!(
+            after_heap_steps, 2,
+            "defer_heap re-enables one repeated unmarked write flush boundary"
+        );
+        assert_eq!(
+            after_memory_steps, 3,
+            "defer_memory re-enables one repeated unmarked write flush boundary"
+        );
     }
 }
 
