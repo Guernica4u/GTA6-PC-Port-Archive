@@ -2405,3 +2405,46 @@ fn sixteen_bit_integer_operations_take_abs_and_neg_on_bit_15() {
         });
     }
 }
+
+/// The 16-bit integer compares take `abs` and `neg` on bit 15 of their
+/// sources as well: `-v1 < v2` (unsigned) of 0 and 10 compares 0x8000 with
+/// 10. The rows and the expected values are gfx1036's.
+#[test]
+fn sixteen_bit_integer_compares_take_abs_and_neg_on_bit_15() {
+    // v_cmp_*_e64 s20, v1, v2 with abs/neg; v_cndmask_b32_e64 v0, 0, 1, s20
+    let rows: [[u32; 4]; 8] = [
+        [0x0000_0000, 0x0000_000A, 0x0000_0000, 0xABCD_1234],
+        [0x0000_0001, 0x0000_000A, 0x0000_0000, 0xABCD_1234],
+        [0x0000_7FFF, 0x0000_000A, 0x0000_0000, 0x5555_AAAA],
+        [0x0000_8000, 0x0000_0000, 0x0000_0000, 0x5555_AAAA],
+        [0x1234_FFFF, 0x0000_0005, 0x0000_0000, 0x0000_0000],
+        [0x0000_8001, 0x0000_7FFF, 0x0000_0000, 0xFFFF_FFFF],
+        [0xFFFF_0003, 0x8000_8003, 0x0000_0000, 0x0BAD_F00D],
+        [0x0000_7FFE, 0x0000_FFFE, 0x0000_0000, 0x0BAD_F00D],
+    ];
+    // (opcode, its VOP3 opcode, abs bits, neg bits, the result per row)
+    let cases: [(&str, u16, u32, u32, [u32; 8]); 6] = [
+        ("v_cmp_lt_u16", 0x0A9, 0b00, 0b01, [0, 0, 0, 0, 0, 1, 0, 0]),
+        ("v_cmp_lt_u16", 0x0A9, 0b10, 0b00, [1, 1, 0, 0, 0, 0, 0, 0]),
+        ("v_cmp_lt_i16", 0x089, 0b00, 0b01, [1, 1, 1, 0, 0, 1, 0, 0]),
+        ("v_cmp_lt_i16", 0x089, 0b01, 0b00, [1, 1, 0, 0, 0, 1, 0, 0]),
+        ("v_cmp_lt_i16", 0x089, 0b10, 0b10, [0, 0, 0, 0, 0, 1, 0, 0]),
+        ("v_cmp_eq_u16", 0x0AA, 0b00, 0b10, [0, 0, 0, 1, 0, 0, 1, 1]),
+    ];
+    for (what, op, abs, neg, want) in cases {
+        let w = vop3(op, 20, vgpr(1), vgpr(2), 0x80);
+        let mut body = vec![w[0] | abs << 8, w[1] | neg << 29];
+        body.extend_from_slice(&vop3(0x101, 0, 0x80, 0x81, sgpr(20)));
+        let shader = build_valu_cs(&body);
+        run_cases(&shader, &rows, |backend, i, inp, got| {
+            assert_eq!(
+                got,
+                want[i],
+                "{backend}: {what} (abs {abs:#04b}, neg {neg:#04b}) of {:#06x}, {:#06x} = {got}, want {}",
+                inp[0] & 0xFFFF,
+                inp[1] & 0xFFFF,
+                want[i],
+            );
+        });
+    }
+}
