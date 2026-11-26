@@ -104,19 +104,28 @@ pub(crate) enum C {
     /// Title threads writing a view into a shader-visible heap: time
     /// waiting for the heaps' lock (held by heap syncs and other writers).
     MirrorWaitUs,
-    /// Heap slot mirrors that made a host view, of those that made one from
-    /// a texture view, from a buffer view a shader reads, and from a buffer
-    /// view it writes through; slots whose record the slot already held;
-    /// slots nulled because their record names no view of ours.
+    /// Mirrors of a heap slot, and what each did with it: made a host view
+    /// (of those, from a texture view, from a buffer view a shader reads,
+    /// from one it writes through, and from anything else — a constant
+    /// buffer or a memory view); left a placed texture for its read; found
+    /// the record the slot already held; nulled a slot whose record names no
+    /// view of ours; passed by a slot that never held a view; and passed
+    /// over a slot past the heap.
+    MirrorCalls,
     MirrorMade,
     MirrorTexture,
     MirrorBufferRead,
     MirrorBufferWrite,
-    MirrorEarly,
-    MirrorNull,
     MirrorOther,
+    MirrorDeferred,
+    MirrorCurrent,
+    MirrorNull,
+    MirrorEmpty,
+    MirrorPast,
 }
-const COUNTERS: usize = 96;
+/// One per [`C`] variant: a counter added without its slot would read past
+/// the array.
+const COUNTERS: usize = 72;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -245,7 +254,7 @@ pub(crate) fn log(frames: f64) {
          asking for other mappings, {:.1} ms waiting for the guard lock; preparing: {:.1} ms in \
          refresh batches, steps (each with the batch it flushes): refresh {:.1} ms, copy {:.1} ms, \
          work {:.1} ms, GPU writes {:.1} ms, textures {:.1} ms, heaps {:.1} ms, title memory {:.1} ms; \
-         heap texture uploads {:.1} ms, state preludes {:.1} ms, heap slots the title copied {:.1} ms ({:.0} slots: {:.0} made views ({:.0} textures, {:.0} buffer reads, {:.0} buffer writes, {:.0} other), {:.0} current, {:.0} nulled), title threads waiting to write views {:.1} ms; copying back compared {:.1} MB          in {:.1} ms; marked pages: {:.0} compared, {:.1} MB written back in {:.1} ms, {:.0} kept the title's, {:.0} saved; working set {:.0} MB, \
+         heap texture uploads {:.1} ms, state preludes {:.1} ms, heap slots the title copied {:.1} ms ({:.0} slots); slot mirrors {:.0} ({:.0} made ({:.0} textures, {:.0} buffer reads, {:.0} buffer writes, {:.0} other), {:.0} deferred, {:.0} current, {:.0} nulled, {:.0} empty, {:.0} past), title threads waiting to write views {:.1} ms; copying back compared {:.1} MB          in {:.1} ms; marked pages: {:.0} compared, {:.1} MB written back in {:.1} ms, {:.0} kept the title's, {:.0} saved; working set {:.0} MB, \
          {:.0} hard faults",
         c[C::Submissions as usize],
         c[C::Copies as usize],
@@ -301,13 +310,17 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::PreludeUs as usize]),
         ms(c[C::SyncHeapsUs as usize]),
         c[C::SyncSlots as usize],
+        c[C::MirrorCalls as usize],
         c[C::MirrorMade as usize],
         c[C::MirrorTexture as usize],
         c[C::MirrorBufferRead as usize],
         c[C::MirrorBufferWrite as usize],
         c[C::MirrorOther as usize],
-        c[C::MirrorEarly as usize],
+        c[C::MirrorDeferred as usize],
+        c[C::MirrorCurrent as usize],
         c[C::MirrorNull as usize],
+        c[C::MirrorEmpty as usize],
+        c[C::MirrorPast as usize],
         ms(c[C::MirrorWaitUs as usize]),
         mb(c[C::CompareBytes as usize]),
         ms(c[C::CompareUs as usize]),
