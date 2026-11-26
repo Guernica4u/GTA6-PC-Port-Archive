@@ -194,6 +194,11 @@ impl<T: Clone> Chunks<T> {
 
     fn recycle(&mut self) {
         (self.current, self.used, self.growth) = (0, 0, CHUNK);
+        // Once large allocations work again, keep their capacity for the
+        // next submission instead of pinning the first small chunks forever.
+        if self.all.len() > CHUNKS_KEPT && self.all[..CHUNKS_KEPT].iter().any(|chunk| chunk.size < CHUNK) {
+            self.all.select_nth_unstable_by_key(CHUNKS_KEPT, |chunk| std::cmp::Reverse(chunk.size));
+        }
         self.all.truncate(CHUNKS_KEPT);
     }
 

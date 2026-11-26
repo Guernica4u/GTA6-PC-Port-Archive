@@ -50,6 +50,28 @@ fn staging_tries_the_request_size_after_smaller_growth_and_recovers() {
 }
 
 #[test]
+fn staging_keeps_full_sized_chunks_after_allocations_recover() {
+    let mut chunks = Chunks::new();
+    for _ in 0..CHUNKS_KEPT {
+        let (buffer, ..) = chunks.take(MIN_CHUNK, |bytes| (bytes == MIN_CHUNK).then_some((bytes, 0))).unwrap();
+        assert_eq!(buffer, MIN_CHUNK);
+    }
+
+    chunks.recycle();
+    for _ in 0..CHUNKS_KEPT {
+        let (buffer, ..) = chunks.take(CHUNK, |bytes| Some((bytes, 0))).unwrap();
+        assert_eq!(buffer, CHUNK);
+    }
+
+    chunks.recycle();
+    assert_eq!(chunks.all.len(), CHUNKS_KEPT);
+    for _ in 0..CHUNKS_KEPT {
+        let (buffer, offset, _) = chunks.take(CHUNK, |_| panic!("a full-size chunk should be reused")).unwrap();
+        assert_eq!((buffer, offset), (CHUNK, 0));
+    }
+}
+
+#[test]
 fn staging_suballocations_in_a_smaller_d3d12_buffer_do_not_overlap() {
     let Some(host) = host() else { return };
     let mut chunks = Chunks::new();
