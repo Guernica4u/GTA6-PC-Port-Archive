@@ -3792,6 +3792,31 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_list_waiting_for_another_queues_write_reads_what_it_wrote() {
+        waiting_lists(false, false);
+    }
+
+    /// The same with the lists' calls translated by workers
+    /// (`crate::list::later`): the title's arguments are copied when it
+    /// calls, and each submission runs what its list recorded.
+    #[cfg(windows)]
+    #[test]
+    fn deferred_lists_waiting_for_another_queues_write_read_what_it_wrote() {
+        waiting_lists(true, false);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires a D3D12 device; run separately for each VICTORY_DEFER_LISTS value"]
+    fn overlapping_copies_across_worker_batches_survive_a_queue_wait() {
+        assert!(
+            crate::host::host().is_some(),
+            "this readback needs a D3D12 device"
+        );
+        waiting_lists(false, true);
+    }
+
+    #[cfg(windows)]
+    fn waiting_lists(deferred: bool, multiple_batches: bool) {
         if crate::host::host().is_none() {
             return; // no host GPU here
         }
@@ -3831,9 +3856,16 @@ mod tests {
             assert_eq!(crate::queue::create(null, desc.as_ptr().cast(), &queue_iid, queue), S_OK);
         }
         assert_eq!(crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator), S_OK);
+        crate::list::later::tests::FORCED.set(deferred);
         for (kind, list) in [(0u32, &mut drawing), (2, &mut computing)] {
             assert_eq!(crate::list::create_list(null, 0, kind, allocator, null, &list_iid, list), S_OK);
         }
+        crate::list::later::tests::FORCED.set(false);
+        // Through the lists' tables, as the title calls them: the wait and
+        // the write are two slots later in newer lists.
+        let later = if crate::list::has_newer_table(drawing) { 0x10 } else { 0 };
+        type Wait64 = extern "system" fn(This, u64, u32, u64, u32);
+        type Write64 = extern "system" fn(This, u64, u64, u32, u32);
         #[repr(C)]
         struct Location {
             resource: This,
@@ -3849,22 +3881,53 @@ mod tests {
         const GREATER_EQUAL: u32 = 7;
 
         // Compute: [copy source → early][wait flag ≥ 1][image → target].
-        slot::<CopyBuffer>(computing, 0x78)(computing, early, 0, source, 0, 1024);
-        crate::list::wait64(computing, flag as u64, GREATER_EQUAL, 1, 0);
-        let into_target = Location { resource: target, kind: 1, footprint: rows };
+        if multiple_batches {
+            // Eight full 32-call batches, followed by five writes that replace
+            // the start of the buffer. Every copy is within both 1 KiB buffers.
+            for (shift, count) in [(0u64, 128), (17, 128), (30, 5)] {
+                for block in 0..count {
+                    let source_offset = (block + shift) % 128 * 8;
+                    slot::<CopyBuffer>(computing, 0x78)(
+                        computing,
+                        early,
+                        block * 8,
+                        source,
+                        source_offset,
+                        8,
+                    );
+                }
+            }
+        } else {
+            slot::<CopyBuffer>(computing, 0x78)(computing, early, 0, source, 0, 1024);
+        }
+        slot::<Wait64>(computing, 0x240 + later)(computing, flag as u64, GREATER_EQUAL, 1, 0);
+        let mut into_target = Location { resource: target, kind: 1, footprint: rows };
         slot::<Copy>(computing, 0x80)(computing, &into_target, 0, 0, 0, &image_at, null.cast());
+        // What the call pointed to is the title's again once it returns.
+        into_target.resource = null;
+        let _ = std::hint::black_box(&into_target).resource;
         slot::<Close>(computing, 0x48)(computing);
         // Graphics: [source → image][flag = 1 at its end].
         let from_source = Location { resource: source, kind: 1, footprint: rows };
         slot::<Copy>(drawing, 0x80)(drawing, &image_at, 0, 0, 0, &from_source, null.cast());
-        crate::list::write64(drawing, flag as u64, 1, 0, 0);
+        slot::<Write64>(drawing, 0x230 + later)(drawing, flag as u64, 1, 0, 0);
         slot::<Close>(drawing, 0x48)(drawing);
 
         slot::<Execute>(compute, 0x50)(compute, 1, &computing);
         let (copied, _) = buffer_bytes(early).unwrap();
         // SAFETY: the buffers hold 1024 bytes; nothing runs meanwhile.
         let read = |at: *mut u8| unsafe { std::slice::from_raw_parts(at, 1024) }.to_vec();
-        assert_eq!(read(copied), bytes, "the part before the wait ran");
+        if multiple_batches {
+            let copied = read(copied);
+            let (blocks, _) = copied.as_chunks::<8>();
+            for (block, actual) in blocks.iter().enumerate() {
+                let last_shift = if block < 5 { 30 } else { 17 };
+                let start = (block + last_shift) % 128 * 8;
+                assert_eq!(actual, &bytes[start..start + 8], "pre-wait block {block}");
+            }
+        } else {
+            assert_eq!(read(copied), bytes, "the part before the wait ran");
+        }
         assert!(read(out).iter().all(|&b| b == 0xEE), "the part after it waits");
         // SAFETY: the buffer holds 256 bytes.
         assert_eq!(unsafe { flag.read_volatile() }, 0);

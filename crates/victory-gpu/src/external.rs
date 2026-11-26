@@ -24,6 +24,8 @@ pub fn host_texture(
     resource: *const Object,
     state: u32,
 ) -> Option<(ID3D12Resource, u32)> {
+    // What the title recorded before runs first (`crate::list::later`).
+    crate::list::drain(list);
     let host = crate::list::host_list(list)?;
     let texture = crate::resource::host_resource(resource)?.clone();
     crate::list::ensure_state(host, resource, state);
@@ -40,6 +42,7 @@ pub fn record<R>(
     f: impl FnOnce(&ID3D12GraphicsCommandList) -> R,
 ) -> Option<R> {
     let mut out = None;
+    crate::list::drain(list);
     crate::list::with_state(list, |host, state| {
         out = Some(f(&host.list));
         state.host_state_lost();

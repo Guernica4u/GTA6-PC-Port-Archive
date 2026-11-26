@@ -4533,6 +4533,13 @@ impl Meter {
                  {waited:.1} ms/frame of draws waiting for pipelines",
                 making = crate::pipeline::making()
             );
+            if let Some((calls, waited)) = crate::list::take_deferred() {
+                tracing::info!(
+                    "list calls translated by workers: {:.0}/frame; title threads waited {:.2} ms/frame for them",
+                    calls as f64 / report_frames,
+                    waited / report_frames
+                );
+            }
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
             let (heaps, heap_used, heap_free) = crate::placement::stats();
             tracing::info!(

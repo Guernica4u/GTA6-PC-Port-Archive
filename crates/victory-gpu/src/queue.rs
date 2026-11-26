@@ -120,6 +120,9 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if crate::host::host().is_some() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        // Lists whose calls workers translate are done first, without
+        // holding up other queues meanwhile (`crate::list::later`).
+        lists.iter().for_each(|&l| crate::list::drain(l));
         let mut held = held();
         for &l in lists {
             for segment in crate::list::segments(l) {

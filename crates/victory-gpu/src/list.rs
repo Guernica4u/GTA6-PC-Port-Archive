@@ -19,6 +19,11 @@ use crate::object::{
 use crate::queue::Written;
 use crate::resource::PAGEABLE_IIDS;
 
+#[cfg(windows)]
+pub(crate) mod later;
+#[cfg(windows)]
+pub(crate) use later::{drain, take_stats as take_deferred};
+
 const ALLOCATOR_IIDS: [Iid; 4] = [
     guid(
         0x6102dee4,
@@ -131,6 +136,10 @@ struct List {
     lost: std::sync::atomic::AtomicBool,
     #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
+    /// The calls waiting for a worker, if the list's calls translate off
+    /// the title's threads (`later`).
+    #[cfg(windows)]
+    log: Option<std::sync::Arc<later::Log>>,
 }
 const _: () = assert!(offset_of!(List, put) == 0x18);
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
@@ -173,6 +182,7 @@ pub(crate) fn segments(this: This) -> Vec<std::sync::Arc<crate::host::HostList>>
     if this.is_null() {
         return Vec::new();
     }
+    drain(this);
     // SAFETY: the title passes one of our lists.
     let list = unsafe { &*this.cast::<List>() };
     if list.lost.load(std::sync::atomic::Ordering::Relaxed) {
@@ -437,12 +447,19 @@ fn new_list(
         return E_INVALIDARG;
     }
     tracing::debug!(kind, "command list");
+    #[cfg(windows)]
+    let log = later::new_log();
+    #[cfg(windows)]
+    let deferring = log.is_some();
+    #[cfg(not(windows))]
+    let deferring = false;
     let list = Box::new(List {
-        object: if crate::device::newer() {
-            Object::new(&NEWER_LIST_FUNCTIONS)
-        } else {
-            Object::new(&LIST_FUNCTIONS)
-        },
+        object: Object::new(match (crate::device::newer(), deferring) {
+            (false, false) => &LIST_FUNCTIONS,
+            (true, false) => &NEWER_LIST_FUNCTIONS,
+            (false, true) => &DEFERRING_LIST_FUNCTIONS,
+            (true, true) => &DEFERRING_NEWER_LIST_FUNCTIONS,
+        }),
         kind,
         put: [0; 5],
         reserved: [0; 64],
@@ -474,6 +491,8 @@ fn new_list(
             state.set_pipeline(pipeline);
             std::sync::Mutex::new(state)
         },
+        #[cfg(windows)]
+        log,
     });
     let hr = object::hand_out(LIST, list, iid, &LIST_IIDS, out);
     if hr == S_OK {
@@ -1111,6 +1130,7 @@ fn resolve_region(
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub(crate) struct Rect {
     left: i32,
     top: i32,
@@ -2085,7 +2105,7 @@ const NEWER_METHODS: [(usize, *const ()); 3] = [
     (148, allocate_upload as *const ()),
 ];
 
-const fn list_table(newer: bool) -> [*const (); 160] {
+const fn list_table(newer: bool, deferring: bool) -> [*const (); 160] {
     let mut f = object::d3d12_object(object::missing_table::<LIST, 160>());
     let mut i = 0;
     while i < METHODS.len() + MORE_METHODS.len() {
@@ -2102,20 +2122,40 @@ const fn list_table(newer: bool) -> [*const (); 160] {
         f[NEWER_METHODS[i].0] = NEWER_METHODS[i].1;
         i += 1;
     }
+    #[cfg(not(windows))]
+    let _ = deferring;
+    // For a list whose calls translate off the title's threads (`later`):
+    // the same methods logging their calls, which then call those above.
+    #[cfg(windows)]
+    if deferring {
+        let mut i = 0;
+        while i < later::METHODS.len() {
+            let (slot, method) = later::METHODS[i];
+            f[if newer { newer_slot(slot) } else { slot }] = method;
+            i += 1;
+        }
+        let mut i = 0;
+        while newer && i < later::NEWER_METHODS.len() {
+            f[later::NEWER_METHODS[i].0] = later::NEWER_METHODS[i].1;
+            i += 1;
+        }
+    }
     f
 }
 
 /// Every slot up to the limit exists and logs, for the methods newer
 /// titles add.
-static LIST_FUNCTIONS: Table<160> = Table(list_table(false));
-static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
+static LIST_FUNCTIONS: Table<160> = Table(list_table(false, false));
+static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true, false));
+static DEFERRING_LIST_FUNCTIONS: Table<160> = Table(list_table(false, true));
+static DEFERRING_NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true, true));
 
 #[cfg(all(test, windows))]
 pub(crate) fn has_newer_table(list: This) -> bool {
     // SAFETY: one of our lists; its first field is the table. The device
     // tests can switch layouts, so use this list's table.
     let table = unsafe { *list.cast::<*const *const ()>() };
-    table == NEWER_LIST_FUNCTIONS.0.as_ptr()
+    table == NEWER_LIST_FUNCTIONS.0.as_ptr() || table == DEFERRING_NEWER_LIST_FUNCTIONS.0.as_ptr()
 }
 
 #[cfg(test)]
@@ -2584,6 +2624,9 @@ mod tests {
         // SAFETY: 40 bytes were handed out.
         unsafe { p.write_bytes(0xab, 40) };
         assert!(allocate_upload(list, 8, 0x30).is_null(), "not a power of two");
+        // Through the table, as the title resets it (with deferred calls,
+        // `later`, the reset waits for the Close above).
+        let reset = slot::<extern "system" fn(This, This, This) -> HRESULT>(list, 0x50);
         assert_eq!(reset(list, allocator, null), S_OK);
         // SAFETY: the list is ours.
         assert!(unsafe { &(*list.cast::<List>()).uploads }.lock().unwrap().is_empty());
