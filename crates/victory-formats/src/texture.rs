@@ -1233,77 +1233,171 @@ mod tests {
         }
     }
 
-    /// Compare both copy directions with independent per-element addressing,
-    /// including padding and the gaps occupied by other mips and array slices.
+    fn linear_copy_pattern(i: usize, salt: usize) -> u8 {
+        (i.wrapping_mul(97) ^ i.rotate_right(7) ^ salt.wrapping_mul(37)) as u8
+    }
+
+    fn check_linear_copy(layout: &Layout, mip: u32, slice: u32, row_pad: usize, depth_pad: usize) {
+        let m = layout.mips[mip as usize];
+        let n = layout.desc.element_bytes as usize;
+        let active = m.width as usize * n;
+        let row = active + row_pad;
+        let span = (m.height as usize - 1) * row + active;
+        let plane = span + depth_pad;
+        let len = (m.depth as usize - 1) * plane + span;
+        let input: Vec<_> = (0..len + 7).map(|i| linear_copy_pattern(i, 3)).collect();
+        let tiled_input: Vec<_> = (0..layout.size as usize + 7)
+            .map(|i| linear_copy_pattern(i, 11))
+            .collect();
+        let mut expected_tile = vec![0xc7; tiled_input.len()];
+        let mut expected_detile = vec![0x39; input.len()];
+        for z in 0..m.depth {
+            for y in 0..m.height {
+                for x in 0..m.width {
+                    let t = layout.offset(mip, x, y, slice + z).unwrap() as usize;
+                    let l = z as usize * plane + y as usize * row + x as usize * n;
+                    expected_tile[t..t + n].copy_from_slice(&input[l..l + n]);
+                    expected_detile[l..l + n].copy_from_slice(&tiled_input[t..t + n]);
+                }
+            }
+        }
+        let mut actual_tile = vec![0xc7; tiled_input.len()];
+        layout
+            .tile(&mut actual_tile, mip, slice, &input, row, plane)
+            .unwrap();
+        assert_eq!(actual_tile, expected_tile);
+        let mut actual_detile = vec![0x39; input.len()];
+        layout
+            .detile(&tiled_input, mip, slice, &mut actual_detile, row, plane)
+            .unwrap();
+        assert_eq!(actual_detile, expected_detile);
+        // The final active byte is enough: no trailing row/depth padding is required.
+        let mut exact_tile = vec![0xc7; layout.size as usize];
+        layout
+            .tile(&mut exact_tile, mip, slice, &input[..len], row, plane)
+            .unwrap();
+        assert_eq!(exact_tile, expected_tile[..layout.size as usize]);
+        let mut exact_detile = vec![0x39; len];
+        layout
+            .detile(
+                &tiled_input[..layout.size as usize],
+                mip,
+                slice,
+                &mut exact_detile,
+                row,
+                plane,
+            )
+            .unwrap();
+        assert_eq!(exact_detile, expected_detile[..len]);
+
+        // Invalid arguments must be rejected before modifying a destination.
+        for (bad_mip, bad_slice) in [(layout.mips.len() as u32, slice), (mip, layout.slices)] {
+            let mut out = vec![0x39; input.len()];
+            assert_eq!(
+                layout.detile(&tiled_input, bad_mip, bad_slice, &mut out, row, plane),
+                Err(Error::Invalid)
+            );
+            assert!(out.iter().all(|&b| b == 0x39));
+        }
+        for short_linear in [false, true] {
+            let mut tiled = vec![
+                0xc7;
+                if short_linear {
+                    layout.size as usize
+                } else {
+                    layout.size as usize - 1
+                }
+            ];
+            let lin = &input[..if short_linear { len - 1 } else { len }];
+            assert_eq!(
+                layout.tile(&mut tiled, mip, slice, lin, row, plane),
+                Err(Error::TooSmall)
+            );
+            assert!(tiled.iter().all(|&b| b == 0xc7));
+            let mut out = vec![0x39; lin.len()];
+            assert_eq!(
+                layout.detile(
+                    &tiled_input[..tiled.len()],
+                    mip,
+                    slice,
+                    &mut out,
+                    row,
+                    plane
+                ),
+                Err(Error::TooSmall)
+            );
+            assert!(out.iter().all(|&b| b == 0x39));
+        }
+
+        if m.depth == 1 {
+            for irrelevant_depth in [0, usize::MAX] {
+                let mut out = vec![0x39; input.len()];
+                layout
+                    .detile(&tiled_input, mip, slice, &mut out, row, irrelevant_depth)
+                    .unwrap();
+                assert_eq!(out, expected_detile);
+            }
+        } else {
+            let mut out = vec![0x39; input.len()];
+            assert_eq!(
+                layout.detile(&tiled_input, mip, slice, &mut out, row, span - 1),
+                Err(Error::TooSmall)
+            );
+            assert!(out.iter().all(|&b| b == 0x39));
+            assert_eq!(
+                layout.detile(&tiled_input, mip, slice, &mut out, row, usize::MAX),
+                Err(Error::TooSmall)
+            );
+            assert!(out.iter().all(|&b| b == 0x39));
+        }
+    }
+    /// Independent sources and an element-wise oracle expose symmetric copy errors.
     #[test]
     fn linear_copies_match_element_addresses() {
-        for dimension in [Dimension::Tex2d, Dimension::Tex3d] {
-            for n in [1, 2, 4, 8, 16] {
-                for width in [256 / n, 256 / n - 1, 256 / n + 1] {
-                    for mips in [1, 3] {
-                        let l = Layout::new(&Desc {
-                            dimension,
-                            depth: 4,
-                            ..desc(width, 5, mips, n, Swizzle::LINEAR)
-                        })
-                        .unwrap();
-                        for mip in 0..mips {
-                            let m = l.mips[mip as usize];
-                            for padding in [0, 13] {
-                                let active = m.width as usize * n as usize;
-                                let row = active + padding;
-                                let plane = row * m.height as usize + padding;
-                                let len = (m.depth as usize - 1) * plane
-                                    + (m.height as usize - 1) * row
-                                    + active;
-                                let linear: Vec<u8> =
-                                    (0..len).map(|i| (i ^ (i >> 8) ^ (i >> 16)) as u8).collect();
-                                let slices = if dimension == Dimension::Tex3d { 1 } else { 4 };
-                                for slice in 0..slices {
-                                    let mut expected = vec![0xcc; l.size as usize];
-                                    let mut back = vec![0xcc; len];
-                                    for z in 0..m.depth {
-                                        for y in 0..m.height {
-                                            for x in 0..m.width {
-                                                let t = l.offset(mip, x, y, slice + z).unwrap()
-                                                    as usize;
-                                                let at = z as usize * plane
-                                                    + y as usize * row
-                                                    + x as usize * n as usize;
-                                                let range = at..at + n as usize;
-                                                expected[t..t + n as usize]
-                                                    .copy_from_slice(&linear[range.clone()]);
-                                                back[range.clone()].copy_from_slice(&linear[range]);
+        let mut cases = 0;
+        for dimension in [Dimension::Tex1d, Dimension::Tex2d, Dimension::Tex3d] {
+            for element_bytes in [1, 2, 4, 8, 16] {
+                for block in [1, 4] {
+                    for width in [
+                        256 / element_bytes * block - 1,
+                        256 / element_bytes * block,
+                        256 / element_bytes * block + 1,
+                    ] {
+                        for height in [1, 7] {
+                            if dimension == Dimension::Tex1d && height != 1 {
+                                continue;
+                            }
+                            for depth in [1, 3] {
+                                for mips in [1, 3] {
+                                    let layout = Layout::new(&Desc {
+                                        dimension,
+                                        width,
+                                        height,
+                                        depth,
+                                        mips,
+                                        element_bytes,
+                                        block,
+                                        samples: 1,
+                                        swizzle: Swizzle::LINEAR,
+                                    })
+                                    .unwrap();
+                                    for mip in 0..mips {
+                                        let slices = if dimension == Dimension::Tex3d {
+                                            1
+                                        } else {
+                                            depth
+                                        };
+                                        for slice in 0..slices {
+                                            for row_pad in [0, 13] {
+                                                for depth_pad in [0, 17] {
+                                                    check_linear_copy(
+                                                        &layout, mip, slice, row_pad, depth_pad,
+                                                    );
+                                                    cases += 1;
+                                                }
                                             }
                                         }
                                     }
-                                    let mut tiled = vec![0xcc; l.size as usize];
-                                    l.tile(&mut tiled, mip, slice, &linear, row, plane).unwrap();
-                                    assert_eq!(tiled, expected);
-                                    let mut actual = vec![0xcc; len];
-                                    l.detile(&tiled, mip, slice, &mut actual, row, plane)
-                                        .unwrap();
-                                    assert_eq!(actual, back);
-                                    // Validation must still happen before any write.
-                                    let mut short = vec![0x7b; len - 1];
-                                    assert_eq!(
-                                        l.detile(&tiled, mip, slice, &mut short, row, plane),
-                                        Err(Error::TooSmall)
-                                    );
-                                    assert!(short.iter().all(|&b| b == 0x7b));
-                                    let saved = tiled.clone();
-                                    assert_eq!(
-                                        l.tile(
-                                            &mut tiled,
-                                            mip,
-                                            slice,
-                                            &linear[..len - 1],
-                                            row,
-                                            plane
-                                        ),
-                                        Err(Error::TooSmall)
-                                    );
-                                    assert_eq!(tiled, saved);
                                 }
                             }
                         }
@@ -1311,6 +1405,7 @@ mod tests {
                 }
             }
         }
+        assert_eq!(cases, 7680);
     }
     #[test]
     fn depth_stencil_is_two_planes() {
