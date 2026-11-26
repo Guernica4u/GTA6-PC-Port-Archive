@@ -997,6 +997,9 @@ enum Step {
     Memory(usize),
 }
 
+type VramRead = (ID3D12Resource, u64, usize, u64);
+type VramProbe = Box<dyn Fn(&mut Vec<VramRead>) + Send>;
+
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload buffers its GPU commands read, kept until the list is reset.
@@ -1030,6 +1033,12 @@ struct Deferred {
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
     missed: Vec<Box<dyn Fn() -> bool + Send>>,
+    /// Per-list VRAM/RAM dirty bitmaps (`crate::memory::bind`) to zero before
+    /// execution and read back after.
+    vram_bitmaps: Vec<(ID3D12Resource, ID3D12Resource)>,
+    /// Probes run after bitmap readbacks to collect any VRAM-backed `memory`
+    /// shadow pages that need CPU readback before `after` callbacks run.
+    vram_probes: Vec<VramProbe>,
 }
 
 impl Host {
@@ -1250,7 +1259,17 @@ impl Host {
         }
         batch.flush();
         let vram_uploads = crate::shadow::take_vram_uploads();
-        self.upload_vram_copies(&vram_uploads, &mut submitted);
+        let mut vram_bitmaps: Vec<(ID3D12Resource, ID3D12Resource)> = Vec::new();
+        let mut seen_bitmaps = std::collections::HashSet::new();
+        for list in runs {
+            for (vram, ram) in &list.deferred().vram_bitmaps {
+                use windows::core::Interface;
+                if seen_bitmaps.insert(vram.as_raw() as usize) {
+                    vram_bitmaps.push((vram.clone(), ram.clone()));
+                }
+            }
+        }
+        self.upload_vram_copies(&vram_uploads, &vram_bitmaps, &mut submitted);
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
@@ -1335,7 +1354,16 @@ impl Host {
                     }
                 }
             }
-            self.readback_vram_copies(&reads, &mut submitted);
+            self.readback_vram_copies(&reads, &vram_bitmaps, true, &mut submitted);
+            let mut extra_reads = crate::shadow::vram_marked_reads();
+            for list in runs {
+                for probe in &list.deferred().vram_probes {
+                    probe(&mut extra_reads);
+                }
+            }
+            if !extra_reads.is_empty() {
+                self.readback_vram_copies(&extra_reads, &[], false, &mut submitted);
+            }
         }
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
@@ -2156,6 +2184,21 @@ impl HostList {
         self.deferred().after.push(Box::new(work));
     }
 
+    /// Registers a per-list VRAM/RAM dirty bitmap pair to zero before
+    /// execution and read back afterward.
+    pub(crate) fn defer_vram_bitmap(&self, vram: ID3D12Resource, ram: ID3D12Resource) {
+        self.deferred().vram_bitmaps.push((vram, ram));
+    }
+
+    /// Registers a probe run after bitmap readbacks to collect VRAM-backed
+    /// shadow pages written through the title-memory page table.
+    pub(crate) fn defer_vram_probe(
+        &self,
+        probe: impl Fn(&mut Vec<(ID3D12Resource, u64, usize, u64)>) + Send + 'static,
+    ) {
+        self.deferred().vram_probes.push(Box::new(probe));
+    }
+
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.deferred().writes.push((dst as usize, what, bytes));
@@ -2794,8 +2837,16 @@ impl Host {
 
     /// Streams dirty CPU shadow ranges into VRAM via a reusable 64 MiB upload ring
     /// and syncs dirty page-table/bitmap metadata before GPU lists run.
-    fn upload_vram_copies(&self, uploads: &[crate::shadow::VramCopy], submitted: &mut u64) {
-        if uploads.is_empty() && !crate::memory::needs_vram_pre() && !crate::shadow::has_vram_bitmaps() {
+    fn upload_vram_copies(
+        &self,
+        uploads: &[crate::shadow::VramCopy],
+        vram_bitmaps: &[(ID3D12Resource, ID3D12Resource)],
+        submitted: &mut u64,
+    ) {
+        if uploads.is_empty()
+            && !crate::memory::needs_vram_pre(vram_bitmaps)
+            && !crate::shadow::has_vram_bitmaps()
+        {
             return;
         }
         const RING_BYTES: u64 = 64 << 20;
@@ -2811,14 +2862,12 @@ impl Host {
 
         let mut offset = 0u64;
         let mut batch: Vec<(ID3D12Resource, u64, u64, u64)> = Vec::new();
-        let flush = |batch: &mut Vec<(ID3D12Resource, u64, u64, u64)>, submitted: &mut u64, sync_meta: bool, wait: bool| {
+        let flush = |batch: &mut Vec<(ID3D12Resource, u64, u64, u64)>, submitted: &mut u64, sync_meta: bool| {
             if batch.is_empty() && !sync_meta {
                 return;
             }
-            let fence_val = wait.then(|| {
-                *submitted += 1;
-                *submitted
-            });
+            *submitted += 1;
+            let fence_val = *submitted;
             self.run_copy_list(
                 |list| {
                     for (dst, dst_off, src_off, len) in batch.iter() {
@@ -2826,11 +2875,11 @@ impl Host {
                         unsafe { list.CopyBufferRegion(dst, *dst_off, &ring_buf, *src_off, *len) };
                     }
                     if sync_meta {
-                        crate::memory::sync_vram_pre(list);
+                        crate::memory::sync_vram_pre(list, vram_bitmaps);
                         crate::shadow::sync_bitmaps_pre(list);
                     }
                 },
-                fence_val,
+                Some(fence_val),
             );
             batch.clear();
         };
@@ -2840,7 +2889,7 @@ impl Host {
             while done < u.len {
                 let mut avail = RING_BYTES - offset;
                 if avail == 0 {
-                    flush(&mut batch, submitted, false, true);
+                    flush(&mut batch, submitted, false);
                     offset = 0;
                     avail = RING_BYTES;
                 }
@@ -2858,13 +2907,20 @@ impl Host {
                 done += chunk;
             }
         }
-        flush(&mut batch, submitted, true, false);
+        flush(&mut batch, submitted, true);
     }
 
     /// Copies GPU-written VRAM ranges and dirty bitmaps back to CPU memory via a
     /// reusable 32 MiB readback ring after GPU lists finish.
-    fn readback_vram_copies(&self, reads: &[(ID3D12Resource, u64, usize, u64)], submitted: &mut u64) {
-        if reads.is_empty() && !crate::memory::needs_vram_post() && !crate::shadow::has_vram_bitmaps() {
+    fn readback_vram_copies(
+        &self,
+        reads: &[(ID3D12Resource, u64, usize, u64)],
+        vram_bitmaps: &[(ID3D12Resource, ID3D12Resource)],
+        sync_meta: bool,
+        submitted: &mut u64,
+    ) {
+        let do_meta = sync_meta && (!vram_bitmaps.is_empty() || crate::shadow::has_vram_bitmaps());
+        if reads.is_empty() && !do_meta {
             return;
         }
         const RING_BYTES: u64 = 32 << 20;
@@ -2881,6 +2937,9 @@ impl Host {
         let mut offset = 0u64;
         let mut batch: Vec<(ID3D12Resource, u64, u64, usize, u64)> = Vec::new();
         let flush = |batch: &mut Vec<(ID3D12Resource, u64, u64, usize, u64)>, submitted: &mut u64, sync_meta: bool| {
+            if batch.is_empty() && !sync_meta {
+                return;
+            }
             *submitted += 1;
             let fence_val = *submitted;
             self.run_copy_list(
@@ -2890,7 +2949,7 @@ impl Host {
                         unsafe { list.CopyBufferRegion(&ring_buf, *dst_off, src, *src_off, *len) };
                     }
                     if sync_meta {
-                        crate::memory::sync_vram_post(list);
+                        crate::memory::sync_vram_post(list, vram_bitmaps);
                         crate::shadow::sync_bitmaps_post(list);
                     }
                 },
@@ -2923,7 +2982,7 @@ impl Host {
                 done += chunk;
             }
         }
-        flush(&mut batch, submitted, true);
+        flush(&mut batch, submitted, do_meta);
     }
 
     #[cfg(test)]
@@ -2961,11 +3020,7 @@ impl Host {
         let uploads = crate::shadow::take_vram_uploads();
         if !uploads.is_empty() {
             let mut dummy = 0u64;
-            if let Ok(mut guard) = self.submitted.try_lock() {
-                self.upload_vram_copies(&uploads, &mut guard);
-            } else {
-                self.upload_vram_copies(&uploads, &mut dummy);
-            }
+            self.upload_vram_copies(&uploads, &[], &mut dummy);
         }
     }
 
@@ -2981,10 +3036,11 @@ impl Host {
     }
 
     fn run_copy_list<F: FnOnce(&ID3D12GraphicsCommandList)>(&self, record: F, wait_fence: Option<u64>) {
-        static CMD: Mutex<Option<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)>> = Mutex::new(None);
+        static CMD: Mutex<Option<(ID3D12CommandAllocator, ID3D12GraphicsCommandList, ID3D12Fence, u64)>> =
+            Mutex::new(None);
         let mut guard = CMD.lock().unwrap_or_else(|e| e.into_inner());
-        let (alloc, list) = guard.get_or_insert_with(|| {
-            // SAFETY: valid D3D12 device creating a direct allocator and closed command list.
+        let (alloc, list, fence, seq) = guard.get_or_insert_with(|| {
+            // SAFETY: valid D3D12 device creating a direct allocator, fence, and closed command list.
             unsafe {
                 let alloc: ID3D12CommandAllocator = self
                     .device
@@ -2994,24 +3050,27 @@ impl Host {
                     .device
                     .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)
                     .unwrap();
+                let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
                 let _ = list.Close();
-                (alloc, list)
+                (alloc, list, fence, 0)
             }
         });
-        // SAFETY: `alloc` and `list` are exclusively held under `CMD`; `wait_fence` or queue FIFO
-        // serializes reuse between submissions.
+        // SAFETY: `alloc` and `list` are exclusively held under `CMD`; `fence` or caller's
+        // test fence serializes reuse between submissions.
         unsafe {
-            let _ = alloc.Reset();
-            let _ = list.Reset(&*alloc, None);
+            alloc.Reset().expect("reset copy allocator");
+            list.Reset(&*alloc, None).expect("reset copy list");
             record(list);
-            let _ = list.Close();
+            list.Close().expect("close copy list");
             let cmd: Option<ID3D12CommandList> = list.cast().ok();
             self.queue.ExecuteCommandLists(&[cmd]);
-            if let Some(fence_val) = wait_fence
-                && self.queue.Signal(&self.fence, fence_val).is_ok()
-                && self.fence.SetEventOnCompletion(fence_val, self.event).is_ok()
-            {
-                WaitForSingleObject(self.event, INFINITE);
+            if wait_fence.is_some() {
+                *seq += 1;
+                if self.queue.Signal(&*fence, *seq).is_ok()
+                    && fence.SetEventOnCompletion(*seq, self.event).is_ok()
+                {
+                    WaitForSingleObject(self.event, INFINITE);
+                }
             }
         }
     }

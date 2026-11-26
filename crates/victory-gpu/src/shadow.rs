@@ -130,12 +130,17 @@ fn try_vram_shadow(size: u64, max_single: u64) -> Option<ID3D12Resource> {
     if budget == 0 {
         return None;
     }
-    let cur = VRAM_BYTES.load(std::sync::atomic::Ordering::Relaxed);
-    if cur + size > budget {
+    VRAM_BYTES
+        .fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |cur| cur.checked_add(size).filter(|&next| next <= budget),
+        )
+        .ok()?;
+    let Some(buf) = h.default_uav_buffer(size) else {
+        VRAM_BYTES.fetch_sub(size, std::sync::atomic::Ordering::Relaxed);
         return None;
-    }
-    let buf = h.default_uav_buffer(size)?;
-    VRAM_BYTES.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+    };
     Some(buf)
 }
 
@@ -151,7 +156,10 @@ struct Backing {
 fn alloc_backing(size: u64, max_vram_single: u64, arena_owned: bool, label: impl FnOnce() -> String) -> Option<Backing> {
     let h = host()?;
     let (buffer, cpu, data, vram) = if let Some(v) = try_vram_shadow(size, max_vram_single) {
-        let cpu = CpuMem::new(size)?;
+        let Some(cpu) = CpuMem::new(size) else {
+            VRAM_BYTES.fetch_sub(size, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        };
         let data = cpu.ptr();
         (v, cpu, data, true)
     } else {
@@ -938,11 +946,16 @@ unsafe impl Send for Bitmap {}
 // SAFETY: as above.
 unsafe impl Sync for Bitmap {}
 
+static BITMAPS: [std::sync::OnceLock<Option<Bitmap>>; 2] = [const { std::sync::OnceLock::new() }; 2];
+
+fn existing_bitmap(memory: bool) -> Option<&'static Bitmap> {
+    BITMAPS[usize::from(memory)].get().and_then(Option::as_ref)
+}
+
 /// The bitmap of other shaders, or (`memory`) of shaders that use title
 /// memory, whose marks go back only while it is not withheld
 /// (`crate::memory::withholding`).
 fn bitmap(memory: bool) -> Option<&'static Bitmap> {
-    static BITMAPS: [std::sync::OnceLock<Option<Bitmap>>; 2] = [const { std::sync::OnceLock::new() }; 2];
     BITMAPS[usize::from(memory)]
         .get_or_init(|| {
             // Written pages, then one read mark per heap index.
@@ -970,12 +983,12 @@ fn bitmap(memory: bool) -> Option<&'static Bitmap> {
 pub(crate) fn has_vram_bitmaps() -> bool {
     [false, true]
         .into_iter()
-        .filter_map(bitmap)
+        .filter_map(existing_bitmap)
         .any(|b| b.vram.is_some())
 }
 
 pub(crate) fn sync_bitmaps_pre(list: &windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList) {
-    for b in [false, true].into_iter().filter_map(bitmap) {
+    for b in [false, true].into_iter().filter_map(existing_bitmap) {
         if let Some(vram) = &b.vram {
             // SAFETY: live bitmap buffers of `b.bytes`.
             unsafe { list.CopyBufferRegion(vram, 0, &b._buffer, 0, b.bytes) };
@@ -984,12 +997,76 @@ pub(crate) fn sync_bitmaps_pre(list: &windows::Win32::Graphics::Direct3D12::ID3D
 }
 
 pub(crate) fn sync_bitmaps_post(list: &windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList) {
-    for b in [false, true].into_iter().filter_map(bitmap) {
+    for b in [false, true].into_iter().filter_map(existing_bitmap) {
         if let Some(vram) = &b.vram {
             // SAFETY: live bitmap buffers of `b.bytes`.
             unsafe { list.CopyBufferRegion(&b._buffer, 0, vram, 0, b.bytes) };
         }
     }
+}
+
+/// Collects VRAM -> CPU readback ranges for any pages marked in `VIEW_WRITES`
+/// whose shadow is VRAM-backed, without clearing the bitmap bits.
+pub(crate) fn vram_marked_reads() -> Vec<(ID3D12Resource, u64, usize, u64)> {
+    let mut marked = Vec::new();
+    let words = (victory_shader::emit::VIEW_WRITE_BITS / 32) as usize;
+    let used = (marks().end as usize).div_ceil(32).min(words.saturating_sub(1));
+    for memory in [false, true] {
+        let Some(b) = existing_bitmap(memory) else {
+            continue;
+        };
+        if b.vram.is_none() {
+            continue;
+        }
+        // SAFETY: mapped bitmap; GPU execution and bitmap readback finished.
+        let bits = unsafe { std::slice::from_raw_parts(b.data as *const u32, words) };
+        for (w, &word) in bits[..used].iter().enumerate() {
+            let mut x = word;
+            while x != 0 {
+                marked.push((w * 32) as u32 + x.trailing_zeros());
+                x &= x - 1;
+            }
+        }
+    }
+    if marked.is_empty() {
+        return Vec::new();
+    }
+    marked.sort_unstable();
+    marked.dedup();
+    let m = marks();
+    let mut seen = std::collections::HashSet::new();
+    let mut reads = Vec::new();
+    for n in marked {
+        let Some((&base, copy)) = m.owners.range(..=n).next_back() else {
+            continue;
+        };
+        let Some(copy) = copy.upgrade() else {
+            continue;
+        };
+        let k = n - base;
+        if k >= pages(copy.start, copy.len) {
+            continue;
+        }
+        let Some((cpu_ptr, vram_base, start, buf_len)) = copy.vram_readback() else {
+            continue;
+        };
+        let page = ((copy.start >> 16) + u64::from(k)) << 16;
+        if !seen.insert((Arc::as_ptr(&copy) as usize, page)) {
+            continue;
+        }
+        let s = page.max(start);
+        let e = (page + PAGE as u64).min(start + buf_len);
+        if e > s {
+            let off = s - start;
+            reads.push((
+                copy.buffer.clone(),
+                vram_base + off,
+                cpu_ptr + off as usize,
+                e - s,
+            ));
+        }
+    }
+    reads
 }
 
 /// The host GPU address of the buffer views' written-pages bitmap, for the
@@ -1864,5 +1941,54 @@ pub(crate) mod tests {
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+    }
+
+    /// A shader write into a VRAM-backed shadow that sets a `VIEW_WRITES` bit
+    /// without a `Step::GpuWrite` still reaches title memory on `Host::execute`.
+    #[test]
+    fn vram_marked_view_writes_go_back_to_title() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let p = crate::watch::tests::pool(1);
+        register(p, p as u64, PAGE as u64);
+        let Some(copy) = find(p as u64, PAGE as u64) else {
+            unregister(p, p as u64);
+            return;
+        };
+        let base = copy.marks.expect("tracked memory gets mark bits") as usize;
+        let Some(b) = bitmap(false) else {
+            unregister(p, p as u64);
+            return;
+        };
+        copy.update(p, PAGE);
+        let list = host.new_list().unwrap();
+        let copy_w = Arc::clone(&copy);
+        let vram_gpu = b.gpu;
+        list.defer_host(move || {
+            copy_w.write_host(p as u64, &0x1337_c0deu32.to_le_bytes());
+        });
+        // Set the VIEW_WRITES mark bit directly on GPU (or RAM when UMA) without Step::GpuWrite.
+        let word_off = ((base / 32) * 4) as u64;
+        let bit_mask = 1u32 << (base % 32);
+        let (up, up_ptr) = host.upload_buffer(4).expect("upload bit");
+        // SAFETY: mapped 4-byte upload buffer.
+        unsafe { up_ptr.cast::<u32>().write_volatile(bit_mask) };
+        list.keep(&up);
+        // SAFETY: open command list and valid buffer regions.
+        unsafe {
+            if let Some(vram) = &b.vram {
+                list.list.CopyBufferRegion(vram, word_off, &up, 0, 4);
+            } else {
+                list.list.CopyBufferRegion(&b._buffer, word_off, &up, 0, 4);
+            }
+        }
+        let _ = vram_gpu;
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: our pool page.
+        let title_word = unsafe { (p as *const u32).read_volatile() };
+        assert_eq!(title_word, 0x1337_c0de);
+        unregister(p, p as u64);
     }
 }
