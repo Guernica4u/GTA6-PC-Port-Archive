@@ -1,5 +1,8 @@
 import unittest
-from tools.check_d3d12_regressions import validate,DIGEST
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
+from tools.check_d3d12_regressions import validate,DIGEST,cbv_configuration,CBV_ENV
 
 class D3D12RegressionTests(unittest.TestCase):
     def test_adapter_and_exit_are_checked(self):
@@ -97,3 +100,47 @@ class D3D12RegressionTests(unittest.TestCase):
         self.assertFalse(validate("root-cbv-window","10de:2704",0,output.replace("131072","65536"))[0])
         self.assertFalse(validate("root-cbv-window","10de:2704",0,output+"\nbound with a short range")[0])
         self.assertFalse(validate("root-cbv-window","10de:2704",0,output+"\nsubstituted null compute pipeline")[0])
+
+class CbvConfigurationTests(unittest.TestCase):
+    def test_inherit_and_stock_are_distinct(self):
+        ambient = {key: "inherited" for key in CBV_ENV}
+        ambient["PATH"] = "/bin"
+        ambient["VK_DRIVER_FILES"] = "selected-driver"
+        before = ambient.copy()
+        p = Path("/unused")
+        self.assertEqual(cbv_configuration("inherit", p, p, ambient), ((), {}, {"mode": "inherit"}))
+        unset, env, report = cbv_configuration("stock", p, p, ambient)
+        self.assertEqual(set(unset), set(CBV_ENV))
+        self.assertEqual(env, {})
+        self.assertEqual(report["route"], "stock")
+        self.assertEqual(ambient, before)
+        self.assertNotIn("VK_DRIVER_FILES", unset)
+
+    def test_launcher_layer_and_fork_use_clean_inputs(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            layer = root / "layer"
+            layer.mkdir()
+            for name in ("frosty.json", "frosty_cbv.so"):
+                (layer / name).write_bytes(name.encode())
+            ambient = {"VKD3D_CONFIG": "force_static_cbv", "VK_INSTANCE_LAYERS": "unrelated",
+                       "VK_LAYER_PATH": "other", "PATH": "/bin"}
+            with patch("project_tuxbox.console_cbv.console_cbv_layer", return_value=str(layer)):
+                unset, env, report = cbv_configuration("launcher", root, root/"test.exe", ambient)
+            self.assertEqual(set(unset), set(CBV_ENV))
+            self.assertEqual(env["VKD3D_CONFIG"], "force_raw_va_cbv")
+            self.assertEqual(env["VK_INSTANCE_LAYERS"], "VK_LAYER_TUXBOX_console_cbv")
+            self.assertEqual(env["VK_ADD_LAYER_PATH"], str(layer))
+            self.assertNotIn("VK_LAYER_PATH", env)
+            self.assertEqual(report["route"], "layer")
+            self.assertEqual(set(report["artifacts_sha256"]), {"frosty.json", "frosty_cbv.so"})
+            self.assertNotIn(str(root), str(report))
+            (root/"tuxbox-features").write_text("cbv_16_byte_alignment\n")
+            with patch("project_tuxbox.console_cbv.console_cbv_layer") as build:
+                _, env, report = cbv_configuration("launcher", root, root/"test.exe", ambient)
+            build.assert_not_called()
+            self.assertEqual(report["route"], "proton-feature")
+            self.assertEqual(env["VKD3D_CONFIG"], "cbv_16_byte_alignment,force_raw_va_cbv")
+            self.assertIn("VK_EXT_descriptor_heap", env["VKD3D_DISABLE_EXTENSIONS"])
+            self.assertNotIn("VK_INSTANCE_LAYERS", env)
+            self.assertEqual(ambient["VK_INSTANCE_LAYERS"], "unrelated")

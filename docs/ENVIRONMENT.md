@@ -93,3 +93,21 @@ All are off by default. Capture variables write the game's data to disk, so don'
 ## Build and test tools
 
 `TUXBOX_XSHADER` selects the shader compiler for launcher preparation and `DXC` selects the DirectX Shader Compiler. `TUXBOX_BLESS_PROFILES`, `TUXBOX_ORACLE_*`, `TUXBOX_TEST_*` and the probe and replay variables in `tools/` belong to individual checks. `TUXBOX_PROVIDER`, `TUXBOX_SHADER_SESSION` and `TUXBOX_WINE_*` are internal; don't set them.
+
+
+### Comparing constant-buffer alignment in synthetic regression controls
+
+`tools/check_d3d12_regressions.py --cbv-mode stock` clears the explicit
+vkd3d and Vulkan-layer overrides listed in the tool; it does not change
+the selected Vulkan driver or remove system-installed implicit layers.
+`--cbv-mode launcher` uses that same cleaned environment and then applies
+the title launcher's console CBV configuration (the Proton feature or
+the Vulkan layer). The default `inherit` preserves previous behavior.
+
+Use identical build artifacts, Proton version, adapter and source prefix
+for both runs, with fresh work/output paths. The report records requested
+mode, route, fixed flags and layer/feature fingerprints, not private
+paths or inherited environment values. The explicit modes retain
+vkd3d info logs locally so the actual descriptor path can be checked.
+The supplied test provider need not match the harness checkout.
+These controls do not establish the accuracy of untested CBV offsets.

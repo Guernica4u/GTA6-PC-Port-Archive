@@ -7,12 +7,59 @@ source Proton prefix is copied and never modified. Logs remain local.
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 from tempfile import TemporaryDirectory
 from time import monotonic
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from project_tuxbox.console_cbv import configure_console_cbv
+
+# These variables can silently change which descriptor model is tested.
+# Do not alter the default inherited configuration or GPU selection.
+CBV_ENV = ("VKD3D_CONFIG", "VKD3D_DISABLE_EXTENSIONS", "VK_INSTANCE_LAYERS",
+           "VK_LAYER_PATH", "VK_ADD_LAYER_PATH", "VK_LOADER_LAYERS_ENABLE",
+           "VK_LOADER_LAYERS_DISABLE", "VK_LOADER_LAYERS_ALLOW",
+           "TUXBOX_REFERENCE_CBV")
+
+
+def cbv_configuration(mode, proton, executable, ambient):
+    """Return explicit environment changes and non-sensitive requested provenance."""
+    if mode == "inherit":
+        return (), {}, {"mode": mode}
+    if mode not in ("stock", "launcher"):
+        raise ValueError("invalid CBV mode")
+    build_env = {key: value for key, value in ambient.items() if key not in CBV_ENV}
+    report = {"mode": mode, "route": "stock", "artifacts_sha256": {}}
+    if mode == "launcher":
+        # The supplied DLL is staged and verified by this synthetic harness;
+        # do not require it to match a potentially different checkout's DLL.
+        build_env.update(PROTONPATH=str(proton.resolve()), TUXBOX_REFERENCE_CBV="1")
+        messages = []
+        configure_console_cbv("proton", build_env, executable, messages.append)
+        if messages == ["Constant-buffer alignment: TuxBox Vulkan layer"]:
+            report["route"] = "layer"
+            layer = Path(build_env["VK_ADD_LAYER_PATH"])
+            report["artifacts_sha256"] = {name: sha(layer / name)
+                                           for name in ("frosty.json", "frosty_cbv.so")}
+        elif messages == ["Constant-buffer alignment: selected Proton build feature"]:
+            report["route"] = "proton-feature"
+            report["artifacts_sha256"]["tuxbox-features"] = sha(proton / "tuxbox-features")
+        else:
+            raise ValueError("launcher CBV configuration was not selected")
+    settings = {key: build_env[key] for key in CBV_ENV if key in build_env}
+    settings.pop("TUXBOX_REFERENCE_CBV", None)
+    # No paths or inherited free-form environment in the shareable receipt.
+    report["vkd3d_config"] = settings.get("VKD3D_CONFIG")
+    report["disabled_extensions"] = settings.get("VKD3D_DISABLE_EXTENSIONS")
+    report["instance_layers"] = settings.get("VK_INSTANCE_LAYERS")
+    return CBV_ENV, settings, report
+
 
 CASES = {
     "root-cbv-window": ("d3d12-root-cbv-window", (), "d3d12-root-cbv-window", ("words=120/120","window=65536","offsets=0,256,65280,65536,65792")),
@@ -151,6 +198,8 @@ def main(argv=None):
     ap.add_argument("--xmem",type=Path)
     ap.add_argument("--adapter",required=True)
     ap.add_argument("--case",choices=tuple(CASES),action="append")
+    ap.add_argument("--cbv-mode", choices=("inherit", "stock", "launcher"), default="inherit",
+                    help="explicitly clear descriptor/layer overrides, or apply the title launcher's CBV setup")
     a=ap.parse_args(argv)
     if not re.fullmatch(r"[a-fA-F0-9]{4}:[a-fA-F0-9]{4}",a.adapter):
         ap.error("adapter must be a PCI vendor:device ID")
@@ -182,6 +231,11 @@ def main(argv=None):
     if any(not p.is_file() for p in (*artifacts.values(),wine)):
         ap.error("missing build, Proton or compiler artifact")
     fingerprints={k:sha(p) for k,p in artifacts.items()}
+    try:
+        unset_cbv, cbv_env, cbv_report = cbv_configuration(
+            a.cbv_mode, a.proton, artifacts[CASES[selected[0]][0] + ".exe"], os.environ)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        ap.error(f"CBV configuration failed: {error}")
     a.work.mkdir(parents=True)
     rows=[]
     for case in selected:
@@ -207,6 +261,11 @@ def main(argv=None):
             cmd=["bwrap","--die-with-parent","--unshare-pid","--unshare-net","--ro-bind","/","/",
                  "--dev-bind","/dev","/dev","--proc","/proc","--tmpfs","/tmp","--bind",str(trial),str(trial),
                  "--unsetenv","WAYLAND_DISPLAY","--chdir",str(trial)]
+            for key in unset_cbv:
+                cmd.extend(("--unsetenv", key))
+            env.update(cbv_env)
+            if a.cbv_mode != "inherit":
+                env["VKD3D_DEBUG"] = "info"
             for k,v in env.items():
                 cmd.extend(("--setenv",k,str(v)))
             cmd+=["--","xvfb-run","-a","timeout","-k","2s","45s",str(wine),str(trial/(name+".exe")),
@@ -227,7 +286,7 @@ def main(argv=None):
     unchanged=fingerprints=={k:sha(p) for k,p in artifacts.items()}
     report=dict(schema=1,scope="Synthetic D3D12 provider controls; not retail execution",
                 adapter=a.adapter.lower(),proton=(a.proton/"version").read_text().strip(),
-                artifacts_sha256=fingerprints,unchanged=unchanged,cases=rows,
+                artifacts_sha256=fingerprints,cbv_configuration=cbv_report,unchanged=unchanged,cases=rows,
                 passed=unchanged and all(row["passed"] for row in rows))
     a.output.parent.mkdir(parents=True,exist_ok=True)
     with a.output.open("x") as stream:
