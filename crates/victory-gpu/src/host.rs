@@ -799,6 +799,10 @@ pub(crate) struct HostList {
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
     states: Mutex<States>,
+    /// Bumped whenever `states` gains or changes an entry (and when it is
+    /// cleared): a draw that ensured its targets against this generation
+    /// need not ensure them again.
+    states_generation: std::sync::atomic::AtomicU64,
     /// Depth textures with a writable twin the list uses (`crate::twin`),
     /// by host copy: the side its first use needs and the side it leaves
     /// newer.
@@ -1133,6 +1137,7 @@ impl Host {
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
+                states_generation: std::sync::atomic::AtomicU64::new(0),
                 twins: Mutex::default(),
                 rebind: false.into(),
                 ours: false.into(),
@@ -1783,6 +1788,7 @@ impl HostList {
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.states_generation.fetch_add(1, Ordering::Relaxed);
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
@@ -1819,14 +1825,22 @@ impl HostList {
         // One host texture for the whole move (`crate::resource::evict` may
         // give it up meanwhile; this list then holds it).
         let copy = crate::resource::host_copy(resource)?;
-        let texture = copy.texture.clone();
         if let Some(Some(twin)) = copy.twin.get()
             && crate::twin::route(self, &copy, twin, wanted)
         {
             return None;
         }
-        let wanted = legal_state(&texture, wanted);
-        self.track(&copy, wanted).map(|before| (texture, before))
+        let wanted = legal_state(&copy.texture, wanted);
+        // The texture is cloned only when a barrier is owed, not on every
+        // call that finds the state already right.
+        self.track(&copy, wanted)
+            .map(|before| (copy.texture.clone(), before))
+    }
+
+    /// The generation of the list's texture states: unchanged when nothing
+    /// the list named has moved since it was last read.
+    pub(crate) fn states_generation(&self) -> u64 {
+        self.states_generation.load(Ordering::Relaxed)
     }
 
     /// The list's state for host texture `copy` becomes `wanted` (a legal
@@ -1834,6 +1848,7 @@ impl HostList {
     /// list's first use (its prelude moves the texture there).
     fn track(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) -> Option<u32> {
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        self.states_generation.fetch_add(1, Ordering::Relaxed);
         match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 copy.note_used();

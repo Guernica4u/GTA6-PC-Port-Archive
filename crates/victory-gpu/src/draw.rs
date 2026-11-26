@@ -64,6 +64,10 @@ pub(crate) struct State {
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
     depth: usize,
+    /// The targets and depth [`State::bind`] last ensured, with the list's
+    /// states generation then: ensuring them again is skipped while nothing
+    /// the list named has moved since.
+    ensured: Option<(Vec<usize>, usize, u64)>,
     /// None leaves the host list's default bounds (0..1) in place.
     depth_bounds: Option<(f32, f32)>,
     /// The title's primitive topology (the host's may differ).
@@ -591,11 +595,25 @@ impl State {
         }
         const RENDER_TARGET: u32 = 0x4;
         const DEPTH_WRITE: u32 = 0x10;
-        for &t in &self.targets {
-            crate::list::ensure_state(list, t as This, RENDER_TARGET);
-        }
-        if self.depth != 0 {
-            crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE);
+        // Every draw binds the same targets, and each `ensure_state` costs a
+        // host copy lookup, a twin check, a state legalisation and a hash
+        // entry before finding out nothing changed: skip them while the
+        // list's states have not moved since the last draw ensured them.
+        let generation = list.states_generation();
+        let stale = match &self.ensured {
+            Some((targets, depth, at)) => {
+                *at != generation || *depth != self.depth || targets != &self.targets
+            }
+            None => true,
+        };
+        if stale {
+            for &t in &self.targets {
+                crate::list::ensure_state(list, t as This, RENDER_TARGET);
+            }
+            if self.depth != 0 {
+                crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE);
+            }
+            self.ensured = Some((self.targets.clone(), self.depth, generation));
         }
         // A depth copy of ours (`crate::twin`) ran a compute pipeline.
         if list.take_rebind() {
