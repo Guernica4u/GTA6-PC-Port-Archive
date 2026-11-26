@@ -1287,8 +1287,10 @@ impl Host {
             }
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
+            // Time every submission when timing is on, including one with a single
+            // list: its wall was in `on the GPU` but missing from `GPU timing`.
             #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 {
+            if timing() {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 gpu_times(started.elapsed(), &runs[i].slowest(frequency, usize::MAX));
@@ -3056,20 +3058,22 @@ impl Meter {
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
-        // Of a frame, ms preparing submissions and ms waiting for the GPU.
-        let [cpu, gpu] = [0, 1].map(|i| {
-            SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
-        });
-        let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
-            let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
-            PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
-        });
-        let [back_ms, back_mb] = [0, 1].map(|i| {
-            COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
-        });
+        // The counters are read in the five-second block, where `GPU timing`
+        // is logged, so both lines cover the same frames.
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             let report_frames = std::mem::take(&mut self.report_frames) as f64;
+            // Of a frame, ms preparing submissions and ms waiting for the GPU.
+            let [cpu, gpu] = [0, 1].map(|i| {
+                SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / report_frames
+            });
+            let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
+                let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
+                PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / report_frames
+            });
+            let [back_ms, back_mb] = [0, 1].map(|i| {
+                COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / report_frames
+            });
             let dropped = crate::draw::take_dropped() as f64 / report_frames;
             let indirect = crate::list::take_indirect() as f64 / report_frames;
             let root_views = crate::draw::take_root_view_slots() as f64 / report_frames;
