@@ -370,8 +370,14 @@ fn parse_exports(file: &PeFile64<'_>, image_base: u64) -> Result<Vec<ExportInfo>
             let (rva, forward) = match e.target() {
                 // The generic iterator adds the image base to an address.
                 ReadTarget::Address { address } => {
-                    let rva = address.checked_sub(image_base).and_then(|a| u32::try_from(a).ok())
-                        .ok_or_else(|| PeError::Malformed(format!("export address {address:#x} outside image_base {image_base:#x}")))?;
+                    let rva = address
+                        .checked_sub(image_base)
+                        .and_then(|a| u32::try_from(a).ok())
+                        .ok_or_else(|| {
+                            PeError::Malformed(format!(
+                                "export address {address:#x} outside image_base {image_base:#x}"
+                            ))
+                        })?;
                     (Some(rva), None)
                 }
                 ReadTarget::Reexport { library, name } => {
@@ -692,6 +698,35 @@ mod tests {
                 (Some("beta"), 1, Some(0x1200)),
                 (Some("gamma"), 2, Some(0x1204)),
             ]
+        );
+    }
+
+    #[test]
+    fn accepts_export_address_at_u32_max() {
+        let mut body = vec![0u8; 0x100];
+        let put32 =
+            |b: &mut Vec<u8>, at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        put32(&mut body, 12, 0x1040); // name of the DLL
+        put32(&mut body, 16, 1); // ordinal base
+        put32(&mut body, 20, 1); // number of functions
+        put32(&mut body, 24, 1); // number of names
+        put32(&mut body, 28, 0x1040); // address table
+        put32(&mut body, 32, 0x1034); // name pointer table
+        put32(&mut body, 36, 0x103C); // name ordinal table
+        put32(&mut body, 0x28, 0xFFFF_FFFF); // address = u32::MAX (valid)
+        put32(&mut body, 0x34, 0x1044);
+        body[0x40..0x44].copy_from_slice(b"t.dl");
+        body[0x44] = b'a';
+        body[0x45] = b'l';
+        body[0x46] = b'p';
+        body[0x47] = b'h';
+        body[0x48] = b'a';
+        body[0x49] = b'\0';
+
+        let info = ImageInfo::parse(&synthetic_image(&body));
+        assert!(
+            info.is_ok(),
+            "export address at u32::MAX should be accepted"
         );
     }
 }
