@@ -57,6 +57,7 @@ fn wave64_lds_within_32_threads_drops_wave_size() {
     let lowered = lower_wave_cs(&words, [32, 1, 1], 16);
     assert_eq!(lowered.wave_size, None);
     assert!(!lowered.lds_wave32_sync);
+    assert_eq!(lowered.lds_barriers, 0);
 }
 
 #[test]
@@ -71,9 +72,21 @@ fn wave64_lds_64_threads_uniform_drops_wave_size_and_emits_barriers() {
         0x0200_0000, // vdst = v2
         S_ENDPGM,
     ];
-    let lowered = lower_wave_cs(&words, [64, 1, 1], 16);
+    let mut lowered = lower_wave_cs(&words, [64, 1, 1], 16);
     assert_eq!(lowered.wave_size, None);
     assert!(lowered.lds_wave32_sync);
+    // 1 barrier after ds_write_b32 + 2 barriers (before & after) around ds_read_b32.
+    assert_eq!(lowered.lds_barriers, 3);
+    #[cfg(windows)]
+    if let Ok(mut v) = crate::emit::validator::Validator::load(
+        crate::emit::validator::Validator::default_path().as_deref(),
+    ) {
+        match v.validate(&mut lowered.dxil) {
+            Ok(()) => {}
+            Err(e) if e.contains("Unknown shader model") => {}
+            Err(e) => panic!("DXIL validation failed: {e}"),
+        }
+    }
 }
 
 #[test]
@@ -91,4 +104,41 @@ fn wave64_lds_64_threads_guarded_keeps_wave_size_64() {
     let lowered = lower_wave_cs(&words, [64, 1, 1], 16);
     assert_eq!(lowered.wave_size, Some(64));
     assert!(!lowered.lds_wave32_sync);
+    assert_eq!(lowered.lds_barriers, 0);
+}
+
+#[test]
+fn wave64_lds_64_threads_divergent_branch_keeps_wave_size_64() {
+    // Divergent s_cbranch_execz around an LDS write leaves guard=None inside the block,
+    // so control-flow reachability must still keep WaveSize(64) and emit zero barriers.
+    let words = [
+        0x7E02_0287, // v_mov_b32 v1, 7
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE94_246A, // s_and_saveexec_b64 s[20:21], vcc
+        0xBF88_0002, // s_cbranch_execz +2 dwords (skip ds_write_b32)
+        0xD834_0000, // ds_write_b32 v0, v1
+        0x0000_0100,
+        0xBEFE_0414, // s_mov_b64 exec, s[20:21]
+        S_ENDPGM,
+    ];
+    let lowered = lower_wave_cs(&words, [64, 1, 1], 16);
+    assert_eq!(lowered.wave_size, Some(64));
+    assert!(!lowered.lds_wave32_sync);
+    assert_eq!(lowered.lds_barriers, 0);
+}
+
+#[test]
+fn wave64_lds_64_threads_readfirstlane_keeps_wave_size_64() {
+    // Non-waterfall v_readfirstlane_b32 changes meaning when split across two Wave32 waves.
+    let words = [
+        0x7E00_0500, // v_readfirstlane_b32 s0, v0
+        0x7E02_0200, // v_mov_b32 v1, s0
+        0xD834_0000, // ds_write_b32 v0, v1
+        0x0000_0100,
+        S_ENDPGM,
+    ];
+    let lowered = lower_wave_cs(&words, [64, 1, 1], 16);
+    assert_eq!(lowered.wave_size, Some(64));
+    assert!(!lowered.lds_wave32_sync);
+    assert_eq!(lowered.lds_barriers, 0);
 }

@@ -78,6 +78,9 @@ pub(crate) struct Lowered {
     /// Whether `lds_wave32_sync` inserted DXIL barriers around LDS accesses.
     #[cfg(test)]
     pub lds_wave32_sync: bool,
+    /// Number of `dx.op.barrier` calls emitted in the DXIL module.
+    #[cfg(test)]
+    pub lds_barriers: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -119,33 +122,9 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     }
 }
 
-/// Returns `true` when every LDS access in `p` executes uniformly across the
-/// workgroup (no per-lane `EXEC` guard), so DXIL group barriers can order
-/// single-wave Wave64 LDS sharing on Wave32 hosts without forcing `WaveSize(64)`.
-fn can_sync_wave64_lds(p: &Program, x: &Parts) -> bool {
-    for (b, block) in p.blocks.iter().enumerate() {
-        for (i, inst) in block.insts.iter().enumerate() {
-            if !matches!(inst.fields, Fields::Ds { gds: false, .. }) {
-                continue;
-            }
-            if matches!(
-                inst.name(),
-                "ds_swizzle_b32" | "ds_bpermute_b32" | "ds_permute_b32" | "ds_nop"
-            ) {
-                continue;
-            }
-            if x.st
-                .guards
-                .get(b)
-                .and_then(|g| g.get(i))
-                .is_some_and(Option::is_some)
-            {
-                return false;
-            }
-        }
-    }
-    true
-}
+#[path = "wave64_lds.rs"]
+mod wave64_lds;
+use wave64_lds::can_sync_wave64_lds;
 
 const TWO_PI: f32 = std::f32::consts::TAU;
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
@@ -1471,6 +1450,8 @@ impl<'a> Lower<'a> {
             wave_size: self.s.wave_size,
             #[cfg(test)]
             lds_wave32_sync: self.lds_wave32_sync,
+            #[cfg(test)]
+            lds_barriers: self.s.m.written_calls("dx.op.barrier") as u32,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -3433,6 +3414,9 @@ impl<'a> Lower<'a> {
                     x
                 };
                 self.write(inst, Reg::V(reg), x, guard);
+                if self.lds_wave32_sync {
+                    self.emit_lds_barrier();
+                }
                 return Ok(());
             };
             let reg = dst_reg.ok_or("an LDS read result")?;
@@ -3446,6 +3430,9 @@ impl<'a> Lower<'a> {
                     self.write(inst, Reg::V(reg + n), x, guard);
                     n += 1;
                 }
+            }
+            if self.lds_wave32_sync {
+                self.emit_lds_barrier();
             }
             return Ok(());
         }
@@ -8658,6 +8645,9 @@ impl<'a> Lower<'a> {
                 for (k, x) in (0..).zip(r) {
                     self.write(inst, Reg::V(reg + k), x, None);
                 }
+            }
+            if self.lds_wave32_sync {
+                self.emit_lds_barrier();
             }
             return Ok(());
         }
