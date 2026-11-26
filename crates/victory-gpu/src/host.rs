@@ -331,6 +331,35 @@ fn takes_render_target(format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORM
 /// refuses `CreateRenderTargetView`, which D3D12 answers by removing the
 /// device (#1952). AMD takes that format as a target, so the refusal is by
 /// vendor and not by format.
+/// The decision `stand_in_for` takes, without a device: the stand-in of a
+/// packed format the host refuses, when it takes the stand-in, `None`
+/// otherwise. Pure, so the cases are testable.
+pub(crate) fn stand_in_decision(format: u32, refused: bool, stand_in_taken: bool) -> Option<u32> {
+    const B4G4R4A4_UNORM: u32 = 115;
+    const B5G5R5A1_UNORM: u32 = 86;
+    if format == B4G4R4A4_UNORM && refused && stand_in_taken {
+        Some(B5G5R5A1_UNORM)
+    } else {
+        None
+    }
+}
+
+/// The format a packed console target is made as on this host, or `None` when
+/// it is made as itself. A driver that answers yes to the format's support
+/// query and then refuses the view removes the device (#1952): the target is
+/// made as `B5G5R5A1_UNORM` when that is refused too as a view and the host
+/// takes the stand-in, so a host that renders to the format keeps it.
+pub(crate) fn stand_in_for(format: u32) -> Option<u32> {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    if format != 115 {
+        return None;
+    }
+    let host = host()?;
+    let refused =
+        refuses_target(host.vendor, format) || !takes_render_target(DXGI_FORMAT(format as i32));
+    stand_in_decision(format, refused, takes_render_target(DXGI_FORMAT(86)))
+}
+
 fn refuses_target(vendor: u32, format: u32) -> bool {
     const NVIDIA: u32 = 0x10DE;
     const B4G4R4A4_UNORM: u32 = 115;
@@ -4211,3 +4240,4 @@ mod present_plane_tests {
         assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
     }
 }
+

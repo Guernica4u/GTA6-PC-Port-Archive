@@ -238,13 +238,7 @@ pub(crate) fn pc_format(format: u32) -> u32 {
         118 => 20,
         119 => 21,
         120 => 22,
-        // `B4G4R4A4_UNORM`: NVIDIA reports it as a render target and then
-        // refuses the view, which D3D12 answers by removing the device (#1952,
-        // the title's 2560x1440 target). `B5G5R5A1_UNORM` is the same two
-        // bytes per texel, so the ladder and the copies keep their sizes; the
-        // colours are reinterpreted (4-4-4-4 read as 5-5-5-1), which is a
-        // shifted picture rather than none.
-        115 => 86,
+
         other => other,
     }
 }
@@ -1127,6 +1121,13 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
         d.flags &= !UNORDERED;
     }
     d.format = pc_format(d.format);
+    // A packed console target the host refuses as a render target is made as
+    // the stand-in of the same two bytes per texel, and only where the host
+    // takes that stand-in: the ladder and the copies keep their sizes, and a
+    // host that renders to the format natively keeps its colours (#1952).
+    if let Some(stand_in) = crate::host::stand_in_for(d.format) {
+        d.format = stand_in;
+    }
     const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
@@ -2362,13 +2363,22 @@ mod tests {
     fn a_packed_four_bit_target_stands_in_for_one_the_host_refuses() {
         const B4G4R4A4_UNORM: u32 = 115;
         const B5G5R5A1_UNORM: u32 = 86;
-        let stand_in = pc_format(B4G4R4A4_UNORM);
-        assert_eq!(stand_in, B5G5R5A1_UNORM);
+        // The stand-in has the same element size, so no ladder step or copy
+        // changes when it is taken.
         assert_eq!(
             element(B4G4R4A4_UNORM),
             element(B5G5R5A1_UNORM),
-            "the stand-in keeps the element size, so no ladder step or copy changes"
+            "the stand-in keeps the element size"
         );
+        // It is chosen only where the host refuses the target and takes the
+        // stand-in: a host that renders to 4-4-4-4 keeps its colours.
+        assert_eq!(
+            crate::host::stand_in_decision(B4G4R4A4_UNORM, true, true),
+            Some(B5G5R5A1_UNORM)
+        );
+        assert_eq!(crate::host::stand_in_decision(B4G4R4A4_UNORM, false, true), None);
+        assert_eq!(crate::host::stand_in_decision(B4G4R4A4_UNORM, true, false), None);
+        assert_eq!(crate::host::stand_in_decision(28, true, true), None);
         // And the formats that answer for themselves still do.
         assert_eq!(pc_format(28), 28, "R8G8B8A8_UNORM is a PC format already");
         assert_eq!(pc_format(118), 20, "D32_FLOAT stands in as D32_FLOAT_S8X24");
@@ -3199,3 +3209,5 @@ mod tests {
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
     }
 }
+
+
