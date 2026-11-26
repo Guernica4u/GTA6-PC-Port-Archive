@@ -679,8 +679,8 @@ def runtime_shader_compiler(backend, env, executable, report):
     except OSError as exc:
         report(f"Could not open ProjectScarlett's shader inputs: {exc}")
         archive = None
-    with shader_session(cache, env, report, archive=archive):
-        yield
+    with shader_session(cache, env, report, archive=archive) as profile:
+        yield profile
 
 
 @contextmanager
@@ -700,7 +700,7 @@ def shader_session(cache, env, report, *, archive=None):
                         kwargs=options, name="shader-compiler", daemon=True)
         worker.start()
         try:
-            yield
+            yield profile
         finally:
             stop.set()
             worker.join()

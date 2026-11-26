@@ -129,3 +129,16 @@ These host measurements cover dispatched requests, not guest-side cache
 lookups or compiler discovery. They contain no shader hashes, title names
 or raw error text. A forcibly killed launcher may not finish writing its
 summary.
+
+
+With `--profile-pipelines`, the capture directory also gets `stage-summary.json`
+containing the host runtime compiler aggregate and the vkd3d-proton PSO event
+aggregate from the same launch. The latter reports summed event durations,
+wall-time coverage (the union of observed intervals), and peak overlapping
+events. Overlap includes nesting and is not a worker count. These PSO events
+can include translation, lookup and driver work; they do not isolate driver
+compilation or measure GPU execution. Do not add host and PSO totals, since they
+can overlap. Missing host profiling or a missing trace is represented by null,
+not zero. The separate preparation aggregate remains in the launch log.
+Keep the raw timeline and detailed pipeline summary local; the combined
+aggregate does not include title or shader identifiers.
