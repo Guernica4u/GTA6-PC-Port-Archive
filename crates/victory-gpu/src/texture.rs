@@ -1144,6 +1144,47 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
     });
 }
 
+/// How many of its largest levels a texture with levels on demand leaves
+/// out (`VICTORY_TEXTURE_DROP_MIPS=N`, at most 4; 0, the default, none),
+/// after soldsawn/victory-nvidia-8gb b4ff304: each level left out takes a
+/// quarter of the texture's memory. Only textures at least 1024 texels on
+/// their shorter side, and never their last level before the shared tail:
+/// views show from the first level held (`crate::tiles`), so shaders see the
+/// texture at half the size per level left out.
+fn drop_levels(mips: &[victory_formats::texture::Mip], tail: usize) -> u64 {
+    let n = drop_mips();
+    let Some(top) = mips.first() else {
+        return 0;
+    };
+    if n == 0 || top.width.min(top.height) < 1024 {
+        return 0;
+    }
+    n.min((tail as u64).saturating_sub(1))
+}
+
+/// Whether a texture of this size has levels left out
+/// ([`drop_levels`]): it is then made level by level (`crate::tiles`) even
+/// if the title holds all of its levels.
+pub(crate) fn drops(width: u64, height: u32) -> bool {
+    drop_mips() > 0 && width.min(u64::from(height)) >= 1024
+}
+
+/// `VICTORY_TEXTURE_DROP_MIPS`, at most 4.
+fn drop_mips() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let n = std::env::var("VICTORY_TEXTURE_DROP_MIPS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+            .min(4);
+        if n > 0 {
+            tracing::info!(levels = n, "the largest levels of large textures left out (VICTORY_TEXTURE_DROP_MIPS)");
+        }
+        n
+    })
+}
+
 impl Staging {
     /// Levels on demand: what says, beside the mapping, which levels of
     /// the texture are the title's now. First the lowest level a live view
@@ -1181,6 +1222,9 @@ impl Staging {
             return u32::MAX;
         }
         let tail = (self.layout.first_tail_mip as usize).min(mips.len());
+        // The largest levels left out on purpose (`VICTORY_TEXTURE_DROP_MIPS`):
+        // as if a view started below them.
+        let first = first.max(drop_levels(mips, tail));
         let there = |from: u64, to: u64| {
             to > from && to <= limit && committed(self.memory.wrapping_add(from as usize), (to - from) as usize)
         };

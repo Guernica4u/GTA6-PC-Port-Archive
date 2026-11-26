@@ -1551,22 +1551,39 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             && r.desc.depth_or_array_size == 1
             && r.desc.mip_levels > 1
             && r.desc.sample_count <= 1;
+        if !shape_fits {
+            TILE_WHY[0].fetch_add(1, Relaxed);
+        } else if !r.host.placed.load(Relaxed) {
+            TILE_WHY[1].fetch_add(1, Relaxed);
+        }
         if shape_fits && r.host.placed.load(Relaxed) && crate::tiles::wanted() {
             let bytes = footprint(&r.desc).map_or(0, |f| f.size);
             let start = r.data() as u64;
             // What the upload can read: a console layout, no XOR mode
             // (`crate::texture` `staging`).
             let readable = texture_layout(&r.desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor());
+            // (Or one whose largest levels are left out on purpose:
+            // `VICTORY_TEXTURE_DROP_MIPS`, `crate::texture::drops`.)
             let partly = readable
                 && bytes >= crate::tiles::floor()
                 && (!crate::texture::committed(r.data().cast_const(), bytes as usize)
                     || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
-                    || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
+                    || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0)
+                    || crate::texture::drops(r.desc.width, r.desc.height));
             let reserved = if partly { host_texture_as(&r.desc, r.host.state, clear, true) } else { None };
             let cut = reserved
                 .as_ref()
                 .zip(crate::host::host())
                 .and_then(|(t, host)| crate::tiles::Tiled::make(&host.device, t, u32::from(r.desc.mip_levels)));
+            TILE_WHY[match () {
+                _ if !readable => 2,
+                _ if bytes < crate::tiles::floor() => 3,
+                _ if !partly => 4,
+                _ if reserved.is_none() => 5,
+                _ if cut.is_none() => 6,
+                _ => 7,
+            }]
+            .fetch_add(1, Relaxed);
             // (Both or neither: a reserved texture the card will not cut
             // into tiles is dropped here, and the old kind is made below.)
             if cut.is_some() {
@@ -1834,6 +1851,11 @@ pub(crate) fn copy_state(this: This) -> Option<(u8, u64, u64)> {
 /// one that is not. Not measured: a tenth to half a second is expected,
 /// and the line says what it took. No line is begun while one is walking.
 #[cfg(windows)]
+/// Why host copies of title textures were or were not made level by level
+/// (`crate::tiles`), counted where they are made; said in the accounting.
+static TILE_WHY: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+#[cfg(windows)]
 pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>, gone: Vec<(u64, u64)>) {
     use std::sync::atomic::Ordering::Relaxed;
     static WALKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1981,6 +2003,13 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
              {gone_none} not mapped); since the line before: {let_go} host copies let go {let_go_mb} MB, {again} made again {again_mb} MB, \
              {made} made in all; noting took {noted_us} us on the frame's thread, the walk {walk_ms} ms on its own; of the host \
              copies {by_level_n} are made level by level and hold {by_level_mb} MB of tiles (in the MB alive, not in the levels not mapped)"
+        );
+        let why: Vec<u64> = TILE_WHY.iter().map(|w| w.load(Relaxed)).collect();
+        tracing::info!(
+            "levels on demand, host copies made since the start: {} not a plain 2D texture with levels, {} not placed; \
+             of the placed: {} unreadable (XOR layout or none), {} under the floor, {} hold all their levels, {} no reserved \
+             texture, {} not cut into tiles, {} made level by level",
+            why[0], why[1], why[2], why[3], why[4], why[5], why[6], why[7]
         );
         WALKING.store(false, Relaxed);
     };
@@ -2481,7 +2510,10 @@ fn host_texture_as(
     // A texture the title fills, whose every subresource is uploaded before
     // anything reads it: cut from a block (what the piece held before shows
     // in no texel).
-    if fills(desc)
+    // (Not for a reserved texture: one cut from a block has memory from the
+    // start and no tiles, so levels on demand found none to give.)
+    if !reserved
+        && fills(desc)
         && d.sample_count <= 1
         && clear_value.is_none()
         && texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor())

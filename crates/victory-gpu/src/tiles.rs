@@ -300,7 +300,29 @@ impl Tiled {
             );
         }
         let standard_levels = u32::from(packed.NumStandardMips);
+        // The first refusals, with what the card said (why levels on demand
+        // made nothing on an RTX 3080).
+        let refuse = |why: &str| {
+            static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if SAID.fetch_add(1, Ordering::Relaxed) < 8 {
+                // SAFETY: a live resource.
+                let host_levels = unsafe { texture.GetDesc() }.MipLevels;
+                tracing::info!(
+                    why,
+                    levels,
+                    host_levels,
+                    total,
+                    standard = standard_levels,
+                    packed_levels = packed.NumPackedMips,
+                    packed_tiles = packed.NumTilesForPackedMips,
+                    count,
+                    first_tiles = ?tilings.first().map(|t| (t.WidthInTiles, t.HeightInTiles, t.DepthInTiles, t.StartTileIndexInOverallResource)),
+                    "levels on demand: the card's tiling refused"
+                );
+            }
+        };
         if total == 0 || standard_levels + u32::from(packed.NumPackedMips) != levels || standard_levels > count {
+            refuse("levels");
             return None;
         }
         let mut standard = Vec::with_capacity(standard_levels as usize);
@@ -311,12 +333,14 @@ impl Tiled {
                 .and_then(|n| n.checked_mul(u32::from(tiling.DepthInTiles)))
                 .unwrap_or(0);
             if tiles == 0 || tiles > HEAP_TILES || tiling.StartTileIndexInOverallResource == D3D12_PACKED_TILE {
+                refuse("a standard level");
                 return None;
             }
             standard.push(tiles);
         }
         let packed_tiles = if packed.NumPackedMips > 0 { packed.NumTilesForPackedMips } else { 0 };
         if (packed.NumPackedMips > 0 && packed_tiles == 0) || packed_tiles > HEAP_TILES {
+            refuse("the packed levels");
             return None;
         }
         let full = u64::from(total) * TILE;
