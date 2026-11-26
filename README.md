@@ -91,8 +91,11 @@ and Windows SDK from `xwin splat --output ~/.xwin`) and runs them in a Wine
 prefix of their own under `target/`. `--vkd3d-proton <dir>` puts that
 folder's `d3d12.dll` and `d3d12core.dll` into the prefix (Wine's own D3D12
 has no shader model 6.6), and `--dxvk <dir>` puts its `dxgi.dll` there
-instead of Wine's DXGI. Arguments after `--` go to `cargo test`.
-Crashing tests die with a backtrace, no dialog.
+instead of Wine's DXGI. Arguments after `--` go to `cargo test`. Crashing
+tests die with a backtrace, no dialog. Without `VICTORY_HLE_PROBE` (the
+prebuilt-fixture hook in `pr/hle-probe`), the two loader end-to-end tests
+are skipped with a message: they cannot build their fixture by starting
+cargo inside Wine.
 
 ## Commands
 

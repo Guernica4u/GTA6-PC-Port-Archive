@@ -137,26 +137,11 @@ pub fn run(root: &Path, o: Options) -> Result<()> {
         overrides.push("dxgi");
     }
 
-    // The loader's end-to-end test cannot start cargo from inside Wine:
-    // its fixture is built here and named to it.
-    let probe_dir = target_dir.join("hle-probe");
-    let status = command(&cargo)
-        .args(["build", "--quiet", "--target", TARGET, "--manifest-path"])
-        .arg(root.join("tests/fixtures/hle-probe/Cargo.toml"))
-        .arg("--target-dir")
-        .arg(&probe_dir)
-        .status()
-        .context("running cargo")?;
-    ensure!(status.success(), "building hle-probe failed");
-    let probe = probe_dir.join(TARGET).join("debug").join("hle_probe.dll");
-
     let mut test = command(&cargo);
-    test.args(["test", "--target", TARGET])
-        .env("VICTORY_HLE_PROBE", wine_path(&probe))
-        .env(
-            "WINEDEBUG",
-            std::env::var_os("WINEDEBUG").unwrap_or_else(|| "-all".into()),
-        );
+    test.args(["test", "--target", TARGET]).env(
+        "WINEDEBUG",
+        std::env::var_os("WINEDEBUG").unwrap_or_else(|| "-all".into()),
+    );
     if !overrides.is_empty() {
         test.env("WINEDLLOVERRIDES", format!("{}=n", overrides.join(",")));
         if vkd3d {
@@ -172,6 +157,23 @@ pub fn run(root: &Path, o: Options) -> Result<()> {
     if o.args.is_empty() {
         // xtask is a host tool (it runs git); it is not tested under Wine.
         test.args(["--workspace", "--exclude", "xtask", "--no-fail-fast"]);
+        // The loader's two end-to-end tests build their fixture by starting
+        // cargo from inside the test process, which Wine cannot do. The
+        // prebuilt-fixture hook (VICTORY_HLE_PROBE) is in pr/hle-probe, not
+        // in this branch, so skip them until it is available.
+        if std::env::var_os("VICTORY_HLE_PROBE").is_none() {
+            eprintln!(
+                "skipping victory-loader's hle-probe tests: they need the \
+                 VICTORY_HLE_PROBE hook from pr/hle-probe (a fixture built on \
+                 the host); pass -- <cargo-test-args> to override"
+            );
+            test.args([
+                "--skip",
+                "loads_binds_and_calls_probe",
+                "--skip",
+                "maps_a_title_dll_the_title_loads_itself",
+            ]);
+        }
     } else {
         test.args(&o.args);
     }
