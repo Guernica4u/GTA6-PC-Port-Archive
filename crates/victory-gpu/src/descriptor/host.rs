@@ -1004,14 +1004,13 @@ impl HostHeap {
         (is_placed_texture(&view) && !kept).then_some(view)
     }
 
-    /// A shader read slot `index` through the heap: the texture it views
-    /// was used now.
-    pub(crate) fn stamp_read(&self, index: u32) {
-        let key = self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).copied().unwrap_or(0);
-        let Some(view) = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten() else {
-            return;
-        };
-        let view = placed_texture(&view).unwrap_or(view);
+    /// A shader read slot's view (as [`Self::mirror`] resolved it) was used
+    /// now: the texture it views is stamped. Taking the view rather than
+    /// the slot is what makes a read slot cost one resolution instead of
+    /// two — the made keys' lock, the global views' lock and a clone of the
+    /// view each time, for every read slot of every submission.
+    pub(crate) fn stamp_read_view(&self, view: &View) {
+        let view = placed_texture(view).unwrap_or_else(|| view.clone());
         if let View::Shader(r, _) = view
             && let Some(t) = crate::resource::made_copy(r as crate::object::This)
         {
