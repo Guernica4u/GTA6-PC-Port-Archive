@@ -2281,3 +2281,65 @@ fn v_mul_legacy_f32_treats_denormals_as_zero() {
         );
     });
 }
+
+/// `v_cvt_f16_u16` and `v_cvt_f16_i16` in VOP3 form apply `abs` and `neg` to
+/// bit 15 of the integer, where a sign bit would be: neg 0 is 0x8000
+/// (32768, or -32768 signed) and abs -1 is 0x7FFF. The rows and the expected
+/// values are gfx1036's; the high half of v0 is kept.
+#[test]
+fn v_cvt_f16_u16_and_i16_take_abs_and_neg_on_bit_15() {
+    // v_mov_b32 v0, v4; v_cvt_f16_{u16,i16}_e64 v0, v1 with abs/neg (VOP3 0x1d0 / 0x1d1)
+    let rows: [[u32; 4]; 8] = [
+        [0x0000_0000, 0, 0, 0x0BAD_F00D],
+        [0x0000_0001, 0, 0, 0x0BAD_F00D],
+        [0x007F_FFFF, 0, 0, 0x0BAD_F00D],
+        [0x437F_8000, 0, 0, 0x0BAD_F00D],
+        [0x0400_8001, 0, 0, 0x0BAD_F00D],
+        [0x03FF_FC00, 0, 0, 0xABCD_1234],
+        [0x0000_7FFF, 0, 0, 0x0BAD_F00D],
+        [0x0000_00FF, 0, 0, 0x0BAD_F00D],
+    ];
+    // The f16 result per row: no modifier, neg, abs, neg of abs.
+    let unsigned: [[u16; 4]; 8] = [
+        [0x0000, 0x7800, 0x0000, 0x7800],
+        [0x3C00, 0x7800, 0x3C00, 0x7800],
+        [0x7C00, 0x7800, 0x7800, 0x7C00],
+        [0x7800, 0x0000, 0x0000, 0x7800],
+        [0x7800, 0x3C00, 0x3C00, 0x7800],
+        [0x7BE0, 0x77C0, 0x77C0, 0x7BE0],
+        [0x7800, 0x7C00, 0x7800, 0x7C00],
+        [0x5BF8, 0x7808, 0x5BF8, 0x7808],
+    ];
+    let signed: [[u16; 4]; 8] = [
+        [0x0000, 0xF800, 0x0000, 0xF800],
+        [0x3C00, 0xF800, 0x3C00, 0xF800],
+        [0xBC00, 0x7800, 0x7800, 0xBC00],
+        [0xF800, 0x0000, 0x0000, 0xF800],
+        [0xF800, 0x3C00, 0x3C00, 0xF800],
+        [0xE400, 0x77C0, 0x77C0, 0xE400],
+        [0x7800, 0xBC00, 0x7800, 0xBC00],
+        [0x5BF8, 0xF7F0, 0x5BF8, 0xF7F0],
+    ];
+    for (op, what, table) in [
+        (0x1D0u16, "v_cvt_f16_u16", &unsigned),
+        (0x1D1, "v_cvt_f16_i16", &signed),
+    ] {
+        for (m, (abs, neg)) in [(0u32, 0u32), (0, 1), (1, 0), (1, 1)]
+            .into_iter()
+            .enumerate()
+        {
+            let w = vop3(op, 0, vgpr(1), 0x80, 0x80);
+            let shader =
+                build_valu_cs(&[vop1(0x001, 0, vgpr(4)), w[0] | abs << 8, w[1] | neg << 29]);
+            run_cases(&shader, &rows, |backend, i, inp, got| {
+                let want = inp[3] & 0xFFFF_0000 | u32::from(table[i][m]);
+                assert_eq!(
+                    got,
+                    want,
+                    "{backend}: {what} (abs {abs}, neg {neg}) of {:#06x} = {got:#010x}, want {want:#010x}",
+                    inp[0] & 0xFFFF,
+                );
+            });
+        }
+    }
+}

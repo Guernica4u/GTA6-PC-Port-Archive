@@ -7054,6 +7054,16 @@ impl<'a> Lower<'a> {
             let r = match name {
                 "v_cvt_f16_u16" | "v_cvt_f16_i16" => {
                     let mut x = self.half_src(inst, 0)?;
+                    // abs and neg act on the integer's bit 15, as on its
+                    // sign bit (measured on gfx1036): neg 0 is 0x8000.
+                    if v.abs & 1 != 0 {
+                        let m = self.s.m.i32(0x7FFF);
+                        x = self.s.m.bin(c, Bin::And, x, m);
+                    }
+                    if v.neg & 1 != 0 {
+                        let m = self.s.m.i32(0x8000);
+                        x = self.s.m.bin(c, Bin::Xor, x, m);
+                    }
                     let op = if name == "v_cvt_f16_i16" {
                         let k16 = self.s.m.i32(16);
                         let t = self.s.m.bin(c, Bin::Shl, x, k16);
