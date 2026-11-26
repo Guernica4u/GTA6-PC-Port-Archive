@@ -326,8 +326,7 @@ fn bury(finished: u64) {
         if all.is_empty() {
             return;
         }
-        let (done, keep): (Vec<(u64, Retired)>, Vec<(u64, Retired)>) =
-            all.into_iter().partition(|(at, _)| *at <= finished);
+        let (done, keep): (Vec<_>, Vec<_>) = all.into_iter().partition(|(at, _)| *at <= finished);
         if !keep.is_empty() {
             RETIRED.lock().unwrap_or_else(|e| e.into_inner()).extend(keep);
         }
