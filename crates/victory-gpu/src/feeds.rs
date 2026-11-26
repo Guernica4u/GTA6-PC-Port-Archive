@@ -85,16 +85,18 @@ impl<T> Graph<T> {
     /// (a title that stops presenting while its pipelines are queued kept
     /// `NOTES_MAX` passes' worth of them, none counted).
     fn ran(&mut self, reads: &[usize], writes: &[usize]) {
-        let writes: Vec<usize> = writes.iter().copied().filter(|&r| r != 0).collect();
-        if writes.is_empty() || self.notes >= NOTES_MAX {
+        if self.notes >= NOTES_MAX || !writes.iter().any(|&r| r != 0) {
             return;
         }
         let pass = self.reads.len() as u32;
-        for &r in &writes {
+        let mut noted = 0;
+        for &r in writes.iter().filter(|&&r| r != 0) {
             self.ran.entry(r).or_default().push(pass);
+            noted += 1;
         }
-        let reads: Vec<usize> = reads.iter().copied().filter(|&r| r != 0).collect();
-        self.notes += reads.len() + writes.len();
+        let mut reads = reads.to_vec();
+        reads.retain(|&r| r != 0);
+        self.notes += noted + reads.len();
         self.reads.push(reads);
     }
 
