@@ -342,7 +342,7 @@ fn run_everywhere(words: &[u32], threads: u32, results: u32, want: &[u32]) -> us
     }
     let (mut ran, mut ran32) = (0, 0);
     for (name, host) in &hosts {
-        let (min, max) = host.wave_lanes();
+        let (min, max) = host.wave_lanes().unwrap_or((0, 0));
         for (shader, lanes) in [(&split, 32), (&native, 64)] {
             if !(min..=max).contains(&lanes) {
                 eprintln!("{name}: waves of {min}-{max} lanes; {lanes}-lane program skipped");

@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod thread_ids;
 mod wave64;
 
 type Why = &'static str;
@@ -77,6 +78,10 @@ pub(crate) struct Lowered {
     /// wave64 ([`wave64`]).
     #[cfg(test)]
     pub group_syncs: u32,
+    /// Whether relabelled threads take their ids by ticket
+    /// (`Lower::console_flat`).
+    #[cfg(test)]
+    pub ticket: bool,
 }
 
 pub(crate) struct Parts<'a> {
@@ -317,6 +322,8 @@ struct Lower<'a> {
     root_memory: bool,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
+    /// The thread's console flat id once relabelled (`Lower::thread_id`).
+    console_flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
@@ -776,6 +783,7 @@ impl<'a> Lower<'a> {
                 if db_shader_control & 1 << 16 != 0),
             root_memory,
             flat: None,
+            console_flat: None,
             no_barrier,
             half_outputs: half_outputs(&x.native.io),
             mask_data: match x.native.stage {
@@ -1514,6 +1522,8 @@ impl<'a> Lower<'a> {
             has_half_wave_mask: self.s.m.has_i32_const(!31),
             #[cfg(test)]
             group_syncs: self.split.as_ref().map_or(0, wave64::Split::syncs),
+            #[cfg(test)]
+            ticket: self.console_flat.is_some() && self.ticket(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -3007,29 +3017,7 @@ impl<'a> Lower<'a> {
         }
         let [x, y, _] = self.s.threads.expect("compute");
         let e = self.s.entry;
-        let i32t = self.s.t.i32;
-        let flat = self.s.op(
-            e,
-            "flattenedThreadIdInGroup.i32",
-            Attr::ReadNone,
-            i32t,
-            96,
-            &[],
-        );
-        let first = self.s.op(
-            e,
-            "waveReadLaneFirst.i32",
-            Attr::NoUnwind,
-            i32t,
-            118,
-            &[flat],
-        );
-        // The host wave size (32 for a split wave64 program).
-        let wave = self.s.wave_size.expect("set with console lanes");
-        let mask = self.s.m.i32(!(wave - 1));
-        let base = self.s.m.bin(e, Bin::And, first, mask);
-        let lane = self.host_lane(e);
-        let f = self.s.m.bin(e, Bin::Add, base, lane);
+        let f = self.console_flat();
         self.s.flags |= flags::WAVE_OPS;
         let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
         Val::I32(match c {

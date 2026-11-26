@@ -216,6 +216,8 @@ mod lower;
 mod rect;
 pub use rect::{rectangle_gs, right_angle};
 #[cfg(all(test, windows))]
+mod lane_order_tests;
+#[cfg(all(test, windows))]
 mod memory_tests;
 mod sampler;
 #[cfg(all(test, windows))]

@@ -246,23 +246,6 @@ impl Host {
         out
     }
 
-    /// The wave sizes the device runs (`WaveLaneCountMin`, `Max`).
-    pub fn wave_lanes(&self) -> (u32, u32) {
-        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
-        // SAFETY: the query writes the structure of the given size.
-        let ok = unsafe {
-            self.device.CheckFeatureSupport(
-                D3D12_FEATURE_D3D12_OPTIONS1,
-                (&raw mut o).cast(),
-                size_of_val(&o) as u32,
-            )
-        };
-        match ok {
-            Ok(()) => (o.WaveLaneCountMin, o.WaveLaneCountMax),
-            Err(_) => (0, 0),
-        }
-    }
-
     /// The root signature translated shaders expect: user data per stage
     /// at `b0`, immediate samplers per stage at `s<n>`, heaps directly
     /// indexed.
@@ -660,6 +643,23 @@ impl Host {
         let device: ID3D12Device2 = self.device.cast().map_err(err)?;
         // SAFETY: the stream points at live data and outlives the call.
         unsafe { device.CreatePipelineState(&desc) }.map_err(err)
+    }
+
+    /// The wave sizes this device runs, fewest and most lanes
+    /// (`D3D12_FEATURE_D3D12_OPTIONS1`); a program declaring a wave size
+    /// outside them is refused.
+    pub fn wave_lanes(&self) -> Result<(u32, u32), String> {
+        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: the feature query writes the structure of the given size.
+        unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut o).cast(),
+                size_of_val(&o) as u32,
+            )
+        }
+        .map_err(err)?;
+        Ok((o.WaveLaneCountMin, o.WaveLaneCountMax))
     }
 
     /// Whether this device fuses DXIL `FMad`, which the lowering emits for
