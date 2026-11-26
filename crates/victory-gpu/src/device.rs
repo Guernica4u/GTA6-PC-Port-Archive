@@ -595,7 +595,6 @@ mod tests {
         assert_eq!(query(&levels[4..], 0x18).0, UNSUPPORTED);
     }
 
-<<<<<<< HEAD
     /// The queries the AMD upscaler's capability check makes.
     #[test]
     fn shader_model_and_wave_options_are_the_consoles() {

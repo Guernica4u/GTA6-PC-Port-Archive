@@ -1010,6 +1010,13 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
+                memory: false,
+                memory_writes: false,
+                view_addresses: false,
+                heap: false,
+                heap_writes: false,
+                view_marks: false,
             };
             assert_eq!(host.required_wave_size(), wave_size);
         }
