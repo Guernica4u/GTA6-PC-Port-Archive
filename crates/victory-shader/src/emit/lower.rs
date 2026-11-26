@@ -481,8 +481,14 @@ fn has_side_effect(inst: &Inst) -> bool {
     let name = inst.name();
     matches!(inst.fields, Fields::Exp { .. })
         || matches!(inst.fields, Fields::Flat { .. }) && !name.starts_with("global_load_")
-        || matches!(inst.fields, Fields::Buffer { lds: true, .. })
+        || matches!(inst.fields, Fields::Flat { lds: true, .. })
         || name.contains("store")
+        || has_atomic_barrier_or_lds_effect(inst)
+}
+
+fn has_atomic_barrier_or_lds_effect(inst: &Inst) -> bool {
+    let name = inst.name();
+    matches!(inst.fields, Fields::Buffer { lds: true, .. })
         || name.contains("atomic")
         || name == "s_barrier"
         || matches!(inst.fields, Fields::Ds { .. })
@@ -3537,6 +3543,10 @@ impl<'a> Lower<'a> {
             }
             MaskData::None => name == "s_bcnt1_i32_b64",
         };
+        let effect = matches!(inst.fields, Fields::Exp { .. })
+            || matches!(inst.fields, Fields::Flat { .. }) && !name.starts_with("global_load_")
+            || name.contains("store")
+            || has_atomic_barrier_or_lds_effect(inst);
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
@@ -3565,7 +3575,7 @@ impl<'a> Lower<'a> {
         };
         match r {
             Ok(()) => Ok(()),
-            Err(why) if has_side_effect(inst) => Err(unsupported(offset, why)),
+            Err(why) if effect => Err(unsupported(offset, why)),
             Err(why) => {
                 for &(_, v) in &inst.writes {
                     self.vals.insert(v, Val::Missing(why));
@@ -10931,6 +10941,9 @@ impl<'a> Lower<'a> {
 }
 
 #[cfg(test)]
+mod whole_wave_effect_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{Lowered, Numeric, Parts, buffer_format, code_table_start, half_shift, lower, packed_half};
     use crate::native::{
@@ -10966,11 +10979,11 @@ mod tests {
     }
 
     /// Whether a synthetic compute program translates with these input registers.
-    fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
+    pub(super) fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
         lowers_structured(words, rsrc2, |_| {})
     }
 
-    fn lowers_structured(
+    pub(super) fn lowers_structured(
         words: &[u32],
         rsrc2: u32,
         prepare: impl FnOnce(&mut structure::Structured),
@@ -11108,69 +11121,8 @@ mod tests {
         )
     }
 
-    fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
+    pub(super) fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
         lower_valu(body).map(|_| ())
-    }
-
-    #[test]
-    fn whole_wave_sections_reject_side_effects() {
-        let save = 0xBE86_3DC1; // s_or_saveexec_b32 s6, -1
-        let restore = 0xBEFE_0306; // s_mov_b32 exec_lo, s6
-        let barrier = [0xBF8A_0000]; // s_barrier
-        let store = [0xE070_0000, 0x8002_0000]; // buffer_store_dword v0, off, s[8:11], 0
-        let mov = 0x7E00_0301; // v_mov_b32 v0, v1
-        let load_lds = [0xE031_0000, 0x8002_0000]; // buffer_load_dword to LDS
-
-        for effect in [barrier.as_slice(), store.as_slice()] {
-            let outside = [&[mov, save, restore], effect].concat();
-            lowers_valu(&outside).unwrap();
-
-            let inside = [&[mov, save], effect, &[restore]].concat();
-            let error =
-                lowers_valu(&inside).expect_err("the translator cannot preserve this effect");
-            assert!(
-                matches!(
-                    error,
-                    crate::ShaderError::Unsupported {
-                        offset: 36,
-                        what: "a side effect in a whole-wave section",
-                    }
-                ),
-                "{error}"
-            );
-        }
-        assert!(matches!(
-            lowers_valu(&[mov, save, load_lds[0], load_lds[1], restore]),
-            Err(crate::ShaderError::Unsupported {
-                offset: 36,
-                what: "a side effect in a whole-wave section",
-            })
-        ));
-    }
-
-    #[test]
-    fn whole_wave_sections_reject_structured_discard() {
-        let words = [
-            0xBE86_3DC1, // s_or_saveexec_b32 s6, -1
-            0x7E00_0280, // v_mov_b32 v0, 0
-            0xBEFE_0306, // s_mov_b32 exec_lo, s6
-            S_ENDPGM,
-        ];
-        lowers(&words, 0).unwrap();
-        // Supply the structured discard annotation on an otherwise pure instruction.
-        let result = lowers_structured(&words, 0, |st| {
-            st.discards.insert((0, 1), structure::Bool::TRUE);
-        });
-        assert!(
-            matches!(
-                result,
-                Err(crate::ShaderError::Unsupported {
-                    offset: 4,
-                    what: "a side effect in a whole-wave section",
-                })
-            ),
-            "{result:?}"
-        );
     }
 
     #[test]
