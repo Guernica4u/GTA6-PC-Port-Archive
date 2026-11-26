@@ -676,6 +676,56 @@ mod tests {
         }
     }
 
+    #[test]
+    fn scratch_just_over_a_chunk_stays_dedicated_until_reset() {
+        let Some(host) = host() else { return };
+        let list = host.new_list().unwrap();
+        let free = Mutex::default();
+        let len = SCRATCH_CHUNK + 1;
+        let allocation_size = SCRATCH_CHUNK + 256;
+        let mut data = vec![0xa5; len as usize];
+        *data.last_mut().unwrap() = 0x5a;
+        let (readback, downloaded) = host.readback_buffer(len).unwrap();
+        let mut allocations = 0;
+        let upload = list
+            .try_scratch_in(
+                len,
+                256,
+                &free,
+                |size| {
+                    assert_eq!(size, allocation_size);
+                    assert_eq!(allocations, 0);
+                    allocations += 1;
+                    host.try_upload_buffer(size)
+                },
+                |buffer, at, gpu, to| {
+                    assert_eq!(at, 0);
+                    // SAFETY: both buffers are live, and the mapped upload and copy fit.
+                    unsafe {
+                        assert_eq!(buffer.GetDesc().Width, allocation_size);
+                        assert_eq!(gpu, buffer.GetGPUVirtualAddress());
+                        std::ptr::copy_nonoverlapping(data.as_ptr(), to, data.len());
+                        list.list.CopyBufferRegion(&readback, 0, buffer, at, len);
+                    }
+                    buffer.as_raw()
+                },
+            )
+            .unwrap();
+        assert_eq!(allocations, 1);
+        assert!(list.scratch.lock().unwrap().chunks.is_empty());
+        assert_eq!(list.deferred().uploads.len(), 1);
+        assert_eq!(list.deferred().uploads[0].as_raw(), upload);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: the submission finished and the readback buffer is live.
+        assert_eq!(unsafe { std::slice::from_raw_parts(downloaded, data.len()) }, data);
+        assert_eq!(list.deferred().uploads[0].as_raw(), upload);
+        list.reset();
+        assert!(list.deferred().uploads.is_empty());
+        assert!(list.scratch.lock().unwrap().chunks.is_empty());
+        println!("D3D12 dedicated scratch copied {len} bytes from a {allocation_size}-byte buffer");
+    }
+
     /// A list with no work before its waits, as the title's queues meet one
     /// another halfway: each write goes as soon as the waits before it are
     /// met, and work holds the later ones back.
