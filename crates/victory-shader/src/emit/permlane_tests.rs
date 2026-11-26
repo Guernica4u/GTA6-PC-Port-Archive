@@ -11,7 +11,7 @@ const THREADS: u32 = 128;
 const OLD: u32 = 42;
 const BASE: u32 = 0x1234_0000;
 
-fn native(cross: bool, fi: bool, bc: bool, alias: bool, wave64: bool) -> NativeProgram {
+fn native(cross: bool, fi: bool, bc: bool, alias: bool, wave64: bool, before_shuffle: &[u32]) -> NativeProgram {
     let mov = |dst: u32, src: u32| 0x7E00_0200 | dst << 17 | src;
     let smov = |dst: u32, src: u32| 0xBE80_0300 | dst << 16 | src;
     let mut words = vec![
@@ -24,6 +24,7 @@ fn native(cross: bool, fi: bool, bc: bool, alias: bool, wave64: bool) -> NativeP
         mov(6, if alias { 256 + 5 } else { 128 + OLD }),
     ];
     words.push(if wave64 { 0xBEFE_0402 } else { smov(126, 2) }); // exec = s[2:3] / s2
+    words.extend_from_slice(before_shuffle);
     words.extend([
         0xD400_0006
             | (if cross { 0x378 } else { 0x377 }) << 16
@@ -124,18 +125,9 @@ fn lowered(native: &NativeProgram) -> Result<HostShader, ShaderError> {
 
 #[test]
 fn permlane_fetch_inactive_outside_the_host_branch_is_rejected() {
-    let mut native = native(true, true, false, false, false);
-    let mut words: Vec<u32> = native
-        .code
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|w| u32::from_le_bytes(*w))
-        .collect();
     // Skip the permutation when EXEC is empty. Structurisation turns this
     // into a host lane branch, so FI cannot read lanes that took the skip.
-    words.insert(8, 0xBF88_0002); // s_cbranch_execz +2 (to the EXEC restore)
-    native.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = native(true, true, false, false, false, &[0xBF88_0002]); // s_cbranch_execz +2 (to the EXEC restore)
     assert!(matches!(
         lowered(&native),
         Err(ShaderError::Unsupported {
@@ -147,58 +139,31 @@ fn permlane_fetch_inactive_outside_the_host_branch_is_rejected() {
 
 #[test]
 fn permlane_fetch_inactive_after_reconvergence_is_allowed() {
-    let mut native = native(true, true, false, false, false);
-    let mut words: Vec<u32> = native
-        .code
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|w| u32::from_le_bytes(*w))
-        .collect();
     // The branch only skips a scalar nop; every host lane meets at the shuffle.
-    words.splice(8..8, [0xBF88_0001, 0xBF80_0000]);
-    native.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = native(true, true, false, false, false, &[0xBF88_0001, 0xBF80_0000]);
     lowered(&native).expect("fetch-inactive after the lanes reconverge");
 }
 
 #[test]
 fn permlane_fetch_inactive_inside_a_uniform_branch_is_allowed() {
-    let mut native = native(true, true, false, false, false);
-    let mut words: Vec<u32> = native
-        .code
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|w| u32::from_le_bytes(*w))
-        .collect();
-    words.splice(8..8, [0xBF06_8000, 0xBF85_0002]); // scalar compare; skip shuffle on SCC
-    native.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = native(true, true, false, false, false, &[0xBF06_8000, 0xBF85_0002]); // scalar compare; skip shuffle on SCC
     lowered(&native).expect("all host lanes take the scalar branch together");
 }
 
 #[test]
 fn permlane_fetch_inactive_after_a_lane_abort_is_rejected() {
-    let mut native = native(true, true, false, false, false);
-    let mut words: Vec<u32> = native
-        .code
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|w| u32::from_le_bytes(*w))
-        .collect();
     // A lane-dependent header test with an unconditional back edge. The
     // emitter's iteration limit returns the looping lanes from the shader;
     // they never meet the lanes which reached the shuffle normally.
-    words.splice(
-        8..8,
-        [
+    let native = native(
+        true, true, false, false, false,
+        &[
             0x7D88_0003, // v_cmp_gt_u32 vcc, s3, v0
             0xBF86_0002, // s_cbranch_vccz -> shuffle
             0xBF80_0000, // s_nop 0
             0xBF82_FFFC, // s_branch -> compare
         ],
     );
-    native.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     assert!(matches!(
         lowered(&native),
         Err(ShaderError::Unsupported {
@@ -210,10 +175,22 @@ fn permlane_fetch_inactive_after_a_lane_abort_is_rejected() {
 
 #[test]
 fn permlane_rows_and_inactive_sources() {
+    check_permlane_rows(false);
+}
+
+/// FI=0 can execute under a lane-dependent branch: an executing lane
+/// whose source took the other branch keeps its destination or zeroes it.
+#[test]
+fn permlane_fi_zero_under_divergent_exec() {
+    check_permlane_rows(true);
+}
+
+fn check_permlane_rows(divergent: bool) {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
+    let mut total_wrong = 0;
     for (backend, warp) in [("hardware", false), ("WARP", true)] {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {backend}; skipped");
@@ -247,12 +224,18 @@ fn permlane_rows_and_inactive_sources() {
                 eprintln!("{backend} does not support the requested console wave size; skipped");
                 continue;
             }
+            let mut wrong = 0;
+            let mut compared = 0;
+            let mut dispatches = 0;
+            let fi_cases: &[bool] = if divergent { &[false] } else { &[false, true] };
             for cross in [false, true] {
-                for fi in [false, true] {
+                for &fi in fi_cases {
                     for bc in [false, true] {
                         for alias in [false, true] {
-                            let shader = lowered(&native(cross, fi, bc, alias, wave64))
-                                .expect("lower permlane");
+                            // s_cbranch_execz skips the two-dword shuffle to the EXEC restore.
+                            let before: &[u32] = if divergent { &[0xBF88_0002] } else { &[] };
+                            let program = native(cross, fi, bc, alias, wave64, before);
+                            let shader = lowered(&program).expect("lower permlane");
                             let (root, pso) =
                                 host.compute_pipeline(&shader).expect("permlane pipeline");
                             for selectors in [
@@ -284,6 +267,7 @@ fn permlane_rows_and_inactive_sources() {
                                             },
                                         )
                                         .expect("dispatch permlane");
+                                    dispatches += 1;
                                     for t in 0..THREADS {
                                         let pos = t % 16;
                                         let packed =
@@ -301,10 +285,15 @@ fn permlane_rows_and_inactive_sources() {
                                             old
                                         };
                                         let got = out[0][t as usize];
-                                        assert_eq!(
-                                            got, want,
-                                            "{backend} wave64={wave64} cross={cross} fi={fi} bc={bc} alias={alias} selectors={selectors:x?} mask={mask:x} lane={t}"
-                                        );
+                                        if got != want {
+                                            if wrong == 0 {
+                                                eprintln!(
+                                                    "{backend} wave{wave} cross={cross} fi={fi} bc={bc} alias={alias} selectors={selectors:x?} mask={mask:x} lane={t} source={src} got={got:#x} expected={want:#x}"
+                                                );
+                                            }
+                                            wrong += 1;
+                                        }
+                                        compared += 1;
                                     }
                                 }
                             }
@@ -312,10 +301,12 @@ fn permlane_rows_and_inactive_sources() {
                     }
                 }
             }
+            eprintln!("{backend} wave{wave} divergent={divergent}: {wrong}/{compared} wrong across {dispatches} dispatches");
+            total_wrong += wrong;
         }
-        eprintln!("permlane: all row and EXEC cases passed on {backend}");
     }
     if ran == 0 {
         eprintln!("no SM 6.6 device with 32-lane rows; GPU checks skipped");
     }
+    assert_eq!(total_wrong, 0, "permlane lane readbacks");
 }
