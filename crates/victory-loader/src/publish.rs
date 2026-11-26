@@ -120,12 +120,6 @@ pub fn write_if_changed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     {
         return Ok(());
     }
-    if std::fs::read(path).is_ok_and(|existing| existing == bytes) {
-        // Publish the sidecar for the next boot; a failure here only costs
-        // the fallback read next time.
-        write_sidecar(path, &digest);
-        return Ok(());
-    }
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -137,9 +131,28 @@ pub fn write_if_changed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     // removed before the rename and written after it, so a sidecar on disk
     // always describes the file on disk. A crash in between leaves no
     // sidecar, and the next boot falls back to reading the image.
+    // The read-back of a cache from before sidecars is inside the same
+    // critical section: written outside it, its sidecar could describe an
+    // image another publisher replaced meanwhile.
     #[cfg(windows)]
     let _lock = publish_lock(path)?;
-    let _ = std::fs::remove_file(sidecar(path));
+    if std::fs::read(path).is_ok_and(|existing| existing == bytes) {
+        // Already there: keep it, and publish the sidecar for the next boot
+        // (a failure there only costs the fallback read next time).
+        let _ = std::fs::remove_file(&staging);
+        write_sidecar(path, &digest);
+        return Ok(());
+    }
+    // A sidecar that cannot be removed must not survive beside an image it
+    // no longer describes: stop before replacing the image.
+    match std::fs::remove_file(sidecar(path)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            let _ = std::fs::remove_file(&staging);
+            return Err(error);
+        }
+    }
     if let Err(error) = std::fs::rename(&staging, path) {
         let _ = std::fs::remove_file(&staging);
         return Err(error);
@@ -245,6 +258,83 @@ mod tests {
         }
         let old = t0.elapsed() / 5;
         eprintln!("64 MB cache hit: sidecar path {hit:?}, old read+compare {old:?}");
+    }
+
+    /// A cache from before sidecars: its sidecar is backfilled under the
+    /// publishers' lock, so it cannot land over an image another publisher
+    /// replaced meanwhile. Held here, a publisher waits for the lock.
+    #[cfg(windows)]
+    #[test]
+    fn a_legacy_sidecar_backfill_waits_for_the_publishers_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.bin");
+        let bytes = vec![0x1au8; 1 << 16];
+        // A legacy cache: the image is there, the sidecar is not.
+        std::fs::write(&path, &bytes).unwrap();
+        let held = publish_lock(&path).unwrap();
+        let (p, b) = (path.clone(), bytes.clone());
+        let published = std::thread::spawn(move || write_if_changed(&p, &b));
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        assert!(
+            !sidecar(&path).exists(),
+            "the sidecar was published outside the publishers' lock"
+        );
+        drop(held);
+        published.join().unwrap().unwrap();
+        assert_eq!(
+            std::fs::read(sidecar(&path)).unwrap(),
+            blake3::hash(&bytes).as_bytes()
+        );
+    }
+
+    /// A sidecar another process holds without delete sharing cannot be
+    /// removed: publication stops before replacing the image, so the sidecar
+    /// on disk still describes the file on disk.
+    #[cfg(windows)]
+    #[test]
+    fn a_sidecar_that_cannot_be_removed_stops_the_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.bin");
+        let a = vec![0xaau8; 1 << 16];
+        let b = vec![0xbbu8; 1 << 16];
+        write_if_changed(&path, &a).unwrap();
+        let side = sidecar(&path);
+        let wide: Vec<u16> = side
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: a valid path; the handle is closed below.
+        let open = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_READ,
+                std::ptr::null(),
+                windows_sys::Win32::Storage::FileSystem::OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(
+            open,
+            INVALID_HANDLE_VALUE,
+            "open the sidecar: {}",
+            std::io::Error::last_os_error()
+        );
+        let stopped = write_if_changed(&path, &b);
+        // SAFETY: our handle.
+        unsafe { CloseHandle(open) };
+        assert!(
+            stopped.is_err(),
+            "a publish whose old sidecar cannot be removed must fail: {stopped:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), a, "the image is untouched");
+        assert_eq!(
+            std::fs::read(&side).unwrap(),
+            blake3::hash(&a).as_bytes(),
+            "the sidecar still describes the image"
+        );
     }
 
     /// Many interleaved publishers of alternating contents: whenever a
