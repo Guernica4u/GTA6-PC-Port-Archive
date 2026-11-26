@@ -7,7 +7,7 @@ impl<'a> Emitter<'a> {
     pub(in crate::hlsl) fn emit_indexed_read(&mut self, idx: usize, ins: &Insn) -> Result<(), String> {
         self.line(&format!("tb_swizzle[tb_lane] = {};", r(&ins.src[0])?));
         self.line("GroupMemoryBarrierWithGroupSync();");
-        self.line(&format!("uint readlane{idx} = tb_swizzle[(tb_lane & ~63u) | ({} & 63u)];", r(&ins.src[1])?));
+        self.line(&format!("uint readlane{idx} = tb_swizzle_read((tb_lane & ~63u) | ({} & 63u));", r(&ins.src[1])?));
         self.line("GroupMemoryBarrierWithGroupSync();");
         Ok(())
     }
@@ -20,7 +20,7 @@ impl<'a> Emitter<'a> {
             let value = if guard.is_empty() { value } else { format!("({}) ? {value} : 0u", guard.join(" && ")) };
             self.line(&format!("tb_swizzle[tb_lane] = {value};"));
             self.line("GroupMemoryBarrierWithGroupSync();");
-            self.line(&format!("uint swizzle{idx} = tb_swizzle[(tb_lane & ~63u) | ({} & 63u)];", r(&ins.src[1])?));
+            self.line(&format!("uint swizzle{idx} = tb_swizzle_read((tb_lane & ~63u) | ({} & 63u));", r(&ins.src[1])?));
             self.line("GroupMemoryBarrierWithGroupSync();");
             return Ok(());
         }
@@ -31,7 +31,7 @@ impl<'a> Emitter<'a> {
             let value = if guard.is_empty() { value } else { format!("({}) ? {value} : 0u", guard.join(" && ")) };
             self.line(&format!("tb_swizzle[tb_lane] = {value};"));
             self.line("GroupMemoryBarrierWithGroupSync();");
-            self.line(&format!("uint swizzle{idx} = tb_swizzle[(tb_lane & ~63u) | {}];", r(&ins.src[1])?));
+            self.line(&format!("uint swizzle{idx} = tb_swizzle_read((tb_lane & ~63u) | {});", r(&ins.src[1])?));
             self.line("GroupMemoryBarrierWithGroupSync();");
             return Ok(());
         }

@@ -1,4 +1,5 @@
 //! Device memory heaps and resources sharing their native GPU allocation.
+mod backing;
 mod import;
 mod shadow;
 mod virtual_place;

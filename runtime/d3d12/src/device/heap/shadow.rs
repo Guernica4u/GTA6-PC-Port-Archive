@@ -280,38 +280,38 @@ fn log_first_mirror() {
 
 pub(super) fn open_shadow_sized(
     device: &ID3D12Device13,
-    base: u64,
+    backing: super::backing::Backing,
     size: u64,
     pin: ImportPin,
     source: &'static str,
 ) -> Result<Arc<ImportedHeap>> {
     let len = usize::try_from(size).map_err(|_| E_INVALIDARG)?;
-    let shadow = ShadowPages::new(base, len, pin.live_flag())?;
+    let shadow = ShadowPages::new(backing.address, len, pin.live_flag())?;
     let native = unsafe { device.OpenExistingHeapFromAddress1(shadow.ptr(), shadow.size) }.map_err(|e| {
         trace_import_failure(source, "sized-shadow", size, e.code());
         e
     })?;
     register(&shadow);
     log_first_mirror();
-    Ok(Arc::new(ImportedHeap::shadowed(native, pin, shadow)))
+    Ok(Arc::new(ImportedHeap::shadowed(native, pin, shadow, backing)))
 }
 
 pub(super) fn open_shadow_legacy(
     host: &ID3D12Device3,
-    base: u64,
+    backing: super::backing::Backing,
     size: u64,
     pin: ImportPin,
     source: &'static str,
 ) -> Result<Arc<ImportedHeap>> {
     let len = usize::try_from(size).map_err(|_| E_INVALIDARG)?;
-    let shadow = ShadowPages::new(base, len, pin.live_flag())?;
+    let shadow = ShadowPages::new(backing.address, len, pin.live_flag())?;
     let native = unsafe { host.OpenExistingHeapFromAddress(shadow.ptr()) }.map_err(|e| {
         trace_import_failure(source, "legacy-shadow", size, e.code());
         e
     })?;
     register(&shadow);
     log_first_mirror();
-    Ok(Arc::new(ImportedHeap::shadowed(native, pin, shadow)))
+    Ok(Arc::new(ImportedHeap::shadowed(native, pin, shadow, backing)))
 }
 
 #[cfg(test)]

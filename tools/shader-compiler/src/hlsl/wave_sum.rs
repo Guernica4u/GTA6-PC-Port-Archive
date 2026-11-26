@@ -11,8 +11,8 @@ pub(super) const DPP8_EXCHANGE: u32 = 0x7fe7;
 // An inclusive wave32 prefix sum built from DPP16 row shifts (see `lower_row_scan`).
 pub(super) const DPP_SCAN: u32 = 0x7ff3;
 
-/// Prove a full-EXEC, single 32-thread group (also valid as a partial
-/// wave64), or a 64-thread group with only within-octet exchanges.
+/// Prove full-EXEC straight-line within-octet exchanges in complete
+/// 32-thread blocks, including groups containing multiple waves.
 /// No branch, EXEC modification, early return, LDS or unknown operands.
 /// Static descriptor loads and a single terminal store can be admitted;
 /// the main emitter still resolves their resource and address metadata.
@@ -21,7 +21,8 @@ pub(super) const DPP_SCAN: u32 = 0x7ff3;
 /// its octet. Constant readlane is
 /// only allowed at 32 threads where wave32/wave64 agree for lanes 0..31.
 pub(super) fn straight_exchange(insns: &mut [Insn], group: [u32; 3]) -> bool {
-    if !matches!(group, [32, 1, 1] | [64, 1, 1]) || insns.len() > 4096
+    let Some(lanes) = group.into_iter().try_fold(1u32, u32::checked_mul) else { return false; };
+    if !(32..=1024).contains(&lanes) || lanes % 32 != 0 || group[2] > 64 || insns.len() > 4096
         || insns.last().is_none_or(|i| i.mnemonic != "s_endpgm")
     { return false; }
     let mut found = false;
@@ -45,7 +46,7 @@ pub(super) fn straight_exchange(insns: &mut [Insn], group: [u32; 3]) -> bool {
             let [Opnd::Vgpr(dst @ 0..=105)] = i.dst[..] else { return false };
             let (Some(Opnd::Vgpr(src)), Some(Opnd::ConstInt(lane @ 0..=31))) =
                 (i.src.first(), i.src.get(1)) else { return false };
-            if group[0] != 32 || i.raw.as_slice() !=
+            if lanes != 32 || i.raw.as_slice() !=
                 [0xd7600000 | u32::from(dst), ((128 + *lane as u32) << 9) | 256 | u32::from(*src)]
             { return false; }
         } else if i.enc == Enc::Smem && i.mnemonic == "s_load_dwordx4" {
@@ -1021,6 +1022,23 @@ pub(super) fn portable_single_wave(insns: &[Insn]) -> bool {
         }
     }
     true
+}
+
+/// The native compute local IDs are x-fast, then y, then z. A group-shared
+/// exchange indexes the whole workgroup, not the x coordinate alone.
+pub(super) fn portable_lane_id(group: [u32; 3]) -> String {
+    let [x, y, z] = group;
+    if y == 1 && z == 1 { "gtid.x".into() }
+    else { format!("(gtid.x + {x}u * (gtid.y + {y}u * gtid.z))") }
+}
+
+/// Reserve enough shared slots for every invocation. The larger allocation
+/// is used only by the proven straight-line DPP8 path; a group-wide barrier
+/// must not be introduced into independently diverging guest waves.
+pub(super) fn portable_declarations(group: [u32; 3]) -> String {
+    let lanes = group.into_iter().product::<u32>();
+    if lanes <= 64 { PORTABLE_DECLARATIONS.to_owned() }
+    else { PORTABLE_DECLARATIONS.replace("tb_reduction_lanes[64]", &format!("tb_reduction_lanes[{lanes}]")) }
 }
 
 // A second barrier prevents a fast host subgroup from overwriting a slot

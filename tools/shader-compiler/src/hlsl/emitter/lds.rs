@@ -92,12 +92,12 @@ impl<'a> Emitter<'a> {
                     } else {
                         offset + u32::from(word) * 4
                     };
-                    let location = format!("tb_lds[((t{t}addr + {byte}u) >> 2) & 8191u]");
+                    let at = format!("(t{t}addr + {byte}u)");
                     if read {
-                        self.wv(&reg, &location)?;
+                        self.wv(&reg, &format!("tb_lds_load({at})"))?;
                     } else {
                         self.touch(&reg);
-                        self.line(&format!("if (exec_lo & 1u) {location} = {};", r(&reg)?));
+                        self.line(&format!("if (exec_lo & 1u) tb_lds_store({at}, {});", r(&reg)?));
                     }
                 }
                 Ok(())
@@ -118,7 +118,8 @@ impl<'a> Emitter<'a> {
                 let scale = if m.contains("st64") { 64 } else { 1 };
                 let (off0, off1) = ((off & 0xff) * scale, ((off >> 8) & 0xff) * scale);
                 let addr = r(&s[0])?;
-                let at = |o: u32| format!("tb_lds[(({addr} + {o:#x}u) >> 2) & 8191u]");
+                let at = |o: u32| format!("tb_lds_load({addr} + {o:#x}u)");
+                let store = |o: u32, value: String| format!("tb_lds_store({addr} + {o:#x}u, {value});");
                 let vd = match d {
                     Some(Opnd::Vgpr(v)) => v,
                     _ => return Err("bad vdst".into()),
@@ -144,17 +145,11 @@ impl<'a> Emitter<'a> {
                         self.wv(&Opnd::Vgpr(vd + 1), &format!("t{t}b"))
                     }
                     "ds_write_b32" => {
-                        self.line(&format!("if (exec_lo & 1u) {} = {};", at(off & 0xffff), r(&s[1])?));
+                        self.line(&format!("if (exec_lo & 1u) {}", store(off & 0xffff, r(&s[1])?)));
                         Ok(())
                     }
                     _ => {
-                        self.line(&format!(
-                            "if (exec_lo & 1u) {{ {} = {}; {} = {}; }}",
-                            at(off0 * 4),
-                            r(&s[1])?,
-                            at(off1 * 4),
-                            r(&s[2])?
-                        ));
+                        self.line(&format!("if (exec_lo & 1u) {{ {} {} }}", store(off0 * 4, r(&s[1])?), store(off1 * 4, r(&s[2])?)));
                         Ok(())
                     }
                 }
@@ -169,7 +164,7 @@ impl<'a> Emitter<'a> {
                 let t = self.tmp;
                 self.tmp += 1;
                 self.line(&format!("uint t{t}a = ({}) + {off:#x}u; uint t{t}s = (t{t}a & 3u) * 8u;", r(&s[0])?));
-                let word = format!("tb_lds[(t{t}a >> 2) & 8191u]");
+                let word = format!("tb_lds[min(t{t}a >> 2, TB_LDS_WORDS - 1u)]");
                 if m.starts_with("ds_write") {
                     let mut data = r(&s[1])?;
                     if m == "ds_write_b16_d16_hi" {
@@ -180,13 +175,13 @@ impl<'a> Emitter<'a> {
                     }
                     // Adjacent lanes can target different halves of the same word.
                     // A plain read-modify-write would lose one lane's update.
-                    self.line(&format!("if (exec_lo & 1u) {{ uint t{t}old; InterlockedOr({word}, 0u, t{t}old);"));
+                    self.line(&format!("if ((exec_lo & 1u) && (t{t}a >> 2) < TB_LDS_WORDS) {{ uint t{t}old; InterlockedOr({word}, 0u, t{t}old);"));
                     self.line(&format!("uint t{t}seen; [allow_uav_condition] do {{ t{t}seen = t{t}old;"));
                     self.line(&format!("uint t{t}new = (t{t}seen & ~({mask:#x}u << t{t}s)) | ((({data}) & {mask:#x}u) << t{t}s);"));
                     self.line(&format!("InterlockedCompareExchange({word}, t{t}seen, t{t}new, t{t}old); }} while (t{t}old != t{t}seen); }}"));
                     return Ok(());
                 }
-                let v = format!("(({word} >> t{t}s) & {mask:#x}u)");
+                let v = format!("((tb_lds_load(t{t}a) >> t{t}s) & {mask:#x}u)");
                 let dst = d.ok_or("no dst")?;
                 let e = match m {
                     "ds_read_u16_d16" => format!("(({} & 0xffff0000u) | {v})", r(&dst)?),
@@ -227,7 +222,7 @@ impl<'a> Emitter<'a> {
                 let t = self.tmp;
                 self.tmp += 1;
                 self.line(&format!(
-                    "uint t{t} = 0u; if (exec_lo & 1u) {{ {func}(tb_lds[(({addr} + {off:#x}u) >> 2) & 8191u], {}, t{t}); }}",
+                    "uint t{t} = 0u; uint t{t}i = ({addr} + {off:#x}u) >> 2; if ((exec_lo & 1u) && t{t}i < TB_LDS_WORDS) {{ {func}(tb_lds[t{t}i], {}, t{t}); }}",
                     r(&s[1])?
                 ));
                 if m.contains("_rtn") {

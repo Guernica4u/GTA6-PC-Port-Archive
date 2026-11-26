@@ -798,6 +798,76 @@ fn execz_skip_allows_uniform_merge_branch_in_window() {
     }
 }
 
+#[test]
+fn portable_reduction_flattens_all_local_coordinates() {
+    let (mut shader, _, _) = fixture::shader(64);
+    for group in [[8, 8, 1], [4, 4, 4], [1, 8, 8], [16, 1, 4]] {
+        shader.psv_threads = Some(group);
+        let translated = super::super::translate(&shader).expect("single complete logical wave");
+        assert_eq!(translated.required_wave_size, None, "{group:?}");
+        assert_eq!(translated.portable_compute_group, Some(group));
+        assert!(!translated.hlsl.contains("WaveReadLaneAt("));
+        assert!(!translated.hlsl.contains("[WaveSize("));
+        let lane = portable_lane_id(group);
+        assert!(translated.hlsl.contains(&format!("tb_reduction_read({lane},")));
+        assert!(!translated.hlsl.contains("tb_reduction_read(gtid.x,"));
+    }
+    for group in [[8, 8, 2], [4, 4, 8]] {
+        shader.psv_threads = Some(group);
+        let translated = super::super::translate(&shader).unwrap();
+        assert_eq!(translated.required_wave_size, Some(64));
+    }
+}
+
+#[test]
+fn straight_exchange_accepts_only_complete_single_wave_groups() {
+    let (mut shader, _, _) = fixture::shader(32);
+    let words = [0x2800_00e9u32, 0xde54_c100, 0xd760_0007, 0x0001_0100, 0xbf81_0000];
+    shader.isa = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    shader.isa_data = shader.isa.clone();
+    for group in [[8, 4, 1], [4, 4, 2], [1, 4, 8]] {
+        shader.psv_threads = Some(group);
+        let t = super::super::translate(&shader).unwrap();
+        assert_eq!(t.required_wave_size, None);
+        assert_eq!(t.portable_compute_group, Some(group));
+        let lane = portable_lane_id(group);
+        assert!(t.hlsl.contains(&format!("tb_reduction_read({lane}, v0,")));
+        assert!(!t.hlsl.contains("tb_reduction_read(gtid.x,"));
+    }
+    let ops = crate::rdna2::disassemble(&shader.isa);
+    for group in [[8, 8, 1], [4, 4, 4], [4, 4, 1], [0, 32, 1], [u32::MAX, 2, 1]] {
+        assert!(!straight_exchange(&mut ops.clone(), group), "{group:?}");
+    }
+    // With no lane read, DPP8 has the same eight-lane groups for either wave width.
+    let mut no_read = ops;
+    no_read.remove(1);
+    for group in [[8, 8, 1], [4, 4, 4]] {
+        assert!(straight_exchange(&mut no_read.clone(), group));
+    }
+}
+
+#[test]
+fn straight_dpp8_portability_spans_multiple_waves_without_cross_wave_reads() {
+    let (mut shader, _, _) = fixture::shader(64);
+    let words = [0x2800_00e9u32, 0xde54_c100, 0xbf81_0000];
+    shader.isa = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    shader.isa_data = shader.isa.clone();
+    for group in [[128, 1, 1], [8, 12, 1], [16, 8, 2], [32, 32, 1], [4, 4, 64]] {
+        shader.psv_threads = Some(group);
+        let t = super::super::translate(&shader).expect("convergent DPP8 exchange");
+        let count = group.into_iter().product::<u32>();
+        assert_eq!(t.required_wave_size, None);
+        assert_eq!(t.portable_compute_group, Some(group));
+        assert!(t.hlsl.contains(&format!("tb_reduction_lanes[{count}]")));
+        assert!(t.hlsl.contains(&format!("({} & ~7u)", portable_lane_id(group))));
+        assert!(!t.hlsl.contains("WaveReadLaneAt("));
+    }
+    let ops = crate::rdna2::disassemble(&shader.isa);
+    for group in [[1, 1, 128], [31, 1, 1], [100, 1, 1], [1024, 2, 1], [0, 32, 1]] {
+        assert!(!straight_exchange(&mut ops.clone(), group), "{group:?}");
+    }
+}
+
 /// The compaction scan from ProjectScarlett compute shaders (0c40c71fbff2 at
 /// 0x97c): a masked select copied to the accumulator, a DPP16 row-shift
 /// inclusive scan, the cross-row add, and the exclusive result.

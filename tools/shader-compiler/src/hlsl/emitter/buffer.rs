@@ -27,11 +27,13 @@ impl<'a> Emitter<'a> {
             };
             if !(2..=10).contains(&k) { continue; }
             let Some(&Opnd::Vgpr(address)) = shift.dst.first() else { continue };
-            // The index holds one value throughout.
+            // The index holds one value throughout. A no-op does not write it.
             let (from, to) = (here.min(j), here.max(j));
-            if self.insns[from..to].iter().any(|i| i.dst.contains(&Opnd::Vgpr(index))) { continue; }
+            if self.insns[from..to].iter().any(|i| i.mnemonic != "v_nop"
+                && i.dst.contains(&Opnd::Vgpr(index))) { continue; }
             let same = self.insns[j + 1..].iter().take(16)
-                .take_while(|i| !i.dst.contains(&Opnd::Vgpr(address)) || i.enc == Enc::Mubuf)
+                .take_while(|i| i.mnemonic == "v_nop"
+                    || !i.dst.contains(&Opnd::Vgpr(address)) || i.enc == Enc::Mubuf)
                 .any(|i| i.enc == Enc::Mubuf && i.mnemonic.starts_with("buffer_load_dword") && i.aux.mask & 3 == 1
                     && i.src.first() == Some(&Opnd::Vgpr(address))
                     && (i.aux.imm..i.aux.imm + dwords(&i.mnemonic)).contains(&ins.aux.imm));

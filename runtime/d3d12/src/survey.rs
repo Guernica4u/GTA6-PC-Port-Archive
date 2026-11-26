@@ -82,6 +82,7 @@ pub(crate) fn install_handler() -> bool {
         // The first call comes from the DLL attach, before title code runs.
         if let Some((start, end)) = title_image() {
             crate::clzero::patch_known_routines(start, end);
+            crate::title_audio::patch(start, end);
         }
         let handle = unsafe { AddVectoredExceptionHandler(1, Some(handler)) };
         VEH_HANDLE.store(handle, Ordering::Release);
@@ -188,6 +189,9 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     } else {
         return CONTINUE_SEARCH;
     };
+    if at_break && crate::title_audio::handle(context, start, int3) {
+        return CONTINUE_EXECUTION;
+    }
     if !enabled() {
         if int3 + 9 > end {
             return CONTINUE_SEARCH;

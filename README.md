@@ -44,6 +44,7 @@ Press Left or Right to change lanes, or Space to take a turn in your current lan
 - [Launch options and environment variables](docs/ENVIRONMENT.md): settings and their defaults
 - Game setup: [The Matrix Awakens](docs/MATRIX_AWAKENS.md) · [GTA VI](docs/PROJECTSCARLETT.md)
 - [Shader coverage](docs/SHADERS.md)
+- [Where to improve](docs/FOCUS.md): open areas for contributors
 - [Source layout](docs/SOURCE_LAYOUT.md)
 - [Credits and references](docs/REFERENCES.md)
 
