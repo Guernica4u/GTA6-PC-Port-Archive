@@ -157,10 +157,12 @@ pub fn run(root: &Path, o: Options) -> Result<()> {
     if o.args.is_empty() {
         // xtask is a host tool (it runs git); it is not tested under Wine.
         test.args(["--workspace", "--exclude", "xtask", "--no-fail-fast"]);
-        // The loader's two end-to-end tests build their fixture by starting
-        // cargo from inside the test process, which Wine cannot do. The
-        // prebuilt-fixture hook (VICTORY_HLE_PROBE) is in pr/hle-probe, not
-        // in this branch, so skip them until it is available.
+        // The loader's two end-to-end tests (victory-loader's
+        // tests/load_probe.rs) build their fixture by starting cargo from
+        // inside the test process, which Wine cannot do. The prebuilt-fixture
+        // hook (VICTORY_HLE_PROBE) is in pr/hle-probe, not in this branch, so
+        // skip them until it is available. The skips are the test binaries'
+        // options, so they go after `--`; cargo itself has no `--skip`.
         if std::env::var_os("VICTORY_HLE_PROBE").is_none() {
             eprintln!(
                 "skipping victory-loader's hle-probe tests: they need the \
@@ -168,6 +170,7 @@ pub fn run(root: &Path, o: Options) -> Result<()> {
                  the host); pass -- <cargo-test-args> to override"
             );
             test.args([
+                "--",
                 "--skip",
                 "loads_binds_and_calls_probe",
                 "--skip",
@@ -195,8 +198,10 @@ fn copy_dlls(dir: &Path, system32: &Path, dlls: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// `path` as Wine's Z: drive (the host's root) names it.
+/// `path` as Wine's Z: drive (the host's root) names it; a relative path is
+/// made absolute first, since Z: names the host's root.
 fn wine_path(path: &Path) -> String {
+    let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     format!("Z:{}", path.display()).replace('/', "\\")
 }
 
