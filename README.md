@@ -143,7 +143,7 @@ title's window has focus:
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
 
-Set `VICTORY_KBM_GTA=1` to use an optional GTA V PC-style keyboard and mouse layout on the stand-in pad (`VICTORY_MOUSE_SENS` scales mouse camera speed, default `1.0`; `VICTORY_MOUSE_INVERT_Y=1` inverts Y). Press `F2` or `` ` `` (`~`) to toggle mouse-look capture (starts unlocked; `Esc`, `P`, or losing focus unlocks automatically):
+Set `VICTORY_KBM_GTA=1` to use an optional GTA V PC-style keyboard and mouse layout on the stand-in pad (`VICTORY_MOUSE_SENS` scales mouse camera speed, default `1.0`; `VICTORY_MOUSE_INVERT_Y=1` inverts Y). Press `F2` or `` ` `` (`~`) to toggle mouse-look capture (starts unlocked; auto-hides the cursor inside the game window while locked, and `Esc`, `P`, or losing focus unlocks and restores it automatically):
 
 | Keys / Mouse | Pad |
 |--------------|-----|
