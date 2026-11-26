@@ -149,6 +149,13 @@ pub(crate) fn count(this: This) -> Option<u32> {
 /// Tracks a mark: `begin` opens a query, and `end` closes it. Returns
 /// whether the mark is one D3D12 allows, so the caller records nothing
 /// else.
+///
+/// The state moves in **recording** order. A list recorded from one thread
+/// records its marks in submission order, and that is the assumption here;
+/// a list recorded from several threads can record a mark before another
+/// one it follows in submission, and this does not order them. Moving the
+/// decision to submission is the fix if a title does that, and it is a
+/// different shape: the state would have to travel with the list.
 pub(crate) fn mark(this: This, index: u32, begin: bool) -> Option<()> {
     if this.is_null() {
         return None;
