@@ -2170,40 +2170,33 @@ impl<'a> Lower<'a> {
     }
 
     /// A 32-bit denormal as the console's float mode reads it: a zero of its
-    /// sign, decided on the bits (the host's own denormal mode varies).
-    fn ftz(&mut self, f: V) -> V {
+    /// sign, or with `positive_zero` a `+0` (what a MAD's product flush
+    /// does). Decided on the bits, because the host's own denormal mode
+    /// varies. A product that is already a zero keeps its sign either way:
+    /// `positive_zero` flushes denormals only, which is where this differs
+    /// from the output multipliers, whose zero is always `+0`.
+    fn ftz_of(&mut self, f: V, positive_zero: bool) -> V {
         let c = self.cur;
         let x = self.as_int(f);
-        let den = self.exponent_is_zero(x);
-        let sign = self.s.m.i32(0x8000_0000);
-        let s = self.s.m.bin(c, Bin::And, x, sign);
-        let r = self.s.m.select(c, den, s, x);
+        let mut den = self.exponent_is_zero(x);
+        let zero = if positive_zero {
+            let mant = self.s.m.i32(0x007F_FFFF);
+            let izero = self.s.m.i32(0);
+            let mantissa = self.s.m.bin(c, Bin::And, x, mant);
+            let has = self.s.m.cmp(c, pred::NE, mantissa, izero);
+            den = self.s.m.bin(c, Bin::And, den, has);
+            self.s.m.i32(0)
+        } else {
+            let sign = self.s.m.i32(0x8000_0000);
+            self.s.m.bin(c, Bin::And, x, sign)
+        };
+        let r = self.s.m.select(c, den, zero, x);
         self.as_float(r)
     }
 
-    /// The console's MAD flush of the product it rounds: a **denormal**
-    /// result comes out `+0`, the sign dropped. A product that is already a
-    /// zero keeps the sign the multiply gave it, which is why a true `-0`
-    /// stays `-0` here where the output multipliers turn any zero into `+0`.
-    ///
-    /// The test is on the product's bits, so it assumes the product reaches
-    /// it unflushed — a host that flushes at the multiply, sign-preserving,
-    /// leaves `-0` (mantissa 0) and passes through as a true zero. Deciding
-    /// from the operands instead (either operand empty means a zero product,
-    /// otherwise an empty exponent is an underflow to `+0`) does not hold on
-    /// the hardware seen so far: it flips an underflowed negative product
-    /// from `-0` to `+0` and misses the model on 14 of 14,440 inputs.
-    fn flush_denormal_to_positive_zero(&mut self, f: V) -> V {
-        let c = self.cur;
-        let x = self.as_int(f);
-        let mant = self.s.m.i32(0x007F_FFFF);
-        let zero = self.s.m.i32(0);
-        let no_exp = self.exponent_is_zero(x);
-        let m = self.s.m.bin(c, Bin::And, x, mant);
-        let has_mant = self.s.m.cmp(c, pred::NE, m, zero);
-        let den = self.s.m.bin(c, Bin::And, no_exp, has_mant);
-        let r = self.s.m.select(c, den, zero, x);
-        self.as_float(r)
+    /// [`Self::ftz_of`] keeping the sign of the zero.
+    fn ftz(&mut self, f: V) -> V {
+        self.ftz_of(f, false)
     }
 
     /// The hardware's maximum (`max`) or minimum of two floats: as DXIL's
@@ -6297,7 +6290,7 @@ impl<'a> Lower<'a> {
                     "v_fmac_f32" => self.fmad(a, bb, acc),
                     "v_mac_f32" => {
                         let m = self.s.m.bin(c, Bin::Mul, a, bb);
-                        let m = self.flush_denormal_to_positive_zero(m);
+                        let m = self.ftz_of(m, true);
                         self.s.m.bin(c, Bin::Add, m, acc)
                     }
                     _ => {
@@ -6313,7 +6306,7 @@ impl<'a> Lower<'a> {
                     self.legacy_mul(a, bb)
                 } else {
                     let m = self.s.m.bin(c, Bin::Mul, a, bb);
-                    self.flush_denormal_to_positive_zero(m)
+                    self.ftz_of(m, true)
                 };
                 let r = self.s.m.bin(c, Bin::Add, m, cc);
                 float(self, r)
