@@ -273,6 +273,9 @@ impl Host {
     /// the layer they run in parallel. Callers take [`WARP_LOCK`] (if at all)
     /// before this, never after.
     fn made<T>(&self, make: impl FnOnce() -> windows::core::Result<T>) -> Result<T, String> {
+        if !cfg!(feature = "diagnostics") {
+            return make().map_err(err);
+        }
         let Ok(queue) = self.device.cast::<ID3D12InfoQueue>() else {
             return make().map_err(err);
         };
