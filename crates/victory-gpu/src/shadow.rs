@@ -492,18 +492,12 @@ impl Shadow {
     pub(crate) fn copy_back_marked(&self, page: usize) -> usize {
         let mut title = pooled(PAGE);
         title.resize(PAGE, 0);
-        let mut synced = Vec::new();
-        let n = self.copy_back_marked_with(page, &mut title, &mut synced);
+        let n = self.copy_back_marked_with(page, &mut title);
         give_back(title);
-        if !synced.is_empty()
-            && let Some(t) = &self.tracked
-        {
-            t.taken(&synced);
-        }
         n
     }
 
-    fn copy_back_marked_with(&self, page: usize, title_buf: &mut [u8], synced: &mut Vec<usize>) -> usize {
+    fn copy_back_marked_with(&self, page: usize, title_buf: &mut [u8]) -> usize {
         let Some(t) = &self.tracked else {
             return 0;
         };
@@ -540,9 +534,11 @@ impl Shadow {
             let _writing = crate::watch::writing(from, n);
             crate::host::write_mapped(from as *mut u8, bytes, n);
         }
-        // Equal to title memory now: taken, unless it holds the page in part.
+        // Equal to title memory now: taken immediately per page so title
+        // writes landing after `writing` drops are not swallowed by a later
+        // batched `taken`.
         if from == page && to == page + PAGE {
-            synced.push(page / PAGE);
+            t.taken(&[page / PAGE]);
         }
         written.map_or(0, |_| n)
     }
@@ -973,11 +969,13 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         return;
     }
     work.sort_unstable_by_key(|&(_, p)| p);
+    let page_nums: Vec<usize> = work.iter().map(|&(_, p)| p / PAGE).collect();
+    let aliased = crate::watch::has_aliases(&page_nums);
     let mut unique: Vec<(Arc<Shadow>, usize)> = Vec::with_capacity(work.len());
-    let mut dups: Vec<(Arc<Shadow>, usize)> = Vec::new();
-    for item in work {
-        if unique.last().is_some_and(|&(_, p)| p == item.1) {
-            dups.push(item);
+    let mut seq: Vec<(Arc<Shadow>, usize)> = Vec::new();
+    for (item, is_aliased) in work.into_iter().zip(aliased) {
+        if is_aliased || unique.last().is_some_and(|&(_, p)| p == item.1) {
+            seq.push(item);
         } else {
             unique.push(item);
         }
@@ -985,17 +983,14 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
     let process = |items: &[(Arc<Shadow>, usize)]| {
         let mut title = pooled(PAGE);
         title.resize(PAGE, 0);
-        let mut synced: std::collections::HashMap<usize, (Arc<Shadow>, Vec<usize>)> = std::collections::HashMap::new();
         let (mut count, mut bytes) = (0u64, 0u64);
         for (copy, page) in items {
-            let key = Arc::as_ptr(copy) as usize;
-            let entry = synced.entry(key).or_insert_with(|| (copy.clone(), Vec::new()));
-            let written = copy.copy_back_marked_with(*page, &mut title, &mut entry.1);
+            let written = copy.copy_back_marked_with(*page, &mut title);
             count += 1;
             bytes += written as u64;
         }
         give_back(title);
-        (count, bytes, synced)
+        (count, bytes)
     };
     let threads = if unique.len() >= 16 {
         std::thread::available_parallelism()
@@ -1006,13 +1001,11 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
     } else {
         1
     };
-    let mut all_synced: std::collections::HashMap<usize, (Arc<Shadow>, Vec<usize>)> = std::collections::HashMap::new();
     let (mut total_pages, mut total_bytes) = (0u64, 0u64);
     if threads < 2 {
-        let (c, b, s) = process(&unique);
+        let (c, b) = process(&unique);
         total_pages += c;
         total_bytes += b;
-        all_synced = s;
     } else {
         let chunk_size = unique.len().div_ceil(threads);
         let mut chunks = unique.chunks(chunk_size);
@@ -1027,36 +1020,15 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
             }
             out
         });
-        for (c, b, s) in results {
+        for (c, b) in results {
             total_pages += c;
             total_bytes += b;
-            for (k, (copy, mut list)) in s {
-                all_synced
-                    .entry(k)
-                    .or_insert_with(|| (copy, Vec::new()))
-                    .1
-                    .append(&mut list);
-            }
         }
     }
-    if !dups.is_empty() {
-        let (c, b, s) = process(&dups);
+    if !seq.is_empty() {
+        let (c, b) = process(&seq);
         total_pages += c;
         total_bytes += b;
-        for (k, (copy, mut list)) in s {
-            all_synced
-                .entry(k)
-                .or_insert_with(|| (copy, Vec::new()))
-                .1
-                .append(&mut list);
-        }
-    }
-    for (_, (copy, list)) in all_synced {
-        if !list.is_empty()
-            && let Some(t) = &copy.tracked
-        {
-            t.taken(&list);
-        }
     }
     #[cfg(feature = "diagnostics")]
     {
