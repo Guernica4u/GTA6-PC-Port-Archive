@@ -1545,8 +1545,8 @@ pub(crate) mod tests {
         copy.update(p, len);
         copy.writing(p, len, true);
         assert!(copy.before.lock().unwrap().0.is_empty(), "no snapshot");
-        // The shaders write a byte in each page; the title writes pages
-        // 1 through 3 meanwhile.
+        // The shaders write a byte in each page; the title writes pages 1
+        // and 2 meanwhile.
         copy.write_host((p + 10) as u64, &[0xaa]);
         copy.write_host((p + PAGE + 20) as u64, &[0xbb]);
         copy.write_host((p + 2 * PAGE + 30) as u64, &[0xcc]);
@@ -1556,6 +1556,7 @@ pub(crate) mod tests {
         unsafe {
             title(PAGE + 40).write_volatile(0x11);
             title(2 * PAGE + 50).write_volatile(0x22);
+            // Page 3 also has a CPU write, even though its GPU write is held.
             title(3 * PAGE + 50).write_volatile(0x33);
         }
         // Page 2 is unmarked and page 3 is marked but withheld.
