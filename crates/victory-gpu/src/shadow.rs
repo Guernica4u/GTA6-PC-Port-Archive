@@ -362,13 +362,17 @@ impl Shadow {
     /// a title write there before the copy-back keeps the page's bytes from
     /// before it ([`crate::watch::Tracked::arm`]).
     pub(crate) fn writing(&self, address: usize, len: usize, marked: bool) {
-        let inserted = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert((address, address + len));
-        if inserted {
-            self.pending_len.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The counter is the fast path's hint for "nothing pending": it has
+        // to move *inside* the lock that `pending` moves under, or a reader
+        // (another thread's copy-back) sees 0 while a range is already in the
+        // set and takes the snapshot path without it - a range that then has
+        // no snapshot, and a count that drifts below the set's size.
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            if pending.insert((address, address + len)) {
+                self.pending_len
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
         }
         if marked && let Some(t) = &self.tracked {
             t.arm(address, address + len);
@@ -507,7 +511,8 @@ impl Shadow {
         // submission runs at a time), and the snapshot with the last range.
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         if pending.remove(&(address, address + len)) {
-            self.pending_len.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            self.pending_len
+                .fetch_sub(1, std::sync::atomic::Ordering::Release);
         }
         if pending.is_empty() {
             compared.clear();
@@ -602,7 +607,10 @@ impl Shadow {
         }
         // Most ranges refreshed in a submission have none: ask the count
         // first, not the lock.
-        let mut busy: Vec<(usize, usize)> = if self.pending_len.load(std::sync::atomic::Ordering::Relaxed) == 0
+        let mut busy: Vec<(usize, usize)> = if self
+            .pending_len
+            .load(std::sync::atomic::Ordering::Acquire)
+            == 0
         {
             Vec::new()
         } else {
