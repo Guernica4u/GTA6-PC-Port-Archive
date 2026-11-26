@@ -152,6 +152,7 @@ fn lower_valu_cs(native: &NativeProgram) -> Result<HostShader, crate::ShaderErro
         mesh_stride: 0,
         view_marks: false,
         native16: false,
+        host_heap_views: 0,
     })?;
 
     let shader = HostShader {
@@ -1724,6 +1725,7 @@ fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: boo
         mesh_stride: 0,
         view_marks: false,
         native16: false,
+        host_heap_views: 0,
     })
     .expect("lower");
     let shader = HostShader {

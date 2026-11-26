@@ -3402,6 +3402,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             Options {
                 view_marks: true,
                 native16: false,
+                ..Default::default()
             },
         )
         .unwrap();

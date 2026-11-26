@@ -573,6 +573,7 @@ fn translate(
                     let marks = emit::Options {
                         view_marks: true,
                         native16: false,
+                        ..Default::default()
                     };
                     match emit::emit_with(&container, &p, &program, &s, &i, &r, marks) {
                         Ok(shader) => {
