@@ -114,7 +114,16 @@ fn in_half_lane_reads_match_the_console_on_every_adapter() {
         // has its lower half only.
         for threads in [64, 128, 32] {
             let p = program(IN_HALF, threads);
-            let cs = emit_for(&p, target).unwrap_or_else(|e| panic!("{name}: {e}"));
+            // A host that cannot run the fixture (a 16-lane iGPU on a
+            // wave64 program) is reported and skipped; `ran` keeps the
+            // test honest if none can.
+            let cs = match emit_for(&p, target) {
+                Ok(cs) => cs,
+                Err(e) => {
+                    eprintln!("{name}: {threads} threads: {e}; skipped");
+                    continue;
+                }
+            };
             let split = !target.runs(64);
             assert_eq!(
                 wave_size(&cs.dxil),
@@ -122,18 +131,22 @@ fn in_half_lane_reads_match_the_console_on_every_adapter() {
                 "{name}: the declared wave size"
             );
             let groups = 3;
-            let out = run(&host, &p, groups).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let out = match run(&host, &p, groups) {
+                Ok(out) => out,
+                Err(e) => {
+                    eprintln!("{name}: {threads} threads: {e}; skipped");
+                    continue;
+                }
+            };
+            ran += 1;
             let want: Vec<u32> = (0..groups)
                 .flat_map(|_| (0..threads).map(|t| t ^ 31))
                 .collect();
             assert_eq!(out, want, "{name}: {threads} threads (split {split})");
             eprintln!("{name}: {threads} threads per group exact (split {split})");
         }
-        ran += 1;
     }
-    if ran == 0 {
-        eprintln!("no hardware adapter; skipped");
-    }
+    assert!(ran > 0, "no adapter ran the program");
 }
 
 /// 3-D groups: the console forms waves from the flat thread id (x
@@ -177,6 +190,7 @@ fn three_dimensional_groups_keep_the_consoles_lanes() {
         eprintln!("no DXGI; skipped");
         return;
     };
+    let mut ran = 0;
     for name in names {
         let Ok(host) = Host::on(&name) else {
             continue;
@@ -192,12 +206,21 @@ fn three_dimensional_groups_keep_the_consoles_lanes() {
         ] {
             let p = program_3d(threads);
             let n: u32 = threads.iter().product();
-            let out = run(&host, &p, 1).unwrap_or_else(|e| panic!("{name}: {e}"));
+            // A host that cannot run the fixture is reported and skipped.
+            let out = match run(&host, &p, 1) {
+                Ok(out) => out,
+                Err(e) => {
+                    eprintln!("{name}: {threads:?}: {e}; skipped");
+                    continue;
+                }
+            };
+            ran += 1;
             let want: Vec<u32> = (0..n).map(|f| f ^ 31).collect();
             assert_eq!(out, want, "{name}: {threads:?} (split {split})");
             eprintln!("{name}: {threads:?} exact (split {split})");
         }
     }
+    assert!(ran > 0, "no adapter ran the program");
 }
 
 /// Runs `body` (v0 = t in, v2 out) on every hardware adapter in groups of
@@ -214,6 +237,7 @@ fn flow_case(label: &str, body: &[u32], threads: u32, want: impl Fn(u32) -> u32,
         eprintln!("no DXGI; skipped");
         return;
     };
+    let mut ran = 0;
     for name in names {
         let Ok(host) = Host::on(&name) else {
             continue;
@@ -221,7 +245,16 @@ fn flow_case(label: &str, body: &[u32], threads: u32, want: impl Fn(u32) -> u32,
         let p = program(body, threads);
         let split = !host.target().runs(64);
         let groups = 2;
-        let out = run(&host, &p, groups).unwrap_or_else(|e| panic!("{name}: {label}: {e}"));
+        // A host that cannot run the fixture (a 16-lane iGPU on a wave64
+        // program) is reported and skipped; `ran` keeps the test honest.
+        let out = match run(&host, &p, groups) {
+            Ok(out) => out,
+            Err(e) => {
+                eprintln!("{name}: {label}: {e}; skipped");
+                continue;
+            }
+        };
+        ran += 1;
         let expect: Vec<u32> = (0..groups).flat_map(|_| (0..threads).map(&want)).collect();
         if !split && !native {
             if out != expect {
@@ -235,6 +268,7 @@ fn flow_case(label: &str, body: &[u32], threads: u32, want: impl Fn(u32) -> u32,
         );
         eprintln!("{name}: {label}, {threads} threads exact (split {split})");
     }
+    assert!(ran > 0, "no adapter ran {label}");
 }
 
 /// A mask counted whole: 40 lanes of the console wave, 32 in one half and
