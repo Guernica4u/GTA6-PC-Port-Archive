@@ -888,6 +888,59 @@ pub(crate) fn forget_read(slot: u32) {
     READS.lock().unwrap_or_else(|e| e.into_inner()).1.push(slot);
 }
 
+/// Write ranges held back from guest memory, indexed by shadow and start.
+#[derive(Default)]
+pub(crate) struct Withheld {
+    ranges: Vec<(usize, usize, usize)>,
+}
+
+impl Withheld {
+    /// Small sets can be cheaper to scan than to sort and search.
+    const LINEAR_LIMIT: usize = 32;
+
+    /// Entries are (shadow identity, start, exclusive end).
+    pub(crate) fn new(ranges: impl IntoIterator<Item = (usize, usize, usize)>) -> Self {
+        let mut ranges: Vec<_> = ranges.into_iter().collect();
+        if ranges.len() <= Self::LINEAR_LIMIT {
+            return Self { ranges };
+        }
+        ranges.sort_unstable();
+        // For each shadow, keep the greatest end of any range up to this
+        // start. A preceding range may extend beyond a later, nested one.
+        let mut previous = None;
+        let mut max_end = 0;
+        for (shadow, _, end) in &mut ranges {
+            if previous != Some(*shadow) {
+                previous = Some(*shadow);
+                max_end = 0;
+            }
+            max_end = max_end.max(*end);
+            *end = max_end;
+        }
+        Self { ranges }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    pub(crate) fn overlaps(&self, shadow: usize, from: usize, to: usize) -> bool {
+        if self.ranges.len() <= Self::LINEAR_LIMIT {
+            return self
+                .ranges
+                .iter()
+                .any(|&(copy, start, end)| copy == shadow && start < to && from < end);
+        }
+        let i = self
+            .ranges
+            .partition_point(|&(copy, start, _)| (copy, start) < (shadow, to));
+        i != 0 && {
+            let (copy, _, end) = self.ranges[i - 1];
+            copy == shadow && from < end
+        }
+    }
+}
+
 /// After a submission: every page its shaders marked as written through
 /// views goes back ([`Shadow::copy_back_marked`]), but for pages in
 /// `withheld` (ranges of copies that lists whose writes stay out of title
@@ -897,7 +950,7 @@ pub(crate) fn forget_read(slot: u32) {
 // shortcut: marks do not tell lists apart: a page that a withheld list and
 // another both wrote through views goes back unless the withheld list
 // declared it.
-pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_withheld: bool) {
+pub(crate) fn copy_back_marks(withheld: &Withheld, memory_withheld: bool) {
     let (mut marked, mut held) = (Vec::new(), Vec::new());
     for memory in [false, true] {
         let Some(b) = bitmap(memory) else {
@@ -947,10 +1000,7 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         marked.iter().filter_map(|&n| page_of(&m, n)).collect()
     };
     for (copy, page) in pages {
-        if withheld
-            .iter()
-            .any(|(c, a, n)| Arc::ptr_eq(c, &copy) && *a < page + PAGE && page < a + n)
-        {
+        if withheld.overlaps(Arc::as_ptr(&copy) as usize, page, page + PAGE) {
             continue;
         }
         let written = copy.copy_back_marked(page);
@@ -1478,10 +1528,9 @@ pub(crate) mod tests {
 
     /// Pages shaders marked (`copy_back_marks`, `victory_shader::emit`
     /// "Write marks") go back by the bytes the GPU changed. The title writes
-    /// a marked page after the copy took it (the guard saves its bytes from
-    /// before) and a page nobody marked: the shader's byte and the title's
-    /// both stay in the first; the second keeps the title's, and the copy's
-    /// byte there (no mark) is not put back. The bits are cleared.
+    /// two marked pages after the copy took them. Both writers' bytes stay
+    /// on the first page. The second overlaps a withheld range and keeps
+    /// the title's bytes. The bits are cleared.
     #[test]
     fn marked_pages_go_back_by_the_bytes_the_gpu_changed() {
         let p = crate::watch::tests::pool(3);
@@ -1507,23 +1556,60 @@ pub(crate) mod tests {
             title(PAGE + 40).write_volatile(0x11);
             title(2 * PAGE + 50).write_volatile(0x22);
         }
-        // The shaders marked pages 0 and 1.
+        // The shaders marked all three pages, but page 2 overlaps a withheld range.
         let bits = b.data as *mut u32;
-        for n in [base, base + 1] {
+        for n in [base, base + 1, base + 2] {
             // SAFETY: a dword of the mapped bitmap.
             unsafe { *bits.add(n / 32) |= 1 << (n % 32) };
         }
-        copy_back_marks(&[], false);
+        let withheld = Withheld::new([(Arc::as_ptr(&copy) as usize, p + 2 * PAGE, p + 2 * PAGE + 1)]);
+        copy_back_marks(&withheld, false);
         // SAFETY: bytes of our pool.
         let read = |at: usize| unsafe { title(at).read_volatile() };
         assert_eq!(read(10), 0xaa, "the shader's byte, page 0");
         assert_eq!((read(PAGE + 20), read(PAGE + 40)), (0xbb, 0x11), "both writers' bytes, page 1");
-        assert_eq!((read(2 * PAGE + 30), read(2 * PAGE + 50)), (0, 0x22), "page 2 not marked");
+        assert_eq!((read(2 * PAGE + 30), read(2 * PAGE + 50)), (0, 0x22), "page 2 withheld");
         // SAFETY: dwords of the mapped bitmap.
-        let left: u32 = (base / 32..=(base + 1) / 32).map(|w| unsafe { *bits.add(w) }).fold(0, |a, w| a | w);
+        let left: u32 = (base / 32..=(base + 2) / 32).map(|w| unsafe { *bits.add(w) }).fold(0, |a, w| a | w);
         assert_eq!(left, 0, "bits cleared");
         assert_eq!(copy.copy_back(p, len), 0, "nothing kept to compare");
         unregister(p, p as u64);
+    }
+
+    #[test]
+    fn withheld_index_matches_overlap_scan() {
+        let ranges = [
+            (3, 8, 8),
+            (2, 7, 19),
+            (1, 3, 8),
+            (2, 10, 11),
+            (3, 4, 7),
+            (2, 20, 23),
+            (2, 7, 8),
+            (2, 6, 6),
+        ];
+        let scanned = Withheld::new(ranges);
+        let indexed = Withheld::new(ranges.repeat(5));
+        for shadow in 0..5 {
+            for from in 0..25 {
+                for to in from..25 {
+                    let expected = ranges.iter().any(|&(copy, start, end)| {
+                        copy == shadow && start < to && from < end
+                    });
+                    assert_eq!(
+                        scanned.overlaps(shadow, from, to),
+                        expected,
+                        "{shadow}: {from}..{to}"
+                    );
+                    assert_eq!(
+                        indexed.overlaps(shadow, from, to),
+                        expected,
+                        "{shadow}: {from}..{to}"
+                    );
+                }
+            }
+        }
+        assert!(!Withheld::default().overlaps(2, 0, usize::MAX));
     }
 
     /// Marks of shaders using title memory stay out of title memory while
@@ -1548,7 +1634,7 @@ pub(crate) mod tests {
             // SAFETY: a dword of the mapped bitmap.
             unsafe { *(b.data as *mut u32).add(n / 32) |= 1 << (n % 32) };
         }
-        copy_back_marks(&[], true);
+        copy_back_marks(&Withheld::default(), true);
         // SAFETY: bytes of our pool.
         let read = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
         assert_eq!((read(10), read(PAGE + 10)), (0xaa, 0), "page 1 held back");
