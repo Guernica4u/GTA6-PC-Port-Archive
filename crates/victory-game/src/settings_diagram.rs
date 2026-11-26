@@ -163,7 +163,9 @@ fn taps(from: usize, to: usize) -> Vec<(usize, Vec<f64>)> {
 /// premultiplied alpha so that transparent texels do not bleed colour.
 fn resize(src: &[f64], w: usize, h: usize, nw: usize, nh: usize) -> Vec<f64> {
     let pre: Vec<f64> = src
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|p| {
             let a = p[3] / 255.0;
             [p[0] * a, p[1] * a, p[2] * a, p[3]]
@@ -195,7 +197,7 @@ fn resize(src: &[f64], w: usize, h: usize, nw: usize, nh: usize) -> Vec<f64> {
             }
         }
     }
-    for p in out.chunks_exact_mut(4) {
+    for p in out.as_chunks_mut::<4>().0 {
         let a = p[3].clamp(0.0, 255.0);
         for v in &mut p[..3] {
             *v = if a > 0.0 {
