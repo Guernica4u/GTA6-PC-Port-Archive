@@ -139,6 +139,20 @@ static ROOT_VIEW_SLOTS: AtomicU64 = AtomicU64::new(0);
 /// Draws recorded on the host GPU since the last frame line.
 static DRAWN: AtomicU64 = AtomicU64::new(0);
 
+/// Work submitted since the last frame line: vertices, indices, dispatch
+/// threads and mesh groups (a mesh group of 128 threads). Whether a frame
+/// draws the scene several times over - the title's console budget for this
+/// scene is a few hundred draws, not thousands - is not visible from the
+/// draw count alone, and this is the smallest thing that says it.
+static WORK: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// The work submitted since the last call: vertices, indices, threads, mesh
+/// groups (the frame report, diagnostics builds).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn take_work() -> [u64; 4] {
+    WORK.each_ref().map(|w| w.swap(0, Ordering::Relaxed))
+}
+
 /// Draws run on the host so far.
 pub(crate) fn drawn() -> u64 {
     DRAWN.load(Ordering::Relaxed)
@@ -1196,6 +1210,7 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
         self.probe_small(list, true);
+        WORK[2].fetch_add(u64::from(x) * u64::from(y) * u64::from(z) * 64, Ordering::Relaxed);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         #[cfg(feature = "diagnostics")]
@@ -1278,6 +1293,7 @@ impl State {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
+                    WORK[3].fetch_add(u64::from(x), Ordering::Relaxed);
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -1681,6 +1697,7 @@ impl State {
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
             #[cfg(feature = "diagnostics")]
             self.probe_small(list, false);
+            WORK[0].fetch_add(u64::from(count) * u64::from(instances), Ordering::Relaxed);
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -1775,6 +1792,7 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            WORK[1].fetch_add(u64::from(indices) * u64::from(instances), Ordering::Relaxed);
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list

@@ -3230,6 +3230,18 @@ impl Meter {
                 crate::copystat::log(report_frames);
                 crate::bindless::log(report_frames);
                 crate::shadow::log_views(report_frames);
+                // What the frame submitted, not only how many commands: a
+                // scene drawn several times over hides behind a draw count.
+                let [vertices, indices, threads, mesh] = crate::draw::take_work();
+                if vertices + indices + threads + mesh > 0 {
+                    tracing::info!(
+                        "work a frame: {:.0} vertices, {:.0} indices, {:.0} dispatch threads, {:.0} mesh groups",
+                        vertices as f64 / report_frames,
+                        indices as f64 / report_frames,
+                        threads as f64 / report_frames,
+                        mesh as f64 / report_frames
+                    );
+                }
                 let [n, bytes] = [0, 1].map(|i| crate::list::READ_BACKS[i].swap(0, Ordering::Relaxed));
                 if n > 0 {
                     tracing::info!(
