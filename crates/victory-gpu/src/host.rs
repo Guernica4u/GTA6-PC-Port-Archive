@@ -1709,8 +1709,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 /// bytes), and the first thread folds the 64 lane hashes in lane order into
 /// the piece's hash. It is another hash than [`CARD_COMPARE`]'s, so one
 /// process uses one of them for every hash it stores and compares (it is
-/// chosen once). Copies are under 1 GiB (`shadow::card_for`): at most
-/// 16,385 pieces, one group each, within a dispatch's 65,535.
+/// chosen once). A large copy with small pieces can need several dispatches.
 pub(crate) const CARD_COMPARE_WIDE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
 cbuffer Span : register(b0) {
@@ -1780,9 +1779,48 @@ pub(crate) fn card_compare_source() -> &'static str {
     if card_hash_wide() { CARD_COMPARE_WIDE } else { CARD_COMPARE }
 }
 
-/// The groups a compare pass over `pieces` pieces is dispatched with.
-pub(crate) fn card_compare_groups(pieces: u32) -> u32 {
-    if card_hash_wide() { pieces } else { pieces.div_ceil(64) }
+/// Local piece offset, piece count and X group count for each dispatch.
+fn card_compare_chunks(pieces: u32, wide: bool) -> impl Iterator<Item = (u32, u32, u32)> {
+    let per_group = if wide { 1 } else { 64 };
+    let limit = 65_535 * per_group;
+    (0..pieces).step_by(limit as usize).map(move |offset| {
+        let count = (pieces - offset).min(limit);
+        (offset, count, count.div_ceil(per_group))
+    })
+}
+
+fn dispatch_card_compare(list: &ID3D12GraphicsCommandList, span: &crate::shadow::CardSpan, size: u32, out_at: u32, mode: u32) {
+    for (offset, count, groups) in card_compare_chunks(span.pieces, card_hash_wide()) {
+        // Both the hash index and the output dword advance across dispatches.
+        let constants = [span.first + offset, span.skew, size, count, out_at + offset * 4, mode];
+        // SAFETY: the caller bound the compare root signature and its buffers.
+        unsafe {
+            list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            list.Dispatch(groups, 1, 1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod card_compare_chunk_tests {
+    use super::card_compare_chunks;
+
+    #[test]
+    fn group_limit_preserves_every_compare_and_hash_index() {
+        for (wide, per_group) in [(true, 1), (false, 64)] {
+            let limit = 65_535 * per_group;
+            for n in [0, 1, limit - 1, limit, limit + 1, 2 * limit + 3] {
+                let mut seen = 0;
+                for (offset, count, groups) in card_compare_chunks(n, wide) {
+                    assert_eq!(offset, seen);
+                    assert!((1..=65_535).contains(&groups));
+                    assert_eq!(groups, count.div_ceil(per_group));
+                    seen += count;
+                }
+                assert_eq!(seen, n);
+            }
+        }
+    }
 }
 
 /// Whether the pieces a flight's compare flags come down to the PC inside
@@ -4390,9 +4428,7 @@ impl Host {
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                         for run in runs {
-                            let constants = [run.first, run.skew, shadow.card_hashed().unwrap_or(size) as u32, run.pieces, 0, 0];
-                            list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(card_compare_groups(run.pieces), 1, 1);
+                            dispatch_card_compare(list, &run, shadow.card_hashed().unwrap_or(size) as u32, 0, 0);
                         }
                     }
                     crate::cardmeter::end(list, timed);
@@ -4484,11 +4520,9 @@ impl Host {
                             continue;
                         };
                         let hashed = r.shadow.card_hashed().unwrap_or(size) as u32;
-                        let constants = [r.span.first, r.span.skew, hashed, r.span.pieces, r.at * 4, if flown { 2 } else { 1 }];
-                        list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(card_compare_groups(r.span.pieces), 1, 1);
+                        dispatch_card_compare(list, &r.span, hashed, r.at * 4, if flown { 2 } else { 1 });
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     // The fetch inside the flight (`inflight_fetch`): behind
