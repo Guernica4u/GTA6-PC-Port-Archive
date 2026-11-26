@@ -915,14 +915,16 @@ mod tests {
                 level1[region] = block as u32;
             }
             assert_eq!(dwords[..LEVEL1], level1, "level one for case {case}");
-            for (entry, word) in dwords[LEVEL1..written].chunks_exact(2).zip(expected_owners) {
+            let (entries, remainder) = dwords[LEVEL1..written].as_chunks::<2>();
+            assert!(remainder.is_empty());
+            for (entry, word) in entries.iter().zip(expected_owners) {
                 let expected = if word == NO_OWNER {
                     [null, 0]
                 } else {
                     let owner = word as usize;
                     [pairs[owner], copies[owner].0 as u32]
                 };
-                assert_eq!(entry, expected, "level two for case {case}");
+                assert_eq!(*entry, expected, "level two for case {case}");
             }
         }
     }
