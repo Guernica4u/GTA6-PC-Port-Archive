@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod confine;
 mod halves;
 
 type Why = &'static str;
@@ -1889,7 +1890,7 @@ impl<'a> Lower<'a> {
                     .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
                 self.s.flags |= flags::WAVE_OPS;
                 let xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
-                let xy = self.mask_halves(at, xy)?;
+                let xy = self.mask_halves(lo, at, xy)?;
                 self.ballots.insert(lo, xy);
                 xy
             }

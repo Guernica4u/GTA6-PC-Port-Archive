@@ -9,7 +9,8 @@
 //! `ds_bpermute_b32`, `v_readlane_b32`, `v_writelane_b32`,
 //! `v_readfirstlane_b32`, lane masks read as data, a whole-wave prefix sum,
 //! LDS), compute lane by lane in branches only some lanes take (where they
-//! may also write LDS), and take branches on a scalar compare. They are
+//! may also write LDS, and, where only one half's lanes take them, read
+//! lane masks, first lanes and LDS), and take branches on a scalar compare. They are
 //! integer only, set every register before reading it, read only LDS that
 //! is written, and run in whole console waves of 1-D groups, so that both
 //! forms store one result each. `VICTORY_HALVES_PROGRAMS` sets how many
@@ -319,29 +320,49 @@ impl Gen {
         self.wrote(d, read < 4);
     }
 
-    /// A branch the lanes below a random console lane take: inside, a
-    /// lane's own arithmetic, and a write of its LDS dword once every
-    /// thread has one.
+    /// A branch the lanes below a random console lane take, or the lanes
+    /// from one: inside, a lane's own arithmetic and a write of its LDS dword
+    /// once every thread has one; where only one half's lanes take it, also
+    /// lane masks, first lanes and (in a group of one wave) LDS reads.
     fn branch(&mut self) {
-        let lanes = 1 + self.r.below(63);
+        let (from, lanes) = (self.r.below(2) == 0, 1 + self.r.below(63));
+        let one_half = if from { lanes >= 32 } else { lanes <= 32 };
+        // v_cmp_le_u32 (from) or v_cmp_gt_u32 (below) vcc, lanes, v10
+        let op: u32 = if from { 0xC3 } else { 0xC4 };
         self.w.extend([
-            vop2(10, 0x1B, k(63), 0),                // v_and_b32 v10, 63, v0
-            0x7D88_0000 | 10 << 9 | k(lanes) as u32, // v_cmp_gt_u32 vcc, lanes, v10
-            0xBE94_246A,                             // s_and_saveexec_b64 s[20:21], vcc
+            vop2(10, 0x1B, k(63), 0), // v_and_b32 v10, 63, v0
+            0x7C00_0000 | op << 17 | 10 << 9 | k(lanes) as u32,
+            0xBE94_246A, // s_and_saveexec_b64 s[20:21], vcc
         ]);
         let at = self.w.len();
         self.w.push(0);
         self.in_branch = true;
         for _ in 0..1 + self.r.below(3) {
-            if self.lds_written && self.r.below(3) == 0 {
-                self.lds_write();
-            } else {
-                self.alu();
+            match self.r.below(5) {
+                0 if self.lds_written => self.lds_write(),
+                1 if one_half => self.ballot(),
+                2 if one_half => self.first_lane(),
+                3 if one_half && self.lds_written && self.threads == 64 => self.lds_read(),
+                _ => self.alu(),
             }
         }
         self.in_branch = false;
         self.w[at] = 0xBF88_0000 | (self.w.len() - at - 1) as u32; // s_cbranch_execz past it
         self.w.push(0xBEFE_0414); // s_mov_b64 exec, s[20:21]
+    }
+
+    /// A read of the LDS dword of another thread of the console wave.
+    fn lds_read(&mut self) {
+        let (d, other) = (self.reg(), self.r.below(64));
+        self.w.extend([
+            vop2(12, 0x1D, LIT, 0), // v_xor_b32 v12, other, v0
+            other,
+            vop2(12, 0x1A, k(2), 12), // v_lshlrev_b32 v12, 2, v12
+            0xD8D8_0000,
+            (d as u32) << 24 | 12, // ds_read_b32 d, v12
+            S_WAITCNT_LGKM,
+        ]);
+        self.wrote(d, false);
     }
 
     /// A branch on a scalar compare (always taken here), around steps that

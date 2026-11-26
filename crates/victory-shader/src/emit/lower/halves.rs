@@ -168,6 +168,12 @@ impl Lower<'_> {
         self.halves && !self.one_host_wave()
     }
 
+    /// The one half of each console wave whose lanes alone run IR block `b`,
+    /// if its entry condition shows one ([`super::confine`]).
+    fn alone(&self, b: usize) -> Option<u8> {
+        self.exchange.half.get(b).copied().flatten()
+    }
+
     /// Whether every thread of the group meets at the IR block being
     /// lowered ([`Exchange`]), where the halves may trade.
     fn meets(&self) -> bool {
@@ -314,9 +320,13 @@ impl Lower<'_> {
         {
             return Ok(None);
         }
-        if !self.meets() {
-            return Err(FIRST_ACROSS);
-        }
+        // Where one half's lanes alone run, its host wave's first lane in
+        // EXEC is the console's, unless a guard may leave EXEC empty (the
+        // console then reads lane 0, which may not be running here).
+        let alone = match self.meets() {
+            true => None,
+            false => Some(self.alone(self.cur_ir).ok_or(FIRST_ACROSS)?),
+        };
         let b = self.cur_ir;
         let i = self.x.p.blocks[b]
             .insts
@@ -324,6 +334,7 @@ impl Lower<'_> {
             .position(|j| std::ptr::eq(j, inst))
             .ok_or(FIRST_ACROSS)?;
         let on = match self.guard(b, i)? {
+            Some(_) if alone.is_some() => return Err(FIRST_ACROSS),
             Some(g) => g,
             None => self.s.m.bool(true),
         };
@@ -342,6 +353,9 @@ impl Lower<'_> {
             .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[ballot]);
         let lane = self.s.m.select(c, any, low, k0);
         let mine = self.read_lane(x, lane);
+        if alone.is_some() {
+            return Ok(Some(mine));
+        }
         let traded = self.trade(c, &[(mine, 0), (ballot, 0)])?;
         let ((x0, x1), (b0, b1)) = (traded[0], traded[1]);
         let any0 = self.s.m.cmp(c, pred::NE, b0, k0);
@@ -352,21 +366,36 @@ impl Lower<'_> {
 
     /// Refuses lane mask `mask` read as data in halves unless every thread
     /// of the group meets at the IR block writing it, where the halves trade
-    /// their ballots ([`Lower::mask_halves`]); program inputs are the entry's.
+    /// their ballots, or one half's lanes alone run it ([`Lower::mask_halves`]);
+    /// program inputs are the entry's.
     pub(super) fn mask_meets(&self, mask: Value) -> Result<(), Why> {
         let b = self.def_block.get(&mask).copied().unwrap_or(0);
-        if self.trades() && !self.exchange.meet.get(b).copied().unwrap_or(false) {
+        let meets = self.exchange.meet.get(b).copied().unwrap_or(false);
+        if self.trades() && !meets && self.alone(b).is_none() {
             return Err(MASK_APART);
         }
         Ok(())
     }
 
-    /// The console mask's dwords from this host wave's ballot `xy`, taken in
-    /// DXIL block `at`: in halves each half's ballot is one of them, traded
-    /// there ([`Lower::mask_meets`]).
-    pub(super) fn mask_halves(&mut self, at: usize, xy: (V, V)) -> Result<(V, V), Why> {
+    /// The console mask's dwords from this host wave's ballot `xy` of lane
+    /// mask `mask`, taken in DXIL block `at`: in halves each half's ballot is
+    /// one of them, traded there, or where one half's lanes alone write it,
+    /// that half's (the other's lanes are not in it).
+    pub(super) fn mask_halves(
+        &mut self,
+        mask: Value,
+        at: usize,
+        xy: (V, V),
+    ) -> Result<(V, V), Why> {
         if !self.trades() {
             return Ok(xy);
+        }
+        let b = self.def_block.get(&mask).copied().unwrap_or(0);
+        if !self.exchange.meet.get(b).copied().unwrap_or(false)
+            && let Some(h) = self.alone(b)
+        {
+            let none = self.s.m.i32(0);
+            return Ok(if h == 0 { (xy.0, none) } else { (none, xy.0) });
         }
         Ok(self.trade(at, &[(xy.0, 0)])?[0])
     }
@@ -374,7 +403,7 @@ impl Lower<'_> {
     /// Refuses a whole-wave reduction or prefix sum in halves where not
     /// every thread of the group meets ([`Lower::reduce_halves`]).
     pub(super) fn reduction_meets(&self) -> Result<(), Why> {
-        if self.trades() && !self.meets() {
+        if self.trades() && !self.meets() && self.alone(self.cur_ir).is_none() {
             return Err(REDUCTION_APART);
         }
         Ok(())
@@ -395,7 +424,9 @@ impl Lower<'_> {
         float: bool,
     ) -> Result<V, Why> {
         use super::super::wave::Op;
-        if !self.trades() {
+        // Where one half's lanes alone run ([`Lower::reduction_meets`]), the
+        // host wave's reduction is over every lane the console's is.
+        if !self.trades() || !self.meets() {
             return Ok(r);
         }
         let c = self.cur;
@@ -545,6 +576,10 @@ pub(super) struct Exchange {
     lds: Option<Lds>,
     /// Why the program cannot run in halves ([`lds_fences`]).
     pub(super) refused: Option<Why>,
+    /// Per IR block not every thread meets at: the one half of each console
+    /// wave whose lanes alone run it, where its entry condition shows one
+    /// ([`super::confine`]).
+    half: Vec<Option<u8>>,
     /// LDS accesses since the last barrier in this block where every thread
     /// meets: `Some(true)` with a write among them (or not known, at a
     /// block's start), `Some(false)` reads only.
@@ -557,6 +592,7 @@ impl Exchange {
             return Exchange::default();
         }
         let meet = meeting(x);
+        let half = super::confine::confined(x, &meet);
         let one_wave_lds = match &x.native.io {
             StageIo::Cs(cs) => {
                 let group = cs.threads.iter().product::<u32>();
@@ -564,7 +600,7 @@ impl Exchange {
             }
             _ => false,
         };
-        let (lds, refused) = match one_wave_lds.then(|| lds_fences(x, &meet)) {
+        let (lds, refused) = match one_wave_lds.then(|| lds_fences(x, &meet, &half)) {
             Some(Ok(l)) => (Some(l), None),
             Some(Err(why)) => (None, Some(why)),
             None => (None, None),
@@ -574,6 +610,7 @@ impl Exchange {
             slots: None,
             lds,
             refused,
+            half,
             pending: None,
         }
     }
@@ -592,8 +629,10 @@ struct Lds {
 /// [`Lds`] of a program, or why it cannot run in halves: a region only some
 /// lanes run (a set of blocks not every thread meets in, joined by edges)
 /// that both writes and reads LDS, or writes it in two instructions, cannot
-/// be put in the console's order without a barrier inside it.
-fn lds_fences(x: &Parts, meet: &[bool]) -> Result<Lds, Why> {
+/// be put in the console's order without a barrier inside it, unless every
+/// block of it accessing LDS is one that only one half's lanes run (`half`),
+/// the same half: its host wave runs them in the console's order.
+fn lds_fences(x: &Parts, meet: &[bool], half: &[Option<u8>]) -> Result<Lds, Why> {
     const MIXED: Why = "LDS a branch only some lanes take both writes and reads (or writes twice), in a group of one console wave64 on a host of 32-lane waves";
     let (p, st) = (x.p, x.st);
     let n = st.exits.len();
@@ -629,8 +668,9 @@ fn lds_fences(x: &Parts, meet: &[bool]) -> Result<Lds, Why> {
             }
         }
     }
-    // Each region's LDS reads, writes and other accesses (atomics).
-    let mut access: HashMap<usize, [u32; 3]> = HashMap::new();
+    // Each region's LDS reads, writes and other accesses (atomics), and the
+    // one half whose lanes alone make them, if there is one.
+    let mut access: HashMap<usize, ([u32; 3], Option<u8>)> = HashMap::new();
     for (b, block) in p.blocks.iter().enumerate() {
         if meets(b) {
             continue;
@@ -651,13 +691,17 @@ fn lds_fences(x: &Parts, meet: &[bool]) -> Result<Lds, Why> {
             } else {
                 2
             };
-            access.entry(find(&mut root, b)).or_default()[k] += 1;
+            let alone = half.get(b).copied().flatten();
+            let e = access.entry(find(&mut root, b)).or_insert(([0; 3], alone));
+            e.0[k] += 1;
+            if e.1 != alone {
+                e.1 = None;
+            }
         }
     }
-    if access
-        .values()
-        .any(|&[r, w, a]| (w > 0 && r > 0) || (a > 0 && w + r > 0) || a > 1 || w > 1)
-    {
+    if access.values().any(|&([r, w, a], alone)| {
+        alone.is_none() && ((w > 0 && r > 0) || (a > 0 && w + r > 0) || a > 1 || w > 1)
+    }) {
         return Err(MIXED);
     }
     let mut lds = Lds::default();

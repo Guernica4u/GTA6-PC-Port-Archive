@@ -175,7 +175,26 @@ fn refusal(words: &[u32], threads: u32, lds_bytes: u32) -> String {
 /// The hand-encoded words are the instructions their comments name.
 #[test]
 fn the_test_programs_are_what_their_comments_say() {
-    let programs: [(Vec<u32>, &[&str]); 23] = [
+    let programs: [(Vec<u32>, &[&str]); 25] = [
+        (
+            lds_tree_step(true),
+            &[
+                "v_cmp_gt_u32 vcc, 16, v0",
+                "v_add_nc_u32 v4, 64, v2",
+                "ds_read_b32 v5, v4",
+                "v_add_nc_u32 v5, v5, v1",
+                "ds_write_b32 v2, v5",
+                "ds_read_b32 v6, v3",
+            ],
+        ),
+        (
+            lds_tree_step(false),
+            &[
+                "v_cmp_le_u32 vcc, 48, v0",
+                "v_add_nc_u32 v4, lit(0xffffffc0), v2",
+                "ds_write_b32 v2, v5",
+            ],
+        ),
         (
             mask_kept_by_a_shift(),
             &[
@@ -217,7 +236,7 @@ fn the_test_programs_are_what_their_comments_say() {
             ],
         ),
         (
-            first_lane_in_a_branch(),
+            first_lane_in_a_branch(20),
             &[
                 "v_cmp_gt_u32 vcc, 20, v0",
                 "s_cbranch_execz",
@@ -226,7 +245,7 @@ fn the_test_programs_are_what_their_comments_say() {
             ],
         ),
         (
-            first_lane_of_a_buffer_load_in_a_branch(0),
+            first_lane_of_a_buffer_load_in_a_branch(0, 20),
             &[
                 "s_cbranch_execz",
                 "buffer_load_dword v4, v0, s[44:47], 0 offen",
@@ -235,7 +254,7 @@ fn the_test_programs_are_what_their_comments_say() {
             ],
         ),
         (
-            mask_in_a_branch(),
+            mask_in_a_branch(20),
             &[
                 "s_cbranch_execz",
                 "v_cmp_gt_u32 vcc, 10, v0",
@@ -500,16 +519,16 @@ fn reads_across_32_lane_halves_are_refused_with_their_reason() {
     assert_eq!(refusal(&unused_first, 64, 0), "translated");
     // A buffer dword loaded at an offset the same in every lane, through a
     // scalar descriptor, is one value: its first lane is the console's, even
-    // inside a branch only some lanes take, where the halves cannot trade.
+    // inside a branch lanes of both halves take, where they cannot trade.
     assert_eq!(
         refusal(&first_lane_of_a_buffer_load(3), 64, 0),
         "translated"
     );
     assert_eq!(
-        refusal(&first_lane_of_a_buffer_load_in_a_branch(3), 64, 0),
+        refusal(&first_lane_of_a_buffer_load_in_a_branch(3, 40), 64, 0),
         "translated"
     );
-    let why = refusal(&first_lane_of_a_buffer_load_in_a_branch(0), 64, 0);
+    let why = refusal(&first_lane_of_a_buffer_load_in_a_branch(0, 40), 64, 0);
     assert!(
         why.contains("a first-lane read of a value that may differ between 32-lane halves"),
         "{why}"
@@ -1372,20 +1391,20 @@ fn first_lane_in_exec() -> Vec<u32> {
     w
 }
 
-/// The first lane's thread id, read inside a branch only threads below 20
-/// take, with console lanes (`v_mbcnt`).
-fn first_lane_in_a_branch() -> Vec<u32> {
+/// The first lane's thread id, read inside a branch only threads below
+/// `below` take, with console lanes (`v_mbcnt`).
+fn first_lane_in_a_branch(below: u32) -> Vec<u32> {
     let mut w = PROLOGUE.to_vec();
     w.extend([
         0x3420_0085, // v_lshlrev_b32 v16, 5, v0
         0xD765_0001,
-        0x0001_00C1,         // v_mbcnt_lo_u32_b32 v1, -1, 0
-        0x7D88_0094,         // v_cmp_gt_u32 vcc, 20, v0
-        0xBE94_246A,         // s_and_saveexec_b64 s[20:21], vcc
-        0xBF88_0002,         // s_cbranch_execz 2
-        vop1(12, 0x02, 256), // v_readfirstlane_b32 s12, v0
-        vop1(2, 0x01, 12),   // v_mov_b32 v2, s12
-        0xBEFE_0414,         // s_mov_b64 exec, s[20:21]
+        0x0001_00C1,                 // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0x7D88_0000 | (128 + below), // v_cmp_gt_u32 vcc, below, v0
+        0xBE94_246A,                 // s_and_saveexec_b64 s[20:21], vcc
+        0xBF88_0002,                 // s_cbranch_execz 2
+        vop1(12, 0x02, 256),         // v_readfirstlane_b32 s12, v0
+        vop1(2, 0x01, 12),           // v_mov_b32 v2, s12
+        0xBEFE_0414,                 // s_mov_b64 exec, s[20:21]
     ]);
     w.extend(store(2, 0));
     w.push(S_ENDPGM);
@@ -1393,8 +1412,8 @@ fn first_lane_in_a_branch() -> Vec<u32> {
 }
 
 /// [`first_lane_of_a_buffer_load`] with the load and the first-lane read
-/// inside a branch only threads below 20 take.
-fn first_lane_of_a_buffer_load_in_a_branch(offset: u32) -> Vec<u32> {
+/// inside a branch only threads below `below` take.
+fn first_lane_of_a_buffer_load_in_a_branch(offset: u32, below: u32) -> Vec<u32> {
     let mut w = PROLOGUE.to_vec();
     w.extend([
         0xF408_0B02,
@@ -1402,12 +1421,12 @@ fn first_lane_of_a_buffer_load_in_a_branch(offset: u32) -> Vec<u32> {
         S_WAITCNT_LGKM,
         0x3420_0085, // v_lshlrev_b32 v16, 5, v0
         0xD765_0001,
-        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
-        0x7E06_0284, // v_mov_b32 v3, 4
-        0x7E0A_0280, // v_mov_b32 v5, 0
-        0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
-        0xBE94_246A, // s_and_saveexec_b64 s[20:21], vcc
-        0xBF88_0005, // s_cbranch_execz 5
+        0x0001_00C1,                 // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0x7E06_0284,                 // v_mov_b32 v3, 4
+        0x7E0A_0280,                 // v_mov_b32 v5, 0
+        0x7D88_0000 | (128 + below), // v_cmp_gt_u32 vcc, below, v0
+        0xBE94_246A,                 // s_and_saveexec_b64 s[20:21], vcc
+        0xBF88_0005,                 // s_cbranch_execz 5
         0xE030_1000,
         0x800B_0400 | offset, // buffer_load_dword v4, v<offset>, s[44:47], 0 offen
         0xBF8C_3F70,          // s_waitcnt vmcnt(0)
@@ -1421,18 +1440,18 @@ fn first_lane_of_a_buffer_load_in_a_branch(offset: u32) -> Vec<u32> {
 }
 
 /// The number of threads below 10, counted inside a branch only threads
-/// below 20 take.
-fn mask_in_a_branch() -> Vec<u32> {
+/// below `below` take.
+fn mask_in_a_branch(below: u32) -> Vec<u32> {
     let mut w = PROLOGUE.to_vec();
     w.extend([
-        0x3420_0085,         // v_lshlrev_b32 v16, 5, v0
-        0x7D88_0094,         // v_cmp_gt_u32 vcc, 20, v0
-        0xBE94_246A,         // s_and_saveexec_b64 s[20:21], vcc
-        0xBF88_0003,         // s_cbranch_execz 3
-        0x7D88_008A,         // v_cmp_gt_u32 vcc, 10, v0
-        sop1(12, 0x10, 106), // s_bcnt1_i32_b64 s12, vcc
-        vop1(2, 0x01, 12),   // v_mov_b32 v2, s12
-        0xBEFE_0414,         // s_mov_b64 exec, s[20:21]
+        0x3420_0085,                 // v_lshlrev_b32 v16, 5, v0
+        0x7D88_0000 | (128 + below), // v_cmp_gt_u32 vcc, below, v0
+        0xBE94_246A,                 // s_and_saveexec_b64 s[20:21], vcc
+        0xBF88_0003,                 // s_cbranch_execz 3
+        0x7D88_008A,                 // v_cmp_gt_u32 vcc, 10, v0
+        sop1(12, 0x10, 106),         // s_bcnt1_i32_b64 s12, vcc
+        vop1(2, 0x01, 12),           // v_mov_b32 v2, s12
+        0xBEFE_0414,                 // s_mov_b64 exec, s[20:21]
     ]);
     w.extend(store(2, 0));
     w.push(S_ENDPGM);
@@ -1470,12 +1489,12 @@ fn collectives_are_traded_where_every_thread_meets() {
             assert_eq!(refusal(&words, threads, 0), "translated", "{threads}");
         }
     }
-    let why = refusal(&first_lane_in_a_branch(), 64, 0);
+    let why = refusal(&first_lane_in_a_branch(40), 64, 0);
     assert!(
         why.contains("a first-lane read of a value that may differ between 32-lane halves, where not every thread of the group meets"),
         "{why}"
     );
-    let why = refusal(&mask_in_a_branch(), 64, 0);
+    let why = refusal(&mask_in_a_branch(40), 64, 0);
     assert!(
         why.contains("a lane mask read as data, written where not every thread of the group meets"),
         "{why}"
@@ -1587,6 +1606,116 @@ fn a_kept_refused_value_refuses_the_write_in_halves() {
         "{why}"
     );
     assert_eq!(refusal(&mask_kept_by_a_shift(), 64, 0), "translated");
+}
+
+/// Every thread writes `tid + 1` at its LDS dword. In a branch only lanes of
+/// one half take (below 16 with `low`, from 48 without), each reads the
+/// dword 16 threads up (or down), adds its own and writes the sum back: a
+/// region that both reads and writes LDS. After the join every thread
+/// reads the dword of thread `tid ^ 32`, in the other half.
+fn lds_tree_step(low: bool) -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085,               // v_lshlrev_b32 v16, 5, v0
+        vop2(2, 0x1A, 128 + 2, 0), // v_lshlrev_b32 v2, 2, v0
+        vop2(1, 0x25, 128 + 1, 0), // v_add_nc_u32 v1, 1, v0
+        0xD834_0000,
+        0x0000_0102, // ds_write_b32 v2, v1
+        S_WAITCNT_LGKM,
+    ]);
+    if low {
+        w.push(0x7D88_0090); // v_cmp_gt_u32 vcc, 16, v0
+    } else {
+        w.push(0x7D86_00B0); // v_cmp_le_u32 vcc, 48, v0
+    }
+    let step: [u32; 2] = if low {
+        [vop2(4, 0x25, 128 + 64, 2), 0] // v_add_nc_u32 v4, 64, v2
+    } else {
+        [vop2(4, 0x25, 255, 2), 0xFFFF_FFC0] // v_add_nc_u32 v4, -64, v2
+    };
+    let mut body: Vec<u32> = if low {
+        step[..1].to_vec()
+    } else {
+        step.to_vec()
+    };
+    body.extend([
+        0xD8D8_0000,
+        0x0500_0004, // ds_read_b32 v5, v4
+        S_WAITCNT_LGKM,
+        vop2(5, 0x25, 256 + 5, 1), // v_add_nc_u32 v5, v5, v1
+        0xD834_0000,
+        0x0000_0502, // ds_write_b32 v2, v5
+    ]);
+    w.extend([0xBE94_246A, 0xBF88_0000 | body.len() as u32]); // s_and_saveexec_b64 s[20:21], vcc; s_cbranch_execz
+    w.extend(body);
+    w.extend([
+        0xBEFE_0414,           // s_mov_b64 exec, s[20:21]
+        vop2(3, 0x1D, 255, 2), // v_xor_b32 v3, 0x80, v2
+        0x0000_0080,
+        0xD8D8_0000,
+        0x0600_0003, // ds_read_b32 v6, v3
+        S_WAITCNT_LGKM,
+    ]);
+    w.extend(store(6, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// What the console gives [`lds_tree_step`]'s thread `l` in a group of 64.
+fn lds_tree_step_want(low: bool, l: u32) -> u32 {
+    let i = l ^ 32;
+    match low {
+        true if i < 16 => (i + 1) + (i + 17),
+        false if i >= 48 => (i + 1) + (i - 15),
+        _ => i + 1,
+    }
+}
+
+/// A branch only one half's lanes take (a compare of the thread id with a
+/// constant, in a group of one console wave or several) lets that half's
+/// host wave run alone: a first-lane read, a mask read as data and LDS both
+/// read and written there translate in halves. The same with lanes of both
+/// halves in the branch are refused.
+#[test]
+fn one_half_regions_translate_in_halves() {
+    for threads in [64, 128] {
+        for words in [
+            first_lane_in_a_branch(20),
+            mask_in_a_branch(20),
+            first_lane_of_a_buffer_load_in_a_branch(0, 20),
+        ] {
+            assert_eq!(refusal(&words, threads, 0), "translated", "{threads}");
+        }
+    }
+    for low in [true, false] {
+        assert_eq!(refusal(&lds_tree_step(low), 64, 256), "translated", "{low}");
+    }
+    for words in [first_lane_in_a_branch(40), mask_in_a_branch(40)] {
+        let why = refusal(&words, 64, 0);
+        assert!(
+            why.contains("where not every thread of the group meets"),
+            "{why}"
+        );
+    }
+    let why = refusal(&lds_written_and_read_in_a_branch(), 64, 256);
+    assert!(
+        why.contains("both writes and reads (or writes twice)"),
+        "{why}"
+    );
+}
+
+/// [`lds_tree_step`] in a group of 64 on every hardware adapter, in halves
+/// and as one wave64 where the adapter runs those: the half that runs the
+/// branch reads and writes LDS in the console's order, and the other half
+/// reads its results after the join.
+#[test]
+fn one_half_lds_regions_match_the_console_on_every_gpu() {
+    let mut failed = Vec::new();
+    for low in [true, false] {
+        let want: Vec<u32> = (0..64).map(|l| lds_tree_step_want(low, l)).collect();
+        failed.extend(differences_with_lds(&lds_tree_step(low), 64, 256, 1, &want));
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
 /// [`in_halves`] on every hardware adapter: in halves, and as one wave64
