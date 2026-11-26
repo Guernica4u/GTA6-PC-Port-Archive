@@ -5647,3 +5647,6 @@ mod fills {
         }
     }
 }
+
+#[cfg(test)]
+mod frame_bench;
