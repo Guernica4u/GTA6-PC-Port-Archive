@@ -4146,21 +4146,46 @@ impl<'a> Lower<'a> {
         let kind = self.used_kind(src);
         let c = self.cur;
         let (base, extra) = self.built_offset(src)?;
-        let offset = &((*offset as u32).wrapping_add(base) as i32);
+        let imm = *offset as u32;
+        let offset = &(imm.wrapping_add(base) as i32);
         let mut addr = self.s.m.i32(*offset as u32);
         if let Some(x) = extra {
             addr = self.s.m.bin(c, Bin::Add, addr, x);
         }
-        if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
-            let so = self.operand(inst, soffset)?;
-            addr = self.s.m.bin(c, Bin::Add, addr, so);
-        }
-        if matches!(src, Source::Built { address, .. } if address.param == CODE) {
-            // A descriptor built around a table in the code.
+        let so = if matches!(soffset, Operand::Scalar { code: NULL, .. }) {
+            None
+        } else {
+            let s = self.operand(inst, soffset)?;
+            addr = self.s.m.bin(c, Bin::Add, addr, s);
+            Some(s)
+        };
+        if let Source::Built { address, bits, words } = src
+            && address.param == CODE
+        {
+            // Descriptor around a code table; keep NUM_RECORDS per dword.
+            let limit = u64::from(words[0]) * u64::from((bits >> 16) & 0x3FFF).max(1);
+            let end = u64::from(imm & !3) + 4;
+            let zero = self.s.m.i32(0);
+            let al = so.map(|s| {
+                let m = self.s.m.i32(!3);
+                self.s.m.bin(c, Bin::And, s, m)
+            });
             for k in 0..count {
-                let off = self.s.m.i32(4 * k);
-                let a = self.s.m.bin(c, Bin::Add, addr, off);
-                let x = self.code_dword(a)?;
+                let fixed = end + 4 * u64::from(k);
+                let x = if fixed > limit {
+                    zero
+                } else {
+                    let off = self.s.m.i32(4 * k);
+                    let a = self.s.m.bin(c, Bin::Add, addr, off);
+                    let x = self.code_dword(a)?;
+                    if let Some(al) = al {
+                        let rest = self.s.m.i32((limit - fixed).min(u64::from(u32::MAX)) as u32);
+                        let out = self.s.m.cmp(c, pred::IUGT, al, rest);
+                        self.s.m.select(c, out, zero, x)
+                    } else {
+                        x
+                    }
+                };
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
