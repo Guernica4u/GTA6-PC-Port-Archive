@@ -15,11 +15,25 @@
 //! The programs are random but plausible, so that most get past decoding:
 //! opcodes from our tables with small register numbers, descriptors loaded
 //! from the root tables first, branches that land on an instruction a few
-//! before or after their own (loops among them), and a store or export at
-//! the end that needs what the body computes. Compute programs run as 32
-//! or 64 lanes, pixel programs read one interpolated input. About one
-//! program in three has a relative move, and in half of those `range`
-//! proves a bound on M0 and builds the program again.
+//! before or after their own (loops among them), and a store or exports at
+//! the end that need what the body computes. About one program in three
+//! has a relative move, and in half of those `range` proves a bound on M0
+//! and builds the program again. The stages, and what each varies
+//! ([`Shape`]):
+//!
+//! * compute (45%), 32 or 64 lanes, group and thread ids, LDS;
+//! * pixel (25%): interpolation of one input element starting at any
+//!   channel, in f32 or completed in f16, a 16-bit input; the colour, and
+//!   depth and stencil;
+//! * vertex (15%), 32 or 64 lanes: the attribute from v4; a parameter
+//!   (16-bit, or two 16-bit rows per dword), the position and clip
+//!   distances;
+//! * mesh (15%), one to four waves of 32 or 64 lanes, vertex and primitive
+//!   limits (some past the host's), lines now and then: the group id read
+//!   from the first lane; per-vertex and per-primitive parameters, the
+//!   primitive (a valid triangle or random indices) and the position.
+//!
+//! Each stage translates about 2-13% of its programs (compute most).
 //!
 //! `VICTORY_RANDOM_PROGRAMS=<n>` sets how many programs run (4,096 by
 //! default, a few seconds in a debug build) and `VICTORY_RANDOM_SEED=<s>`
@@ -37,8 +51,8 @@ use super::container::{self, SigElement};
 use crate::dxbc::{self, Container, FourCC};
 use crate::gfx10::{self, Encoding};
 use crate::native::{
-    ComputeIo, HwStage, NativeProgram, PsInput, ResourceType, RootParam, RootType, StageIo, Usage,
-    UsedResource,
+    ComputeIo, HwStage, MeshIo, NativeProgram, PsInput, ResourceType, RootParam, RootType, StageIo,
+    Usage, UsedResource, VsInput, VsOutput,
 };
 use crate::{io, range, resource};
 use std::io::Write;
@@ -55,22 +69,37 @@ const LITERAL: u32 = 255;
 /// A branch whose offset is filled in once every instruction's place is known.
 const BRANCH_PENDING: u32 = 0xDEAD;
 
-/// xorshift64, seeded through splitmix64 so neighbouring seeds diverge.
-struct Rng(u64);
+/// xorshift64, seeded through splitmix64 so neighbouring seeds diverge;
+/// with the program's first user SGPR.
+struct Rng {
+    state: u64,
+    /// The SGPR of user-data dword 0 ([`HwStage::user_sgpr`]): 0, or 8 for
+    /// a mesh program. The registers below are counted from it.
+    base: u32,
+}
 
 impl Rng {
     fn new(seed: u64) -> Rng {
         let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        Rng((z ^ (z >> 31)) | 1)
+        Rng {
+            state: (z ^ (z >> 31)) | 1,
+            base: 0,
+        }
     }
 
     fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
+        self.state ^= self.state << 13;
+        self.state ^= self.state >> 7;
+        self.state ^= self.state << 17;
+        self.state
+    }
+
+    /// SGPR `n` counted from the first user SGPR: s0-s7 hold the root
+    /// parameters, s8-s23 the descriptors the prologue loads.
+    fn s(&self, n: u32) -> u32 {
+        self.base + n
     }
 
     fn word(&mut self) -> u32 {
@@ -99,22 +128,28 @@ impl Rng {
     /// (s0-s7) and the descriptors (s8-s23), so that most programs keep
     /// their resources.
     fn sdst(&mut self) -> u32 {
-        if self.percent(85) {
-            24 + self.below(16)
+        if self.percent(92) {
+            let n = self.below(16);
+            self.s(24 + n)
         } else {
             self.sreg()
         }
     }
 
+    /// An SGPR to read: also the system SGPRs before the user data.
     fn sreg(&mut self) -> u32 {
+        let (low, high) = (self.below(8), self.below(16));
         match self.below(100) {
-            0..30 => self.below(8),
-            30..60 => 24 + self.below(16),
+            0..30 => self.s(low),
+            30..60 => self.s(24 + high),
             60..66 => VCC + self.below(2),
             66..68 => M0,
             68..70 => NULL,
             70..76 => EXEC + self.below(2),
-            _ => self.below(40),
+            _ => {
+                let end = self.s(40);
+                self.below(end)
+            }
         }
     }
 
@@ -166,20 +201,37 @@ fn relative_move(r: &mut Rng) -> Vec<u32> {
     words
 }
 
+/// An interpolation of a channel of attribute 0 (rarely 1, which no input
+/// holds): mostly both halves over the first barycentrics (v0, v1), in f32
+/// or completed in f16 (the low or high half of the result), or
+/// `v_interp_mov_f32`; now and then a single random half.
+fn interpolation(r: &mut Rng) -> Vec<u32> {
+    let vintrp = |dst: u32, op: u32, attr: u32, chan: u32, src: u32| {
+        0xC800_0000 | dst << 18 | op << 16 | attr << 10 | chan << 8 | src
+    };
+    let (dst, attr, chan) = (r.vgpr(), u32::from(r.percent(5)), r.below(4));
+    match r.below(100) {
+        // v_interp_p1_f32 dst, v0; v_interp_p2_f32 dst, v1
+        0..55 => vec![vintrp(dst, 0, attr, chan, 0), vintrp(dst, 1, attr, chan, 1)],
+        // v_interp_p1_f32 dst, v0; v_interp_p2_f16 dst, attr, v1, dst
+        55..70 => {
+            let high = if r.percent(50) { 1 << 14 } else { 0 };
+            vec![
+                vintrp(dst, 0, attr, chan, 0),
+                0xD400_0000 | 0x35A << 16 | high | dst,
+                attr | chan << 6 | (256 + 1) << 9 | (256 + dst) << 18,
+            ]
+        }
+        // v_interp_mov_f32 dst, p10/p20/p0
+        70..80 => vec![vintrp(dst, 2, attr, chan, r.below(3))],
+        _ => vec![vintrp(dst, r.below(3), attr, chan, r.below(4))],
+    }
+}
+
 /// One instruction: its words, a pending branch's offset still unset.
 fn instruction(r: &mut Rng, stage: HwStage) -> Vec<u32> {
-    if stage == HwStage::Ps && r.percent(8) {
-        // v_interp_p1_f32, v_interp_p2_f32 or v_interp_mov_f32 of a channel
-        // of attribute 0 (rarely 1, which no input holds).
-        let attr = u32::from(r.percent(5));
-        return vec![
-            0xC800_0000
-                | r.vgpr() << 18
-                | r.below(3) << 16
-                | attr << 10
-                | r.below(4) << 8
-                | r.below(4),
-        ];
+    if stage == HwStage::Ps && r.percent(10) {
+        return interpolation(r);
     }
     if r.percent(4) {
         return relative_move(r);
@@ -257,15 +309,22 @@ fn instruction(r: &mut Rng, stage: HwStage) -> Vec<u32> {
             let op = [0x02, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09][r.below(7) as usize];
             vec![0xBF80_0000 | op << 16 | BRANCH_PENDING]
         }
-        // Scalar loads (and rarely other SMEM) from the root tables' addresses.
+        // Scalar loads (and rarely other SMEM) from the root tables'
+        // addresses, or through the UAV's descriptor for the buffer forms.
         80..85 => {
-            let op = loop {
-                let op = r.opcode(Encoding::Smem);
+            let t = gfx10::opcodes(Encoding::Smem);
+            let (op, name) = loop {
+                let (op, name) = t[r.below(t.len() as u32) as usize];
                 if op < 0x20 || r.percent(5) {
-                    break op;
+                    break (u32::from(op), name);
                 }
             };
-            let base = [2, 3][r.below(2) as usize]; // s[4:5], s[6:7]
+            let table = [4, 6][r.below(2) as usize];
+            let base = if name.starts_with("s_buffer_") {
+                r.s(8) / 2 // s[8:11]
+            } else {
+                r.s(table) / 2 // s[4:5], s[6:7]
+            };
             let soffset = if r.percent(70) { NULL } else { r.sreg() };
             vec![
                 0xF400_0000 | op << 18 | r.sdst() << 6 | base,
@@ -278,17 +337,18 @@ fn instruction(r: &mut Rng, stage: HwStage) -> Vec<u32> {
             let soffset = if r.percent(70) { 0x80 } else { r.sreg() };
             vec![
                 0xE000_0000 | op << 18 | r.below(4) << 12 | (r.below(64) * 4),
-                soffset << 24 | 2 << 16 | r.vgpr() << 8 | r.vgpr(),
+                soffset << 24 | (r.s(8) / 4) << 16 | r.vgpr() << 8 | r.vgpr(),
             ]
         }
         89..90 => {
             let op = r.opcode(Encoding::Mtbuf);
             vec![
                 0xE800_0000 | r.below(128) << 19 | (op & 7) << 16 | r.below(4) << 12,
-                0x80 << 24 | (op >> 3 & 1) << 21 | 2 << 16 | r.vgpr() << 8 | r.vgpr(),
+                0x80 << 24 | (op >> 3 & 1) << 21 | (r.s(8) / 4) << 16 | r.vgpr() << 8 | r.vgpr(),
             ]
         }
-        // Images: the texture at s[12:19] (or the UAV), the sampler at s[20:23].
+        // Images: the texture at s[12:19] (now and then the UAV), the sampler
+        // at s[20:23].
         90..95 => {
             let op = r.opcode(Encoding::Mimg);
             let r128 = if r.percent(10) { 1 << 15 } else { 0 };
@@ -298,10 +358,11 @@ fn instruction(r: &mut Rng, stage: HwStage) -> Vec<u32> {
                 | (1 + r.below(15)) << 8
                 | r.below(8) << 3
                 | r128;
-            let rsrc = [3, 2][r.below(2) as usize];
+            let view = if r.percent(90) { 12 } else { 8 };
+            let rsrc = r.s(view) / 4;
             vec![
                 w0,
-                r.below(4) << 30 | 5 << 21 | rsrc << 16 | r.vgpr() << 8 | r.vgpr(),
+                r.below(4) << 30 | (r.s(20) / 4) << 21 | rsrc << 16 | r.vgpr() << 8 | r.vgpr(),
             ]
         }
         95..98 => {
@@ -316,7 +377,8 @@ fn instruction(r: &mut Rng, stage: HwStage) -> Vec<u32> {
             let saddr = if r.percent(50) {
                 NULL
             } else {
-                [4, 6][r.below(2) as usize]
+                let table = [4, 6][r.below(2) as usize];
+                r.s(table)
             };
             vec![
                 0xDC00_8000 | op << 18 | r.below(0x1000),
@@ -328,25 +390,111 @@ fn instruction(r: &mut Rng, stage: HwStage) -> Vec<u32> {
     words
 }
 
+/// The stage of the program of `seed`: compute, pixel, vertex or mesh.
+fn stage(seed: u64) -> HwStage {
+    match Rng::new(seed).below(100) {
+        0..45 => HwStage::Cs,
+        45..70 => HwStage::Ps,
+        70..85 => HwStage::Vs,
+        _ => HwStage::Ms,
+    }
+}
+
+/// The draws that make the shape of the program of `seed` ([`Shape`],
+/// [`input_channels`]): their own sequence, so that the container is made
+/// from the seed alone.
+fn shape_rng(seed: u64) -> Rng {
+    Rng::new(seed ^ 0x5348_4150_455F_5345)
+}
+
+/// The channels of a pixel or vertex program's input element: the first
+/// (x to w) and how many.
+fn input_channels(seed: u64) -> (u8, u8) {
+    let mut r = shape_rng(seed);
+    let col = r.below(4);
+    (col as u8, 1 + r.below(4 - col) as u8)
+}
+
+/// What the program of `seed` exports and reads besides the basics, which
+/// its container's signatures must match.
+#[derive(Debug, Clone, Copy)]
+struct Shape {
+    /// Mesh: a per-vertex parameter (param0, row 1); always in a vertex
+    /// program.
+    vertex_param: bool,
+    /// Mesh: a per-primitive parameter (param1, row 0 of `PSG1`).
+    primitive_param: bool,
+    /// Pixel: depth and stencil (`exp mrtz`) after the colour.
+    depth: bool,
+    /// Vertex: clip distances (`exp pos1`, `SV_ClipDistance` in row 2).
+    clip: bool,
+    /// Vertex and mesh: the per-vertex parameter as 16-bit values, two per
+    /// dword with `pack2` (the second row then row 2).
+    half: bool,
+    pack2: bool,
+    /// Pixel: the input as 16-bit values.
+    half_input: bool,
+}
+
+fn shape(seed: u64) -> Shape {
+    let mut r = shape_rng(seed);
+    r.below(4); // the input's channels
+    r.below(4);
+    Shape {
+        vertex_param: r.percent(50),
+        primitive_param: r.percent(50),
+        depth: r.percent(25),
+        clip: r.percent(25),
+        half: r.percent(25),
+        pack2: r.percent(50),
+        half_input: r.percent(25),
+    }
+}
+
+/// `s_load_dwordx<n>` (`op` 2: 4 dwords, 3: 8) of `sdata` from the address
+/// in `sbase` (even), at a byte offset.
+fn s_load(op: u32, sdata: u32, sbase: u32, offset: u32) -> [u32; 2] {
+    [
+        0xF400_0000 | op << 18 | sdata << 6 | (sbase / 2),
+        NULL << 25 | offset,
+    ]
+}
+
+/// Triangle (0, 1, 2), each corner's index in its 10-bit field.
+const TRIANGLE: u32 = 1 << 10 | 2 << 20;
+
 /// The program of `seed`.
 fn program(seed: u64) -> NativeProgram {
+    let stage = stage(seed);
     let mut r = Rng::new(seed);
-    let stage = if r.percent(70) {
-        HwStage::Cs
-    } else {
-        HwStage::Ps
+    r.below(100); // the stage's draw
+    r.base = u32::from(stage.user_sgpr(0));
+    let wave64 = match stage {
+        HwStage::Cs | HwStage::Ms => r.percent(30),
+        HwStage::Vs => r.percent(50),
+        _ => false,
     };
-    let wave64 = stage == HwStage::Cs && r.percent(30);
+    let base = r.base;
+    let s = |n| base + n;
     let mut words = vec![
-        0xBE85_0380, // s_mov_b32 s5, 0
-        0xBE87_0380, // s_mov_b32 s7, 0
-        0xF408_0202,
-        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
-        0xF40C_0302,
-        0xFA00_0020, // s_load_dwordx8 s[12:19], s[4:5], 0x20
-        0xF408_0503,
-        0xFA00_0000, // s_load_dwordx4 s[20:23], s[6:7], 0
+        0xBE80_0380 | s(5) << 16, // s_mov_b32 s5, 0
+        0xBE80_0380 | s(7) << 16, // s_mov_b32 s7, 0
     ];
+    words.extend(s_load(2, s(8), s(4), 0)); // s_load_dwordx4 s[8:11], s[4:5], 0
+    words.extend(s_load(3, s(12), s(4), 0x20)); // s_load_dwordx8 s[12:19], s[4:5], 0x20
+    words.extend(s_load(2, s(20), s(6), 0)); // s_load_dwordx4 s[20:23], s[6:7], 0
+    if stage == HwStage::Vs && r.percent(75) {
+        // The primitive id (v2) is refused in a vertex program: most leave
+        // it unread.
+        words.push(0x7E04_0280); // v_mov_b32 v2, 0
+    }
+    if stage == HwStage::Ms {
+        // The group id is the same in every lane only as the first lane
+        // reads it (`io` refuses a per-lane read): read it so, then free v5.
+        let group = s(40);
+        words.push(0x7E00_0000 | group << 17 | 0x02 << 9 | (256 + 5)); // v_readfirstlane_b32
+        words.push(0x7E00_0000 | 5 << 17 | 0x01 << 9 | group); // v_mov_b32 v5, group
+    }
     let body: Vec<Vec<u32>> = (0..2 + r.below(30))
         .map(|_| instruction(&mut r, stage))
         .collect();
@@ -367,10 +515,41 @@ fn program(seed: u64) -> NativeProgram {
         }
         words.extend(inst);
     }
-    words.extend(match stage {
-        HwStage::Ps => [0xF800_180F, 0x0302_0100], // exp mrt0 v0, v1, v2, v3 done vm
-        _ => [0xE070_0000, 0x8002_0000],           // buffer_store_dword v0, off, s[8:11], 0
-    });
+    let shape = shape(seed);
+    let (vertex_param, primitive_param) = (shape.vertex_param, shape.primitive_param);
+    match stage {
+        HwStage::Ps if shape.depth => {
+            words.extend([0xF800_100F, 0x0302_0100]); // exp mrt0 v0, v1, v2, v3 vm
+            words.extend([0xF800_1883, 0x0000_0504]); // exp mrtz v4, v5, off, off done vm
+        }
+        HwStage::Ps => words.extend([0xF800_180F, 0x0302_0100]), // exp mrt0 v0, v1, v2, v3 done vm
+        HwStage::Cs => {
+            // buffer_store_dword v0, off, s[8:11], 0
+            words.extend([0xE070_0000, 0x80 << 24 | (s(8) / 4) << 16]);
+        }
+        HwStage::Vs => {
+            words.extend([0xF800_020F, 0x0706_0504]); // exp param0 v4, v5, v6, v7
+            if shape.clip {
+                words.extend([0xF800_00CF, 0x0302_0100]); // exp pos0 v0, v1, v2, v3
+                words.extend([0xF800_08DF, 0x0B0A_0908]); // exp pos1 v8, v9, v10, v11 done
+            } else {
+                words.extend([0xF800_08CF, 0x0302_0100]); // exp pos0 v0, v1, v2, v3 done
+            }
+        }
+        _ => {
+            if vertex_param {
+                words.extend([0xF800_020F, 0x0706_0504]); // exp param0 v4, v5, v6, v7
+            }
+            if primitive_param {
+                words.extend([0xF800_021F, 0x0B0A_0908]); // exp param1 v8, v9, v10, v11
+            }
+            if r.percent(50) {
+                words.extend([0x7E12_02FF, TRIANGLE]); // v_mov_b32 v9, triangle (0, 1, 2)
+            }
+            words.extend([0xF800_0941, 0x0000_0009]); // exp prim v9 done
+            words.extend([0xF800_08CF, 0x0302_0100]); // exp pos0 v0, v1, v2, v3 done
+        }
+    }
     words.push(S_ENDPGM);
 
     let param = |root, sgprs, user_data, slot| RootParam {
@@ -391,6 +570,13 @@ fn program(seed: u64) -> NativeProgram {
         user_data,
         slot,
     };
+    let output = |row, param| VsOutput {
+        usage: Usage::Generic,
+        row,
+        param,
+        fp16: shape.half && param == 0,
+        pack2: shape.half && shape.pack2 && param == 0,
+    };
     let (col, cols) = input_channels(seed);
     let io = match stage {
         HwStage::Ps => StageIo::Ps {
@@ -400,15 +586,59 @@ fn program(seed: u64) -> NativeProgram {
                 mask: ((1 << cols) - 1) << col,
                 attr: 0,
                 flat: false,
-                fp16: false,
+                fp16: shape.half_input,
                 pack2: false,
                 row2: 0,
             }],
             // PERSP_CENTER, PERSP_SAMPLE, LINEAR_CENTER, or several.
             input_addr: [1 << 1, 1, 1 << 4, 0x7F][r.below(4) as usize],
-            db_shader_control: 0,
+            // Depth and stencil export enables, POPS (not read by the
+            // translation today).
+            db_shader_control: [0, 3, 1 << 16][r.below(3) as usize],
             patches: vec![],
         },
+        // Vertex, primitive and instance ids in v0, v2 and v3, the input
+        // from v4.
+        HwStage::Vs => StageIo::Vs {
+            inputs: vec![VsInput {
+                usage: Usage::Generic,
+                row: 0,
+                mask: ((1 << cols) - 1) << col,
+                vgpr: 4,
+            }],
+            outputs: vec![output(1, 0)],
+        },
+        HwStage::Ms => {
+            let lanes = if wave64 { 64 } else { 32 };
+            // One or two waves, now and then four (past the host's 128).
+            let threads = lanes << if r.percent(10) { 2 } else { r.below(2) };
+            let mut outputs = Vec::new();
+            if vertex_param {
+                outputs.push(output(1, 0));
+            }
+            if primitive_param {
+                outputs.push(output(0, 0x81));
+            }
+            StageIo::Ms(MeshIo {
+                outputs,
+                clip_cntl: 0,
+                threads,
+                // Mostly one vertex and one primitive per lane, or fewer; now
+                // and then more than the host allows (256).
+                max_vertices: match r.below(10) {
+                    0 => 1 + r.below(300),
+                    1..4 => threads / 2,
+                    _ => threads,
+                },
+                max_primitives: match r.below(10) {
+                    0 => 1 + r.below(300),
+                    1..4 => threads / 4,
+                    _ => threads,
+                },
+                topology: if r.percent(95) { 2 } else { 1 },
+                lds_bytes: if r.percent(50) { 512 * r.below(32) } else { 0 },
+            })
+        }
         // 8 user SGPRs, group ids, thread ids and LDS now and then.
         _ => StageIo::Cs(ComputeIo {
             rsrc2: 8 << 1
@@ -441,36 +671,95 @@ fn program(seed: u64) -> NativeProgram {
     }
 }
 
-/// The channels of a pixel program's input element: the first (x to w)
-/// and how many, from the program's seed.
-fn input_channels(seed: u64) -> (u8, u8) {
-    let col = (seed >> 3 & 3) as u8;
-    (col, 1 + (seed >> 5) as u8 % (4 - col))
-}
-
-/// The container of the program of `seed`: for a pixel program the
-/// signatures it uses (one float input element in row 0, a float4
-/// target), for compute none.
+/// The container of the program of `seed`: the signatures its stage uses
+/// ([`Shape`] says which). Pixel: one float input element in row 0, a
+/// float4 target, and depth and stencil. Vertex: the same input; the
+/// position, a float4 in row 1 (16-bit, or two 16-bit rows 1 and 2) and
+/// clip distances in row 2 (row 3 then) out. Mesh: the position and the
+/// parameters (per primitive in `PSG1`). Compute: none.
 fn container(seed: u64, stage: HwStage) -> Vec<u8> {
-    if stage != HwStage::Ps {
-        return dxbc::build(&[]);
-    }
-    let el = |name: &str, kind, col, cols: u8| SigElement {
+    let el = |name: &str, kind, row, col, cols: u8| SigElement {
         name: name.into(),
         index: 0,
         kind,
         comp: 9,
         interp: 0,
-        row: Some(0),
+        row: Some(row),
         col,
         cols,
         usage: (1 << cols) - 1,
         half: false,
     };
+    let shape = shape(seed);
     let (col, cols) = input_channels(seed);
-    let isg1 = container::signature(&[el("TEXCOORD", 0, col, cols)], true);
-    let osg1 = container::signature(&[el("SV_Target", 16, 0, 4)], false);
-    dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)])
+    let input = SigElement {
+        half: stage == HwStage::Ps && shape.half_input,
+        ..el("TEXCOORD", 0, 0, col, cols)
+    };
+    let position = el("SV_Position", 3, 0, 0, 4);
+    // The per-vertex parameter: row 1, and with `pack2` a second 16-bit
+    // row 2.
+    let params = |index_base: u32| -> Vec<SigElement> {
+        let half = |row, index| SigElement {
+            index,
+            half: shape.half,
+            ..el("TEXCOORD", 0, row, 0, 4)
+        };
+        let mut v = vec![half(1, index_base)];
+        if shape.half && shape.pack2 {
+            v.push(half(2, index_base + 1));
+        }
+        v
+    };
+    let (isg1, osg1, psg1) = match stage {
+        HwStage::Ps => {
+            let mut osg1 = vec![el("SV_Target", 16, 0, 0, 4)];
+            if shape.depth {
+                let system = |name: &str, kind, comp| SigElement {
+                    row: None,
+                    comp,
+                    ..el(name, kind, 0, 0, 1)
+                };
+                osg1.push(system("SV_Depth", 17, 9));
+                osg1.push(system("SV_StencilRef", 20, 5));
+            }
+            (vec![input], osg1, vec![])
+        }
+        HwStage::Vs => {
+            let mut osg1 = vec![position];
+            osg1.extend(params(0));
+            if shape.clip {
+                let row = if shape.half && shape.pack2 { 3 } else { 2 };
+                osg1.push(el("SV_ClipDistance", 6, row, 0, 4));
+            }
+            (vec![input], osg1, vec![])
+        }
+        HwStage::Ms => {
+            let mut osg1 = vec![position];
+            if shape.vertex_param {
+                osg1.extend(params(0));
+            }
+            let psg1 = shape
+                .primitive_param
+                .then(|| el("TEXCOORD", 0, 0, 0, 4))
+                .into_iter()
+                .map(|e| SigElement { index: 2, ..e })
+                .collect();
+            (vec![], osg1, psg1)
+        }
+        _ => return dxbc::build(&[]),
+    };
+    let isg1 = container::signature(&isg1, true);
+    let osg1 = container::signature(&osg1, false);
+    let psg1 = container::signature(&psg1, false);
+    let mut parts = vec![(FourCC::OSG1, &osg1[..])];
+    if stage != HwStage::Ms {
+        parts.push((FourCC::ISG1, &isg1[..]));
+    }
+    if stage == HwStage::Ms {
+        parts.push((FourCC::PSG1, &psg1[..]));
+    }
+    dxbc::build(&parts)
 }
 
 /// What translating `native` came to.
@@ -527,7 +816,8 @@ fn random_programs_translate_or_are_refused_the_same_way_every_time() {
     let first = env("VICTORY_RANDOM_SEED", 1);
     let trace = env("VICTORY_RANDOM_TRACE", 0) != 0;
     let mut failed = Vec::new();
-    let mut translated = 0;
+    // Programs and translated programs per stage.
+    let mut stages: Vec<(HwStage, u64, u64)> = Vec::new();
     for seed in first..first.saturating_add(count) {
         if trace {
             // Past the test's output capture, so that the last seed shows
@@ -545,7 +835,15 @@ fn random_programs_translate_or_are_refused_the_same_way_every_time() {
         let once = || std::panic::catch_unwind(|| translate(&native, &c, options));
         let why = match (once(), once()) {
             (Ok(a), Ok(b)) if a == b => {
-                translated += u32::from(matches!(a, Outcome::Translated(_)));
+                let at = match stages.iter().position(|s| s.0 == native.stage) {
+                    Some(at) => at,
+                    None => {
+                        stages.push((native.stage, 0, 0));
+                        stages.len() - 1
+                    }
+                };
+                stages[at].1 += 1;
+                stages[at].2 += u64::from(matches!(a, Outcome::Translated(_)));
                 continue;
             }
             (Ok(a), Ok(b)) => format!("translates differently: {a:?} then {b:?}"),
@@ -570,14 +868,20 @@ fn random_programs_translate_or_are_refused_the_same_way_every_time() {
         failed.len(),
         &failed[..failed.len().min(20)]
     );
-    // The generator still reaches DXIL emission (about one program in ten
-    // translates): a change that has every program refused early would
-    // leave this test checking nothing.
+    // The generator still reaches DXIL emission in every stage: a change
+    // that has a stage's programs all refused early would leave this test
+    // checking nothing there.
     if count >= 1000 {
-        assert!(
-            u64::from(translated) * 50 >= count,
-            "only {translated} of {count} random programs translated"
-        );
+        for stage in [HwStage::Cs, HwStage::Ps, HwStage::Vs, HwStage::Ms] {
+            let (programs, translated) = stages
+                .iter()
+                .find(|s| s.0 == stage)
+                .map_or((0, 0), |s| (s.1, s.2));
+            assert!(
+                translated * 100 >= programs && programs * 20 >= count,
+                "{stage:?}: {translated} of {programs} random programs translated"
+            );
+        }
     }
 }
 
