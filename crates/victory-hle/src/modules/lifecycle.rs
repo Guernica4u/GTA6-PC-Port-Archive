@@ -375,8 +375,7 @@ extern "system" fn stand_in_proc(
         // Auto-hide the cursor inside the client area while GTA mouse-look lock
         // (`~` / `F2`) is active; when unlocked, DefWindowProcW restores `IDC_ARROW`.
         wm::WM_SETCURSOR
-            if (lparam as u32 & 0xFFFF) == wm::HTCLIENT
-                && super::gameinput::cursor_locked() =>
+            if (lparam as u32 & 0xFFFF) == wm::HTCLIENT && super::gameinput::cursor_locked() =>
         {
             // SAFETY: hides the cursor only inside our client area on the UI thread.
             unsafe { wm::SetCursor(std::ptr::null_mut()) };
@@ -476,6 +475,8 @@ extern "system" fn window_proc(
                 let title = std::mem::transmute::<*mut c_void, wm::WNDPROC>(title);
                 wm::CallWindowProcW(title, hwnd, message, wparam, lparam)
             };
+            // SAFETY: runs on this window's UI thread; restores the standard
+            // arrow cursor if the title's window procedure left none set.
             unsafe {
                 if wm::GetCursor().is_null() {
                     let arrow = wm::LoadCursorW(std::ptr::null_mut(), wm::IDC_ARROW);
