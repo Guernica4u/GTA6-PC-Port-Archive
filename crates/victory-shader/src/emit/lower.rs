@@ -11011,7 +11011,7 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// A back edge to header `to` from the current block (the latch: a back
+/// A back edge to header `to` from the current block (the latch: a back
     /// edge gets no critical-edge block, see [`Self::latch`] for the one
     /// exception): the count goes up; the result compares it with
     /// [`LOOP_LIMIT`] by `p` (below: go on; at or above: stop).
