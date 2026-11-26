@@ -3411,6 +3411,50 @@ impl<'a> Lower<'a> {
         Ok(out)
     }
 
+    /// Elects inside guest EXEC even when the host never branched. A split
+    /// wave exchanges each half's selected value and whether that half
+    /// participates. If both halves are empty, console lane zero wins.
+    fn guarded_firstlane(&mut self, value: V, exec: V, join: bool) -> Result<V, Why> {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let physical = self
+            .s
+            .op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+        let none = self.s.m.i32(u32::MAX);
+        let candidate = self.s.m.select(c, exec, physical, none);
+        let (min, unsigned) = (self.s.m.i8(2), self.s.m.i8(1));
+        let first = self.s.op(
+            c,
+            "waveActiveOp.i32",
+            Attr::NoUnwind,
+            i32t,
+            119,
+            &[candidate, min, unsigned],
+        );
+        let live = self.s.m.cmp(c, pred::NE, first, none);
+        let zero = self.s.m.i32(0);
+        let lane = self.s.m.select(c, live, first, zero);
+        let mine = self.read_lane(value, lane);
+        if !join {
+            return Ok(mine);
+        }
+        let (_, half, _) = self.split_ids();
+        // Prefer live lower, live upper, empty lower, then empty upper.
+        // An absent peer ranks after all four possibilities.
+        let two = self.s.m.i32(2);
+        let empty_rank = self.s.m.bin(c, Bin::Add, half, two);
+        let rank = self.s.m.select(c, live, half, empty_rank);
+        let peer = self.exchange(
+            Exchange::ReadFirstLane,
+            self.cur_ir,
+            c,
+            &[mine, rank],
+            &[0, 4],
+        )?;
+        let prefer_peer = self.s.m.cmp(c, pred::IULT, peer[1], rank);
+        Ok(self.s.m.select(c, prefer_peer, peer[0], mine))
+    }
+
     /// Split waves: `(low, high)` dwords of the console mask whose lane bit
     /// is `bit`, from each half's ballot.
     fn split_ballot(&mut self, b: usize, at: usize, bit: V) -> Result<(V, V), Why> {
@@ -6344,10 +6388,14 @@ impl<'a> Lower<'a> {
             }
             return r;
         }
-        // A scalar result (`v_readlane`, `v_readfirstlane`) is written
-        // whatever EXEC holds.
+        // Scalar results are written regardless of EXEC. In compute,
+        // v_readfirstlane still needs EXEC to select the source lane.
         let mut guard = match v.dst {
-            Some(Operand::Scalar { .. }) => None,
+            Some(Operand::Scalar { .. })
+                if name != "v_readfirstlane_b32" || self.x.native.stage != HwStage::Cs =>
+            {
+                None
+            }
             _ => self.guard(b, i)?,
         };
         if let Some(d) = v.dpp {
@@ -7238,6 +7286,12 @@ impl<'a> Lower<'a> {
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
                 self.s.flags |= flags::WAVE_OPS;
+                let join =
+                    self.split.is_some() && !self.wave_uniform(inst) && !self.scalarizes(inst);
+                if let Some(g) = guard {
+                    let r = self.guarded_firstlane(a, g, join)?;
+                    return self.write_i(inst, r, None);
+                }
                 let r = self.s.op(
                     c,
                     "waveReadLaneFirst.i32",
@@ -7246,7 +7300,7 @@ impl<'a> Lower<'a> {
                     118,
                     &[a],
                 );
-                if self.split.is_some() && !self.wave_uniform(inst) && !self.scalarizes(inst) {
+                if join {
                     // Where the group runs together the low half has lanes
                     // (it fills first), so its first lane is the wave's.
                     let other =
