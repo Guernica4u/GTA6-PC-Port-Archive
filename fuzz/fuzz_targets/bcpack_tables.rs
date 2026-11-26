@@ -13,9 +13,9 @@ fuzz_target!(|data: &[u8]| {
 
     // Each 4-byte chunk is (24-bit offset, new value) into the shipped tables.
     let mut bytes = SHIPPED.to_vec();
-    for chunk in data.chunks_exact(4) {
-        let at = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], 0]) as usize % bytes.len();
-        bytes[at] = chunk[3];
+    for &[a, b, c, value] in data.as_chunks::<4>().0 {
+        let at = u32::from_le_bytes([a, b, c, 0]) as usize % bytes.len();
+        bytes[at] = value;
     }
     let Ok(tables) = Tables::parse(&bytes) else { return };
 
