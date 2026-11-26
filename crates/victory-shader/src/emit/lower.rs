@@ -4146,37 +4146,41 @@ impl<'a> Lower<'a> {
         let kind = self.used_kind(src);
         let c = self.cur;
         let (base, extra) = self.built_offset(src)?;
-        let imm = *offset as u32;
-        let offset = &(imm.wrapping_add(base) as i32);
-        let mut addr = self.s.m.i32(*offset as u32);
-        if let Some(x) = extra {
-            addr = self.s.m.bin(c, Bin::Add, addr, x);
-        }
-        let so = if matches!(soffset, Operand::Scalar { code: NULL, .. }) {
-            None
-        } else {
-            let s = self.operand(inst, soffset)?;
-            addr = self.s.m.bin(c, Bin::Add, addr, s);
-            Some(s)
-        };
         if let Source::Built { address, bits, words } = src
             && address.param == CODE
         {
-            // Descriptor around a code table; keep NUM_RECORDS per dword.
+            // Descriptor around a code table; keep NUM_RECORDS per dword and
+            // truncate base, imm and soffset independently as RDNA2 SMEM does.
+            let imm_al = (*offset as u32) & !3;
             let limit = u64::from(words[0]) * u64::from((bits >> 16) & 0x3FFF).max(1);
-            let end = u64::from(imm & !3) + 4;
+            let end = u64::from(imm_al) + 4;
             let zero = self.s.m.i32(0);
-            let al = so.map(|s| {
-                let m = self.s.m.i32(!3);
-                self.s.m.bin(c, Bin::And, s, m)
-            });
+            let not3 = self.s.m.i32(!3);
+            let mut code_a = match extra {
+                Some(x) => {
+                    let b = self.s.m.i32(base);
+                    let sum = self.s.m.bin(c, Bin::Add, b, x);
+                    let al_b = self.s.m.bin(c, Bin::And, sum, not3);
+                    let ia = self.s.m.i32(imm_al);
+                    self.s.m.bin(c, Bin::Add, al_b, ia)
+                }
+                None => self.s.m.i32((base & !3).wrapping_add(imm_al)),
+            };
+            let al = if matches!(soffset, Operand::Scalar { code: NULL, .. }) {
+                None
+            } else {
+                let s = self.operand(inst, soffset)?;
+                let a = self.s.m.bin(c, Bin::And, s, not3);
+                code_a = self.s.m.bin(c, Bin::Add, code_a, a);
+                Some(a)
+            };
             for k in 0..count {
                 let fixed = end + 4 * u64::from(k);
                 let x = if fixed > limit {
                     zero
                 } else {
                     let off = self.s.m.i32(4 * k);
-                    let a = self.s.m.bin(c, Bin::Add, addr, off);
+                    let a = self.s.m.bin(c, Bin::Add, code_a, off);
                     let x = self.code_dword(a)?;
                     if let Some(al) = al {
                         let rest = self.s.m.i32((limit - fixed).min(u64::from(u32::MAX)) as u32);
@@ -4189,6 +4193,15 @@ impl<'a> Lower<'a> {
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
+        }
+        let offset = &((*offset as u32).wrapping_add(base) as i32);
+        let mut addr = self.s.m.i32(*offset as u32);
+        if let Some(x) = extra {
+            addr = self.s.m.bin(c, Bin::Add, addr, x);
+        }
+        if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
+            let so = self.operand(inst, soffset)?;
+            addr = self.s.m.bin(c, Bin::Add, addr, so);
         }
         // Constant data through the resource heap itself is a raw buffer: the
         // host's constant buffer views need 256-byte alignment, the title's

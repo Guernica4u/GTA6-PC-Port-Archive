@@ -833,14 +833,14 @@ fn code_table_stride_program() -> Vec<u32> {
     w.extend(s_mov_literal(19, 0x3101_6FAC));
     w.extend(s_mov_literal(22, 21));
     w.extend(s_mov_literal(23, 0x3101_6FAC));
-    w.extend(s_mov_literal(40, 0x8)); // the soffset
+    w.extend(s_mov_literal(40, 0xe)); // unaligned soffset
     w.extend(s_buffer_load(8, 30, 8, 0x10)); // A@0x10: data
     w.extend(s_buffer_load(8, 31, 8, 0x14)); // A@0x14: zero
     w.extend(s_buffer_load(8, 32, 12, 0x10)); // B@0x10: zero
     w.extend(s_buffer_load(8, 33, 12, 0xc)); // B@0xc: data
-    // C with soffset s40: immediate 4 reads 0xc (data), immediate 8 reads 0x10 (zero).
-    w.extend([0xF400_0000 | 8 << 18 | 34 << 6 | 8, 40 << 25 | 4]);
-    w.extend([0xF400_0000 | 8 << 18 | 35 << 6 | 8, 40 << 25 | 8]);
+    // C (NR 16) with soffset 0xe: imm 2 reads 0xc (data, not 0x10), imm 4 reads 0.
+    w.extend([0xF400_0000 | 8 << 18 | 34 << 6 | 8, 40 << 25 | 2]);
+    w.extend([0xF400_0000 | 8 << 18 | 35 << 6 | 8, 40 << 25 | 4]);
     w.extend(s_buffer_load(10, 36, 20, 0xc)); // D dwordx4: data, data, zero, zero
     w.push(0xBE8A_0302); // s_mov_b32 s10, s2 — reuse s10, the UAV table
     w.push(0xBE8B_0380); // s_mov_b32 s11, 0
@@ -944,7 +944,7 @@ fn scalar_buffer_loads_of_a_code_table_keep_num_records_with_stride_and_soffset(
                 0,
                 0
             ],
-            "{label}: stride 4/1, soffset 0x8 + imm 4/8, wide load"
+            "{label}: stride 4/1, soffset 0xe + imm 2/4, wide load"
         );
         ran += 1;
     }
