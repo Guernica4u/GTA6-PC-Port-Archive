@@ -940,6 +940,26 @@ fn refusal_message(
     message
 }
 
+/// Takes `[address, address + len)` apart and releases it: the teardown a
+/// range with mapped views needs. `VirtualFree(MEM_RELEASE)` alone fails
+/// while a view is mapped, which is what a caller that maps physical pages
+/// and then frees the reservation meets; this unmaps the views (the module's
+/// own `unmap`, which also forgets them and their aliases) and releases the
+/// placeholders that are left. `false` when the range could not be released.
+#[cfg(test)]
+pub(crate) unsafe fn release(address: *mut c_void, len: usize) -> bool {
+    if address.is_null() || len == 0 {
+        return false;
+    }
+    {
+        let mut physical = physical();
+        unmap(&mut physical, address as usize, len);
+    }
+    // SAFETY: the caller mapped over a placeholder that `unmap` has just
+    // returned; the release acts on the whole range.
+    unsafe { VirtualFree(address, 0, MEM_RELEASE) != 0 }
+}
+
 /// Returns `[base, base + len)` to placeholders; views reaching past it
 /// are mapped again outside it.
 fn unmap(physical: &mut Physical, base: usize, len: usize) {
@@ -1441,7 +1461,13 @@ mod tests {
                 runs(&pages, 0, 4 * PAGE).map(|r| r.iter().map(|&(_, n)| n).collect::<Vec<_>>()),
                 Some(vec![4])
             );
+            // And the reservation is released with its views, which is the
+            // part the host call alone cannot do: the page table is shared by
+            // the whole process, so the test gives back what it took.
+            assert!(release(range, 4 * PAGE), "the range is released with its views");
+            assert_eq!(query(range).host.State, 0x1_0000); // MEM_FREE
         }
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
     }
 
     #[test]
@@ -1733,3 +1759,7 @@ pub mod low_guards {
         }
     }
 }
+
+
+
+
