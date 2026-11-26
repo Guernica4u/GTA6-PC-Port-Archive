@@ -41,6 +41,7 @@ The launcher sets these for a Proton or Wine launch. A value you set yourself is
 | --- | --- | --- |
 | `TUXBOX_RUNTIME_SHADERS` | on | `0` stops translating shaders during play |
 | `TUXBOX_RUNTIME_SHADER_JOBS` | half the CPU cores, at least 2 where there are two, at most 32 | Compiler jobs during play, 1 to 32 |
+| `TUXBOX_PROFILE_SHADERS` | `0` | Set to `1` for aggregate host shader-stage timing in the log (preparation and runtime). No title identifiers are included; `--profile-pipelines` enables runtime timing unless explicitly disabled. |
 | `TUXBOX_SHADER_PREP_JOBS` | one per CPU core, at most 32 | Compiler jobs for ProjectScarlett preparation |
 | `TUXBOX_SHADER_PREP` | `chase` | Frosty preparation: `0`, `1`, `menu` or `chase` |
 | `TUXBOX_SHADER_PREP_UI` | on for ProjectScarlett | `1` shows a desktop progress window |
@@ -93,3 +94,28 @@ All are off by default. Capture variables write the game's data to disk, so don'
 ## Build and test tools
 
 `TUXBOX_XSHADER` selects the shader compiler for launcher preparation and `DXC` selects the DirectX Shader Compiler. `TUXBOX_BLESS_PROFILES`, `TUXBOX_ORACLE_*`, `TUXBOX_TEST_*` and the probe and replay variables in `tools/` belong to individual checks. `TUXBOX_PROVIDER`, `TUXBOX_SHADER_SESSION` and `TUXBOX_WINE_*` are internal; don't set them.
+
+
+### Reading host shader stage timings
+
+For a cold and warm run, keep the same executable, prefix, compiler and settings,
+and set `TUXBOX_PROFILE_SHADERS=1` for both launches. The aggregate JSON lines
+labelled `Shader stage timings (preparation)` and `(runtime)` separate the
+work done before the title starts from that done by the live compiler. The
+runtime profile is also enabled by `--profile-pipelines`, unless explicitly
+disabled. Keep the existing game log if the results need to be compared later.
+
+`requests.compiled` counts newly published source entries (including reuse of
+identical DXIL); `reuse.content` counts those that did not need DXC again.
+`reuse.source` counts exact cached entries served by the host. A warm guest
+can read its cache without sending a request at all, so an empty runtime
+profile is valid. Refused, cached-refusal and failed requests stay separate.
+Stage outcomes count tool attempts, not shaders: a timeout and its successful
+fallback are separate calls. Stage totals sum concurrent worker wall times
+and can exceed the elapsed session time; they are not CPU time. The existing
+vkd3d-proton pipeline trace measures driver-side calls separately.
+
+These host measurements cover dispatched requests, not guest-side cache
+lookups, compiler discovery failures or process memory. They contain no
+shader hashes, title names or raw error text. A forcibly killed launcher may
+not finish writing its summary.
