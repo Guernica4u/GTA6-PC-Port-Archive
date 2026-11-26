@@ -1,0 +1,120 @@
+name: Test report
+description: How far the title got on your machine, and where it stopped.
+title: "<GPU>: <what happened>"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing. A report helps most when it says which machine, which build, and where the title stopped.
+
+        Do **not** attach or paste game files or anything derived from them (archives, shaders, textures, dumps of title memory); see [docs/asset-policy.md](https://github.com/Belobug/VIctory-Belobug-AMD/blob/main/docs/asset-policy.md). Console output, `crashes.log` and profiles of the emulator are fine.
+
+  - type: textarea
+    id: system
+    attributes:
+      label: Machine and build (`victory system`)
+      description: |
+        Paste the output of `victory system` (run it with the same build you tested). It lists Windows, the CPU, memory and commit, the GPU and driver, and what the GPU supports (shader model, mesh shaders, wave sizes, the view heap).
+        If your build has no `system` command yet, paste `victory --version` and fill in Windows, CPU, RAM, GPU, VRAM and driver version by hand.
+      render: text
+    validations:
+      required: true
+
+  - type: dropdown
+    id: profile
+    attributes:
+      label: Build profile
+      options:
+        - release (`cargo build --release -p victory`)
+        - diag (`cargo build --profile diag -p victory --features diagnostics`)
+        - other (say below)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: console
+    attributes:
+      label: Console profile
+      options:
+        - series-x
+        - series-s
+    validations:
+      required: true
+
+  - type: dropdown
+    id: reached
+    attributes:
+      label: How far it got
+      options:
+        - Did not start (no window)
+        - Stopped during the first loading screen
+        - Menus work, stopped or failed while loading the world
+        - The world loads but renders wrong (black, missing objects, corrupt)
+        - The world runs, then stopped later
+        - The world runs without stopping (report frame rate and problems below)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: ending
+    attributes:
+      label: How it ended
+      options:
+        - It did not end
+        - The process exited or crashed (entry in crashes.log)
+        - Device removed / driver timeout (screens went black for a moment)
+        - Froze (no progress, window not responding)
+        - The whole desktop froze
+    validations:
+      required: true
+
+  - type: input
+    id: fps
+    attributes:
+      label: Frame rate
+      description: As shown in the picture's top-left corner or the window caption, and where (menus, standing still, driving).
+      placeholder: "menus 30 fps; world 4 to 6 standing still"
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment variables and arguments
+      description: Every `VICTORY_*` variable you set and the full `victory run` command line. Write "none" if you set none.
+      render: text
+      placeholder: |
+        VICTORY_PRESENT_TARGET=1x1:1
+        victory run <exe> --execute --console series-x
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you saw, step by step, and anything that changed the result (another setting, a second run, a driver version).
+    validations:
+      required: true
+
+  - type: textarea
+    id: crashes
+    attributes:
+      label: crashes.log
+      description: The new entries from `%LOCALAPPDATA%\victory\data\crashes.log`, if the run ended.
+      render: text
+
+  - type: textarea
+    id: console-output
+    attributes:
+      label: Console output
+      description: The last lines before it stopped (warnings and errors first). For long logs, attach the file instead.
+      render: text
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I ran the title from files I supplied myself, and attached no game files or data derived from them.
+          required: true
+        - label: I looked for an open issue about the same GPU and the same problem.
+          required: false
