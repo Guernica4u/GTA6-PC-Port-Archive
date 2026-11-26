@@ -388,12 +388,6 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
-pub(crate) struct PipelineState {
-    pub(crate) pso: ID3D12PipelineState,
-    /// The library contains this PSO under its name.
-    pub(crate) in_library: bool,
-}
-
 /// The pipeline named `name`: loaded from the library by `load` if it is
 /// there with the same description, else made by `create` and stored. A
 /// name asked for by several threads is loaded or made by one at a time
@@ -402,13 +396,13 @@ pub(crate) fn pipeline(
     name: &str,
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
-) -> windows::core::Result<PipelineState> {
+) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
     #[cfg(feature = "diagnostics")]
     LAST.set(Some((name.to_owned(), true)));
     let Some(libraries) = libraries() else {
         MADE.fetch_add(1, Ordering::Relaxed);
-        return create().map(|pso| PipelineState { pso, in_library: false });
+        return create();
     };
     let _held = NAMES.hold(name);
     // No lock at all: the shard's load interface lives as long as the
@@ -416,7 +410,7 @@ pub(crate) fn pipeline(
     let loads = &libraries[shard_of(name)].loads;
     if let Ok(pso) = load(loads, PCWSTR(wide.as_ptr())) {
         LOADED.fetch_add(1, Ordering::Relaxed);
-        return Ok(PipelineState { pso, in_library: true });
+        return Ok(pso);
     }
     // Compiled outside the lock: compiles take up to seconds.
     #[cfg(feature = "diagnostics")]
@@ -429,11 +423,10 @@ pub(crate) fn pipeline(
         .unwrap_or_else(|e| e.into_inner());
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
-    let in_library = unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok();
-    if in_library {
+    if unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
         l.added += 1;
     }
-    Ok(PipelineState { pso, in_library })
+    Ok(pso)
 }
 
 #[cfg(feature = "diagnostics")]
@@ -978,7 +971,7 @@ mod tests {
         // SAFETY: D3D12 objects are free-threaded.
         unsafe impl Sync for Made {}
         impl Made {
-            fn get(&self, made: bool) -> windows::core::Result<PipelineState> {
+            fn get(&self, made: bool) -> windows::core::Result<ID3D12PipelineState> {
                 let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                     // SAFETY: a borrowed pointer the description never releases.
                     pRootSignature: unsafe { std::mem::transmute_copy(&self.1) },

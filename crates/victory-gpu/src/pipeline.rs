@@ -997,7 +997,9 @@ impl Prebuild {
         });
         #[cfg(feature = "diagnostics")]
         make::log_built(&key);
-        if made.as_ref().is_some_and(|pipeline| pipeline.in_library) {
+        if made.is_some() {
+            // shortcut: a pipeline the library refused to store is listed
+            // too; a run then makes it at first use.
             library::note_prebuilt(key);
         }
         library::save(false);
