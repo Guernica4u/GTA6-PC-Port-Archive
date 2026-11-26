@@ -41,8 +41,10 @@ static DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Keeps the pipeline library and the early list in `dir` from now on.
 pub fn use_pipeline_cache(dir: PathBuf) {
-    sweep_staging(&dir, std::process::id(), STAGING_KEPT);
-    let _ = DIR.set(dir);
+    DIR.get_or_init(|| {
+        sweep_staging(&dir, std::process::id(), STAGING_KEPT);
+        dir
+    });
 }
 
 /// How long another process's staging file is left alone: the folder is
@@ -54,11 +56,17 @@ const STAGING_KEPT: std::time::Duration = std::time::Duration::from_secs(10 * 60
 /// processes' once untouched for `kept`. A cut write leaves its file, and no
 /// later write reuses the name.
 fn sweep_staging(dir: &std::path::Path, pid: u32, kept: std::time::Duration) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let Some(writer) = name.to_str().and_then(staging_pid) else { continue };
-        let Ok(meta) = entry.metadata() else { continue };
+        let Some(writer) = name.to_str().and_then(staging_pid) else {
+            continue;
+        };
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
         if !meta.is_file() {
             continue;
         }
