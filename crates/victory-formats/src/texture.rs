@@ -1235,7 +1235,15 @@ mod tests {
     #[test]
     fn packed_rgb_mips_copy_whole_horizontal_pairs() {
         for format in [68, 69] {
-            for swizzle in [Swizzle::LINEAR, Swizzle::SW_4KB_S] {
+            // Tiled byte offsets from AMD PAL c5e800072a32f68b6ccc4422936d96167c6e0728.
+            // Navi22 (family 0x8f, rev 0x32, GB_ADDR_CONFIG=0x43), GB_GR and BG_RG.
+            // Addr2ComputeSurfaceInfo gives 32-bit 2x1 elements. Mip 0 spans 5x6 elements.
+            // Addr2ComputeSurfaceAddrFromCoord: mip 1, slice 1, x=2, y=0..2, no XOR.
+            for (swizzle, slice_bytes, last_pairs) in [
+                (Swizzle::LINEAR, 2304, [2312, 2568, 2824]),
+                (Swizzle::SW_4KB_S, 4096, [5640, 5656, 5672]),
+                (Swizzle::SW_64KB_S, 65536, [81928, 81944, 81960]),
+            ] {
                 let texture = Texture::new(&TextureDesc {
                     dimension: Dimension::Tex2d,
                     width: 10,
@@ -1251,19 +1259,13 @@ mod tests {
                 let m = l.mips[1];
                 // Mip 1 is 5x3 texels. Its three rows each use three 32-bit words.
                 assert_eq!((m.width, m.height, l.desc.element_bytes), (3, 3, 4));
-                let (slice, rows) = if swizzle == Swizzle::LINEAR {
-                    (2304, [0, 256, 512])
-                } else {
-                    // 4 KiB S tail: mip 1 starts at 0x600. Y0 and Y1
-                    // feed bits 4 and 5, and X0 and X1 feed bits 2 and 3.
-                    (4096, [0x600, 0x610, 0x620])
-                };
-                assert_eq!(texture.size, (2 * slice) as u64);
+                assert_eq!(texture.size, 2 * slice_bytes);
                 let input: Vec<u8> = (0..44).collect();
                 let mut expected = vec![0xcc; texture.size as usize];
                 let mut back = [0xcc; 44];
-                for (y, offset) in rows.into_iter().enumerate() {
-                    let at = slice + offset;
+                for (y, last_pair) in last_pairs.into_iter().enumerate() {
+                    assert_eq!(l.offset(1, 2, y as u32, 1).unwrap(), last_pair);
+                    let at = last_pair as usize - 8;
                     expected[at..at + 12].copy_from_slice(&input[y * 16..y * 16 + 12]);
                 }
                 let mut tiled = vec![0xcc; expected.len()];
