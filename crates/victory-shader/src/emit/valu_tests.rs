@@ -253,7 +253,9 @@ fn run_cases_with_output(
         }
         ran += 1;
     }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+    if ran == 0 {
+        crate::emit::host::no_device("no SM 6.6 device", &[]);
+    }
 }
 
 const BITREPLICATE_BODY: [u32; 9] = {
