@@ -211,8 +211,10 @@ fn open_pad() -> Option<Pad> {
     None
 }
 
-/// Every present HID interface's device path.
+/// Every present HID interface's NUL-terminated device path.
 fn device_paths() -> Vec<Vec<u16>> {
+    const DETAIL_SIZE: usize = std::mem::size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>();
+    const PATH_OFFSET: usize = std::mem::offset_of!(SP_DEVICE_INTERFACE_DETAIL_DATA_W, DevicePath);
     let mut paths = Vec::new();
     // SAFETY: the HID interface class, no enumerator or parent window.
     let set: HDEVINFO = unsafe {
@@ -257,16 +259,16 @@ fn device_paths() -> Vec<Vec<u16>> {
                 std::ptr::null_mut(),
             )
         };
-        if required == 0 {
+        if (required as usize) < DETAIL_SIZE {
             continue;
         }
-        let mut buffer = vec![0u8; required as usize];
+        let mut buffer = vec![0u32; (required as usize).div_ceil(std::mem::size_of::<u32>())];
         let detail = buffer
             .as_mut_ptr()
             .cast::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>();
         // SAFETY: the buffer is the size the API asked for; cbSize is its header.
         unsafe {
-            (*detail).cbSize = std::mem::size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32;
+            (*detail).cbSize = DETAIL_SIZE as u32;
             if SetupDiGetDeviceInterfaceDetailW(
                 set,
                 &interface,
@@ -279,16 +281,15 @@ fn device_paths() -> Vec<Vec<u16>> {
                 continue;
             }
         }
-        // The path starts after the u32 cbSize, as UTF-16.
-        // SAFETY: the API wrote the path at this offset in our buffer.
-        let path = unsafe { buffer.as_ptr().add(4).cast::<u16>() };
-        let mut len = 0usize;
-        // SAFETY: the API wrote a NUL-terminated path into the buffer.
-        while unsafe { *path.add(len) } != 0 {
-            len += 1;
+        let capacity = (required as usize - PATH_OFFSET) / std::mem::size_of::<u16>();
+        // SAFETY: the UTF-16 field is aligned and the slice is inside the initialized buffer.
+        let path = unsafe {
+            let start = buffer.as_ptr().cast::<u8>().add(PATH_OFFSET).cast::<u16>();
+            std::slice::from_raw_parts(start, capacity)
+        };
+        if let Some(end) = path.iter().position(|&unit| unit == 0) {
+            paths.push(path[..=end].to_vec());
         }
-        // SAFETY: `path` is valid for `len` u16s in the live buffer.
-        paths.push(unsafe { std::slice::from_raw_parts(path, len) }.to_vec());
     }
     // SAFETY: the set is ours.
     unsafe { SetupDiDestroyDeviceInfoList(set) };
@@ -486,6 +487,7 @@ mod tests {
         let paths = device_paths();
         println!("hid interfaces: {}", paths.len());
         for path in &paths {
+            let path = path.strip_suffix(&[0]).expect("HID path must end in NUL");
             println!("  {}", String::from_utf16_lossy(path));
         }
         match open_pad() {
