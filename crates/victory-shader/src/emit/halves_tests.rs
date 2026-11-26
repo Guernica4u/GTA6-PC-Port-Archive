@@ -174,7 +174,30 @@ fn refusal(words: &[u32], threads: u32, lds_bytes: u32) -> String {
 /// The hand-encoded words are the instructions their comments name.
 #[test]
 fn the_test_programs_are_what_their_comments_say() {
-    let programs: [(Vec<u32>, &[&str]); 7] = [
+    let programs: [(Vec<u32>, &[&str]); 10] = [
+        (
+            lane_reads(),
+            &[
+                "v_readlane_b32 s12, v0, 40",
+                "s_mov_b32 s20, 63",
+                "v_readlane_b32 s13, v0, s20",
+                "v_readlane_b32 s14, v0, 5",
+                "buffer_store_dword v4, v16, s[40:43], 0 offen offset:8",
+            ],
+        ),
+        (
+            lane_read_in_a_branch(),
+            &[
+                "v_cmp_gt_u32 vcc, 20, v0",
+                "s_and_saveexec_b64 s[20:21], vcc",
+                "s_cbranch_execz",
+                "s_mov_b64 exec, s[20:21]",
+            ],
+        ),
+        (
+            lane_read_under_a_uniform_branch(),
+            &["s_cmp_eq_u32 s5, 0", "s_cbranch_scc0"],
+        ),
         (
             small_group(),
             &[
@@ -298,12 +321,25 @@ fn reads_across_32_lane_halves_are_refused_with_their_reason() {
         &[S_ENDPGM],
     ]
     .concat();
-    assert!(
-        refusal(&readlane, 64, 0).contains("a lane read that may cross 32-lane halves"),
-        "{}",
-        refusal(&readlane, 64, 0)
-    );
+    // A lane read where every thread of the group meets is traded between
+    // the halves; the same program translates for 64-lane hosts.
+    assert_eq!(refusal(&readlane, 64, 0), "translated");
     assert!(lowered(&native(&readlane, true, 64, 0), false).is_ok());
+    // Inside a branch only lanes below 20 take, the halves cannot meet.
+    let why = refusal(&lane_read_in_a_branch(), 64, 0);
+    assert!(
+        why.contains("where not every thread of the group meets"),
+        "{why}"
+    );
+    // Under a branch on a uniform condition both halves of a console wave
+    // go alike, but two console waves of one group need not.
+    let uniform = lane_read_under_a_uniform_branch();
+    assert_eq!(refusal(&uniform, 64, 0), "translated");
+    let why = refusal(&uniform, 128, 0);
+    assert!(
+        why.contains("where not every thread of the group meets"),
+        "{why}"
+    );
 
     let first = [
         PROLOGUE.as_slice(),
@@ -540,6 +576,82 @@ fn first_lane_of_a_buffer_load(offset: u32) -> Vec<u32> {
     w.extend(store(5, 0));
     w.push(S_ENDPGM);
     w
+}
+
+/// Per thread `l`, three dwords at `l * 32`: the thread ids of lanes 40, 63
+/// (named by an SGPR) and 5 of its console wave, through `v_readlane_b32`.
+fn lane_reads() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0xD760_000C,
+        0x0001_5100, // v_readlane_b32 s12, v0, 40
+        0x7E04_020C, // v_mov_b32 v2, s12
+        0xBE94_03BF, // s_mov_b32 s20, 63
+        0xD760_000D,
+        0x0000_2900, // v_readlane_b32 s13, v0, s20
+        0x7E06_020D, // v_mov_b32 v3, s13
+        0xD760_000E,
+        0x0001_0B00, // v_readlane_b32 s14, v0, 5
+        0x7E08_020E, // v_mov_b32 v4, s14
+    ]);
+    for (vdata, slot) in [(2, 0), (3, 1), (4, 2)] {
+        w.extend(store(vdata, 4 * slot));
+    }
+    w.push(S_ENDPGM);
+    w
+}
+
+/// Lane 40's thread id, read inside a branch only threads below 20 take.
+fn lane_read_in_a_branch() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+        0xBE94_246A, // s_and_saveexec_b64 s[20:21], vcc
+        0xBF88_0003, // s_cbranch_execz 3
+        0xD760_000C,
+        0x0001_5100, // v_readlane_b32 s12, v0, 40
+        0x7E04_020C, // v_mov_b32 v2, s12
+        0xBEFE_0414, // s_mov_b64 exec, s[20:21]
+    ]);
+    w.extend(store(2, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// Lane 40's thread id, read under a branch on a scalar compare.
+fn lane_read_under_a_uniform_branch() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0xBF06_8005, // s_cmp_eq_u32 s5, 0
+        0xBF84_0003, // s_cbranch_scc0 3
+        0xD760_000C,
+        0x0001_5100, // v_readlane_b32 s12, v0, 40
+        0x7E04_020C, // v_mov_b32 v2, s12
+    ]);
+    w.extend(store(2, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// [`lane_reads`] on every hardware adapter, in halves (traded between the
+/// two host waves) and as one wave64 where the adapter runs those: in groups
+/// of one and of two console waves, every lane gets its console wave's lanes.
+#[test]
+fn lane_reads_across_halves_match_the_console_on_every_gpu() {
+    let mut failed = Vec::new();
+    for threads in [64, 128] {
+        let want: Vec<u32> = (0..threads)
+            .flat_map(|l| {
+                let base = l & !63;
+                [base + 40, base + 63, base + 5]
+            })
+            .collect();
+        failed.extend(differences(&lane_reads(), threads, 3, &want));
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
 /// Per thread `l` of a group of 128 (two console wave64s), two dwords at
