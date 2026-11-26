@@ -162,6 +162,23 @@ fn parse_scripted(list: &str) -> Vec<Scripted> {
         .collect()
 }
 
+/// The keys still held at `now`: a key is held from its `at` for `hold`.
+/// The comparison goes through `checked_sub` rather than `at + hold`, so
+/// a pair whose sum leaves `Duration`'s range cannot panic, and a `hold`
+/// of zero keeps the key for the default instead of dropping it in
+/// silence (a lost press is what this switch exists to rule out).
+#[cfg(any(test, feature = "diagnostics"))]
+fn held(keys: &[Scripted], now: Duration) -> Vec<u8> {
+    const DEFAULT_HOLD: Duration = Duration::from_millis(200);
+    keys.iter()
+        .filter(|&&(at, hold, _)| {
+            now.checked_sub(at)
+                .is_some_and(|age| age < if hold.is_zero() { DEFAULT_HOLD } else { hold })
+        })
+        .map(|&(_, _, vk)| vk)
+        .collect()
+}
+
 fn fallback(keys: &[KeyState]) -> PadState {
     let on = |vk: u8| {
         if keys.iter().any(|k| k.virtual_key == vk) {
@@ -1327,10 +1344,7 @@ mod host {
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
-            .filter(|&&(at, hold, _)| (at..at + hold).contains(&now))
-            .map(|&(_, _, vk)| vk)
-            .collect()
+        held(keys, now)
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
@@ -1803,6 +1817,24 @@ mod tests {
         );
     }
 
+    /// The window itself, not just the parse: a key with a long hold is still
+    /// down 350 ms in and up after it, a zero hold keeps the default, and a
+    /// pair whose sum leaves `Duration`'s range does not panic.
+    #[test]
+    fn a_scripted_key_is_held_exactly_its_window() {
+        let keys = parse_scripted("100:Enter:0.8,200:X:0,300:Z:1e19");
+        let at = |secs: f64| Duration::try_from_secs_f64(secs).unwrap();
+        assert_eq!(held(&keys, at(99.0)), Vec::<u8>::new());
+        assert_eq!(held(&keys, at(100.0)), vec![0x0D]);
+        assert_eq!(held(&keys, at(100.35)), vec![0x0D], "still down");
+        assert_eq!(held(&keys, at(100.8)), Vec::<u8>::new(), "released");
+        // A zero hold falls back to the default rather than dropping the key.
+        assert_eq!(held(&keys, at(200.1)), vec![b'X']);
+        assert_eq!(held(&keys, at(200.25)), Vec::<u8>::new());
+        // An absurd hold does not panic on the sum.
+        assert_eq!(held(&keys, at(300.5)), vec![b'Z']);
+    }
+
     #[test]
     fn scripted_keys_merge_into_connected_host_pad() {
         let (hub, host) = fake();
@@ -1929,3 +1961,7 @@ mod tests {
         release(back);
     }
 }
+
+
+
+
