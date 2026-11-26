@@ -127,7 +127,8 @@ impl Inst {
 /// count. Fails on instructions the IR cannot express yet
 /// ([`ShaderError::Unsupported`]).
 pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderError> {
-    build_bounded(code, wave64, vgprs, &HashMap::new())
+    let list = decode(code)?;
+    build_bounded_owned(code, list, wave64, vgprs, &HashMap::new())
 }
 
 /// [`build`], with the largest M0 (at most 255) each relative move can see,
@@ -138,7 +139,31 @@ pub fn build_bounded(
     vgprs: u16,
     m0_max: &HashMap<usize, u8>,
 ) -> Result<Program, ShaderError> {
-    let list = gfx10::decode(code)?;
+    let list = decode(code)?;
+    build_bounded_owned(code, list, wave64, vgprs, m0_max)
+}
+
+pub(crate) fn decode(code: &[u8]) -> Result<Vec<Instruction>, ShaderError> {
+    gfx10::decode(code)
+}
+
+pub(crate) fn build_bounded_decoded(
+    code: &[u8],
+    list: &[Instruction],
+    wave64: bool,
+    vgprs: u16,
+    m0_max: &HashMap<usize, u8>,
+) -> Result<Program, ShaderError> {
+    build_bounded_owned(code, list.to_vec(), wave64, vgprs, m0_max)
+}
+
+pub(crate) fn build_bounded_owned(
+    code: &[u8],
+    list: Vec<Instruction>,
+    wave64: bool,
+    vgprs: u16,
+    m0_max: &HashMap<usize, u8>,
+) -> Result<Program, ShaderError> {
     let lanes = 1 + u8::from(wave64);
     let isa = |offset, reason| ShaderError::Isa { offset, reason };
 
