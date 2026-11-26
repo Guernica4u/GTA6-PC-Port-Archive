@@ -2343,3 +2343,65 @@ fn v_cvt_f16_u16_and_i16_take_abs_and_neg_on_bit_15() {
         }
     }
 }
+
+/// The 16-bit integer operations take `abs` and `neg` on bit 15 of their
+/// sources too: there is no integer negation, so `-v1 + v2` of 0 and 0xb717
+/// is 0x3717 (0x8000 + 0xb717). The rows and the expected values are
+/// gfx1036's; the high half of v0 is kept.
+#[test]
+fn sixteen_bit_integer_operations_take_abs_and_neg_on_bit_15() {
+    // v_mov_b32 v0, v4; <op>_e64 v0, v1, v2 with abs/neg
+    let rows: [[u32; 4]; 7] = [
+        [0x0000_0000, 0xB8D1_B717, 0xB380_0000, 0x0BAD_F00D],
+        [0x0000_0001, 0x477F_EFFF, 0x0000_0001, 0x0BAD_F00D],
+        [0x3F7F_FFFF, 0xFFE0_0001, 0x42C9_0000, 0x0BAD_F00D],
+        [0x7C00_8000, 0x7800_D640, 0xB800_7FFF, 0x0BAD_F00D],
+        [0x0400_8001, 0x4248_3800, 0xFE00_03FF, 0x0BAD_F00D],
+        [0x0000_7FFF, 0x7C01_3E00, 0xFBFF_0200, 0x0BAD_F00D],
+        [0x0000_0003, 0x0000_7FFF, 0x0000_0100, 0x0BAD_F00D],
+    ];
+    // (opcode, its VOP3 opcode, abs bits, neg bits)
+    let cases: [(&str, u16, u32, u32); 12] = [
+        ("v_add_nc_u16", 0x303, 0, 0b01),
+        ("v_add_nc_u16", 0x303, 0, 0b10),
+        ("v_add_nc_u16", 0x303, 0b01, 0),
+        ("v_add_nc_u16", 0x303, 0b10, 0b10),
+        ("v_sub_nc_u16", 0x304, 0, 0b10),
+        ("v_mul_lo_u16", 0x305, 0b01, 0),
+        ("v_max_i16", 0x30A, 0, 0b01),
+        ("v_max_i16", 0x30A, 0b10, 0),
+        ("v_min_u16", 0x30B, 0b10, 0b10),
+        ("v_lshlrev_b16", 0x314, 0, 0b10),
+        ("v_lshlrev_b16", 0x314, 0b01, 0),
+        ("v_max_u16", 0x309, 0, 0b10),
+    ];
+    // The low half of the result per case and row.
+    let want: [[u16; 7]; 12] = [
+        [0x3717, 0x7000, 0x8000, 0xD640, 0x3801, 0x3DFF, 0x0002],
+        [0x3717, 0x7000, 0x8000, 0xD640, 0x3801, 0x3DFF, 0x0002],
+        [0xB717, 0xF000, 0x8000, 0xD640, 0x3801, 0xBDFF, 0x8002],
+        [0xB717, 0xF000, 0x8000, 0x5640, 0x3801, 0x3DFF, 0x0002],
+        [0xC8E9, 0x9002, 0x7FFE, 0x29C0, 0xC801, 0xC1FF, 0x0004],
+        [0x0000, 0xEFFF, 0x7FFF, 0x0000, 0x3800, 0xC200, 0x7FFD],
+        [0xB717, 0xEFFF, 0x7FFF, 0x0000, 0x3800, 0x3E00, 0x7FFF],
+        [0x3717, 0x6FFF, 0x0001, 0x5640, 0x3800, 0x7FFF, 0x7FFF],
+        [0x0000, 0x0001, 0x8001, 0x8000, 0x8001, 0x7FFF, 0x0003],
+        [0x3717, 0xDFFE, 0x8000, 0x5640, 0x7000, 0x0000, 0xFFF8],
+        [0xB717, 0xDFFE, 0x8000, 0xD640, 0x7000, 0x0000, 0xFFF8],
+        [0x3717, 0x6FFF, 0xFFFF, 0x8000, 0xB800, 0xBE00, 0xFFFF],
+    ];
+    for (&(what, op, abs, neg), want) in cases.iter().zip(want) {
+        let w = vop3(op, 0, vgpr(1), vgpr(2), 0x80);
+        let shader = build_valu_cs(&[vop1(0x001, 0, vgpr(4)), w[0] | abs << 8, w[1] | neg << 29]);
+        run_cases(&shader, &rows, |backend, i, inp, got| {
+            let want = inp[3] & 0xFFFF_0000 | u32::from(want[i]);
+            assert_eq!(
+                got,
+                want,
+                "{backend}: {what} (abs {abs:#04b}, neg {neg:#04b}) of {:#06x}, {:#06x} = {got:#010x}, want {want:#010x}",
+                inp[0] & 0xFFFF,
+                inp[1] & 0xFFFF,
+            );
+        });
+    }
+}
