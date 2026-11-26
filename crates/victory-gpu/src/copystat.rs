@@ -104,8 +104,16 @@ pub(crate) enum C {
     /// Title threads writing a view into a shader-visible heap: time
     /// waiting for the heaps' lock (held by heap syncs and other writers).
     MirrorWaitUs,
+    /// The title's calls into its command lists that did work, the time
+    /// they took, and the time they waited for the list's own locks before
+    /// doing any (`list::with_state`): the recording side of a frame, which
+    /// nothing else on this line times. A call that costs far more than its
+    /// instructions is one waiting on the submission's locks.
+    Calls,
+    CallUs,
+    CallWaitUs,
 }
-const COUNTERS: usize = 61;
+const COUNTERS: usize = 64;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -235,7 +243,7 @@ pub(crate) fn log(frames: f64) {
          refresh batches, steps (each with the batch it flushes): refresh {:.1} ms, copy {:.1} ms, \
          work {:.1} ms, GPU writes {:.1} ms, textures {:.1} ms, heaps {:.1} ms, title memory {:.1} ms; \
          heap texture uploads {:.1} ms, state preludes {:.1} ms, heap slots the title copied {:.1} ms ({:.0} slots), title threads waiting to write views {:.1} ms; copying back compared {:.1} MB          in {:.1} ms; marked pages: {:.0} compared, {:.1} MB written back in {:.1} ms, {:.0} kept the title's, {:.0} saved; working set {:.0} MB, \
-         {:.0} hard faults",
+         {:.0} hard faults; list calls {:.0} in {:.1} ms, {:.1} ms waiting for the list",
         c[C::Submissions as usize],
         c[C::Copies as usize],
         mb(c[C::CopyBytes as usize]),
@@ -304,6 +312,9 @@ pub(crate) fn log(frames: f64) {
             let hard = hard_faults();
             (hard - HARD.swap(hard, Relaxed).min(hard)) as f64 / frames
         },
+        c[C::Calls as usize],
+        ms(c[C::CallUs as usize]),
+        ms(c[C::CallWaitUs as usize]),
     );
     let held: Vec<String> = crate::watch::held_times()
         .iter()

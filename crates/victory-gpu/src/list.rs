@@ -132,12 +132,32 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
+///
+/// Diagnosed: how many of the title's calls did work, how long they took,
+/// and how long they waited for the list's own locks first. Nothing else on
+/// the frame line times recording, so a call that costs far more than its
+/// instructions can only be read as time waiting on a submission — this
+/// separates the two.
 #[cfg(windows)]
 pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
     let Some(list) = host_list(this) else { return };
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
-    f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
+    #[cfg(feature = "diagnostics")]
+    let waiting = started.elapsed().as_micros() as u64;
+    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(feature = "diagnostics")]
+    let handler = std::time::Instant::now();
+    f(list, &mut state);
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::Calls, 1);
+        add(C::CallUs, handler.elapsed().as_micros() as u64);
+        add(C::CallWaitUs, waiting);
+    }
 }
 
 /// The host list a title list's calls record into (its current segment),
