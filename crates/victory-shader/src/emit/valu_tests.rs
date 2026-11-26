@@ -2350,7 +2350,11 @@ fn vs_rt_and_viewport_array_index_exports_render_across_slices_and_viewports() {
         super::emit(&c, &native, &p, &st, &io, &res).expect("PS emit")
     };
 
-    let build_vs = |misc_z: u32, clip: Option<f32>, osg_elems: Vec<SigElement>| -> HostShader {
+    let translate_vs = |misc_z: u32,
+                        clip: Option<f32>,
+                        osg_elems: Vec<SigElement>,
+                        misc_fill: u8|
+     -> Result<HostShader, crate::ShaderError> {
         // v4, v5 = vertex input POSITION.xy; v6 = 0.0; v7 = 1.0.
         let mut words = vec![
             vop1(0x01, 6, 128),
@@ -2360,7 +2364,11 @@ fn vs_rt_and_viewport_array_index_exports_render_across_slices_and_viewports() {
             misc_z,
         ];
         words.extend_from_slice(&exp_inst(12, 0xF, [4, 5, 6, 7], false, false)); // pos0
-        words.extend_from_slice(&exp_inst(13, 0x4, [0, 0, 8, 0], clip.is_none(), false)); // pos1.z
+        // The compiler enables all four channels in pos1, with the
+        // packed layer/viewport in z and zeros in the other three.
+        words.extend_from_slice(&exp_inst(
+            13, 0xF, [misc_fill, misc_fill, 8, misc_fill], clip.is_none(), false,
+        ));
         if let Some(clip_val) = clip {
             words.push(vop1(0x01, 9, 255));
             words.push(clip_val.to_bits());
@@ -2395,7 +2403,7 @@ fn vs_rt_and_viewport_array_index_exports_render_across_slices_and_viewports() {
         let st = structure::structure(&p).expect("VS structure");
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("VS res");
         let io = io::raise(&p, &native).expect("VS io");
-        let vs = super::emit(&c, &native, &p, &st, &io, &res).expect("VS emit");
+        let vs = super::emit(&c, &native, &p, &st, &io, &res)?;
 
         let host_c = Container::parse(&vs.dxil).expect("emitted VS container");
         let sfi0 = u64::from_le_bytes(
@@ -2419,7 +2427,10 @@ fn vs_rt_and_viewport_array_index_exports_render_across_slices_and_viewports() {
             v.validate(&mut copy).expect("VS DXIL validation failed");
             assert_eq!(copy[4..20], ours[..], "VS container hash mismatch");
         }
-        vs
+        Ok(vs)
+    };
+    let build_vs = |misc_z, clip, osg_elems| {
+        translate_vs(misc_z, clip, osg_elems, 6).expect("full-mask pos1 with zero padding")
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -2461,6 +2472,14 @@ fn vs_rt_and_viewport_array_index_exports_render_across_slices_and_viewports() {
     };
     let vs_both_keep = build_vs(0x0001_0001, Some(1.0), both_sig());
     let vs_both_clip = build_vs(0x0001_0001, Some(-1.0), both_sig());
+    // The other channels can also carry real data. Nonzero values and
+    // unknown vertex inputs still fall outside this lowering.
+    for fill in [7, 4] {
+        let Err(error) = translate_vs(0x0001_0001, Some(1.0), both_sig(), fill) else {
+            panic!("unsupported pos1 channel from v{fill} was accepted");
+        };
+        assert!(error.to_string().contains("clip, cull or point-size exports"), "{error}");
+    }
 
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let adapters = Host::adapters();

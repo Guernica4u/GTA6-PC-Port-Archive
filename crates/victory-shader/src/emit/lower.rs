@@ -10008,6 +10008,11 @@ impl<'a> Lower<'a> {
                     // `SV_RenderTargetArrayIndex` in bits 0..15 and
                     // `SV_ViewportArrayIndex` in bits 16..31.
                     if ch != 2 {
+                        // The console compiler enables every channel, but
+                        // writes zero to the unused components.
+                        if self.konst(&HashMap::new(), value) == Some(0) {
+                            continue;
+                        }
                         return Err("clip, cull or point-size exports");
                     }
                     if let Some(id) = by_kind(4) {
