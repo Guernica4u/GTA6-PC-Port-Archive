@@ -2288,8 +2288,8 @@ fn v_mul_legacy_f32_treats_denormals_as_zero() {
 /// which is what the same entry documents.
 ///
 /// The independent runtime reference had an observed error below 6e-9 binary32 ULP over the band.
-/// Its conservative error bound is 2.24e-8 ULP. The inward guard requires the reference to
-/// stay inside its binade before applying the 1-ULP criterion.
+/// Its conservative error bound is 2.24e-8 ULP. The guard keeps the reference's uncertainty
+/// within one binade and narrows the acceptance window by more than the reference error.
 ///
 /// `log2(1 + t)` in binary64 from the atanh identity: with `z = t / (2 + t)`, which stays within 1/15
 /// over this band, the value is `(2 * z) * (1 + z^2/3 + z^2/5 + ... + z^2/15) / ln 2`, the sum built
@@ -2315,7 +2315,7 @@ fn reference_grid(y: f64) -> (f64, f64) {
 }
 
 /// The operands of the corrected band, in increasing binary32 encoding order, by the deterministic
-/// integer recipe qualified in VIC-0018: the 152 encodings the published regression covered, 33
+/// integer recipe below: the 152 encodings from the earlier narrow-band regression, 33
 /// encodings spread over each of the two extensions out to 1/8, clusters within two steps of every
 /// old and new band edge and of the |x - 1| = 2^-4 marks, the six binade-transition anchors with
 /// their immediate neighbours, and the encodings named by the upstream report and by the accuracy
@@ -2439,10 +2439,8 @@ fn log_fallback_probe_inputs() -> Vec<u32> {
 enum Held {
     /// Direct3D's published bound for `log` alone - absolute 2^-21 on inputs in [0.5, 2], relative
     /// 2^-21 elsewhere. Used outside the corrected interval, where this translator still runs DXIL's
-    /// `Log`: RDNA2 asks for 1 ULP across its whole domain and the host does not deliver that near
-    /// unity (VIC-0005 measured up to 86% relative error there), so those inputs are held to what
-    /// this backend promises while their distance from the guest bound is printed in the
-    /// `VIC6 FALLBACK` lines.
+    /// `Log`. The host bound applies to these assertions. Separate fallback probes report
+    /// the remaining gap in guest ULPs.
     HostPublishedBound,
     /// Special results both the guest and D3D state exactly: `log(+-0) = -inf`, `log(+inf) = +inf`.
     NegativeInfinity,
@@ -2516,6 +2514,7 @@ fn within_published_log_bound(input_bits: u32, actual_bits: u32) -> bool {
 #[test]
 fn v_log_f32_near_unity_meets_rdna2_one_ulp() {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let verbose = std::env::var("VICTORY_LOG_F32_VERBOSE").as_deref() == Ok("1");
 
     // One `v_log_f32 v0, v1`. The operand arrives as a root constant, so every input reaches the
     // operation as a runtime VGPR value nothing can fold away at translate time.
@@ -2633,15 +2632,16 @@ fn v_log_f32_near_unity_meets_rdna2_one_ulp() {
         for &input in &in_band {
             let got = run(input)
                 .unwrap_or_else(|e| panic!("{label}: dispatch at {input:08x} failed: {e}"));
-            println!("VIC6 BITS {label} {input:08x} {got:08x}");
+            if verbose {
+                println!("VIC6 BITS {label} {input:08x} {got:08x}");
+            }
             checked += 1;
             // The binary32 operand converts exactly, so `t` is exact, and the reference is the
             // mathematical result to about 6e-9 of a binary32 ULP.
             let reference = log2_reference(f64::from(f32::from_bits(input)) - 1.0);
             let (step, binade) = reference_grid(reference);
-            // One 24th of a ULP of guard. It is far bigger than the reference's own error and far
-            // smaller than a ULP, so a result that passes with the guard taken off is within one
-            // ULP of the true mathematical value, not merely of the reference.
+            // A guard of 2^-24 ULP exceeds the reference error bound. Accept only when the
+            // uncertainty stays in one binade and the distance is at most one ULP minus the guard.
             let guard = step * 2f64.powi(-24);
             let magnitude = reference.abs();
             if !(magnitude - guard > binade && magnitude + guard < 2.0 * binade) {
@@ -2669,7 +2669,9 @@ fn v_log_f32_near_unity_meets_rdna2_one_ulp() {
         for &input in LOG_EXACT_POSITIVE_ZERO_INPUTS {
             let got = run(input)
                 .unwrap_or_else(|e| panic!("{label}: dispatch at {input:08x} failed: {e}"));
-            println!("VIC6 BITS {label} {input:08x} {got:08x}");
+            if verbose {
+                println!("VIC6 BITS {label} {input:08x} {got:08x}");
+            }
             checked += 1;
             if got != 0x0000_0000 {
                 problems.push(format!("{input:08x}: expected bit-exact +0, got {got:08x}"));
@@ -2679,7 +2681,9 @@ fn v_log_f32_near_unity_meets_rdna2_one_ulp() {
         for &(input, held) in LOG_BEYOND_INTERVAL_ROWS {
             let got = run(input)
                 .unwrap_or_else(|e| panic!("{label}: dispatch at {input:08x} failed: {e}"));
-            println!("VIC6 BITS {label} {input:08x} {got:08x}");
+            if verbose {
+                println!("VIC6 BITS {label} {input:08x} {got:08x}");
+            }
             checked += 1;
             let ok = match held {
                 Held::HostPublishedBound => within_published_log_bound(input, got),
@@ -2706,7 +2710,9 @@ fn v_log_f32_near_unity_meets_rdna2_one_ulp() {
             let ulp = (f64::from(f32::from_bits(got)) - reference).abs() / step;
             probe_over_one += usize::from(ulp > 1.0);
             probe_worst_ulp = probe_worst_ulp.max(ulp);
-            println!("VIC6 FALLBACK {label} {input:08x} {got:08x} {ulp:.4}");
+            if verbose {
+                println!("VIC6 FALLBACK {label} {input:08x} {got:08x} {ulp:.4}");
+            }
         }
 
         let violation_count = problems.len();
@@ -2727,9 +2733,8 @@ fn v_log_f32_near_unity_meets_rdna2_one_ulp() {
         ran += 1;
     }
     println!("VIC6 BACKENDS ran={ran} in_band={}", in_band.len());
-    // A backend that is simply absent stays a skip, as elsewhere in these GPU tests, so this suite
-    // still runs where no physical NVIDIA device exists. Which backends actually answered is in the
-    // VIC6 ADAPTER, VIC6 BACKEND and VIC6 BACKENDS lines above, not hidden inside the pass count.
+    // An unavailable backend is skipped, as in other GPU tests. The adapter and backend
+    // summaries show which devices actually ran.
     if !open_problems.is_empty() {
         panic!("{}", open_problems.join("\n"));
     }

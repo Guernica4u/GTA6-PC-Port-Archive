@@ -6392,7 +6392,7 @@ impl<'a> Lower<'a> {
                     22 => self.fract(a, 1.0, f32::from_bits(0x3F7F_FFFF)),
                     // RDNA2 holds `v_log_f32` to 1 ULP and to exact +0 at the input 1.0; DXIL's bound
                     // near unity is absolute only, so that one instruction gets its own lowering.
-                    _ if name == "v_log_f32" => self.log_f32(a),
+                    23 => self.log_f32(a),
                     _ => self.unary(op, a),
                 };
                 float(self, r)
