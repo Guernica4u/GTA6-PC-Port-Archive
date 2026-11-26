@@ -348,7 +348,7 @@ impl Shadow {
         let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let segments = &mut before.0;
-        let epoch = crate::watch::current_epoch();
+        let refreshed_epoch = self.refreshed_epoch.load(Ordering::Acquire);
         // The segments the range overlaps or touches.
         let first = segments.partition_point(|(at, bytes, _)| at + bytes.len() < from);
         let last = first + segments[first..].iter().take_while(|(at, _, _)| *at <= to).count();
@@ -358,6 +358,10 @@ impl Shadow {
         {
             return;
         }
+        let epoch = segments[first..last]
+            .iter()
+            .map(|(_, _, ep)| *ep)
+            .fold(refreshed_epoch, u64::min);
         let start = segments.get(first).filter(|_| first < last).map_or(from, |s| s.0.min(from));
         let end = segments[first..last].last().map_or(to, |(at, bytes, _)| (at + bytes.len()).max(to));
         #[cfg(feature = "diagnostics")]
@@ -2033,6 +2037,65 @@ pub(crate) mod tests {
         // SAFETY: our pool.
         let got = unsafe { ((p + 0x1000) as *const u8).read_volatile() };
         assert_eq!(got, 0xCC, "GPU bytes must land in title memory");
+        unregister(p, p as u64);
+        crate::watch::tests::free(p);
+    }
+
+    /// Merging adjacent/overlapping snapshot segments must not discard the earlier
+    /// segment's snapshot epoch, so a remap of the earlier segment is not overwritten.
+    #[test]
+    fn merging_overlapping_snapshot_segments_preserves_earlier_epoch() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            return; // no host GPU here
+        };
+        copy.update(p, len);
+        // S1 snapshots page 0:
+        copy.writing(p, PAGE, false);
+        // Page 0 is remapped!
+        crate::watch::title_memory_remapped(p, PAGE);
+        // SAFETY: our pool.
+        unsafe { (p as *mut u8).write_volatile(0x22) };
+        // S1 now snapshots touching page 1, merging with page 0:
+        copy.writing(p + PAGE, PAGE, false);
+        // GPU writes to page 0:
+        copy.write_host(p as u64, &[0xAA]);
+        // Copy back:
+        copy.copy_back(p, 2 * PAGE);
+        // SAFETY: our pool.
+        let title0 = unsafe { (p as *const u8).read_volatile() };
+        assert_eq!(title0, 0x22, "remapped page 0 must not be overwritten after merge");
+        unregister(p, p as u64);
+        crate::watch::tests::free(p);
+    }
+
+    /// Remapping title memory after `copy.update` but before `copy.writing` must
+    /// be respected, because `self.data` holds bytes from `refreshed_epoch`.
+    #[test]
+    fn remap_between_update_and_writing_preserves_new_title_bytes() {
+        let p = crate::watch::tests::pool(1);
+        register(p, p as u64, PAGE as u64);
+        let Some(copy) = find(p as u64, PAGE as u64) else {
+            unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            return; // no host GPU here
+        };
+        copy.update(p, PAGE);
+        // Remap happens AFTER update:
+        crate::watch::title_memory_remapped(p, PAGE);
+        // SAFETY: our pool.
+        unsafe { (p as *mut u8).write_volatile(0x22) };
+        // Now writing is called:
+        copy.writing(p, PAGE, false);
+        copy.write_host(p as u64, &[0xAA]);
+        copy.copy_back(p, PAGE);
+        // SAFETY: our pool.
+        let title = unsafe { (p as *const u8).read_volatile() };
+        assert_eq!(title, 0x22, "remap between update and writing must not be overwritten");
         unregister(p, p as u64);
         crate::watch::tests::free(p);
     }
