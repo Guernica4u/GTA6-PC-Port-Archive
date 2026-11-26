@@ -32,7 +32,7 @@
 //! them (`make`). Stores and serialising keep the lock: the size asked for
 //! must still be right when the bytes are written.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -146,13 +146,27 @@ fn shard_of(name: &str) -> usize {
 /// older complete snapshot could be published over a newer one.
 static SAVING: Mutex<()> = Mutex::new(());
 
-fn libraries() -> Option<&'static [Mutex<Library>; SHARDS]> {
-    static LIBRARIES: OnceLock<Option<[Mutex<Library>; SHARDS]>> = OnceLock::new();
+/// A shard of the library: the interface loads use, and the state stores and
+/// saves lock.
+struct Shared {
+    /// The same pipeline library, for loads only. A load holds nothing here,
+    /// so it never waits out a save: a save holds the shard's lock while it
+    /// serialises (230-600 MB in the world, #1683), some of them on the
+    /// pipeline workers themselves, and every load of the shard waited for
+    /// it (#1615's remainder, #2179).
+    loads: ID3D12PipelineLibrary1,
+    /// The library stores, saves and pre-build notes lock: the size a save
+    /// asks for must still be right when it serialises.
+    state: Mutex<Library>,
+}
+
+fn libraries() -> Option<&'static [Shared; SHARDS]> {
+    static LIBRARIES: OnceLock<Option<[Shared; SHARDS]>> = OnceLock::new();
     LIBRARIES
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let read = |file| DIR.get().and_then(|d| std::fs::read(d.join(file)).ok());
-            let mut shards: Vec<Mutex<Library>> = Vec::with_capacity(SHARDS);
+            let mut shards: Vec<Shared> = Vec::with_capacity(SHARDS);
             for shard in 0..SHARDS {
                 let blob = read(shard_file(shard)).unwrap_or_default();
                 let tag = tag(&blob);
@@ -163,7 +177,11 @@ fn libraries() -> Option<&'static [Mutex<Library>; SHARDS]> {
                 {
                     library.prebuilt = listed(&list, &tag);
                 }
-                shards.push(Mutex::new(library));
+                // Loads take the interface alone: the library is
+                // free-threaded but for loads of one name, which `NAMES`
+                // keeps apart from each other.
+                let loads = library.library.clone();
+                shards.push(Shared { loads, state: Mutex::new(library) });
             }
             shards.try_into().ok()
         })
@@ -249,6 +267,7 @@ fn listed(list: &[u8], tag: &str) -> HashSet<String> {
 pub(crate) fn prebuilt(key: &str) -> bool {
     libraries().is_some_and(|l| {
         l[shard_of(key)]
+            .state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .prebuilt
@@ -259,7 +278,10 @@ pub(crate) fn prebuilt(key: &str) -> bool {
 /// The pre-build has the title pipeline `key` in the library now.
 pub(crate) fn note_prebuilt(key: String) {
     if let Some(libraries) = libraries() {
-        let mut shard = libraries[shard_of(&key)].lock().unwrap_or_else(|e| e.into_inner());
+        let mut shard = libraries[shard_of(&key)]
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         shard.prebuilt_changed |= shard.prebuilt.insert(key);
     }
 }
@@ -292,14 +314,10 @@ pub(crate) fn pipeline(
         return create();
     };
     let _held = NAMES.hold(name);
-    // The interface alone under the lock: loads take up to seconds. Its
-    // blob lives as long as the library, which is never dropped.
-    let loads = libraries[shard_of(name)]
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .library
-        .clone();
-    if let Ok(pso) = load(&loads, PCWSTR(wide.as_ptr())) {
+    // No lock at all: the shard's load interface lives as long as the
+    // library, which is never dropped, and loads add nothing to it.
+    let loads = &libraries[shard_of(name)].loads;
+    if let Ok(pso) = load(loads, PCWSTR(wide.as_ptr())) {
         LOADED.fetch_add(1, Ordering::Relaxed);
         return Ok(pso);
     }
@@ -309,6 +327,7 @@ pub(crate) fn pipeline(
     let pso = create()?;
     MADE.fetch_add(1, Ordering::Relaxed);
     let mut l = libraries[shard_of(name)]
+        .state
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     // SAFETY: a live pipeline; a name already stored (a description that
@@ -358,7 +377,7 @@ pub(crate) fn save(now: bool) {
     let mut saved = 0u32;
     let mut total = 0usize;
     for (shard, library) in libraries.iter().enumerate() {
-        if let Some(bytes) = save_shard(dir, shard, library, write_atomically) {
+        if let Some(bytes) = save_shard(dir, shard, &library.state, write_atomically) {
             saved += 1;
             total += bytes;
         }
@@ -405,11 +424,15 @@ fn save_shard(
         if l.added == 0 && !l.prebuilt_changed {
             return None;
         }
-        // SAFETY: a buffer of the size the library asks for.
-        let bytes = unsafe {
-            let mut bytes = vec![0u8; l.library.GetSerializedSize()];
-            l.library.Serialize(&mut bytes).map(|()| bytes)
+        // SAFETY: a plain size query on a live library.
+        let size = unsafe { l.library.GetSerializedSize() };
+        let Some(mut bytes) = zeroed(size) else {
+            // Left for a later save: the pipelines stay counted as added.
+            tracing::warn!(bytes = size, shard, "no memory to serialise the host pipeline library shard; saved later");
+            return None;
         };
+        // SAFETY: a buffer of the size the library asks for.
+        let bytes = unsafe { l.library.Serialize(&mut bytes).map(|()| bytes) };
         match bytes {
             Ok(bytes) => {
                 // Kept beside the bytes it holds for.
@@ -438,6 +461,18 @@ fn save_shard(
     l.added -= added;
     l.prebuilt_changed = l.prebuilt.len() != prebuilt_count;
     Some(blob.len())
+}
+
+/// `n` zero bytes, or `None` when the host has no memory for them. A shard
+/// holds each pipeline's machine code (about 1.7 GB in all on NVIDIA after
+/// `--cache --pipelines`), and an infallible allocation of that size aborted
+/// the whole process mid-run ("memory allocation of 2650101862 bytes failed",
+/// RTX 4050 Laptop, 32 GB).
+fn zeroed(n: usize) -> Option<Vec<u8>> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(n).ok()?;
+    v.resize(n, 0);
+    Some(v)
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
@@ -479,15 +514,30 @@ fn created() -> (u64, usize) {
 /// list as loaded), and in this one.
 #[derive(Default)]
 struct Used {
-    before: HashSet<String>,
+    /// Each earlier key with its place in the list as loaded: the list is
+    /// kept most recent run first, so a lower place is a more recent run.
+    before: HashMap<String, usize>,
     now: HashSet<String>,
 }
 
 impl Used {
-    /// The list to keep: this run's keys, then earlier runs' others, at
-    /// most `EARLY_MAX` (the oldest go once it is full).
+    /// The list as saved: one key a line, most recent run first (a list in
+    /// no order, as earlier builds saved it, reads as well).
+    fn read(listed: &str) -> Used {
+        let mut before = HashMap::new();
+        for (place, key) in listed.lines().filter(|l| !l.is_empty()).enumerate() {
+            before.entry(key.to_owned()).or_insert(place);
+        }
+        Used { before, now: HashSet::new() }
+    }
+
+    /// The list to keep: this run's keys, then earlier runs' others, most
+    /// recent first, at most `EARLY_MAX` (the oldest go once it is full -
+    /// a set gave no order to drop by, so any earlier keys made room).
     fn list(&self) -> Vec<String> {
-        let earlier = self.before.iter().filter(|k| !self.now.contains(*k));
+        let mut earlier: Vec<_> = self.before.iter().filter(|(k, _)| !self.now.contains(*k)).collect();
+        earlier.sort_unstable_by_key(|&(_, &place)| place);
+        let earlier = earlier.into_iter().map(|(k, _)| k);
         self.now.iter().chain(earlier).take(EARLY_MAX).cloned().collect()
     }
 }
@@ -505,9 +555,9 @@ fn used() -> std::sync::MutexGuard<'static, Option<Used>> {
             .get()
             .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
             .unwrap_or_default();
-        let before: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
-        tracing::info!(pipelines = before.len(), "title pipelines to start early");
-        *used = Some(Used { before, now: HashSet::new() });
+        let read = Used::read(&listed);
+        tracing::info!(pipelines = read.before.len(), "title pipelines to start early");
+        *used = Some(read);
     }
     used
 }
@@ -520,7 +570,7 @@ pub(crate) fn keep_early_list() {
 
 /// Whether the title pipeline with `key` was drawn with in an earlier run.
 pub(crate) fn wanted_early(key: &str) -> bool {
-    used().as_ref().is_some_and(|u| u.before.contains(key))
+    used().as_ref().is_some_and(|u| u.before.contains_key(key))
 }
 
 /// The title pipeline with `key` was drawn or dispatched with.
@@ -547,15 +597,25 @@ mod tests {
         assert_ne!(a, name("graphics", b"root", &[b"vsp", b"s"], "state"));
     }
 
-    /// This run's keys stay in the list; earlier runs' fill it up to the cap.
+    /// This run's keys stay in the list; earlier runs' fill it up to the cap,
+    /// most recent first - once it is full the *oldest* runs' keys make room.
     #[test]
     fn the_early_list_keeps_this_run_first() {
-        let keys = |r: std::ops::Range<usize>| r.map(|i| format!("{i:032x}")).collect::<HashSet<_>>();
-        let used = Used { before: keys(0..EARLY_MAX), now: keys(EARLY_MAX - 10..EARLY_MAX + 10) };
+        let keys = |r: std::ops::Range<usize>| r.map(|i| format!("{i:032x}")).collect::<Vec<_>>();
+        // Earlier runs' keys, place 0 the most recent.
+        let before = keys(0..EARLY_MAX).into_iter().enumerate().map(|(place, k)| (k, place)).collect();
+        let used = Used { before, now: keys(EARLY_MAX - 10..EARLY_MAX + 10).into_iter().collect() };
         let list = used.list();
         assert_eq!(list.len(), EARLY_MAX);
         assert!(used.now.iter().all(|k| list.contains(k)));
         assert_eq!(list.iter().collect::<HashSet<_>>().len(), EARLY_MAX, "no key twice");
+        // Ten earlier-only keys do not fit: the ten oldest (the highest
+        // places) are the ones left out, not any ten.
+        assert!(list.contains(&format!("{:032x}", 0)), "the most recent earlier key is kept");
+        assert!(
+            !list.contains(&format!("{:032x}", EARLY_MAX - 11)),
+            "the oldest earlier key made room"
+        );
     }
 
     /// A pipeline always lands in the same shard, and a corpus of names
@@ -742,6 +802,102 @@ mod tests {
         for (i, code) in codes.iter().enumerate() {
             shared.load(i, code).expect("every pipeline");
         }
+    }
+
+    /// A stored pipeline loads while a save holds its shard's lock (a save
+    /// serialises the whole shard, for seconds in the world).
+    #[test]
+    fn a_pipeline_loads_while_a_save_holds_the_library() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::core::s;
+        let (Some(device), Some(shards)) = (
+            crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()),
+            libraries(),
+        ) else {
+            return; // no host GPU here
+        };
+        let shard = &shards[shard_of("test: a pipeline loads while a save holds the library")];
+        // No resources, and the root signature made apart: a compiler need
+        // not keep one the source names (Wine's does not).
+        let source = "[numthreads(1, 1, 1)] void main() {}";
+        let mut blob = None;
+        // SAFETY: the source outlives the call; the blob is read within it.
+        let code = unsafe {
+            if D3DCompile(
+                source.as_ptr().cast(),
+                source.len(),
+                None,
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut blob,
+                None,
+            )
+            .is_err()
+            {
+                return; // no shader compiler here
+            }
+            let blob = blob.unwrap();
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+                .to_vec()
+        };
+        // SAFETY: an empty description; the blob is read while it lives.
+        let root: ID3D12RootSignature = unsafe {
+            let mut blob = None;
+            D3D12SerializeRootSignature(
+                &D3D12_ROOT_SIGNATURE_DESC::default(),
+                D3D_ROOT_SIGNATURE_VERSION_1,
+                &mut blob,
+                None,
+            )
+            .unwrap();
+            let blob = blob.unwrap();
+            let bytes = std::slice::from_raw_parts(
+                blob.GetBufferPointer().cast::<u8>(),
+                blob.GetBufferSize(),
+            );
+            device.CreateRootSignature(0, bytes).unwrap()
+        };
+        struct Made(ID3D12Device1, ID3D12RootSignature, Vec<u8>);
+        // SAFETY: D3D12 objects are free-threaded.
+        unsafe impl Sync for Made {}
+        impl Made {
+            fn get(&self, made: bool) -> windows::core::Result<ID3D12PipelineState> {
+                let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    // SAFETY: a borrowed pointer the description never releases.
+                    pRootSignature: unsafe { std::mem::transmute_copy(&self.1) },
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: self.2.as_ptr().cast(),
+                        BytecodeLength: self.2.len(),
+                    },
+                    ..Default::default()
+                };
+                pipeline(
+                    "test: a pipeline loads while a save holds the library",
+                    // SAFETY: the description points at live data.
+                    |library, name| unsafe { library.LoadComputePipeline(name, &desc) },
+                    || match made {
+                        // SAFETY: as above.
+                        true => unsafe { self.0.CreateComputePipelineState(&desc) },
+                        false => panic!("made again, not loaded"),
+                    },
+                )
+            }
+        }
+        let made = Made(device, root, code);
+        made.get(true).expect("made and stored");
+        let saving = shard.state.lock().unwrap_or_else(|e| e.into_inner());
+        let (done, loaded) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            let made = &made;
+            s.spawn(move || done.send(made.get(false).is_ok()));
+            let loaded = loaded.recv_timeout(std::time::Duration::from_secs(30));
+            drop(saving);
+            assert_eq!(loaded, Ok(true), "the load waited for the save");
+        });
     }
 
     /// A key the pre-build records while a shard's files are being written
