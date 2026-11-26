@@ -142,6 +142,7 @@ impl Shader {
     /// shader that does not translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
         if let Some(t) = self.translated.get() {
+            self.finish_translation(t.is_some());
             return t.as_ref();
         }
         let out = self
@@ -190,6 +191,11 @@ impl Shader {
     ) -> (Option<bool>, Option<bool>) {
         let mut deps = self.deps.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ok) = deps.done {
+            return (Some(ok), None);
+        }
+        if let Some(t) = self.translated.get() {
+            let ok = t.is_some();
+            deps.done = Some(ok);
             return (Some(ok), None);
         }
         deps.waiters.push(Arc::downgrade(pending));
