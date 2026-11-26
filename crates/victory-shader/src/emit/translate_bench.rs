@@ -90,6 +90,7 @@ fn bench_translate() {
         let n = std::time::Instant::now();
         let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         stages[2] += n.elapsed().as_secs_f64();
+        let n = std::time::Instant::now();
         let io = crate::io::raise(&p, &native).unwrap();
         stages[3] += n.elapsed().as_secs_f64();
         let n = std::time::Instant::now();
