@@ -997,6 +997,39 @@ enum Step {
     Memory(usize),
 }
 
+/// FxHash's multiply-rotate step, for the per-list dedup sets
+/// ([`Deferred::refreshed`], [`Deferred::textures`]): their keys are a few
+/// words each, and the default SipHash costs more than the lookup they guard.
+#[derive(Default)]
+struct Fx(u64);
+
+impl std::hash::Hasher for Fx {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(u64::from(b));
+        }
+    }
+
+    fn write_u32(&mut self, n: u32) {
+        self.write_u64(u64::from(n));
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    fn write_usize(&mut self, n: usize) {
+        self.write_u64(n as u64);
+    }
+}
+
+/// A set with [`Fx`]: the per-list dedup sets.
+type FastSet<T> = std::collections::HashSet<T, std::hash::BuildHasherDefault<Fx>>;
+
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload buffers its GPU commands read, kept until the list is reset.
@@ -1011,12 +1044,12 @@ struct Deferred {
     kept: Vec<windows::core::IUnknown>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
-    /// A list asks a few dozen times, where a linear scan of three words
-    /// beats hashing them (SipHash over a tuple is ~20 ns, the scan is
-    /// under 5 at these lengths).
-    refreshed: Vec<(usize, usize, usize)>,
+    /// A list's lists refresh thousands of distinct ranges, so this is a set
+    /// with a cheap hash, not SipHash (which costs more than the lookup) and
+    /// not a `Vec` (whose scan is O(n) per refresh, O(n²) per list).
+    refreshed: FastSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
-    textures: Vec<usize>,
+    textures: FastSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -2080,8 +2113,7 @@ impl HostList {
     ) {
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
-        if !deferred.refreshed.contains(&key) {
-            deferred.refreshed.push(key);
+        if deferred.refreshed.insert(key) {
             deferred
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
@@ -2110,8 +2142,7 @@ impl HostList {
     pub(crate) fn defer_heap(&self, viewed: &std::sync::Arc<crate::bindless::Viewed>) {
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(viewed) as usize, usize::MAX, 0);
-        if !deferred.refreshed.contains(&key) {
-            deferred.refreshed.push(key);
+        if deferred.refreshed.insert(key) {
             deferred.copies.push(Step::Heap(viewed.clone()));
         }
     }
@@ -2273,12 +2304,7 @@ impl HostList {
     /// Whether this is the first time since the reset that the list asks
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
-        let mut deferred = self.deferred();
-        if deferred.textures.contains(&key) {
-            return false;
-        }
-        deferred.textures.push(key);
-        true
+        self.deferred().textures.insert(key)
     }
 
     /// Runs `work` when the list is submitted, in order with its copies.
