@@ -715,7 +715,7 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
 /// in every tracker holding them. True if one of `[first, last)` was
 /// guarded.
 fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
-    if first + 1 == last && !g.alias_of.contains_key(&first) {
+    if first.checked_add(1) == Some(last) && !g.alias_of.contains_key(&first) {
         mark_changed(g, first, last, save);
         return open(g, first);
     }
@@ -747,7 +747,7 @@ fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
 /// Gives write access back to the pages of `[first, last)` we guarded,
 /// batching contiguous runs into single `VirtualProtect` calls.
 fn open_guarded(g: &mut Guards, first: usize, last: usize) {
-    if first + 1 == last {
+    if first.checked_add(1) == Some(last) {
         open(g, first);
         return;
     }
@@ -764,14 +764,27 @@ fn open_guarded(g: &mut Guards, first: usize, last: usize) {
         }
         let end = guarded[i] + 1;
         i += 1;
-        for page in start..end {
-            g.protected.remove(&page);
-        }
         let mut old = 0;
         // SAFETY: blocks we made read-only (failing harmlessly if gone).
-        unsafe { VirtualProtect((start * PAGE) as *const _, (end - start) * PAGE, PAGE_READWRITE, &mut old) };
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::OpenPages, (end - start) as u64);
+        let ok = unsafe {
+            VirtualProtect(
+                (start * PAGE) as *const _,
+                (end - start) * PAGE,
+                PAGE_READWRITE,
+                &mut old,
+            ) != 0
+        };
+        if ok {
+            for page in start..end {
+                g.protected.remove(&page);
+            }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::OpenPages, (end - start) as u64);
+        } else {
+            for page in start..end {
+                open(g, page);
+            }
+        }
     }
 }
 
