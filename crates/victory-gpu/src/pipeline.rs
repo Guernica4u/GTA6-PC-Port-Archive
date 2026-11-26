@@ -64,6 +64,9 @@ pub(crate) struct Shader {
     /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]
     pub(crate) ambient: Option<crate::ambient::Role>,
+    /// The screen probes' ray activation (`CS_ScreenProbes_ActivateRays`).
+    #[cfg(windows)]
+    pub(crate) activate: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -116,6 +119,9 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
+                #[cfg(windows)]
+                activate: stage == "compute"
+                    && bytes.windows(28).any(|w| w == b"CS_ScreenProbes_ActivateRays"),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })
@@ -472,6 +478,16 @@ pub(crate) fn activate_left_out<'a>(this: This) -> Option<&'a Shader> {
         return None;
     }
     p.shaders.iter().find(|s| s.stage == "compute").map(|s| &**s)
+}
+
+/// The compute shader of a title pipeline that activates the screen probes'
+/// rays, when it runs (not left out), for `crate::fill`'s count zeroing.
+#[cfg(windows)]
+pub(crate) fn activate_ran<'a>(this: This) -> Option<&'a Shader> {
+    if this.is_null() {
+        return None;
+    }
+    pipeline(this).shaders.iter().find(|s| s.activate).map(|s| &**s)
 }
 
 /// Host pipelines queued and not made yet.

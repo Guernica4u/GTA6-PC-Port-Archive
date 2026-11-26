@@ -100,6 +100,54 @@ pub(crate) fn ranges(view: &View) -> Vec<(u64, u64)> {
     out
 }
 
+/// With the ray activation run (`VICTORY_ACTIVATE_RAYS=1`):
+/// `VICTORY_ACTIVATE_COUNTS=<dwords>[,...]` zeroes, right after it, the
+/// buffers it writes at those places of its table (`1`: 112, the tiles' ray
+/// counts its last `buffer_atomic_add` counts up), so that its tiles are set
+/// up but none asks for rays.
+pub(crate) fn counts() -> Option<&'static [u32]> {
+    static SET: OnceLock<Vec<u32>> = OnceLock::new();
+    let set = SET.get_or_init(|| {
+        let v = std::env::var("VICTORY_ACTIVATE_COUNTS").unwrap_or_default();
+        match v.trim() {
+            "" | "0" => Vec::new(),
+            "1" => vec![112],
+            v => v.split(',').filter_map(|n| n.trim().parse().ok()).collect(),
+        }
+    });
+    (!set.is_empty()).then_some(set.as_slice())
+}
+
+/// Which bytes of each buffer [`counts`] names are zeroed
+/// (`VICTORY_ACTIVATE_COUNT_BYTES=<from>,<bytes>`; unset: all). The tiles'
+/// counts are 24 bytes, two sets of dispatch arguments: `0,12` the first,
+/// `12,12` the second.
+pub(crate) fn count_bytes(range: (u64, u64)) -> Option<(u64, u64)> {
+    static SET: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+    let set = *SET.get_or_init(|| {
+        let v = std::env::var("VICTORY_ACTIVATE_COUNT_BYTES").ok()?;
+        let mut n = v.split(',').map(|n| n.trim().parse::<u64>().ok());
+        Some((n.next()??, n.next()??))
+    });
+    let Some((from, bytes)) = set else {
+        return Some(range);
+    };
+    (from < range.1).then(|| (range.0 + from, bytes.min(range.1 - from)))
+}
+
+/// Logs each buffer the ray activation writes, once: its table place and
+/// the memory it names.
+pub(crate) fn tell(slot: u8, offset: u32, ranges: &[(u64, u64)]) {
+    static TOLD: std::sync::Mutex<Vec<(u8, u32)>> = std::sync::Mutex::new(Vec::new());
+    let mut told = TOLD.lock().unwrap_or_else(|e| e.into_inner());
+    if told.contains(&(slot, offset)) || told.len() > 64 {
+        return;
+    }
+    told.push((slot, offset));
+    let bytes: Vec<u64> = ranges.iter().map(|r| r.1).collect();
+    tracing::info!(slot, offset_dwords = offset, ?bytes, "a buffer the ray activation writes");
+}
+
 static ZEROED: AtomicU64 = AtomicU64::new(0);
 static TIMES: AtomicU64 = AtomicU64::new(0);
 

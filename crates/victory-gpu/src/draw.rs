@@ -3158,6 +3158,7 @@ impl State {
         unsafe { list.list.Dispatch(x, y, z) };
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        self.zero_ray_counts(list);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on()
             && self.ambient(list, p, role)
@@ -3176,12 +3177,39 @@ impl State {
         let Some(shader) = crate::pipeline::activate_left_out(self.pipeline as This) else {
             return;
         };
+        self.zero_writes(list, shader, None);
+    }
+
+    /// After a dispatch of the screen probes' ray activation, run: its rays'
+    /// counts zeroed, so that no tile asks for rays (`crate::fill`,
+    /// `VICTORY_ACTIVATE_COUNTS`).
+    fn zero_ray_counts(&mut self, list: &HostList) {
+        let Some(offsets) = crate::fill::counts() else {
+            return;
+        };
+        let Some(shader) = crate::pipeline::activate_ran(self.pipeline as This) else {
+            return;
+        };
+        self.zero_writes(list, shader, Some(offsets));
+    }
+
+    /// Zeroes the buffers `shader` writes through its tables: all of them, or
+    /// those at `only` (dwords into their table).
+    fn zero_writes(&mut self, list: &HostList, shader: &crate::pipeline::Shader, only: Option<&[u32]>) {
         let Some(t) = shader.translated() else {
             return;
         };
         let (mut zeroed, mut missed) = (0u64, 0u32);
         let mut done: Vec<(u64, u64)> = Vec::new();
         for u in t.used.iter().filter(|u| u.kind == ResourceType::Uav && u.root == RootType::Table) {
+            if let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot))
+                && let Some(view) = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+            {
+                crate::fill::tell(u.slot, u.table_offset_dwords, &crate::fill::ranges(&view));
+            }
+            if only.is_some_and(|only| !only.contains(&u.table_offset_dwords)) {
+                continue;
+            }
             let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot)).cloned() else {
                 missed += 1;
                 continue;
@@ -3199,6 +3227,14 @@ impl State {
                     continue;
                 }
                 done.push(range);
+                // Of the ray counts, only the part asked for.
+                let range = match only {
+                    Some(_) => match crate::fill::count_bytes(range) {
+                        Some(part) => part,
+                        None => continue,
+                    },
+                    None => range,
+                };
                 if list.place_zero(range.0 as usize, range.1 as usize) {
                     zeroed += range.1;
                 } else {
@@ -4437,6 +4473,7 @@ impl State {
         // back (`crate::indirect`).
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            self.zero_ray_counts(list);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
