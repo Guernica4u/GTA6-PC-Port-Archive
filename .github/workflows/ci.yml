@@ -31,6 +31,3 @@ jobs:
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
         run: cargo test --workspace --locked
-      - name: Benchmark report and run limits
-        shell: powershell
-        run: .\tests\bench.ps1

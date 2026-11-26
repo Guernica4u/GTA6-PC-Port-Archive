@@ -94,15 +94,10 @@ target\release\victory.exe translate --cache --pipelines <game dir>\shaders.rpf 
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
 
-To compare builds, run the same scene with each executable. The Markdown
-reports in `%LOCALAPPDATA%\victory\bench` include frame peaks, failure
-counts, memory samples, crash RVA and the stop reason. Defaults are 180 s,
-8 GiB maximum process RSS and 3 GiB minimum available system memory.
-
-```powershell
-$first = .\scripts\victory-bench.ps1 -Title 'D:\titles\test.exe' -Console series-s -Label 'baseline'
-.\scripts\victory-bench.ps1 -Title 'D:\titles\test.exe' -Console series-s -Exe 'D:\candidate\victory.exe' -Baseline $first
-```
+To compare Windows builds, use the same scene, console, cache state and limits.
+`cargo xtask bench --title <exe> --console series-s --label baseline` prints
+the report path. For the second run, add `--exe <candidate-victory.exe>
+--baseline <report>`. See `cargo xtask bench --help` for memory and time limits.
 
 The `translate --cache` step (minutes; again after a change of the shader
 translator) translates every shader the title can ask for into the cache
