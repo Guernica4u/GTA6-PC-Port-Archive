@@ -166,6 +166,37 @@ fn mirror(handle: u64) {
 /// calls). Called before each submission: shaders take descriptors from the
 /// heap at indices in their data, where a slot never mirrored reads nothing.
 #[cfg(windows)]
+/// The readable (committed, not PAGE_NOACCESS/PAGE_GUARD  --  the same pages a
+/// kernel read fails on) sub-ranges of `[from, to)`, as one `VirtualQuery`
+/// walk. Starts at `from` itself: VirtualQuery rounds down to the containing
+/// region's base, so each next is past `at >= from`, and a heap placed past
+/// a 64 KiB boundary cannot make the walk land before its start.
+#[cfg(windows)]
+fn readable_regions(from: usize, to: usize) -> Vec<(usize, usize)> {
+    use windows_sys::Win32::System::Memory::{
+        MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    let mut out = Vec::new();
+    let mut at = from;
+    while at < to {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0 {
+            break;
+        }
+        let next = (info.BaseAddress as usize)
+            .saturating_add(info.RegionSize)
+            .max(at + 1)
+            .min(to);
+        if info.State == MEM_COMMIT && info.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 {
+            out.push((at, next));
+        }
+        at = next;
+    }
+    out
+}
+
 pub(crate) fn sync_heaps() {
     // Held throughout: a heap is not dropped while its slots are made.
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
@@ -183,33 +214,14 @@ pub(crate) fn sync_heaps() {
             // pages are readable (committed and not guarded), instead of one
             // kernel read per 64 KiB page. A page with nothing mapped (the
             // title unmaps heap pages too) holds no records.
-            use windows_sys::Win32::System::Memory::{
-                MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
-            };
-            let page_size = crate::watch::PAGE;
-            let mut at = from & !(page_size - 1);
-            while at < to {
-                // SAFETY: plain data filled in by the query.
-                let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-                // SAFETY: a valid out pointer of the right size.
-                if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0 {
-                    break;
-                }
-                let next = (info.BaseAddress as usize + info.RegionSize).max(at + 1).min(to);
-                // ReadProcessMemory reads guarded pages' neighbours fine but
-                // fails on PAGE_NOACCESS/PAGE_GUARD: the same pages a kernel
-                // read of 4 bytes would fail on.
-                if info.State == MEM_COMMIT && info.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 {
-                    let (page, end) = (at.max(from), next.min(to));
-                    let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
-                    #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(
-                        crate::copystat::C::SyncSlots,
-                        last.min(u64::from(heap.desc.count)).saturating_sub(first),
-                    );
-                    host.sync_slots(first as u32, last.min(u64::from(heap.desc.count)) as u32, start, step);
-                }
-                at = next;
+            for (page, end) in readable_regions(from, to) {
+                let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(
+                    crate::copystat::C::SyncSlots,
+                    last.min(u64::from(heap.desc.count)).saturating_sub(first),
+                );
+                host.sync_slots(first as u32, last.min(u64::from(heap.desc.count)) as u32, start, step);
             }
         }
     }
@@ -904,6 +916,34 @@ pub(crate) mod tests {
         eprintln!("{mb} MB, {} pages: per-page reads {t_old:?}, region walk {t_new:?}", old.len());
         // SAFETY: freeing our allocation.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// A heap placed past a 64 KiB boundary with a decommitted 4 KiB region
+    /// just before it: the walk starts at `from` and every returned range
+    /// stays within [from, to) with end > start, so the slot math in
+    /// sync_heaps cannot underflow.
+    #[test]
+    fn readable_regions_of_an_unaligned_start_never_reach_before_it() {
+        use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
+        let page = crate::watch::PAGE;
+        let pool = crate::watch::tests::pool(4);
+        // Decommit the second 4 KiB page: [pool + 4 KiB, pool + 8 KiB) free.
+        // SAFETY: our allocation, page-aligned address and size.
+        unsafe { VirtualFree((pool + 4096) as *mut _, 4096, MEM_DECOMMIT) };
+        // A "placed heap" starting at pool + 8 KiB, right past the hole.
+        let from = pool + 8192;
+        let to = pool + 4 * page;
+        let regions = readable_regions(from, to);
+        assert!(!regions.is_empty());
+        assert_eq!(regions[0].0, from, "the walk starts at from, not before it");
+        for &(a, b) in &regions {
+            assert!(a >= from && b > a && b <= to, "range within [from, to): {a:#x}..{b:#x}");
+        }
+        // An aligned start over the same memory skips the hole.
+        let all = readable_regions(pool, to);
+        assert!(all.iter().all(|&(a, b)| a >= pool && b > a && b <= to));
+        assert!(!all.iter().any(|&(a, b)| a < pool + 8192 && b > pool + 4096), "the decommitted page is out");
+        crate::watch::tests::free(pool);
     }
 
     /// Work to run while `make_read` makes the textures of a read slot (the
