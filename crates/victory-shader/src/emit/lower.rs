@@ -6866,16 +6866,43 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.bin(c, Bin::And, x, m))
     }
 
+    /// Widens an f16, explicitly preserving subnormal inputs for fused math.
+    fn widen_half(&mut self, h: V, fused: bool) -> V {
+        let c = self.cur;
+        let f32t = self.s.t.f32;
+        let normal = self.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
+        if !fused {
+            return normal;
+        }
+        // A half subnormal is an exactly representable normal f32.
+        // Build it from the bits so host half arithmetic cannot flush it.
+        let m = &mut self.s.m;
+        let (magnitude, sign_mask, min_normal, k16) =
+            (m.i32(0x7FFF), m.i32(0x8000), m.i32(0x0400), m.i32(16));
+        let fraction = m.bin(c, Bin::And, h, magnitude);
+        let tiny = m.cmp(c, pred::IULT, fraction, min_normal);
+        let sign = m.bin(c, Bin::And, h, sign_mask);
+        let sign = m.bin(c, Bin::Shl, sign, k16);
+        let fraction = m.cast(c, Cast::UiToFp, fraction, f32t);
+        let unit = m.f32(0x3380_0000); // 2^-24
+        let exact = m.bin(c, Bin::Mul, fraction, unit);
+        let exact = self.as_int(exact);
+        let exact = self.s.m.bin(c, Bin::Or, exact, sign);
+        let exact = self.as_float(exact);
+        self.s.m.select(c, tiny, exact, normal)
+    }
+
     /// An f16 source as an f32 (exact), with its abs/neg modifiers.
     fn half_fsrc(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        self.half_fsrc_for(inst, k, false)
+    }
+
+    fn half_fsrc_for(&mut self, inst: &Inst, k: usize, fused: bool) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
         let h = self.half_src(inst, k)?;
-        let f32t = self.s.t.f32;
-        let mut f = self
-            .s
-            .op(self.cur, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
+        let mut f = self.widen_half(h, fused);
         if v.abs >> k & 1 != 0 {
             f = self.unary(6, f);
         }
@@ -7039,7 +7066,8 @@ impl<'a> Lower<'a> {
             return float_result(self, r);
         }
         if float3.contains(&name) {
-            let (a, b) = (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?);
+            let fused = matches!(name, "v_fma_f16" | "v_fmac_f16");
+            let (a, b) = (self.half_fsrc_for(inst, 0, fused)?, self.half_fsrc_for(inst, 1, fused)?);
             let acc = if matches!(name, "v_fmac_f16" | "v_mac_f16") {
                 // The accumulator is the destination's half that is written.
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
@@ -7054,12 +7082,11 @@ impl<'a> Lower<'a> {
                 };
                 let m = self.s.m.i32(0xFFFF);
                 let x = self.s.m.bin(c, Bin::And, x, m);
-                self.s
-                    .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x])
+                self.widen_half(x, fused)
             } else {
-                self.half_fsrc(inst, 2)?
+                self.half_fsrc_for(inst, 2, fused)?
             };
-            if matches!(name, "v_fma_f16" | "v_fmac_f16") {
+            if fused {
                 if v.omod != 0 {
                     return Err("an output modifier on a 16-bit operation");
                 }

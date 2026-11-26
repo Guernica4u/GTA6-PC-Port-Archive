@@ -691,6 +691,39 @@ fn half_fmac_rounds_once_to_nearest_even() {
 }
 
 #[test]
+fn fused_half_keeps_subnormal_operands() {
+    let cases = [
+        ([0x7e00_0001, 0xfc00_fc00, 0x5640_5152, 0], Some(0xfc00)),
+        ([0x0000_fc00, 0x0000_0001, 0x5640_5152, 0], Some(0xfc00)),
+        ([0x0000_8001, 0x0000_fc00, 0x5640_5152, 0], Some(0x7c00)),
+        ([0x0000_0400, 0x0000_fc00, 0x5640_5152, 0], Some(0xfc00)),
+        ([0x0000_0001, 0x0000_6800, 0x5640_0000, 0], Some(0x0800)),
+        ([0x0000_0000, 0x0000_3c00, 0x5640_0001, 0], Some(0x0001)),
+        ([0x0000_8000, 0x0000_fc00, 0x5640_5152, 0], None),
+    ];
+    let inputs: Vec<_> = cases.iter().map(|&(words, _)| words).collect();
+    let initial = vop1(0x001, 0, vgpr(3));
+    let fmac = (0x036 << 25) | (2 << 9) | u32::from(vgpr(1));
+    let [fma, sources] = vop3(0x34b, 0, vgpr(1), vgpr(2), vgpr(3));
+
+    for (form, program) in [("fmac", &[fmac][..]), ("fma", &[fma, sources][..])] {
+        for (rounding, mode) in [("rne", &[][..]), ("rtz", &[0xba80_0881, 3][..])] {
+            let body = [mode, &[initial], program].concat();
+            let shader = build_valu_cs(&body);
+            run_cases(&shader, &inputs, |device, i, _, actual| {
+                assert_eq!(actual >> 16, 0x5640, "{device} {form} {rounding} row {i}");
+                let value = actual & 0xffff;
+                if let Some(expected) = cases[i].1 {
+                    assert_eq!(value, expected, "{device} {form} {rounding} row {i}");
+                } else {
+                    assert!(value & 0x7fff > 0x7c00, "{device} {form} {rounding} row {i}: {value:04x}");
+                }
+            });
+        }
+    }
+}
+
+#[test]
 fn half_fma_rounds_once_toward_zero() {
     let [op, src] = vop3(0x34b, 0, vgpr(1), vgpr(2), vgpr(3));
     let shader = build_valu_cs(&[0xba80_0881, 3, op, src]); // MODE.FP_ROUND16_64 = RTZ
