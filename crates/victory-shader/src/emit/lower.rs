@@ -621,11 +621,10 @@ impl<'a> Lower<'a> {
             if console_lanes {
                 s.wave_size = Some(wave);
             } else if one_wave && s.lds_dwords > 0 {
-                if wave == 64 && threads <= 32 {
-                    // <= 32 threads fits inside one Wave32 warp too: no WaveSize(64) needed.
-                } else if wave == 64 && can_sync_wave64_lds(p, x) {
+                if wave == 64 && can_sync_wave64_lds(p, x) {
                     // Uniform single-wave Wave64 LDS accesses: sync with DXIL group
-                    // barriers instead of locking to WaveSize(64) so Wave32 hosts run it.
+                    // barriers instead of locking to WaveSize(64) so Wave32 (and
+                    // narrower WARP) hosts run it safely across 1..=64 threads.
                 } else {
                     s.wave_size = Some(wave);
                 }
@@ -633,7 +632,6 @@ impl<'a> Lower<'a> {
         }
         let lds_wave32_sync = matches!(&x.native.io, StageIo::Cs(cs) if x.native.wave64
             && !console_lanes
-            && cs.threads.iter().product::<u32>() > 32
             && cs.threads.iter().product::<u32>() <= 64
             && s.lds_dwords > 0
             && can_sync_wave64_lds(p, x));

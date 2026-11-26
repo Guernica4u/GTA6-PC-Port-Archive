@@ -56,8 +56,8 @@ fn wave64_lds_within_32_threads_drops_wave_size() {
     ];
     let lowered = lower_wave_cs(&words, [32, 1, 1], 16);
     assert_eq!(lowered.wave_size, None);
-    assert!(!lowered.lds_wave32_sync);
-    assert_eq!(lowered.lds_barriers, 0);
+    assert!(lowered.lds_wave32_sync);
+    assert_eq!(lowered.lds_barriers, 3);
 }
 
 #[test]
