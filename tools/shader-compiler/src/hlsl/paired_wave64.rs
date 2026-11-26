@@ -314,6 +314,58 @@ fn ds_swizzle(em: &mut Emitter<'_>, ins: &Insn) -> Result<(), String> {
     Ok(())
 }
 
+/// A simple unsigned comparison produces two ballot words directly. Keep
+/// the generic lane-local implementation for any other emitted shape,
+/// including CMPX, DPP, mask operands and aliased scalar destinations.
+fn direct_compare(em: &mut Emitter<'_>, ins: &Insn, code: &str, written: &[[String; 2]]) -> bool {
+    let op = match ins.mnemonic.as_str() {
+        "v_cmp_eq_u32" => "==",
+        "v_cmp_ne_u32" => "!=",
+        "v_cmp_lt_u32" => "<",
+        "v_cmp_le_u32" => "<=",
+        "v_cmp_gt_u32" => ">",
+        "v_cmp_ge_u32" => ">=",
+        _ => return false,
+    };
+    let [[low, high]] = written else { return false };
+    let [a, b] = ins.src.as_slice() else { return false };
+    let operand = |source: &Opnd, lane: Option<u32>| -> Option<String> {
+        match source {
+            Opnd::Vgpr(n) => Some(match lane {
+                Some(lane) => format!("v{n}__{lane}"),
+                None => format!("v{n}"),
+            }),
+            Opnd::Sgpr(_) => {
+                let value = r(source).ok()?;
+                if &value == low || &value == high { None } else { Some(value) }
+            }
+            Opnd::ConstInt(_) | Opnd::Literal(_) => r(source).ok(),
+            _ => None,
+        }
+    };
+    let (Some(a0), Some(b0)) = (operand(a, None), operand(b, None)) else { return false };
+    let expected = format!("{low} = (((exec_lo & 1u) != 0u) && ({a0} {op} {b0})) ? 1u : 0u; {high} = 0u;");
+    let actual = code.lines().map(str::trim).filter(|s| !s.is_empty() && !s.starts_with("//"))
+        .collect::<Vec<_>>().join(" ");
+    if actual != expected { return false; }
+    for (word, _) in identifiers(code) {
+        if is_vector_register(word) {
+            em.regs.insert(word.to_string());
+        }
+    }
+    em.line("{");
+    for lane in 0..2u32 {
+        // Ballot across the host wave, then intersect with guest EXEC.
+        // Both words are computed before either destination is modified.
+        let (a, b) = (operand(a, Some(lane)).unwrap(), operand(b, Some(lane)).unwrap());
+        let exec = if lane == 0 { "exec_lo" } else { "exec_hi" };
+        em.line(&format!("uint tb_cmp{lane} = WaveActiveBallot({a} {op} {b}).x & {exec};"));
+    }
+    em.line(&format!("{low} = tb_cmp0; {high} = tb_cmp1;"));
+    em.line("}");
+    true
+}
+
 pub(super) fn emit(em: &mut Emitter<'_>, idx: usize, ins: &Insn, is_ps: bool, br: Option<usize>) -> Result<(), String> {
     let m = ins.mnemonic.as_str();
     if !per_lane(ins.enc) {
@@ -440,6 +492,9 @@ pub(super) fn emit(em: &mut Emitter<'_>, idx: usize, ins: &Insn, is_ps: bool, br
         if scalar && after.starts_with('=') && !after.starts_with("==") && !written.iter().any(|w| w.iter().any(|n| n == word)) {
             return Err(format!("paired wave64: {m} writes {word} outside a known mask"));
         }
+    }
+    if moved.is_none() && direct_compare(em, ins, &code, &written) {
+        return Ok(());
     }
     let vectors: BTreeSet<&str> = identifiers(&code).map(|(word, _)| word).filter(|w| is_vector_register(w)).collect();
     let mut shadowed = read.clone();

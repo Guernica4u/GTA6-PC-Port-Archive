@@ -84,6 +84,27 @@ PROGRAMS = {
 }
 
 
+# Each comparison feeds a conditional select and a dependent result, with
+# alternating VCC and explicit SGPR destinations. Inputs cover sparse and
+# empty EXEC halves, scalar constants, and dependent register values.
+PROGRAMS['unsigned_compare_chain'] = [
+    'v_mov_b32_e32 v10, v0', 'v_mov_b32_e32 v11, v1',
+    's_mov_b32 s40, 0x12345678',
+] + [
+    item
+    for op in ('eq', 'ne', 'lt', 'le', 'gt', 'ge')
+    for item in (
+        f'v_cmp_{op}_u32_e32 vcc, s40, v10',
+        'v_cndmask_b32_e32 v10, v11, v10, vcc',
+        f'v_cmp_{op}_u32_e64 s[30:31], v10, v11',
+        'v_cndmask_b32_e64 v11, v10, v11, s[30:31]',
+        'v_add_nc_u32_e32 v10, v1, v10',
+        's_bcnt1_i32_b64 s20, vcc',
+        's_bcnt1_i32_b64 s21, s[30:31]',
+    )
+] * 4
+
+
 def assemble(llvm_mc, lines):
     result = subprocess.run([str(llvm_mc), "-triple=amdgcn-amd-amdhsa", "-mcpu=gfx1030",
                              "-mattr=-wavefrontsize32,+wavefrontsize64", "-show-encoding"],
@@ -222,7 +243,8 @@ def step(w, text):
         cmpx = base.startswith('v_cmpx')
         if cmpx: dst, a, b = 'exec', ops[-2], ops[-1]
         else: dst, a, b = ops
-        test = {'lt': lambda x, y: x < y, 'eq': lambda x, y: x == y, 'ne': lambda x, y: x != y}[base.split('_')[2]]
+        test = {'lt': lambda x, y: x < y, 'le': lambda x, y: x <= y, 'gt': lambda x, y: x > y,
+                'ge': lambda x, y: x >= y, 'eq': lambda x, y: x == y, 'ne': lambda x, y: x != y}[base.split('_')[2]]
         mask = sum(1 << l for l in range(64) if w.active(l) and test(w.value(a, l), w.value(b, l)))
         w.store(dst, mask); return
     if base == 'v_permlanex16_b32':
@@ -324,7 +346,7 @@ def inputs(rng):
 def selected():
     """Each program in one console wave per group, and some in four."""
     single = [(name, body, 64) for name, body in PROGRAMS.items()]
-    return single + [(f"{name}_x4", PROGRAMS[name], 256) for name in ("saveexec", "waterfall", "permlane", "dispatch")]
+    return single + [(f"{name}_x4", PROGRAMS[name], 256) for name in ("saveexec", "waterfall", "permlane", "dispatch", "unsigned_compare_chain")]
 
 
 def main(argv=None):

@@ -90,3 +90,14 @@ fn group_shared_accesses_are_checked_against_the_declared_size() {
     }
     assert!(checked > 0, "no host profile translated the shared-memory program");
 }
+
+#[test]
+fn paired_integer_compare_emits_ballots_without_lane_shadows() {
+    // v_cmp_lt_u32_e32 vcc, 0x3e8, v0; s_endpgm.
+    let words = [0x7d8200ff, 0x000003e8, 0xbf810000];
+    let hlsl = translate_paired_wave64(&program(64, &words)).unwrap().hlsl;
+    assert!(hlsl.contains("WaveActiveBallot(0x3e8u < v0__0)"));
+    assert!(hlsl.contains("WaveActiveBallot(0x3e8u < v0__1)"));
+    assert!(!hlsl.contains("tbm_vcc_lo"));
+    assert!(!hlsl.contains("uint v0 ="));
+}
