@@ -261,6 +261,62 @@ impl HostList {
         true
     }
 
+    /// Zeroes `len` bytes of title memory at `dst` on the card, at this place
+    /// of the list, as a shader's write would (for the stand-in of a program
+    /// the layer leaves out, `crate::fill`). `false` where the bytes have no
+    /// host copy (nothing on the card has read or written them yet).
+    pub(crate) fn place_zero(&self, dst: usize, len: usize) -> bool {
+        /// Bytes of the zeroed buffer copies are taken from.
+        const ZEROS: u64 = 4 << 20;
+        struct Zeros(Option<ID3D12Resource>);
+        // SAFETY: D3D12 resources are free-threaded; this one is only read.
+        unsafe impl Send for Zeros {}
+        // SAFETY: as above.
+        unsafe impl Sync for Zeros {}
+        static ZERO: OnceLock<Zeros> = OnceLock::new();
+        if len == 0 || !on() {
+            return false;
+        }
+        let Some(host) = host() else {
+            return false;
+        };
+        let Some(zero) = ZERO
+            .get_or_init(|| {
+                // A committed buffer starts zeroed; nothing ever writes it.
+                let b = host.uav_buffer(ZEROS);
+                if let Some(b) = &b {
+                    name(b, || "zeros for left-out programs".into());
+                }
+                Zeros(b)
+            })
+            .0
+            .as_ref()
+        else {
+            return false;
+        };
+        let Some(to) = crate::shadow::peek(dst as u64, len as u64).filter(|s| !s.in_place()) else {
+            return false;
+        };
+        let at = to.offset(dst as u64);
+        to.refresh(self, dst as u64, len as u64);
+        // SAFETY: an open list; live buffers (the list holds the copy, the
+        // zeros live for the run), ranges inside them.
+        unsafe {
+            wait_for_all(host, &self.list);
+            let mut done = 0u64;
+            while done < len as u64 {
+                let n = (len as u64 - done).min(ZEROS);
+                self.list.CopyBufferRegion(&to.buffer, at + done, zero, 0, n);
+                done += n;
+            }
+            wait_for_all(host, &self.list);
+        }
+        to.gpu_writes(self, dst as u64, len as u64);
+        self.deferred().title_written();
+        self.changed_something();
+        true
+    }
+
     /// For a copy of `[src, src + len)` into a texture: a buffer (readable by
     /// copies) that holds what shaders wrote there, at this place of the list.
     /// `None` where shaders do not write it.

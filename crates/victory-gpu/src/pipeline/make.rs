@@ -79,9 +79,18 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
         std::env::var_os("VICTORY_ACTIVATE_RAYS").is_none_or(|v| v == "0")
     });
     if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
-        return Some("ray activation shader without BVH, left out");
+        return Some(ACTIVATE_LEFT_OUT);
     }
     None
+}
+
+/// Why the screen probes' ray activation is left out (see [`left_out`]).
+const ACTIVATE_LEFT_OUT: &str = "ray activation shader without BVH, left out";
+
+/// Whether `p` is the screen probes' ray activation, left out: what it
+/// writes is zeroed in its place (`crate::fill`).
+pub(super) fn activate_left_out(p: &Pending) -> bool {
+    p.left_out == Some(ACTIVATE_LEFT_OUT)
 }
 
 /// Confirmed first-scene producers. Prepare these at creation even on a cold

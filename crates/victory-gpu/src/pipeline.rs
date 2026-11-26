@@ -459,6 +459,21 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// The compute shader of a title pipeline the layer leaves out because it
+/// activates the screen probes' rays (`CS_ScreenProbes_ActivateRays`), for
+/// the stand-in that zeroes what it writes (`crate::fill`).
+#[cfg(windows)]
+pub(crate) fn activate_left_out<'a>(this: This) -> Option<&'a Shader> {
+    if this.is_null() {
+        return None;
+    }
+    let p = pipeline(this);
+    if !make::activate_left_out(&p.host) {
+        return None;
+    }
+    p.shaders.iter().find(|s| s.stage == "compute").map(|s| &**s)
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {

@@ -3109,6 +3109,7 @@ impl State {
                 "a dispatch without a host pipeline dropped"
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            self.zero_left_out(list);
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_drop(self.pipeline as This);
@@ -3163,6 +3164,54 @@ impl State {
         {
             self.host_pipeline = 0;
             self.host_roots[1] = 0;
+        }
+    }
+
+    /// In place of a left-out dispatch of the screen probes' ray activation:
+    /// the buffers it writes zeroed (`crate::fill`, `VICTORY_ACTIVATE_ZERO=1`).
+    fn zero_left_out(&mut self, list: &HostList) {
+        if !crate::fill::on() {
+            return;
+        }
+        let Some(shader) = crate::pipeline::activate_left_out(self.pipeline as This) else {
+            return;
+        };
+        let Some(t) = shader.translated() else {
+            return;
+        };
+        let (mut zeroed, mut missed) = (0u64, 0u32);
+        let mut done: Vec<(u64, u64)> = Vec::new();
+        for u in t.used.iter().filter(|u| u.kind == ResourceType::Uav && u.root == RootType::Table) {
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot)).cloned() else {
+                missed += 1;
+                continue;
+            };
+            let Some(view) = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) else {
+                missed += 1;
+                continue;
+            };
+            let ranges = crate::fill::ranges(&view);
+            if ranges.is_empty() {
+                missed += 1;
+            }
+            for range in ranges {
+                if done.contains(&range) {
+                    continue;
+                }
+                done.push(range);
+                if list.place_zero(range.0 as usize, range.1 as usize) {
+                    zeroed += range.1;
+                } else {
+                    missed += 1;
+                }
+            }
+        }
+        crate::fill::note(zeroed, missed);
+        if zeroed > 0 {
+            self.buffers_written();
+            // The copies set nothing of the list's, but what is bound stays
+            // as the title left it only if nothing else changed: bind anew.
+            self.host_pipeline = 0;
         }
     }
 
@@ -4192,6 +4241,9 @@ impl State {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
+            if kind == DISPATCH {
+                self.zero_left_out(list);
+            }
             return false;
         };
         // Indirect rectangles (the title's tiled lighting, 256
