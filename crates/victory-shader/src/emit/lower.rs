@@ -623,8 +623,7 @@ impl<'a> Lower<'a> {
             let needs_wave = console_lanes || one_wave && s.lds_dwords > 0;
             halves = Self::halves_wanted(x, needs_wave);
             if halves {
-                halves_refused =
-                    Self::halves_lds(group, s.lds_dwords).or(Self::halves_tiles(cs.threads));
+                halves_refused = Self::halves_tiles(cs.threads);
             }
             if needs_wave {
                 s.wave_size = Some(if halves { 32 } else { wave });
@@ -1356,7 +1355,7 @@ impl<'a> Lower<'a> {
             }
         }
         self.cur = self.s.entry;
-        if let Some(why) = self.halves_refused {
+        if let Some(why) = self.halves_refused.or(self.exchange.refused) {
             return Err(unsupported(0, why));
         }
         self.find_sections();
@@ -1392,6 +1391,7 @@ impl<'a> Lower<'a> {
                 };
                 self.vals.insert(phi.value, val);
             }
+            self.lds_block_start(b);
             let mut i = 0;
             self.mode16 = self.round16[b];
             while i < p.blocks[b].insts.len() {
@@ -1417,6 +1417,7 @@ impl<'a> Lower<'a> {
                 i += 1;
             }
             self.mask_ok = self.mask_data == MaskData::Console;
+            self.lds_block_end(b);
             self.tail[b] = Some(self.cur);
             self.exit(b)?;
         }
@@ -3305,6 +3306,7 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
         }
+        self.lds_order(name);
         if self.s.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
         }

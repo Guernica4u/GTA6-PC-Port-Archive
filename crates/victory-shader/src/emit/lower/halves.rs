@@ -45,10 +45,15 @@
 //!
 //! LDS: the console compiler leaves out barriers between the lanes of one
 //! wave, and so between all of a group's threads only when the group is one
-//! wave. A group of 33 to 64 threads with LDS (two host waves sharing what
-//! the console's one wave ordered by itself) is refused; groups of several
-//! console waves order their LDS with barriers, and those of 32 threads or
-//! fewer are one host wave.
+//! wave. In a group of 33 to 64 threads the two host waves share what the
+//! console's one wave ordered by running one instruction at a time, so group
+//! barriers put them back in that order ([`Lds`]): before each LDS access
+//! that may meet an earlier one where every thread meets, and on the edges
+//! into and out of a region only some lanes run that accesses LDS. Inside
+//! such a region nothing can be put in order, so one that both writes and
+//! reads, or writes twice, is refused. Groups of several console waves
+//! order their LDS with barriers, and those of 32 threads or fewer are one
+//! host wave.
 //!
 //! Approach after DexNom's fork (DexNom/Victory 5f4c3df, `set_host_max_wave`
 //! and the thread relabelling into halves) and upstream PR #2176
@@ -69,13 +74,6 @@ impl Lower<'_> {
     /// halves: the host's waves are 32 lanes at most.
     pub(super) fn halves_wanted(x: &Parts, needs_wave: bool) -> bool {
         needs_wave && x.native.wave64 && x.host_wave32
-    }
-
-    /// Why a program in halves cannot run: LDS a group of one console wave
-    /// shares without barriers, split across two host waves.
-    pub(super) fn halves_lds(group: u32, lds_dwords: u32) -> Option<Why> {
-        (lds_dwords > 0 && group > HALF && group <= 64)
-            .then_some("LDS one console wave64 shares without barriers, on a host of 32-lane waves")
     }
 
     /// Why a program in halves cannot run: a group of several rows whose
@@ -241,6 +239,56 @@ impl Lower<'_> {
         Ok(r)
     }
 
+    /// At the start of IR block `b`, after its phis: the group barrier where a
+    /// region accessing LDS comes back ([`Lds`]). What LDS accesses are
+    /// pending at a block's start is not known.
+    pub(super) fn lds_block_start(&mut self, b: usize) {
+        let Some(lds) = &self.exchange.lds else {
+            return;
+        };
+        if lds.at_entry.contains(&b) {
+            self.group_barrier();
+            self.exchange.pending = None;
+        } else {
+            self.exchange.pending = Some(true);
+        }
+    }
+
+    /// At the end of IR block `b`, before it branches: the group barrier
+    /// before a region accessing LDS ([`Lds`]).
+    pub(super) fn lds_block_end(&mut self, b: usize) {
+        if self
+            .exchange
+            .lds
+            .as_ref()
+            .is_some_and(|l| l.before_exit.contains(&b))
+        {
+            self.group_barrier();
+        }
+    }
+
+    /// Before the LDS access `name` where every thread meets: a group
+    /// barrier when an access since the last one may meet it (a write, or a
+    /// read before this write), as the console's one wave orders them.
+    pub(super) fn lds_order(&mut self, name: &str) {
+        let meets = self
+            .exchange
+            .meet
+            .get(self.cur_ir)
+            .copied()
+            .unwrap_or(false);
+        if self.exchange.lds.is_none() || !meets {
+            return;
+        }
+        let writes = !name.starts_with("ds_read");
+        let pending = self.exchange.pending;
+        if pending == Some(true) || writes && pending == Some(false) {
+            self.group_barrier();
+            self.exchange.pending = None;
+        }
+        self.exchange.pending = Some(writes || self.exchange.pending == Some(true));
+    }
+
     /// A group barrier ordering group-shared memory
     /// (`GroupMemoryBarrierWithGroupSync`).
     fn group_barrier(&mut self) {
@@ -282,6 +330,14 @@ pub(super) struct Exchange {
     meet: Vec<bool>,
     /// [`Lower::slots`], once made.
     slots: Option<V>,
+    /// A group of one console wave with LDS: where it needs barriers.
+    lds: Option<Lds>,
+    /// Why the program cannot run in halves ([`lds_fences`]).
+    pub(super) refused: Option<Why>,
+    /// LDS accesses since the last barrier in this block where every thread
+    /// meets: `Some(true)` with a write among them (or not known, at a
+    /// block's start), `Some(false)` reads only.
+    pending: Option<bool>,
 }
 
 impl Exchange {
@@ -289,11 +345,122 @@ impl Exchange {
         if !halves {
             return Exchange::default();
         }
+        let meet = meeting(x);
+        let one_wave_lds = match &x.native.io {
+            StageIo::Cs(cs) => {
+                let group = cs.threads.iter().product::<u32>();
+                cs.lds_bytes() > 0 && group > HALF && group <= 64
+            }
+            _ => false,
+        };
+        let (lds, refused) = match one_wave_lds.then(|| lds_fences(x, &meet)) {
+            Some(Ok(l)) => (Some(l), None),
+            Some(Err(why)) => (None, Some(why)),
+            None => (None, None),
+        };
         Exchange {
-            meet: meeting(x),
+            meet,
             slots: None,
+            lds,
+            refused,
+            pending: None,
         }
     }
+}
+
+/// Where a group of one console wave orders its LDS in halves: the blocks
+/// ending with a group barrier (before they branch into a region only some
+/// lanes run that accesses LDS) and those starting with one (where such a
+/// region comes back).
+#[derive(Default)]
+struct Lds {
+    before_exit: HashSet<usize>,
+    at_entry: HashSet<usize>,
+}
+
+/// [`Lds`] of a program, or why it cannot run in halves: a region only some
+/// lanes run (a set of blocks not every thread meets in, joined by edges)
+/// that both writes and reads LDS, or writes it in two instructions, cannot
+/// be put in the console's order without a barrier inside it.
+fn lds_fences(x: &Parts, meet: &[bool]) -> Result<Lds, Why> {
+    const MIXED: Why = "LDS a branch only some lanes take both writes and reads (or writes twice), in a group of one console wave64 on a host of 32-lane waves";
+    let (p, st) = (x.p, x.st);
+    let n = st.exits.len();
+    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (b, e) in st.exits.iter().enumerate() {
+        match *e {
+            LaneExit::Jump(t) => succ[b].push(t),
+            LaneExit::Branch {
+                taken, not_taken, ..
+            } => {
+                succ[b].push(taken);
+                succ[b].push(not_taken);
+            }
+            LaneExit::End => {}
+            LaneExit::Indirect => return Err(MIXED),
+        }
+    }
+    let meets = |b: usize| meet.get(b).copied().unwrap_or(false);
+    // The regions: blocks not every thread meets in, by their edges.
+    let mut root: Vec<usize> = (0..n).collect();
+    fn find(root: &mut [usize], mut b: usize) -> usize {
+        while root[b] != b {
+            root[b] = root[root[b]];
+            b = root[b];
+        }
+        b
+    }
+    for (b, next) in succ.iter().enumerate() {
+        for &t in next {
+            if !meets(b) && !meets(t) {
+                let (rb, rt) = (find(&mut root, b), find(&mut root, t));
+                root[rb] = rt;
+            }
+        }
+    }
+    // Each region's LDS reads, writes and other accesses (atomics).
+    let mut access: HashMap<usize, [u32; 3]> = HashMap::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        if meets(b) {
+            continue;
+        }
+        for inst in &block.insts {
+            let name = inst.name();
+            if !matches!(inst.fields, Fields::Ds { .. })
+                || name.starts_with("ds_swizzle")
+                || name.contains("permute")
+                || name == "ds_nop"
+            {
+                continue;
+            }
+            let k = if name.starts_with("ds_read") {
+                0
+            } else if name.starts_with("ds_write") {
+                1
+            } else {
+                2
+            };
+            access.entry(find(&mut root, b)).or_default()[k] += 1;
+        }
+    }
+    if access
+        .values()
+        .any(|&[r, w, a]| (w > 0 && r > 0) || (a > 0 && w + r > 0) || a > 1 || w > 1)
+    {
+        return Err(MIXED);
+    }
+    let mut lds = Lds::default();
+    for (u, next) in succ.iter().enumerate() {
+        for &v in next {
+            if meets(u) && !meets(v) && access.contains_key(&find(&mut root, v)) {
+                lds.before_exit.insert(u);
+            }
+            if !meets(u) && meets(v) && access.contains_key(&find(&mut root, u)) {
+                lds.at_entry.insert(v);
+            }
+        }
+    }
+    Ok(lds)
 }
 
 /// Per IR block, whether every thread of the group gets there together and

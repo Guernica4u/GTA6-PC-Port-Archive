@@ -174,7 +174,53 @@ fn refusal(words: &[u32], threads: u32, lds_bytes: u32) -> String {
 /// The hand-encoded words are the instructions their comments name.
 #[test]
 fn the_test_programs_are_what_their_comments_say() {
-    let programs: [(Vec<u32>, &[&str]); 10] = [
+    let programs: [(Vec<u32>, &[&str]); 15] = [
+        (
+            lds_after_a_spin(),
+            &[
+                "v_mov_b32 v5, lit(0x00000bad)",
+                "v_cmp_gt_u32 vcc, 32, v0",
+                "s_mov_b32 s22, lit(0x00004e20)",
+                "s_sub_u32 s22, s22, 1",
+                "s_cmp_lg_u32 s22, 0",
+                "s_cbranch_scc1",
+                "ds_write_b32 v3, v5",
+                "ds_write_b32 v2, v1",
+                "ds_read_b32 v4, v3",
+            ],
+        ),
+        (
+            lds_across(),
+            &[
+                "v_add_nc_u32 v1, 1, v0",
+                "ds_write_b32 v2, v1",
+                "v_xor_b32 v3, lit(0x00000080), v2",
+                "ds_read_b32 v4, v3",
+            ],
+        ),
+        (
+            lds_across_a_branch(),
+            &[
+                "ds_write_b32 v2, v5",
+                "v_cmp_gt_u32 vcc, 48, v0",
+                "s_and_saveexec_b64 s[20:21], vcc",
+                "s_cbranch_execz",
+                "s_mov_b64 exec, s[20:21]",
+                "ds_read_b32 v4, v3",
+            ],
+        ),
+        (
+            lds_written_and_read_in_a_branch(),
+            &[
+                "s_cbranch_execz",
+                "ds_write_b32 v2, v1",
+                "ds_read_b32 v4, v3",
+            ],
+        ),
+        (
+            lds_written_twice_in_a_branch(),
+            &["ds_write_b32 v2, v1", "ds_write_b32 v3, v1"],
+        ),
         (
             lane_reads(),
             &[
@@ -409,12 +455,14 @@ fn reads_across_32_lane_halves_are_refused_with_their_reason() {
     assert_eq!(refusal(&unused, 64, 0), "translated");
 }
 
-/// LDS shared by a group that is one console wave64 (no barriers between
-/// its lanes) cannot be split into two host waves; one of 32 threads or
-/// fewer is one host wave, and a group of several console waves keeps the
-/// console's barriers.
+/// A group of one console wave64 shares LDS without barriers; in halves its
+/// accesses are put in the console's order with group barriers. A region
+/// only some lanes run cannot be ordered inside, so one that both writes
+/// and reads, or writes twice, is refused. A group of 32 threads or fewer
+/// is one host wave, and one of several console waves keeps the console's
+/// barriers.
 #[test]
-fn lds_of_a_one_wave64_group_is_refused_in_halves() {
+fn lds_of_a_one_wave64_group_is_ordered_in_halves() {
     let lds = [
         PROLOGUE.as_slice(),
         &[
@@ -433,13 +481,185 @@ fn lds_of_a_one_wave64_group_is_refused_in_halves() {
         &[S_ENDPGM],
     ]
     .concat();
-    let why = refusal(&lds, 64, 256);
-    assert!(
-        why.contains("LDS one console wave64 shares without barriers"),
-        "{why}"
-    );
-    assert_eq!(refusal(&lds, 32, 256), "translated");
+    for threads in [64, 48, 32] {
+        assert_eq!(refusal(&lds, threads, 256), "translated", "{threads}");
+    }
     assert_eq!(refusal(&lds, 128, 512), "translated");
+    for words in [
+        lds_written_and_read_in_a_branch(),
+        lds_written_twice_in_a_branch(),
+    ] {
+        let why = refusal(&words, 64, 256);
+        assert!(
+            why.contains("both writes and reads (or writes twice)"),
+            "{why}"
+        );
+    }
+}
+
+/// Every lane writes `tid + 1` at its own dword, then reads the dword of
+/// lane `tid ^ 32`, in the other half.
+fn lds_across() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+        0xD834_0000,
+        0x0000_0102, // ds_write_b32 v2, v1
+        0x3A06_04FF,
+        0x0000_0080, // v_xor_b32 v3, 0x80, v2
+        0xD8D8_0000,
+        0x0400_0003, // ds_read_b32 v4, v3
+        S_WAITCNT_LGKM,
+    ]);
+    w.extend(store(4, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// Every lane writes 0 at its own dword; lanes below 48 then write `tid + 1`
+/// there inside a branch, and after it every lane reads the dword of lane
+/// `tid ^ 32`, in the other half.
+fn lds_across_a_branch() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+        0x7E0A_0280, // v_mov_b32 v5, 0
+        0xD834_0000,
+        0x0000_0502, // ds_write_b32 v2, v5
+        0x7D88_00B0, // v_cmp_gt_u32 vcc, 48, v0
+        0xBE94_246A, // s_and_saveexec_b64 s[20:21], vcc
+        0xBF88_0002, // s_cbranch_execz 2
+        0xD834_0000,
+        0x0000_0102, // ds_write_b32 v2, v1
+        0xBEFE_0414, // s_mov_b64 exec, s[20:21]
+        0x3A06_04FF,
+        0x0000_0080, // v_xor_b32 v3, 0x80, v2
+        0xD8D8_0000,
+        0x0400_0003, // ds_read_b32 v4, v3
+        S_WAITCNT_LGKM,
+    ]);
+    w.extend(store(4, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// Lanes below 32 first spin 20,000 times; then every lane writes a poison
+/// dword into the dword of lane `tid ^ 32` (in the other half), its own
+/// `tid + 1` into its own dword, and reads lane `tid ^ 32`'s. On the console
+/// all poison is written before any lane's own dword, so every lane reads
+/// its partner's `tid + 1`. Two host waves out of step (the upper one ahead)
+/// would read poison: the barriers are what keep them in the console's order.
+fn lds_after_a_spin() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+        0x3A06_04FF,
+        0x0000_0080, // v_xor_b32 v3, 0x80, v2
+        0x7E0A_02FF,
+        0x0000_0BAD, // v_mov_b32 v5, 0xbad
+        0x7E0C_0280, // v_mov_b32 v6, 0
+        0x7D88_00A0, // v_cmp_gt_u32 vcc, 32, v0
+        0xBE94_246A, // s_and_saveexec_b64 s[20:21], vcc
+        0xBF88_0006, // s_cbranch_execz 6
+        0xBE96_03FF,
+        0x0000_4E20, // s_mov_b32 s22, 20000
+        0x4A0C_0C81, // v_add_nc_u32 v6, 1, v6
+        0x8096_8116, // s_sub_u32 s22, s22, 1
+        0xBF07_8016, // s_cmp_lg_u32 s22, 0
+        0xBF85_FFFC, // s_cbranch_scc1 -4
+        0xBEFE_0414, // s_mov_b64 exec, s[20:21]
+        0xD834_0000,
+        0x0000_0503, // ds_write_b32 v3, v5
+        0xD834_0000,
+        0x0000_0102, // ds_write_b32 v2, v1
+        0xD8D8_0000,
+        0x0400_0003, // ds_read_b32 v4, v3
+        S_WAITCNT_LGKM,
+    ]);
+    w.extend(store(4, 0));
+    w.extend(store(6, 4));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// Lanes below 48 write their dword and read lane `tid ^ 32`'s, both inside
+/// one branch.
+fn lds_written_and_read_in_a_branch() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+        0x7D88_00B0, // v_cmp_gt_u32 vcc, 48, v0
+        0xBE94_246A, // s_and_saveexec_b64 s[20:21], vcc
+        0xBF88_0007, // s_cbranch_execz 7
+        0xD834_0000,
+        0x0000_0102, // ds_write_b32 v2, v1
+        0x3A06_04FF,
+        0x0000_0080, // v_xor_b32 v3, 0x80, v2
+        0xD8D8_0000,
+        0x0400_0003, // ds_read_b32 v4, v3
+        S_WAITCNT_LGKM,
+        0xBEFE_0414, // s_mov_b64 exec, s[20:21]
+    ]);
+    w.extend(store(4, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// Lanes below 48 write two dwords in two instructions inside one branch.
+fn lds_written_twice_in_a_branch() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+        0x3A06_04FF,
+        0x0000_0080, // v_xor_b32 v3, 0x80, v2
+        0x7D88_00B0, // v_cmp_gt_u32 vcc, 48, v0
+        0xBE94_246A, // s_and_saveexec_b64 s[20:21], vcc
+        0xBF88_0004, // s_cbranch_execz 4
+        0xD834_0000,
+        0x0000_0102, // ds_write_b32 v2, v1
+        0xD834_0000,
+        0x0000_0103, // ds_write_b32 v3, v1
+        0xBEFE_0414, // s_mov_b64 exec, s[20:21]
+    ]);
+    w.extend(store(1, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// [`lds_across`], [`lds_across_a_branch`] and [`lds_after_a_spin`] in a
+/// group of 64 on every
+/// hardware adapter, in halves (two host waves, put in order by barriers)
+/// and as one wave64 where the adapter runs those: every lane reads what the
+/// other half's lane wrote, as on the console.
+#[test]
+fn one_wave_lds_crosses_the_halves_in_order_on_every_gpu() {
+    let across: Vec<u32> = (0..64).map(|l| (l ^ 32) + 1).collect();
+    let mut failed = differences_with_lds(&lds_across(), 64, 256, 1, &across);
+    let branch: Vec<u32> = (0..64)
+        .map(|l| if l ^ 32 < 48 { (l ^ 32) + 1 } else { 0 })
+        .collect();
+    failed.extend(differences_with_lds(
+        &lds_across_a_branch(),
+        64,
+        256,
+        1,
+        &branch,
+    ));
+    let spin: Vec<u32> = (0..64)
+        .flat_map(|l| [(l ^ 32) + 1, if l < 32 { 20_000 } else { 0 }])
+        .collect();
+    failed.extend(differences_with_lds(&lds_after_a_spin(), 64, 256, 2, &spin));
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
 /// Runs `words`, one group of `threads` of a wave64 program whose lanes store
@@ -447,7 +667,18 @@ fn lds_of_a_one_wave64_group_is_refused_in_halves() {
 /// as one wave64 where the adapter runs 64-lane waves. A line per lane whose
 /// dwords differ from `want` (the console's, `per_lane` per lane).
 fn differences(words: &[u32], threads: u32, per_lane: usize, want: &[u32]) -> Vec<String> {
-    let n = native(words, true, threads, 0);
+    differences_with_lds(words, threads, 0, per_lane, want)
+}
+
+/// [`differences`] for a program with `lds_bytes` of LDS.
+fn differences_with_lds(
+    words: &[u32],
+    threads: u32,
+    lds_bytes: u32,
+    per_lane: usize,
+    want: &[u32],
+) -> Vec<String> {
+    let n = native(words, true, threads, lds_bytes);
     let forms = [
         ("halves", shader(lowered(&n, true).expect("halves"))),
         ("wave64", shader(lowered(&n, false).expect("one wave64"))),
