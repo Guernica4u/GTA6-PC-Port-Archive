@@ -1,7 +1,63 @@
 //! Sixteen-lane row permutations and their host participation check.
 
 use super::{Attr, Atom, Bin, Inst, LaneExit, Lower, Operand, Program, Reg, Structured, V, Why, pred};
-use crate::gfx10::Valu;
+use crate::gfx10::{Fields, Valu};
+use crate::ir::Value;
+use std::collections::HashSet;
+
+/// A guest SCC can depend on an SGPR phi selected by a divergent host
+/// branch. Prove ordinary scalar expressions from compute SGPR inputs.
+/// Phis and wave operations require their own participation proof.
+fn host_uniform_scalars(p: &Program, order: &[usize]) -> HashSet<Value> {
+    let mut uniform: HashSet<_> = p
+        .inputs
+        .iter()
+        .filter_map(|&(reg, v)| matches!(reg, Reg::S(0..=105)).then_some(v))
+        .collect();
+    for &b in order {
+        for inst in &p.blocks[b].insts {
+            let Fields::Sop { src, .. } = &inst.fields else {
+                continue;
+            };
+            let name = inst.name();
+            let pure = name.starts_with("s_cmp_")
+                || name.starts_with("s_cmpk_")
+                || matches!(
+                    name,
+                    "s_mov_b32"
+                        | "s_mov_b64"
+                        | "s_movk_i32"
+                        | "s_add_u32"
+                        | "s_sub_u32"
+                        | "s_add_i32"
+                        | "s_sub_i32"
+                        | "s_and_b32"
+                        | "s_or_b32"
+                        | "s_xor_b32"
+                        | "s_lshl_b32"
+                        | "s_lshr_b32"
+                        | "s_ashr_i32"
+                        | "s_cselect_b32"
+                        | "s_cselect_b64"
+                );
+            if pure
+                && src.iter().all(|x| match x {
+                    Operand::Scalar { code: 0..=105, .. } | Operand::Literal(_) => true,
+                    Operand::Const(k) => crate::resource::inline(*k).is_some(),
+                    _ => false,
+                })
+                && inst.reads.iter().all(|(_, v)| uniform.contains(v))
+            {
+                uniform.extend(
+                    inst.writes
+                        .iter()
+                        .filter_map(|&(r, v)| matches!(r, Reg::S(0..=105) | Reg::Scc).then_some(v)),
+                );
+            }
+        }
+    }
+    uniform
+}
 
 /// Blocks reached by every host lane: a fetch-inactive shuffle cannot
 /// recover registers of invocations absent from a divergent host branch.
@@ -12,10 +68,8 @@ fn all_lane_blocks(p: &Program, st: &Structured) -> Option<Vec<bool>> {
     let mut reaches_end = vec![false; n];
     reaches_end[exit_block] = true;
     let mut rpo = vec![usize::MAX; exit_block];
-    for (index, block) in crate::ir::reverse_postorder(&p.blocks)
-        .into_iter()
-        .enumerate()
-    {
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    for (index, &block) in order.iter().enumerate() {
         rpo[block] = index;
     }
     let mut aborts = vec![false; exit_block];
@@ -87,13 +141,23 @@ fn all_lane_blocks(p: &Program, st: &Structured) -> Option<Vec<bool>> {
         }
     }
     let mut all = vec![true; n];
+    let uniform = host_uniform_scalars(p, &order);
     for (branch, exit) in st.exits.iter().enumerate() {
         let divergent = match *exit {
-            LaneExit::Branch { when, .. } => !st
-                .bools
-                .support(when)
-                .iter()
-                .all(|a| matches!(a, Atom::Uniform(_))),
+            LaneExit::Branch {
+                when,
+                taken,
+                not_taken,
+            } => {
+                // Lower::exit also tests a per-lane iteration counter on a back edge.
+                rpo[taken] <= rpo[branch]
+                    || rpo[not_taken] <= rpo[branch]
+                    || !st
+                        .bools
+                        .support(when)
+                        .iter()
+                        .all(|a| matches!(a, Atom::Uniform(v) if uniform.contains(v)))
+            }
             _ => false,
         };
         if !divergent && !aborts[branch] {

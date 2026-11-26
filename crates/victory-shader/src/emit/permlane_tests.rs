@@ -151,6 +151,35 @@ fn permlane_fetch_inactive_inside_a_uniform_branch_is_allowed() {
 }
 
 #[test]
+fn permlane_fetch_inactive_under_a_computed_uniform_scalar_is_allowed() {
+    let native = native(true, true, false, false, false, &[
+        0x800c_8100, // s_add_u32 s12, s0, 1
+        0xbf06_800c, // s_cmp_eq_u32 s12, 0
+        0xbf85_0002, // skip the FI shuffle on SCC
+    ]);
+    lowered(&native).expect("the scalar argument and literal agree across host lanes");
+}
+
+#[test]
+fn permlane_fetch_inactive_after_a_divergent_scalar_phi_is_rejected() {
+    let native = native(true, true, false, false, false, &[
+        0xbe8c_0380, // s_mov_b32 s12, 0
+        0xbf88_0001, // s_cbranch_execz skips s12 = 1
+        0xbe8c_0381, // s_mov_b32 s12, 1
+        0xbefe_03c1, // restore all lanes
+        0xbf06_800c, // s_cmp_eq_u32 s12, 0
+        0xbf85_0002, // skip the FI shuffle on SCC
+    ]);
+    assert!(matches!(
+        lowered(&native),
+        Err(ShaderError::Unsupported {
+            what: "a permlane fetch from lanes outside the host branch",
+            ..
+        })
+    ));
+}
+
+#[test]
 fn permlane_fetch_inactive_after_a_lane_abort_is_rejected() {
     // A lane-dependent header test with an unconditional back edge. The
     // emitter's iteration limit returns the looping lanes from the shader;
