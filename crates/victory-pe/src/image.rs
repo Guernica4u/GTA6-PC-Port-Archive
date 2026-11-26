@@ -371,9 +371,17 @@ fn parse_exports(file: &PeFile64<'_>, image_base: u64) -> Result<Vec<ExportInfo>
                 NameOrOrdinal::Ordinal(_) => None,
             };
             let (rva, forward) = match e.target() {
-                // The generic iterator adds the image base to an address.
+                // The generic iterator adds the image base to a 32-bit RVA.
                 ReadTarget::Address { address } => {
-                    (Some(address.wrapping_sub(image_base) as u32), None)
+                    let rva = address
+                        .checked_sub(image_base)
+                        .and_then(|a| u32::try_from(a).ok())
+                        .ok_or_else(|| {
+                            PeError::Malformed(format!(
+                                "export address {address:#x} outside image_base {image_base:#x}"
+                            ))
+                        })?;
+                    (Some(rva), None)
                 }
                 ReadTarget::Reexport { library, name } => {
                     let symbol = match name {
@@ -928,5 +936,31 @@ mod tests {
                 (Some("gamma"), 2, Some(0x1204)),
             ]
         );
+    }
+
+    #[test]
+    fn keeps_valid_export_rva_when_image_base_is_high() {
+        let mut body = vec![0u8; 0x100];
+        let put32 =
+            |b: &mut Vec<u8>, at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        put32(&mut body, 12, 0x1040); // name of the DLL
+        put32(&mut body, 16, 1); // ordinal base
+        put32(&mut body, 20, 1); // number of functions
+        put32(&mut body, 24, 1); // number of names
+        put32(&mut body, 28, 0x1028); // address table
+        put32(&mut body, 32, 0x1034); // name pointer table
+        put32(&mut body, 36, 0x103C); // name ordinal table
+        put32(&mut body, 0x28, 0x1200); // address entry: object adds image_base to this RVA
+        put32(&mut body, 0x34, 0x1050);
+        body[0x40..0x46].copy_from_slice(b"t.dll\0");
+        body[0x50..0x56].copy_from_slice(b"alpha\0");
+
+        let info = ImageInfo::parse(&synthetic_image(&body)).unwrap();
+        let exports: Vec<_> = info
+            .exports
+            .iter()
+            .map(|e| (e.name.as_deref(), e.ordinal, e.rva))
+            .collect();
+        assert_eq!(exports, [(Some("alpha"), 1, Some(0x1200))]);
     }
 }
