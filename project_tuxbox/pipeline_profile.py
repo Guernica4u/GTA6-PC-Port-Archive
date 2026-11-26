@@ -1,5 +1,5 @@
 """Capture native vkd3d-proton pipeline creation and correlate it with Wine log timestamps."""
-from collections import Counter
+from collections import Counter, defaultdict
 from contextlib import contextmanager
 import heapq
 import json
@@ -38,7 +38,8 @@ def event_activity(intervals):
 
 def summarize(trace):
     totals = {}
-    pipeline_kinds = {}
+    pipeline_kinds = defaultdict(set)
+    pending = defaultdict(Counter)
     slowest = []
     intervals = []
     with trace.open(encoding="utf-8", errors="replace") as stream:
@@ -74,9 +75,11 @@ def summarize(trace):
             key, operation = match.groups()
             label = operation.split()[0]
             if label in ("GFX", "COMP", "LINK"):
-                pipeline_kinds[key] = "compute" if label == "COMP" else "graphics"
-            kind = "driver_internal" if label == "META" else pipeline_kinds.get(key, "unknown")
-            total = totals.setdefault(kind, Counter())
+                kind = "compute" if label == "COMP" else "graphics"
+                pipeline_kinds[key].add(kind)
+            else:
+                kind = "driver_internal" if label == "META" else None
+            total = totals.setdefault(kind, Counter()) if kind is not None else pending[key]
             total["calls"] += 1
             total["over_100_ms"] += duration >= 100
             total["total_ms"] += duration
@@ -85,6 +88,15 @@ def summarize(trace):
             heapq.heappush(slowest, (duration, index, row))
             if len(slowest) > 20:
                 heapq.heappop(slowest)
+    def inferred_kind(key):
+        kinds = pipeline_kinds.get(key, ())
+        return next(iter(kinds)) if len(kinds) == 1 else "unknown"
+
+    for key, counts in pending.items():
+        totals.setdefault(inferred_kind(key), Counter()).update(counts)
+    for _, _, row in slowest:
+        if row["type"] is None:
+            row["type"] = inferred_kind(row["pipeline_key"])
     for group in totals.values():
         group["total_ms"] = round(group["total_ms"], 3)
     return dict(groups=totals, activity=event_activity(intervals),

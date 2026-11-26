@@ -43,6 +43,28 @@ class PerformanceTests(unittest.TestCase):
                 self.assertNotIn(first.parent.name, env["VKD3D_QUEUE_PROFILE"])
                 self.assertEqual(env["TUXBOX_PROFILE_SHADERS"], "0")
 
+    def test_pipeline_kind_inference_is_order_independent_and_conflicts_are_unknown(self):
+        with TemporaryDirectory() as tmp:
+            trace = Path(tmp) / "trace.json"
+            events = [
+                ("0000000000000001 FALLBACK OK", 200000),
+                ("0000000000000001 COMP MISS", 10000),
+                ("0000000000000002 LINK OK", 4000),
+                ("0000000000000002 CACHE OK", 5000),
+                ("0000000000000003 COMP OK", 6000),
+                ("0000000000000003 FALLBACK OK", 7000),
+                ("0000000000000003 GFX OK", 8000),
+            ]
+            expected = {"compute": {"calls": 3, "total_ms": 216, "over_100_ms": 1},
+                        "graphics": {"calls": 3, "total_ms": 17, "over_100_ms": 0},
+                        "unknown": {"calls": 1, "total_ms": 7, "over_100_ms": 0}}
+            for order in (events, list(reversed(events))):
+                trace.write_text("".join(json.dumps(dict(name=name, pid="pso", ph="X",
+                                 ts=1000, dur=duration)) + ",\n" for name, duration in order))
+                result = summarize(trace)
+                self.assertEqual(result["groups"], expected)
+                self.assertEqual(result["slowest"][0]["type"], "compute")
+
     def test_pipeline_stage_report_keeps_overlapping_time_and_missing_host_separate(self):
         from project_tuxbox.shader_profile import ShaderProfile
         with TemporaryDirectory() as tmp:
