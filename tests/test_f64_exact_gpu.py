@@ -15,7 +15,8 @@ class F64ExactReferenceTests(unittest.TestCase):
         negative_denormal = 0x8000_0000_0000_0001
         self.assertEqual(reference("v_floor_f64", negative_denormal), bits(-1.0))
         self.assertEqual(reference("v_floor_f64", negative_denormal, keep_denormals=False), bits(-0.0))
-        self.assertEqual(reference("v_trunc_f64", 0x7ff0_0000_0000_0001), 0x7ff8_0000_0000_0001)
+        self.assertEqual(reference("v_trunc_f64", 0x7ff0_0000_0000_0001), 0x7ff0_0000_0000_0001)
+        self.assertEqual(reference("v_trunc_f64", 0x7ff0_0000_0000_0001, ieee=True), 0x7ff8_0000_0000_0001)
         self.assertEqual(reference("v_cvt_i32_f64", 0x7ff8_0000_0000_0000), 0)
 
     def test_integer_conversions(self):

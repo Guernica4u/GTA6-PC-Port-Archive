@@ -2,10 +2,10 @@
 //! progress panel.
 //!
 //! A shader is counted once, by its request key, however often the title asks
-//! for it. A pipeline is counted once per creation call from the title; that
+//! for it. A refused attempt that a later one overcame is not counted. A pipeline is counted once per creation call from the title; that
 //! call includes any translation wait and the driver's own compile.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
@@ -60,12 +60,17 @@ impl ShaderCounts {
 #[derive(Default)]
 struct Shaders {
     seen: HashMap<String, Shader>,
+    /// Attempts whose refusal is expected, because a retry replaces them.
+    superseded: HashSet<String>,
     counts: ShaderCounts,
 }
 
 impl Shaders {
     /// Returns whether anything changed.
     fn record(&mut self, key: &str, shader: Shader) -> bool {
+        if shader == Shader::Unsupported && self.superseded.contains(key) {
+            return false;
+        }
         match self.seen.get(key).copied() {
             None => {
                 self.seen.insert(key.to_owned(), shader);
@@ -77,6 +82,18 @@ impl Shaders {
             Some(_) => return false,
         }
         *self.counts.slot(shader) += 1;
+        true
+    }
+
+    /// Stop counting `key` as unsupported, now and if it is refused again.
+    /// Returns whether a count changed.
+    fn supersede(&mut self, key: &str) -> bool {
+        self.superseded.insert(key.to_owned());
+        if self.seen.get(key) != Some(&Shader::Unsupported) {
+            return false;
+        }
+        self.seen.remove(key);
+        self.counts.unsupported -= 1;
         true
     }
 }
@@ -113,6 +130,14 @@ fn touch() {
 pub(crate) fn record(key: &str, shader: Shader) {
     let changed = SHADERS.lock().unwrap_or_else(|e| e.into_inner()).record(key, shader);
     if changed {
+        touch();
+    }
+}
+
+/// A retry compiled the program, so the refusal of `key` was one attempt on the
+/// way to it.
+pub(crate) fn supersede(key: &str) {
+    if SHADERS.lock().unwrap_or_else(|e| e.into_inner()).supersede(key) {
         touch();
     }
 }

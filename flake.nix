@@ -53,6 +53,7 @@
         xwayland
         mangohud
         zenity
+        vulkan-tools
       ];
 
       # The isolated GPU checks start Proton's Wine directly, without umu's runtime

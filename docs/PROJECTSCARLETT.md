@@ -63,7 +63,7 @@ compiler. The runtime reports an actual compiler load failure separately
 from other pipeline errors. This is not a confirmed fix for the black-screen
 report in #39.
 
-Copy the providers again after each rebuild. The launcher enables the constant-buffer layer only when the staged `d3d12_xs.dll` is byte-identical to `build/d3d12-smoke/d3d12_xs.dll`.
+Copy the providers again after each rebuild. The launcher enables the constant-buffer layer only when the staged `d3d12_xs.dll` is byte-identical to `build/d3d12-smoke/d3d12_xs.dll`. With it, the launcher also adds `force_raw_va_cbv` to `VKD3D_CONFIG`, so constant buffers bound by address are read from the guest's 16-byte offsets.
 
 ## Launch
 
@@ -250,10 +250,20 @@ python tuxbox.py run --prepare-only --backend proton --prefix PREFIX /path/to/sc
 ## What to expect
 
 The two shader and memory paths added on November 26, 2026 have passed TuxBox's
-checks but haven't been tried in this game: the [32-lane
-translation](SHADERS.md#64-lane-programs-on-32-lane-hosts) on NVIDIA, and the
-[memory copy](USAGE.md#memory-copy) on AMD's Linux driver. Please report how far
-either gets.
+checks. The [memory copy](USAGE.md#memory-copy) on AMD's Linux driver hasn't
+been tried in this game yet; please report how far it gets. The [32-lane
+translation](SHADERS.md#64-lane-programs-on-32-lane-hosts) has had two NVIDIA
+reports, both ending in the same GPU hang ([#232](https://github.com/brcly/TuxBox/issues/232)):
+
+- An RTX 3080 Ti (driver 620.70.06, GE-Proton11-14, main at c6ce497) loaded for
+  about 2 h 40 min on a cold shader cache and reached the world's setup behind
+  the loading art. The kernel then logged Xid 109 (`CTX SWITCH TIMEOUT`) and
+  vkd3d-proton reported the device lost.
+- An RTX 5090 hit the same Xid 109 about 19 minutes in; an earlier run on it
+  ended with Xid 13.
+
+Xid 109 means a GPU context could not be switched out in time, which usually
+means one dispatch ran far too long.
 
 On November 25, 2026, an offline run on a GeForce RTX 4070 Ti SUPER got into the
 story intro. The game's own crash report records the state `Game Running`, frame
@@ -268,8 +278,14 @@ list ran out of descriptor memory. The prologue cutscene did not appear.
   [Lanes self-test](../examples/lanes/README.md#self-test). Stalls still occur at
   the intro. A wait that never completes is released after five seconds, and the
   log reports which lists write the label and where each queue stopped.
-- **Descriptor memory.** Shader-visible descriptor slots are not reclaimed and can
-  run out.
+- **Descriptor memory.** Since #172, shader-visible descriptor slots are reused
+  once the GPU has finished the work that referenced them, and the oldest are
+  evicted when the heap fills. The [Lanes self-test](../examples/lanes/README.md#self-test)
+  checks this, but no long game run has confirmed it yet. Compute dispatches
+  whose root has no descriptor tables and indexes the resource heap directly
+  are still skipped on paged layouts
+  ([#232](https://github.com/brcly/TuxBox/issues/232); draft fix in
+  [#235](https://github.com/brcly/TuxBox/pull/235)).
 - **Missing effects.** Many shaders are still unsupported, and large compute
   pipelines can receive empty stand-ins. Expect missing or wrong rendering.
   Image correctness hasn't been checked. [Shader coverage](SHADERS.md#projectscarlett-refusals)
@@ -831,3 +847,16 @@ The issue #39 log contains 262 failed driver allocation attempts and
 131 host import failure messages, not a confirmed VRAM exhaustion or
 a proven fault in these provider call sites. The opt-in trace is intended
 to distinguish those possibilities in a subsequent authorized run.
+
+
+### Comparing provider revisions
+
+A run from a different checkout does not redeploy the title's DLLs.
+The launcher logs SHA-256 of the staged D3D12 provider and of the local
+`build/d3d12-smoke/d3d12_xs.dll` when available. It warns if they differ.
+For an A/B test, build and deploy the intended provider explicitly, then
+pass `--require-current-provider` before the title path to refuse a launch
+unless the staged file matches the local build. This does not rebuild or
+replace a DLL, prove which source revision produced the local build, or
+inspect modules actually loaded by Wine. Record the build revision and
+driver separately.

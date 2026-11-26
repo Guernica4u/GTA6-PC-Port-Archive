@@ -69,3 +69,24 @@ fn every_host_profile_receives_the_recorded_translation() {
         changed.join("\n")
     );
 }
+
+/// RDNA2 reads 0 past a group's LDS allocation and drops the writes. An HLSL
+/// groupshared index past the array is undefined and can fault on NVIDIA, so
+/// every access must be checked against the declared size.
+#[test]
+fn group_shared_accesses_are_checked_against_the_declared_size() {
+    let &(_, threads, words) = programs::PROGRAMS.iter().find(|program| program.0 == "shared").unwrap();
+    let shader = program(threads, words);
+    let mut checked = 0;
+    for translated in [translate(&shader), translate_for_wave32_host(&shader), translate_paired_wave64(&shader)] {
+        let Ok(translated) = translated else { continue };
+        let hlsl = &translated.hlsl;
+        assert!(hlsl.contains("#define TB_LDS_WORDS "), "{hlsl}");
+        assert!(!hlsl.contains("8191u"), "an access still wraps instead of being checked:\n{hlsl}");
+        for line in hlsl.lines().filter(|line| line.contains("tb_lds[")) {
+            assert!(line.contains("TB_LDS_WORDS"), "unchecked group shared access: {line}");
+        }
+        checked += 1;
+    }
+    assert!(checked > 0, "no host profile translated the shared-memory program");
+}

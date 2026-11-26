@@ -93,6 +93,49 @@ class SelectProton(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, PINNED_PROTON):
                     proton_installation(None)
 
+    def test_default_finds_flatpak_steam_tools(self):
+        for suffix in ("", "-x86_64"):
+            with self.subTest(suffix=suffix), tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp).resolve()
+                steam = home / ".var/app/com.valvesoftware.Steam/.local/share/Steam"
+                install = steam / "compatibilitytools.d" / f"{PINNED_PROTON}{suffix}"
+                install.mkdir(parents=True)
+                (install / "proton").touch()
+                with patch.dict(os.environ, {}, clear=True), \
+                        patch.object(Path, "home", return_value=home):
+                    self.assertEqual(proton_installation(None), install)
+
+    def test_default_reads_library_folders_from_each_steam_installation(self):
+        for relative in (".local/share/Steam",
+                         ".var/app/com.valvesoftware.Steam/.local/share/Steam"):
+            with self.subTest(steam=relative), tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp).resolve()
+                steam = home / relative
+                (steam / "steamapps").mkdir(parents=True)
+                library = home / "Other Steam Library"
+                (steam / "steamapps/libraryfolders.vdf").write_text(
+                    f'"libraryfolders" {{ "0" {{ "path" "{library.as_posix()}" }} }}')
+                install = library / "steamapps/common" / PINNED_PROTON
+                install.mkdir(parents=True)
+                (install / "proton").touch()
+                with patch.dict(os.environ, {}, clear=True), \
+                        patch.object(Path, "home", return_value=home):
+                    self.assertEqual(proton_installation(None), install)
+
+    def test_selected_steam_client_keeps_priority(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp).resolve()
+            selected = home / "Selected Steam"
+            flatpak = home / ".var/app/com.valvesoftware.Steam/.local/share/Steam"
+            for steam in (selected, flatpak):
+                install = steam / "compatibilitytools.d" / PINNED_PROTON
+                install.mkdir(parents=True)
+                (install / "proton").touch()
+            with patch.dict(os.environ, {"STEAM_COMPAT_CLIENT_INSTALL_PATH": str(selected)},
+                            clear=True), patch.object(Path, "home", return_value=home):
+                self.assertEqual(proton_installation(None),
+                                 selected / "compatibilitytools.d" / PINNED_PROTON)
+
     @unittest.skipUnless(sys.platform == "linux", "Wine prefix drive links and POSIX modes require Linux")
     def test_linux_title_drive_uses_prefix_and_preserves_existing_assignment(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -332,7 +375,7 @@ class ConsoleConstantBuffers(unittest.TestCase):
             self.assertEqual(env["VK_ADD_LAYER_PATH"], "/user/extra")
             self.assertEqual(env["VK_INSTANCE_LAYERS"], "VK_LAYER_TUXBOX_console_cbv:overlay")
             self.assertEqual(env["VKD3D_DISABLE_EXTENSIONS"], "first;second")
-            self.assertEqual(env["VKD3D_CONFIG"], "force_static_cbv")
+            self.assertEqual(env["VKD3D_CONFIG"], "force_raw_va_cbv,force_static_cbv")
             self.assertEqual(env["PRESSURE_VESSEL_FILESYSTEMS_RO"], layer + ":/user/mount")
             before = env.copy()
             configure_console_cbv("proton", env, self.exe, self.log.status)
@@ -352,13 +395,14 @@ class ConsoleConstantBuffers(unittest.TestCase):
                "VKD3D_CONFIG": "other"}
         with patch("project_tuxbox.console_cbv.console_cbv_layer", return_value=self.layer) as layer:
             configure_console_cbv("proton", env, self.exe, self.log.status)
-            self.assertEqual(env["VKD3D_CONFIG"], "cbv_16_byte_alignment,other")
+            self.assertEqual(env["VKD3D_CONFIG"], "cbv_16_byte_alignment,force_raw_va_cbv,other")
             self.assertEqual(env["VKD3D_DISABLE_EXTENSIONS"], "first;VK_EXT_descriptor_buffer;VK_EXT_descriptor_heap")
             layer.assert_not_called()
             wine = {"PROTONPATH": str(self.root)}
             configure_console_cbv("wine", wine, self.exe, self.log.status)
             self.assertEqual(wine["VK_ADD_LAYER_PATH"], self.layer)
-            self.assertNotIn("VKD3D_CONFIG", wine)
+            # Without the raw address, NVIDIA rounds a root CBV down to 64 bytes.
+            self.assertEqual(wine["VKD3D_CONFIG"], "force_raw_va_cbv")
             self.assertNotIn("VKD3D_DISABLE_EXTENSIONS", wine)
             fork = {"PROTONPATH": str(self.root)}
             configure_console_cbv("proton", fork, self.exe, self.log.status)

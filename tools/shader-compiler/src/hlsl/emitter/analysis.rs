@@ -519,7 +519,7 @@ impl<'a> Emitter<'a> {
             if setreg {
                 continue;
             }
-            if let Some(high) = float64::pair_source_highs(ins) {
+            for high in float64::pair_source_highs(ins) {
                 if !written.contains(&format!("v{high}")) {
                     live.insert((1, high));
                 }

@@ -247,26 +247,81 @@ fn request(
     }
     // The title is now waiting on the host worker; the progress panel counts it.
     let _waiting = progress::waiting();
-    let start = Instant::now();
-    loop {
+    let mut checked = Instant::now();
+    let reply = await_reply(Duration::from_secs(90), std::thread::sleep, || {
+        if !reply_is_due(&published, checked.elapsed()) {
+            return None;
+        }
+        checked = Instant::now();
         if let Some(bytes) = read_portable_file(&result, stage) {
+            return Some(Some(bytes));
+        }
+        failed.exists().then_some(None)
+    });
+    match reply {
+        Some(Some(bytes)) => {
             REPLIES.of(dir).insert(name);
             progress::record(key, Shader::Translated);
-            return Some(bytes);
+            Some(bytes)
         }
-        if failed.exists() {
+        Some(None) => {
             // The host records a refusal in its cache before it reports the failure.
             if let Some(cache) = compiler_cache(dir) {
                 CACHED.of(cache).insert(format!("{key}.unsupported"));
             }
             progress::record(key, Shader::Unsupported);
-            return None;
+            None
         }
-        if start.elapsed() >= Duration::from_secs(90) {
+        None => {
             progress::record(key, Shader::TimedOut);
+            None
+        }
+    }
+}
+
+/// The longest pause between two looks for the host's reply.
+const SLOWEST_LOOK: Duration = Duration::from_millis(25);
+/// How often the reply is looked for while the request is still outstanding.
+const UNPROMPTED_LOOK: Duration = Duration::from_millis(250);
+
+/// Whether to look for the reply now.
+///
+/// The host publishes the reply, or the failure, before it removes the request.
+/// Asking for the request is cheap: it exists, in a directory that holds only
+/// the outstanding ones. Asking for an absent reply is not, because Wine then
+/// reads the whole session directory for another spelling of the name: about
+/// 4 ms at 12,000 replies and 13 ms at 40,000. The reply is still looked for now
+/// and then, in case a request is not removed.
+fn reply_is_due(request: &Path, since_last: Duration) -> bool {
+    since_last >= UNPROMPTED_LOOK || !request.exists()
+}
+
+/// The pause before the next look, having waited this long: an eighth of the
+/// wait, so a reply is seen soon after it is ready whether that takes 2 ms or
+/// 2 s, between 1 ms and `SLOWEST_LOOK`.
+fn pause_after(waited: Duration) -> Duration {
+    (waited / 8).clamp(Duration::from_millis(1), SLOWEST_LOOK)
+}
+
+/// Look for the host's reply until it arrives or `limit` passes.
+///
+/// The host answers a shader it has compiled before in a few milliseconds, and
+/// a title that creates its shaders one at a time waits for each answer.
+fn await_reply<T>(
+    limit: Duration,
+    mut pause: impl FnMut(Duration),
+    mut look: impl FnMut() -> Option<T>,
+) -> Option<T> {
+    let start = Instant::now();
+    loop {
+        if let Some(reply) = look() {
+            return Some(reply);
+        }
+        let waited = start.elapsed();
+        if waited >= limit {
             return None;
         }
-        std::thread::sleep(Duration::from_millis(25));
+        pause(pause_after(waited));
     }
 }
 

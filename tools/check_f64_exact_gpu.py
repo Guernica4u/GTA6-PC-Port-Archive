@@ -56,7 +56,7 @@ def edge_doubles():
     return out
 
 
-def reference(name, b, keep_denormals=True):
+def reference(name, b, keep_denormals=True, ieee=False):
     lo, hi = b & 0xffffffff, b >> 32
     if name == "v_cvt_f64_i32":
         return bits(float(lo - (1 << 32) if lo >> 31 else lo))
@@ -64,7 +64,11 @@ def reference(name, b, keep_denormals=True):
         return bits(float(hi))
     x = value(b)
     if math.isnan(x):
-        return (b | QUIET) if name in ROUNDING else 0
+        # Rounding quiets a signaling NaN only in IEEE mode, which these
+        # programs leave off (MODE 0xc0).
+        if name not in ROUNDING:
+            return 0
+        return b | QUIET if ieee else b
     if name in ROUNDING:
         if math.isinf(x):
             return b

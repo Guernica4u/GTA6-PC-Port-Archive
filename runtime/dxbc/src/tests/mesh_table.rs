@@ -226,8 +226,12 @@ fn pixel_layout_reads_four_word_typed_unordered_access_views() {
     };
     let slots: Vec<_> = ranges.iter().map(|r| (r.range_type, r.base_register, r.offset_in_table)).collect();
     assert_eq!(slots, [(0, 91, 2), (1, 13, 3)]);
-    // Only a pixel program holds such a view, and only a typed one.
-    assert!(MeshLayout::read(&program, &resources, &root).is_none());
+    // A mesh program records the same view (ProjectScarlett declares u7 so).
+    let mesh = MeshLayout::read(&program, &resources, &root).unwrap();
+    let (seen, wanted) = (mesh.tables[&(16, 96)], layout.tables[&(16, 96)]);
+    assert_eq!((seen.parameter, seen.kind, seen.register, seen.space), (wanted.parameter, 1, wanted.register, wanted.space));
+    // Only a typed view takes this shape, in either stage.
+    assert!(MeshLayout::read(&program, &[[3, 0, 91, 91], [8, 0, 13, 13]], &root).is_none());
     assert!(MeshLayout::read_stage(&program, &[[3, 0, 91, 91], [8, 0, 13, 13]], &root, true).is_none());
     // Other four-word unordered-access shapes stay unrecognised.
     let structured = build([[0x300, 16, 91, 4, 0x00808], [0x303, 24, 13, 16, 0x00804]]);

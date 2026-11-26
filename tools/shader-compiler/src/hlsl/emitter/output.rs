@@ -327,11 +327,23 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 .collect();
             let _ = writeln!(h, "static const uint tb_code[{}] = {{ {} }};", words.len().max(1), if words.is_empty() { "0".to_string() } else { words.join(", ") });
         }
-        if self.micropoly_vote.is_some() {
-            writeln!(h, "groupshared uint tb_lds[784];\ngroupshared uint tb_raster_votes[2];").unwrap();
+        let lds_words = if self.micropoly_vote.is_some() {
+            Some(784)
         } else if self.is_cs && self.uses_lds {
-            let words = self.reflected_lds_words.or_else(|| wave_cull::lds_words(self)).unwrap_or(8192);
-            let _ = writeln!(h, "groupshared uint tb_lds[{words}];");
+            Some(self.reflected_lds_words.or_else(|| wave_cull::lds_words(self)).unwrap_or(8192))
+        } else {
+            None
+        };
+        if let Some(words) = lds_words {
+            // RDNA2 returns 0 for LDS reads past the group's allocation and drops the
+            // writes. An HLSL groupshared index past the array is undefined, and NVIDIA
+            // can fault on it, so every access is checked against the declared size.
+            let _ = writeln!(h, "#define TB_LDS_WORDS {words}u\ngroupshared uint tb_lds[TB_LDS_WORDS];");
+            h.push_str("uint tb_lds_load(uint byte) { uint i = byte >> 2; return i < TB_LDS_WORDS ? tb_lds[i] : 0u; }\n");
+            h.push_str("void tb_lds_store(uint byte, uint value) { uint i = byte >> 2; if (i < TB_LDS_WORDS) tb_lds[i] = value; }\n");
+        }
+        if self.micropoly_vote.is_some() {
+            h.push_str("groupshared uint tb_raster_votes[2];\n");
         }
         Ok(h)
     }
@@ -373,7 +385,10 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 return Ok(h);
             }
             if self.compute_swizzle || self.indexed_lane {
-                writeln!(h, "groupshared uint tb_swizzle[{}];", tx * ty_ * tz).unwrap();
+                // A group of 32 or 96 lanes ends in half a guest wave64. A lane
+                // read can name a lane of its missing half, past the array.
+                writeln!(h, "#define TB_SWIZZLE_WORDS {}u\ngroupshared uint tb_swizzle[TB_SWIZZLE_WORDS];", tx * ty_ * tz).unwrap();
+                h.push_str("uint tb_swizzle_read(uint i) { return i < TB_SWIZZLE_WORDS ? tb_swizzle[i] : 0u; }\n");
             }
             if let Some(width) = self.required_wave_size.filter(|_| !self.portable_wave64) {
                 writeln!(h, "[WaveSize({width})]").unwrap();

@@ -11,8 +11,8 @@ pub(super) const DPP8_EXCHANGE: u32 = 0x7fe7;
 // An inclusive wave32 prefix sum built from DPP16 row shifts (see `lower_row_scan`).
 pub(super) const DPP_SCAN: u32 = 0x7ff3;
 
-/// Prove a full-EXEC, single 32-thread group (also valid as a partial
-/// wave64), or a 64-thread group with only within-octet exchanges.
+/// Prove full-EXEC straight-line within-octet exchanges in complete
+/// 32-thread blocks, including groups containing multiple waves.
 /// No branch, EXEC modification, early return, LDS or unknown operands.
 /// Static descriptor loads and a single terminal store can be admitted;
 /// the main emitter still resolves their resource and address metadata.
@@ -21,7 +21,8 @@ pub(super) const DPP_SCAN: u32 = 0x7ff3;
 /// its octet. Constant readlane is
 /// only allowed at 32 threads where wave32/wave64 agree for lanes 0..31.
 pub(super) fn straight_exchange(insns: &mut [Insn], group: [u32; 3]) -> bool {
-    if !matches!(group, [32, 1, 1] | [64, 1, 1]) || insns.len() > 4096
+    let Some(lanes) = group.into_iter().try_fold(1u32, u32::checked_mul) else { return false; };
+    if !(32..=1024).contains(&lanes) || lanes % 32 != 0 || group[2] > 64 || insns.len() > 4096
         || insns.last().is_none_or(|i| i.mnemonic != "s_endpgm")
     { return false; }
     let mut found = false;
@@ -45,7 +46,7 @@ pub(super) fn straight_exchange(insns: &mut [Insn], group: [u32; 3]) -> bool {
             let [Opnd::Vgpr(dst @ 0..=105)] = i.dst[..] else { return false };
             let (Some(Opnd::Vgpr(src)), Some(Opnd::ConstInt(lane @ 0..=31))) =
                 (i.src.first(), i.src.get(1)) else { return false };
-            if group[0] != 32 || i.raw.as_slice() !=
+            if lanes != 32 || i.raw.as_slice() !=
                 [0xd7600000 | u32::from(dst), ((128 + *lane as u32) << 9) | 256 | u32::from(*src)]
             { return false; }
         } else if i.enc == Enc::Smem && i.mnemonic == "s_load_dwordx4" {
@@ -868,42 +869,69 @@ fn guard_region(
     false
 }
 
+/// Validate the control flow of a single reduction region: the one whose first
+/// DPP instruction is at `first`, spanning the byte offsets `start..=end`.
+/// Returns an error when the region may execute on a partial lane set (an early
+/// exit before it, or a divergent branch crossing it). `verified_reads` are the
+/// result reads of the regions before this one, matching the order
+/// [`check_control_flow`] processes them.
+pub(super) fn check_region(
+    insns: &[Insn],
+    first: usize,
+    start: i64,
+    end: i64,
+    verified_reads: &[usize],
+) -> Result<(), String> {
+    let ins = &insns[first];
+    // A row scan sums with the integer add's identity.
+    let operation = if ins.op == DPP_SCAN { "v_add_nc_u32" } else { ins.mnemonic.as_str() };
+    for (branch_index, branch) in insns.iter().enumerate().filter(|(_, i)| i.enc == Enc::Sopp) {
+        let pc = branch.offset as i64;
+        if branch.op == 1 && pc < start {
+            return Err(format!("wave reduction at {start:#x} after an early exit"));
+        }
+        if Emitter::branch_cond(branch.op).is_some() {
+            let target = pc + 4 + 4 * branch.aux.imm;
+            if (pc < start && target >= start) || (pc > end && target <= end)
+                || (pc >= start && pc <= end)
+            {
+                if !guard_region(insns, branch_index, start as usize, end as usize, first, operation, verified_reads) {
+                    if std::env::var("TUXBOX_WAVE_DEBUG").is_ok() {
+                        let prev = insns.get(branch_index.checked_sub(1).unwrap_or(0));
+                        eprintln!("WAVEDEBUG region=[{start:#x}..{end:#x}] op={} branch_idx={} op={} pc={:#x} target={:#x} prev={:?}",
+                            ins.mnemonic, branch_index, branch.op, pc, target,
+                            prev.map(|p| (p.mnemonic.as_str(), p.src.iter().map(|o| format!("{o:?}")).collect::<Vec<_>>())));
+                    }
+                    return Err(format!(
+                        "wave reduction at {start:#x} may execute in divergent control flow"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Validate fixed-width reductions and return EXECZ instruction indices whose
 /// masked region and whole-wave arrival permit a wave-wide empty-EXEC vote.
 pub(super) fn check_control_flow(insns: &[Insn], width: u32) -> Result<BTreeSet<usize>, String> {
     let mut execz_guards = BTreeSet::new();
     let mut verified_reads = Vec::new();
     for (first, region) in reduction_regions(insns, width) {
-        let ins = &insns[first];
-        // A row scan sums with the integer add's identity.
-        let operation = if ins.op == DPP_SCAN { "v_add_nc_u32" } else { ins.mnemonic.as_str() };
         let start = insns[*region.start()].offset as i64;
         let end = insns[*region.end()].offset as i64;
         let last_read = *region.end() - 1;
+        check_region(insns, first, start, end, &verified_reads)?;
+        // Every branch that affects the region passed `check_region`, so the
+        // EXECZ ones among them are safe to vote on.
         for (branch_index, branch) in insns.iter().enumerate().filter(|(_, i)| i.enc == Enc::Sopp) {
             let pc = branch.offset as i64;
-            if branch.op == 1 && pc < start {
-                return Err(format!("wave reduction at {start:#x} after an early exit"));
-            }
-            if Emitter::branch_cond(branch.op).is_some() {
+            if branch.op == 8 && Emitter::branch_cond(branch.op).is_some() {
                 let target = pc + 4 + 4 * branch.aux.imm;
                 if (pc < start && target >= start) || (pc > end && target <= end)
                     || (pc >= start && pc <= end)
                 {
-                    if !guard_region(insns, branch_index, start as usize, end as usize, first, operation, &verified_reads) {
-                        if std::env::var("TUXBOX_WAVE_DEBUG").is_ok() {
-                            let prev = insns.get(branch_index.checked_sub(1).unwrap_or(0));
-                            eprintln!("WAVEDEBUG region=[{start:#x}..{end:#x}] op={} branch_idx={} op={} pc={:#x} target={:#x} prev={:?}",
-                                ins.mnemonic, branch_index, branch.op, pc, target,
-                                prev.map(|p| (p.mnemonic.as_str(), p.src.iter().map(|o| format!("{o:?}")).collect::<Vec<_>>())));
-                        }
-                        return Err(format!(
-                            "wave reduction at {start:#x} may execute in divergent control flow"
-                        ));
-                    }
-                    if branch.op == 8 {
-                        execz_guards.insert(branch_index);
-                    }
+                    execz_guards.insert(branch_index);
                 }
             }
         }
@@ -1021,6 +1049,23 @@ pub(super) fn portable_single_wave(insns: &[Insn]) -> bool {
         }
     }
     true
+}
+
+/// The native compute local IDs are x-fast, then y, then z. A group-shared
+/// exchange indexes the whole workgroup, not the x coordinate alone.
+pub(super) fn portable_lane_id(group: [u32; 3]) -> String {
+    let [x, y, z] = group;
+    if y == 1 && z == 1 { "gtid.x".into() }
+    else { format!("(gtid.x + {x}u * (gtid.y + {y}u * gtid.z))") }
+}
+
+/// Reserve enough shared slots for every invocation. The larger allocation
+/// is used only by the proven straight-line DPP8 path; a group-wide barrier
+/// must not be introduced into independently diverging guest waves.
+pub(super) fn portable_declarations(group: [u32; 3]) -> String {
+    let lanes = group.into_iter().product::<u32>();
+    if lanes <= 64 { PORTABLE_DECLARATIONS.to_owned() }
+    else { PORTABLE_DECLARATIONS.replace("tb_reduction_lanes[64]", &format!("tb_reduction_lanes[{lanes}]")) }
 }
 
 // A second barrier prevents a fast host subgroup from overwriting a slot

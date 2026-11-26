@@ -1,0 +1,139 @@
+{
+  "scope": "Native RDNA2 execution of synthetic inputs under all 1024 MODE[9:0] values, compared with the f64-modes reference model",
+  "device": "AMD Radeon RX 6950 XT",
+  "seed": 142022930,
+  "records": 4096,
+  "inputs_sha256": "37be12c4595eea788256427d74192204d289a6d3da176b82a63339aedfc2f965",
+  "kernels_sha256": "707b9a386dec543106f68cef1ed79bf8c44498889fb5b19cd87c4e1ce8b6ab36",
+  "native_runs": 58720256,
+  "model_comparisons": 475136,
+  "mismatches": 0,
+  "instructions": [
+    {
+      "instruction": "v_cvt_f64_f32",
+      "mode_bits_that_change_results": "0x210",
+      "modes_compared": 4,
+      "comparisons": 16384,
+      "mismatches": 0,
+      "examples": [],
+      "native_results_sha256": "defbc5d3a2df970c02844478d70a9d82895e8966d4d19079d2a8a2aa042ed0fb"
+    },
+    {
+      "instruction": "v_cvt_f32_f64",
+      "mode_bits_that_change_results": "0x063",
+      "modes_compared": 16,
+      "comparisons": 65536,
+      "mismatches": 0,
+      "examples": [],
+      "native_results_sha256": "dd2b467e2085df2e2755a22a63cb9c676f02d8ab21aff192f0e2963c6a2a936c"
+    },
+    {
+      "instruction": "v_min_f64",
+      "mode_bits_that_change_results": "0x240",
+      "modes_compared": 4,
+      "comparisons": 16384,
+      "mismatches": 0,
+      "examples": [],
+      "native_results_sha256": "7bfba6150d57c267d3db0bb15f9857c0ae08bad0e270cfd411b788dd97ad2c68"
+    },
+    {
+      "instruction": "v_max_f64",
+      "mode_bits_that_change_results": "0x240",
+      "modes_compared": 4,
+      "comparisons": 16384,
+      "mismatches": 0,
+      "examples": [],
+      "native_results_sha256": "fc1bdb595f4b9aaadf51bcde6822fe2f5c2ec00861c603f4b55d0529c529761c"
+    },
+    {
+      "instruction": "v_frexp_exp_i32_f64",
+      "mode_bits_that_change_results": "0x040",
+      "modes_compared": 2,
+      "comparisons": 8192,
+      "mismatches": 0,
+      "examples": [],
+      "native_results_sha256": "b88ac0093f9fc47a12c20ebe5dc45b2d3ee869cbf14cda8a1c5fbddd87aee181"
+    },
+    {
+      "instruction": "v_frexp_mant_f64",
+      "mode_bits_that_change_results": "0x240",
+      "modes_compared": 4,
+      "comparisons": 16384,
+      "mismatches": 0,
+      "examples": [],
+      "native_results_sha256": "0cb1b4d1d01a5a5a5be9a78e88e6a838fd97604342337b41470e05969b55d201"
+    },
+    {
+      "instruction": "v_fract_f64",
+      "mode_bits_that_change_results": "0x2cc",
+      "modes_compared": 32,
+      "comparisons": 131072,
+      "mismatches": 0,
+      "examples": [],
+      "native_results_sha256": "5fdcb7504f444ea499609d08454d5dfe0e26daba91381a3a1e251df63912b3ad"
+    },
+    {
+      "instruction": "v_ldexp_f64",
+      "mode_bits_that_change_results": "0x2cc",
+      "modes_compared": 32,
+      "comparisons": 131072,
+      "mismatches": 0,
+      "examples": [],
+      "native_results_sha256": "61dd554873c1fe222cd4edfafe4d38464ea81008b7454ce4fb992dd1c3ef227d"
+    },
+    {
+      "instruction": "v_frexp_exp_i32_f32",
+      "mode_bits_that_change_results": "0x010",
+      "modes_compared": 2,
+      "comparisons": 8192,
+      "mismatches": 0,
+      "examples": [],
+      "native_results_sha256": "ead017576fca12bc555079fd4fb4df3985c7d58610170c9e42063af68f18ebbc"
+    },
+    {
+      "instruction": "v_frexp_mant_f32",
+      "mode_bits_that_change_results": "0x210",
+      "modes_compared": 4,
+      "comparisons": 16384,
+      "mismatches": 0,
+      "examples": [],
+      "native_results_sha256": "3911d941cf86c44398fd310adacd13c6ef68a56e01d30434f56427a18f31e952"
+    },
+    {
+      "instruction": "v_trunc_f64",
+      "mode_bits_that_change_results": "0x200",
+      "modes_compared": 2,
+      "comparisons": 8192,
+      "mismatches": 0,
+      "examples": [],
+      "native_results_sha256": "437e4a9d6737fdb7f9d9382f91d1fa4a025218e9d9bcb44b08577fb1ddd35e1d"
+    },
+    {
+      "instruction": "v_floor_f64",
+      "mode_bits_that_change_results": "0x240",
+      "modes_compared": 4,
+      "comparisons": 16384,
+      "mismatches": 0,
+      "examples": [],
+      "native_results_sha256": "7d500f085d54fcc19e1d620262bf562bcfc9bb03f03b9c3bb1daeefd94d326c0"
+    },
+    {
+      "instruction": "v_ceil_f64",
+      "mode_bits_that_change_results": "0x240",
+      "modes_compared": 4,
+      "comparisons": 16384,
+      "mismatches": 0,
+      "examples": [],
+      "native_results_sha256": "cc8bf7a1977b6f3655d05c2f1b23f03ba0eae9ac453417ce0ba44bd01825291a"
+    },
+    {
+      "instruction": "v_rndne_f64",
+      "mode_bits_that_change_results": "0x200",
+      "modes_compared": 2,
+      "comparisons": 8192,
+      "mismatches": 0,
+      "examples": [],
+      "native_results_sha256": "f48f4d92df98eec4b27111a38d9de13cb2a00d2f48820e32fc24ed4e8b633dc0"
+    }
+  ]
+}

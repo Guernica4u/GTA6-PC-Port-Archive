@@ -7,8 +7,7 @@ use tuxbox_xshader::{extract, ShaderExtract, Stage};
 
 // Used only for deterministic refusals by the HLSL emitter.
 const UNSUPPORTED_HLSL: u8 = 65;
-/// Generated HLSL above this size would need more than about 9 GB of DXC memory.
-const MAX_HLSL_BYTES: usize = 8 << 20;
+use tuxbox_xshader::hlsl::MAX_HLSL_BYTES;
 
 enum Error {
     Other(String),
