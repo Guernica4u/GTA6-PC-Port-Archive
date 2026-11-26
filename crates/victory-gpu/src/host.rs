@@ -1011,9 +1011,12 @@ struct Deferred {
     kept: Vec<windows::core::IUnknown>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
-    refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// A list asks a few dozen times, where a linear scan of three words
+    /// beats hashing them (SipHash over a tuple is ~20 ns, the scan is
+    /// under 5 at these lengths).
+    refreshed: Vec<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
-    textures: std::collections::HashSet<usize>,
+    textures: Vec<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -2077,7 +2080,8 @@ impl HostList {
     ) {
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
-        if deferred.refreshed.insert(key) {
+        if !deferred.refreshed.contains(&key) {
+            deferred.refreshed.push(key);
             deferred
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
@@ -2106,7 +2110,8 @@ impl HostList {
     pub(crate) fn defer_heap(&self, viewed: &std::sync::Arc<crate::bindless::Viewed>) {
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(viewed) as usize, usize::MAX, 0);
-        if deferred.refreshed.insert(key) {
+        if !deferred.refreshed.contains(&key) {
+            deferred.refreshed.push(key);
             deferred.copies.push(Step::Heap(viewed.clone()));
         }
     }
@@ -2268,7 +2273,12 @@ impl HostList {
     /// Whether this is the first time since the reset that the list asks
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
-        self.deferred().textures.insert(key)
+        let mut deferred = self.deferred();
+        if deferred.textures.contains(&key) {
+            return false;
+        }
+        deferred.textures.push(key);
+        true
     }
 
     /// Runs `work` when the list is submitted, in order with its copies.
