@@ -1295,6 +1295,21 @@ fn current(this: This) -> bool {
 /// [`castable`]'s formats (colour textures, through the enhanced-barrier
 /// creation; it starts in the common state) where the host takes that.
 #[cfg(windows)]
+/// The descriptions tried for a host texture, in order: what the title asked
+/// for first, then without the initial state, then without the clear value,
+/// then without either. None of them changes a flag: a texture made without
+/// `ALLOW_RENDER_TARGET` takes no view, so dropping a permission here would
+/// lose the draw further down instead of at the call that refused it.
+fn rungs(initial: u32) -> Vec<(u32, bool)> {
+    let mut out: Vec<(u32, bool)> = Vec::with_capacity(4);
+    for rung in [(initial, true), (0, true), (initial, false), (0, false)] {
+        if !out.contains(&rung) {
+            out.push(rung);
+        }
+    }
+    out
+}
+
 fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<HostTexture> {
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
@@ -1400,7 +1415,7 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         // render target view, which loses the draw further down instead of
         // here (`Host::rtv` binds a null view for the case that does happen).
         let mut made = Ok(());
-        for (try_state, with_clear) in [(initial, true), (0, true), (initial, false), (0, false)] {
+        for (try_state, with_clear) in rungs(initial) {
             // SAFETY: the description has the host layout (checked size, same
             // fields); the out pointer is ours.
             made = unsafe {
@@ -2531,6 +2546,21 @@ mod tests {
         assert_eq!(memory_key(0x1_0000, &buffer(256)), None);
     }
 
+    /// The ladder the host refuses a description with: the same description
+    /// with the state and the clear value given up in turn, and never with a
+    /// permission dropped (a target made without `ALLOW_RENDER_TARGET` takes
+    /// no view, so the draw would be lost further down).
+    #[test]
+    fn the_ladder_keeps_the_description_and_only_drops_state_or_clear() {
+        // What the title asked for comes first, both values go away by the
+        // end, and a state of zero does not repeat a rung.
+        assert_eq!(rungs(0x0c), [(0x0c, true), (0, true), (0x0c, false), (0, false)]);
+        assert_eq!(rungs(0), [(0, true), (0, false)]);
+        // That no permission is dropped is structural: `rungs` takes no
+        // flags, so every rung asks for the description it was given.
+        assert_eq!(rungs(0x0c).len(), 4);
+    }
+
     /// Castable formats: every format of the same element but typeless and
     /// depth ones; block formats among block formats of their block size.
     #[test]
@@ -3201,3 +3231,4 @@ mod tests {
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
     }
 }
+
