@@ -758,26 +758,8 @@ impl HostHeap {
             if !for_draw || !is_texture(&view) {
                 return false;
             }
-            let held = self.kept.lock().unwrap_or_else(|e| e.into_inner())[index as usize]
-                .as_ref()
-                .map(|(res, _)| windows::core::Interface::as_raw(res));
-            let Some(held) = held else {
-                return true;
-            };
-            is_placed_texture(&view)
-                && placed_texture(&view).is_some_and(|p| {
-                    let (View::Shader(r, _) | View::Unordered(r, ..)) = p else {
-                        return false;
-                    };
-                    !crate::resource::host_copy(r as crate::object::This).is_some_and(|copy| {
-                        windows::core::Interface::as_raw(&copy.texture) == held
-                            || copy.twin.get().and_then(Option::as_ref).is_some_and(|t| {
-                                t.planes
-                                    .iter()
-                                    .any(|p| windows::core::Interface::as_raw(&p.texture) == held)
-                            })
-                    })
-                })
+            let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            needs_remake_kept(&kept, index, &view)
         };
         if made[index as usize] == key && !needs_remake() {
             return Some(view);
@@ -830,6 +812,73 @@ impl HostHeap {
             self.keep(index, kept.flatten());
         }
         Some(view)
+    }
+
+    /// [`Self::mirror`] of each `(index, handle)`, batched as one draw's table
+    /// entries are: the records are read once, `VIEWS`, `made` and `kept` are
+    /// locked once for the whole call, and only slots whose record changed
+    /// (or that need a remake) go through the full mirror, race re-check
+    /// included. The result is aligned with `slots`.
+    pub(crate) fn mirror_draw(&self, slots: &[(u32, u64)]) -> Vec<Option<View>> {
+        // The records, read once.
+        let records: Vec<[u32; 3]> = slots
+            .iter()
+            .map(|&(_, handle)| {
+                // SAFETY: the handle is a descriptor slot in title memory.
+                unsafe { (handle as *const [u32; 3]).read_unaligned() }
+            })
+            .collect();
+        // The current view of each record, one VIEWS lock for all of them.
+        let views: Vec<Option<View>> = {
+            let views = super::VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+            records
+                .iter()
+                .map(|&[tag, i, generation]| {
+                    (tag == VIEW_TAG)
+                        .then(|| {
+                            views
+                                .list
+                                .get(i as usize)
+                                .filter(|(_, current)| *current == generation)
+                                .map(|(view, _)| view.clone())
+                        })
+                        .flatten()
+                })
+                .collect()
+        };
+        let mut out: Vec<Option<View>> = vec![None; slots.len()];
+        {
+            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            for (at, ((&(index, _), &[_, i, generation]), view)) in
+                slots.iter().zip(&records).zip(&views).enumerate()
+            {
+                if index >= self.count {
+                    continue; // left to the full mirror below (the cap diagnostic)
+                }
+                let key = u64::from(generation) << 32 | u64::from(i);
+                let current = view.is_some();
+                let is_made = match made.get(index as usize) {
+                    Some(&m) if current => m == key,
+                    Some(&m) => m == 0,
+                    None => false,
+                };
+                if is_made
+                    && view
+                        .as_ref()
+                        .is_none_or(|v| !needs_remake_kept(&kept, index, v))
+                {
+                    out[at] = view.clone();
+                }
+            }
+        }
+        // Changed slots go through the full mirror, race re-check included.
+        for (at, &(index, handle)) in slots.iter().enumerate() {
+            if out[at].is_none() {
+                out[at] = self.mirror(index, handle, true);
+            }
+        }
+        out
     }
 
     /// The view host slot `index` was made from, in a few words, with the
@@ -1211,6 +1260,32 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
 /// own copy of title memory ([`crate::shadow::for_view`]): the slot holds
 /// it, so that draws reading the view find and refresh that copy.
 type Kept = Option<(ID3D12Resource, Option<std::sync::Arc<crate::shadow::Shadow>>)>;
+
+/// The remake check of [`HostHeap::mirror`], against an already-locked
+/// `kept`: a draw re-mirrors a placed texture's slot left null, and one whose
+/// memory got a later unordered/renderable view's HostTexture.
+fn needs_remake_kept(kept: &[Kept], index: u32, view: &View) -> bool {
+    let held = kept[index as usize]
+        .as_ref()
+        .map(|(res, _)| windows::core::Interface::as_raw(res));
+    let Some(held) = held else {
+        return true;
+    };
+    is_placed_texture(view)
+        && placed_texture(view).is_some_and(|p| {
+            let (View::Shader(r, _) | View::Unordered(r, ..)) = p else {
+                return false;
+            };
+            !crate::resource::host_copy(r as crate::object::This).is_some_and(|copy| {
+                windows::core::Interface::as_raw(&copy.texture) == held
+                    || copy.twin.get().and_then(Option::as_ref).is_some_and(|t| {
+                        t.planes
+                            .iter()
+                            .any(|p| windows::core::Interface::as_raw(&p.texture) == held)
+                    })
+            })
+        })
+}
 
 /// Buffer views refused so far (diagnostics: the first are logged).
 #[cfg(feature = "diagnostics")]
@@ -1876,6 +1951,101 @@ mod tests {
         }
         assert!(host.mirror(0, title_heap.start, true).is_some());
         assert!(host.kept(0), "made for the draw");
+    }
+
+    /// mirror_draw returns exactly what per-slot mirror returns, and batches
+    /// the VIEWS/made/kept locks: one call per draw instead of one per entry.
+    #[test]
+    fn mirror_draw_matches_mirror_and_batches_the_locks() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        const N: u32 = 256;
+        let heap_desc: [u32; 8] = [0, N, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(
+            crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap),
+            0
+        );
+        let title_heap = crate::descriptor::heap(heap);
+        let memory = vec![0u8; 1 << 16];
+        let address = memory.as_ptr() as u64;
+        let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let mut view = [0u32; 16];
+        view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+        let slots: Vec<(u32, u64)> = (0..N)
+            .map(|i| {
+                let at = title_heap.start + u64::from(i) * 32;
+                crate::descriptor::create_placed_srv(null, &words, &view, at);
+                (i, at)
+            })
+            .collect();
+        let host = title_heap.host().expect("a host view heap");
+        // Make every slot once, as a first draw would.
+        for &(i, h) in &slots {
+            assert!(host.mirror(i, h, true).is_some());
+        }
+        // Batched equals per-slot, on the warm path.
+        let batched = host.mirror_draw(&slots);
+        for (at, &(i, h)) in slots.iter().enumerate() {
+            assert!(batched[at].is_some(), "slot {i} mirrored");
+            assert!(host.mirror(i, h, true).is_some());
+        }
+        // Cost under contention: a title thread writing views (taking VIEWS)
+        // while the draw mirrors, as in a frame. 100 rounds of N entries,
+        // per-slot vs one batched call.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let contender = {
+            let stop = stop.clone();
+            let at = title_heap.start + u64::from(N) * 32;
+            let null = null as usize;
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    crate::descriptor::create_placed_srv(null as *const _, &words, &view, at);
+                }
+            })
+        };
+        let t0 = std::time::Instant::now();
+        for _ in 0..100 {
+            for &(i, h) in &slots {
+                std::hint::black_box(host.mirror(i, h, true));
+            }
+        }
+        let per_slot = t0.elapsed() / 100;
+        let t0 = std::time::Instant::now();
+        for _ in 0..100 {
+            std::hint::black_box(host.mirror_draw(&slots));
+        }
+        let batched_t = t0.elapsed() / 100;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        contender.join().unwrap();
+        eprintln!(
+            "{N} table entries per draw under VIEWS contention: per-slot {per_slot:?}, mirror_draw {batched_t:?}"
+        );
+        // And uncontended, for the pure lock-count difference.
+        let t0 = std::time::Instant::now();
+        for _ in 0..100 {
+            for &(i, h) in &slots {
+                std::hint::black_box(host.mirror(i, h, true));
+            }
+        }
+        let per_slot = t0.elapsed() / 100;
+        let t0 = std::time::Instant::now();
+        for _ in 0..100 {
+            std::hint::black_box(host.mirror_draw(&slots));
+        }
+        let batched_t = t0.elapsed() / 100;
+        eprintln!(
+            "{N} table entries per draw uncontended: per-slot {per_slot:?}, mirror_draw {batched_t:?}"
+        );
     }
 
     /// A slot viewing a texture given up (`crate::resource::evict`) holds it

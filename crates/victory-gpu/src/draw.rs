@@ -1228,22 +1228,6 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
-        let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
-            return;
-        };
-        let handle = table + u64::from(u.table_offset_dwords) * 4;
-        let Some(heap) = self.heap_of(handle) else {
-            return;
-        };
-        let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
-            return;
-        };
-        if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u, &view, true);
-        }
-    }
-
     /// The descriptors a shader reads through tables, made from the
     /// title's slots. Constant buffers there are raw views of their data
     /// (translated shaders read them so: the host wants constant buffer
@@ -1279,9 +1263,38 @@ impl State {
         }
         fresh.sort_unstable();
         fresh.dedup();
+        // The entries not made afresh, grouped by their host heap: each
+        // heap's slots are mirrored in one batched call (one VIEWS/made/kept
+        // lock per heap per draw instead of one per entry).
+        type Entries<'a> = Vec<(u32, u64, &'a UsedResource)>;
+        let mut by_heap: Vec<(usize, &crate::descriptor::host::HostHeap, Entries)> = Vec::new();
         for u in used.iter().filter(tables) {
-            if !fresh.contains(&u.slot) {
-                self.table_entry(list, u, compute);
+            if fresh.contains(&u.slot) {
+                continue;
+            }
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+                continue;
+            };
+            let handle = table + u64::from(u.table_offset_dwords) * 4;
+            let Some(heap) = self.heap_of(table) else {
+                continue;
+            };
+            let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
+                continue;
+            };
+            let ptr = host as *const crate::descriptor::host::HostHeap as usize;
+            match by_heap.iter_mut().find(|(p, _, _)| *p == ptr) {
+                Some((_, _, entries)) => entries.push((index, handle, u)),
+                None => by_heap.push((ptr, host, vec![(index, handle, u)])),
+            }
+        }
+        for (_, host, entries) in by_heap {
+            let slots: Vec<(u32, u64)> = entries.iter().map(|&(i, h, _)| (i, h)).collect();
+            let views = host.mirror_draw(&slots);
+            for ((_, _, u), view) in entries.into_iter().zip(views) {
+                if let Some(view) = view {
+                    readable(list, u, &view, true);
+                }
             }
         }
         let mut made = Vec::new();
