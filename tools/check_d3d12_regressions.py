@@ -132,6 +132,18 @@ def validate(case, adapter, status, output):
     return True, passes[0]
 
 
+def copy_prefix(source, trial):
+    """Copy the source prefix, skipping rebuilt GPU caches.
+
+    A reflinkable filesystem would make a full copy free, but ext4 has no
+    reflinks and the prefix can carry tens of GB of caches, so the copy is
+    bounded to what keeps a trial disposable: registries, files and user
+    data, never the caches. Those rebuild into the trial's own cache path.
+    """
+    ignore = shutil.ignore_patterns("shadercache", "tuxbox_shader_cache")
+    shutil.copytree(source, trial, ignore=ignore, symlinks=True, dirs_exist_ok=False)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     for arg in ("build-dir","proton","prefix","compiler-dir","work","output"):
@@ -182,7 +194,7 @@ def main(argv=None):
                     shutil.copyfile(source,trial/k)
                     if sha(trial/k)!=fingerprints[k]:
                         raise ValueError("artifact changed during staging")
-            subprocess.run(["cp","-a","--reflink=auto",str(a.prefix),str(trial/"prefix")],check=True,timeout=90)
+            copy_prefix(a.prefix, trial/"prefix")
             for k in ("tmp","runtime","cache"):
                 (trial/k).mkdir(mode=0o700)
             env={"WINEPREFIX":trial/"prefix","WINESERVER":files/"bin/wineserver",

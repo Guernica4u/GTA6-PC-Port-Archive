@@ -55,6 +55,29 @@ fn a_late_result_replaces_a_timeout() {
 }
 
 #[test]
+fn a_refusal_that_a_retry_overcame_is_not_counted() {
+    let mut shaders = Shaders::default();
+    shaders.record("first-attempt", Shader::Unsupported);
+    shaders.record("real", Shader::Unsupported);
+    assert!(shaders.supersede("first-attempt"));
+    assert_eq!(shaders.counts.unsupported, 1);
+    // A later pipeline repeats the attempt before it retries.
+    assert!(!shaders.record("first-attempt", Shader::Unsupported));
+    assert!(!shaders.supersede("first-attempt"));
+    assert_eq!(shaders.counts.unsupported, 1);
+}
+
+#[test]
+fn superseding_leaves_other_results_alone() {
+    let mut shaders = Shaders::default();
+    shaders.record("compiled", Shader::Translated);
+    assert!(!shaders.supersede("compiled"));
+    assert!(!shaders.supersede("never-recorded"));
+    assert!(!shaders.record("never-recorded", Shader::Unsupported));
+    assert_eq!(shaders.counts, ShaderCounts { translated: 1, ..ShaderCounts::default() });
+}
+
+#[test]
 fn numbers_are_grouped_in_threes() {
     assert_eq!(grouped(0), "0");
     assert_eq!(grouped(999), "999");

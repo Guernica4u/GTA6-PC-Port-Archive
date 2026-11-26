@@ -93,6 +93,49 @@ class SelectProton(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, PINNED_PROTON):
                     proton_installation(None)
 
+    def test_default_finds_flatpak_steam_tools(self):
+        for suffix in ("", "-x86_64"):
+            with self.subTest(suffix=suffix), tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp).resolve()
+                steam = home / ".var/app/com.valvesoftware.Steam/.local/share/Steam"
+                install = steam / "compatibilitytools.d" / f"{PINNED_PROTON}{suffix}"
+                install.mkdir(parents=True)
+                (install / "proton").touch()
+                with patch.dict(os.environ, {}, clear=True), \
+                        patch.object(Path, "home", return_value=home):
+                    self.assertEqual(proton_installation(None), install)
+
+    def test_default_reads_library_folders_from_each_steam_installation(self):
+        for relative in (".local/share/Steam",
+                         ".var/app/com.valvesoftware.Steam/.local/share/Steam"):
+            with self.subTest(steam=relative), tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp).resolve()
+                steam = home / relative
+                (steam / "steamapps").mkdir(parents=True)
+                library = home / "Other Steam Library"
+                (steam / "steamapps/libraryfolders.vdf").write_text(
+                    f'"libraryfolders" {{ "0" {{ "path" "{library.as_posix()}" }} }}')
+                install = library / "steamapps/common" / PINNED_PROTON
+                install.mkdir(parents=True)
+                (install / "proton").touch()
+                with patch.dict(os.environ, {}, clear=True), \
+                        patch.object(Path, "home", return_value=home):
+                    self.assertEqual(proton_installation(None), install)
+
+    def test_selected_steam_client_keeps_priority(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp).resolve()
+            selected = home / "Selected Steam"
+            flatpak = home / ".var/app/com.valvesoftware.Steam/.local/share/Steam"
+            for steam in (selected, flatpak):
+                install = steam / "compatibilitytools.d" / PINNED_PROTON
+                install.mkdir(parents=True)
+                (install / "proton").touch()
+            with patch.dict(os.environ, {"STEAM_COMPAT_CLIENT_INSTALL_PATH": str(selected)},
+                            clear=True), patch.object(Path, "home", return_value=home):
+                self.assertEqual(proton_installation(None),
+                                 selected / "compatibilitytools.d" / PINNED_PROTON)
+
     @unittest.skipUnless(sys.platform == "linux", "Wine prefix drive links and POSIX modes require Linux")
     def test_linux_title_drive_uses_prefix_and_preserves_existing_assignment(self):
         with tempfile.TemporaryDirectory() as tmp:

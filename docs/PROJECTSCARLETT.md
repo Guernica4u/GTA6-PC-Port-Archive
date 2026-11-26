@@ -849,6 +849,18 @@ a proven fault in these provider call sites. The opt-in trace is intended
 to distinguish those possibilities in a subsequent authorized run.
 
 
+### Comparing provider revisions
+
+A run from a different checkout does not redeploy the title's DLLs.
+The launcher logs SHA-256 of the staged D3D12 provider and of the local
+`build/d3d12-smoke/d3d12_xs.dll` when available. It warns if they differ.
+For an A/B test, build and deploy the intended provider explicitly, then
+pass `--require-current-provider` before the title path to refuse a launch
+unless the staged file matches the local build. This does not rebuild or
+replace a DLL, prove which source revision produced the local build, or
+inspect modules actually loaded by Wine. Record the build revision and
+driver separately.
+
 ### Investigating compute loop guards after a device loss
 
 Compare the exact same recorded requests against two xshader builds without
@@ -861,7 +873,10 @@ python tools/audit_shader_guards.py REQUESTS --baseline OLD_XSHADER --candidate 
 This reports the number of compute translations with the generic structured
 loop guard (65,536) or block dispatcher guard (1,000,000), including newly
 admitted compute programs. It also counts dispatchers without that generic
-guard, not necessarily unbounded loops. Both emitters use private digest-verified
+guard, and persistent PC-range dispatchers separately. The range check is
+not an iteration limit. The report includes aggregate before/after shape
+transitions, including existing compute translations that gain or lose a
+generic guard. Both emitters use private digest-verified
 copies of each input, with the original request mode (including `.wave32`).
 Use `--select` with an exact local worklist, or `--include-keys` for local
 per-request attribution. The default report omits request keys and paths.

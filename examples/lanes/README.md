@@ -56,6 +56,8 @@ The game also imports Windows core API sets for services such as files, timing a
 | `wave64-shader` | A console shader that sums across 64-lane waves, translated while the game runs; not part of `all` |
 | `raster-tables` | A console vertex and pixel pair drawn under a root with two descriptor tables, reading through the second ([raster tables](#raster-tables)) |
 | `raster-samplers` | A console pixel program's literal linear sampler, under a root whose static sampler at that register is point-filtered ([raster tables](#raster-tables)) |
+| `compute-root` | Two root-less console compute programs under a root with three descriptor tables that the provider cannot reflect ([compute roots](#compute-roots)) |
+| `mesh-samplers` | The same literal sampler in a mesh pipeline, whose mesh root the provider builds ([raster tables](#raster-tables)); not part of `all` |
 
 ```sh
 python tuxbox.py verify --only lanes-selftest --output build/lanes-selftest.json
@@ -118,13 +120,30 @@ The `raster-tables` scenario draws a fullscreen triangle with two hand-written c
 
 The `raster-samplers` scenario draws with the same vertex program and a third hand-written pixel program. It samples a 2x1 texture of 1.0 and 3.0, at table 1 slot 0, with a linear clamped sampler it builds from literal words, as the console compiles a static sampler into a program. It declares that sampler as `s0`, where the title's root has a point-filtered static sampler. The provider has to give the literal state a static sampler of its own in the reflected root, so every texel reads 1.5. Bound to the root's `s0`, the texels read the point-filtered 1.0.
 
-That root is made while the game runs, so nothing can be prepared before launch. `verify` runs both scenarios with the host worker, requires the provider to report the reflected root and pipeline, and fails if either program was translated without a root.
+The `mesh-samplers` scenario samples the same way through a mesh pipeline. Its pixel program declares `s0` and `s1`, which the title's root has as point-filtered static samplers, so neither register can stand in for the literal state and the program does not translate against that root. Its mesh program is a console container with FSSM records only: they name the root constant `b501` where the root declares `b500`, so the provider builds the mesh stage a root of its own. The provider has to add the literal state to that root as a private static sampler and translate the pixel program against it, so every texel reads 1.5. Without that it falls back to the pixel program's translation without a root, whose private sampler the pipeline's root lacks, and the pipeline becomes a stand-in. The mesh program's desktop translation (`mesh_samplers.hlsl`, a fullscreen triangle) is compiled into the prepared cache under its digest before launch.
+
+These roots are made while the game runs, so the pixel programs cannot be prepared before launch. `verify` runs the three scenarios with the host worker, requires the provider to report the reflected root (for the vertex pipelines) or the mesh pipeline and its descriptor slots, and fails if a pixel or vertex program was translated without a root.
 
 ```sh
 python tuxbox.py verify --only lanes-raster-tables --output build/lanes-raster-tables.json
 ```
 
 The suite runs on the Proton backend and removes only these programs' cache entries from the prefix.
+
+## Compute roots
+
+The `compute-root` scenario creates two root-less console compute programs (`shader_fixture.py`; not taken from any game) under a root with three descriptor tables. Without user-data records the provider cannot reflect that root, so it must translate each program against the root as given. Both programs store a word through table 1, and their FSSM records and PSV binding name that descriptor `u3, space2`, a register the root does not declare. A translation made without the root therefore cannot be bound.
+
+- The first program stores through slot 2, which the root declares as `u2, space1`. Its translation for the root writes the word to that view; a wrong view, or a stand-in that leaves the decoy, fails the scenario.
+- The second stores through slot 5, past the end of the table. The translator refuses it for this root, and the provider must give it a stand-in rather than fall back to the root-less translation.
+
+`verify` runs the scenario with the host worker. It fails if either program was translated without its root, if the second was not refused, or if the provider substituted anything but that one stand-in.
+
+```sh
+python tuxbox.py verify --only lanes-compute-root --output build/lanes-compute-root.json
+```
+
+It runs on the Proton backend and removes only these programs' cache entries from the prefix.
 
 ## Deterministic replay
 
@@ -139,3 +158,16 @@ Run `python tuxbox.py verify --only lanes --output build/lanes-results.json` to 
 An interactive run compared the displayed board after keyboard presses, mouse clicks, and input from a hot-plugged virtual Xbox controller. It also checked the three DLLs loaded from the package. [Input and loader results](../../evidence/lanes-xbox-input.json) · [Captured board](../../evidence/lanes-xbox-board.png)
 
 To repeat the keyboard part on Linux, run `python tools/check_lanes_input.py --prefix PREFIX --output build/lanes-input.json`. It launches the package with `tuxbox.py run`, presses keys through XTest, and reads the presented board from the X root window. Left and Right must move the highlighted lane. Steering into the next barrier must show COLLISION, and a later move must be ignored. R must restart, and Escape must exit with status 0 and leave no process in the prefix. The checks read the board, so they hold for any course. On a Wayland desktop the game runs in a private rootful Xwayland; elsewhere, run the check under `xvfb-run`. Add `--adapter VVVV:DDDD` and `--proton` as for the launcher.
+
+
+### Partial compute root recovery
+
+`compute-root-recovery` uses a version 1.1 root with two tables, one
+pre-existing UAV and an independently corroborated missing slot in the
+second table. Only the latter has a user-data record. A logical 128-entry
+heap limited to 64 resident descriptors forces paging. Both writes and
+all other guard words must match; stand-ins are disabled.
+
+```sh
+python tuxbox.py verify --only lanes-compute-root-recovery --output build/lanes-compute-root-recovery.json
+```

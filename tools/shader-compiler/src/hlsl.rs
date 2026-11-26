@@ -46,6 +46,9 @@ mod raw_idxen;
 #[path = "tests/hlsl/wide_atomic_test.rs"]
 mod wide_atomic_test;
 #[cfg(test)]
+#[path = "tests/hlsl/image_cmpswap.rs"]
+mod image_cmpswap;
+#[cfg(test)]
 #[path = "tests/hlsl/cpu_oracle.rs"]
 mod cpu_oracle;
 #[cfg(test)]

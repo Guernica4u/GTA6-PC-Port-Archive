@@ -399,3 +399,49 @@ fn a_literal_sampler_takes_the_private_static_the_runtime_appends() {
     let out = super::super::translate(&ex).unwrap();
     assert!(out.hlsl.contains("SamplerState samp21 : register(s21, space32765);"), "{}", out.hlsl);
 }
+
+#[test]
+fn cube_sample_with_lod_clamp_lowers_without_an_offset() {
+    // The sample instruction with dim=3 (cube) and modi=1 (clamp).
+    // v[4:6] coordinates, v7 clamp, v8 result.
+    let mut words = SAMPLE.to_vec();
+    words[6] = 0xf0840118; // image_sample_cl, dim 3
+    words[7] = 0x00a10804; // vaddr v4, dst v8, SRSRC s4, SSAMP s20
+    let out = super::super::translate(&pixel(&words)).unwrap();
+    assert!(out.profile.starts_with("ps_6_"), "{}", out.profile);
+    assert!(out.hlsl.contains("TextureCube<float4>"), "{}", out.hlsl);
+    assert!(out.hlsl.contains(".Sample("), "{}", out.hlsl);
+    assert!(out.hlsl.contains("tb_cube_dir(asfloat(v4), asfloat(v5), asfloat(v6))"), "{}", out.hlsl);
+    assert!(out.hlsl.contains("asfloat(v7)"), "{}", out.hlsl);
+}
+
+/// A cube sample with derivatives takes them on the face: (ds, dt) along x, then
+/// along y, before the (s, t, face) coordinates. HLSL takes derivatives of the
+/// direction, which is affine in (s, t), so a difference of directions gives them.
+fn cube_gradient_call(opcode: u32) -> String {
+    let mut words = SAMPLE.to_vec();
+    words[6] = opcode;
+    words[7] = 0x00a10804; // vaddr v4, dst v8, SRSRC s4, SSAMP s20
+    let out = super::super::translate(&pixel(&words)).unwrap();
+    assert!(out.hlsl.contains("TextureCube<float4>"), "{}", out.hlsl);
+    out.hlsl.lines().find(|line| line.contains(".SampleGrad(")).expect("a gradient sample").trim().to_owned()
+}
+
+fn along(ds: u32, dt: u32) -> String {
+    format!("(tb_cube_dir(1.5 + asfloat(v{ds}), 1.5 + asfloat(v{dt}), asfloat(v10)) - tb_cube_dir(1.5, 1.5, asfloat(v10)))")
+}
+
+#[test]
+fn a_cube_gradient_sample_reads_two_derivatives_per_direction() {
+    let call = cube_gradient_call(0xf0880118); // image_sample_d, dim 3
+    let expected = format!("tb_cube_dir(asfloat(v8), asfloat(v9), asfloat(v10)), {}, {});", along(4, 5), along(6, 7));
+    assert!(call.ends_with(&expected), "{call}");
+}
+
+#[test]
+fn cube_sample_with_derivatives_and_a_lod_clamp_lowers() {
+    // modi=3 (d_cl): TextureCube.SampleGrad takes the clamp without an offset.
+    let call = cube_gradient_call(0xf08c0118);
+    let expected = format!("{}, {}, asfloat(v11));", along(4, 5), along(6, 7));
+    assert!(call.ends_with(&expected), "{call}");
+}

@@ -28,8 +28,25 @@ def guard_sites(hlsl):
     code = re.sub(rb"//[^\n]*|/\*[\s\S]*?\*/", b"", hlsl)
     structured = len(re.findall(rb"\+\+tb_guard\s*<\s*65536u\b", code))
     dispatch = re.findall(rb"\bwhile\s*\(\s*tb_pc\s*!=\s*\d+u\s*(?:&&\s*tb_guard\+\+\s*<\s*(1000000u))?\s*\)", code)
+    # The persistent emitter uses a program-counter range check instead of
+    # either generic guard. This is a separate shape, not evidence of a bound
+    # on dynamic iterations (the PC can move backwards).
+    persistent = len(re.findall(rb"\bwhile\s*\(\s*tb_pc\s*<\s*\d+u\s*\)", code))
     return dict(structured=structured, guarded_dispatch=dispatch.count(b"1000000u"),
-                other_dispatch=dispatch.count(b""))
+                other_dispatch=dispatch.count(b""), persistent_dispatch=persistent)
+
+
+GUARD_FIELDS = ("structured", "guarded_dispatch", "other_dispatch", "persistent_dispatch")
+
+
+def has_guard(row):
+    return row["status"] == "compute" and bool(row["structured"] or row["guarded_dispatch"])
+
+
+def guard_shape(row):
+    if row["status"] != "compute":
+        return row["status"]
+    return "+".join(k for k in GUARD_FIELDS if row[k]) or "no_matched_sites"
 
 
 def probe(emitter, source, timeout):
@@ -76,13 +93,20 @@ def audit(sources, baseline, candidate, jobs, timeout, *, include_keys=False):
         counts = Counter(r["status"] for r in side)
         compute = [r for r in side if r["status"] == "compute"]
         totals[name] = dict(statuses={k: counts[k] for k in ("compute", "other_stage", "refused", "failed")},
-                            compute_with_guard=sum(bool(r["structured"] or r["guarded_dispatch"]) for r in compute),
-                            **{k: sum(r[k] for r in compute) for k in ("structured", "guarded_dispatch", "other_dispatch")})
+                            compute_with_guard=sum(has_guard(r) for r in compute),
+                            **{k: sum(r[k] for r in compute) for k in GUARD_FIELDS})
     admitted = [r for _, before, r in rows if before["status"] == "refused" and r["status"] == "compute"]
-    report = dict(schema=1, scope="Static emitted HLSL guard sites; not runtime loop counts or causation",
+    retained = [(before, after) for _, before, after in rows
+                if before["status"] == after["status"] == "compute"]
+    transitions = Counter((guard_shape(before), guard_shape(after)) for _, before, after in rows)
+    report = dict(schema=2, scope="Static emitted HLSL guard sites; not runtime loop counts or causation",
                   requests=len(rows), tool_sha256=dict(baseline=old_hash, candidate=new_hash),
                   totals=totals, newly_admitted_compute=len(admitted),
-                  newly_admitted_guarded=sum(bool(r["structured"] or r["guarded_dispatch"]) for r in admitted),
+                  newly_admitted_guarded=sum(has_guard(r) for r in admitted),
+                  newly_guarded_existing_compute=sum(not has_guard(b) and has_guard(a) for b, a in retained),
+                  no_longer_guarded_existing_compute=sum(has_guard(b) and not has_guard(a) for b, a in retained),
+                  shape_transitions=[dict(baseline=b, candidate=a, requests=n)
+                                     for (b, a), n in sorted(transitions.items())],
                   inconclusive=sum("failed" in (b["status"], a["status"]) for _, b, a in rows))
     if include_keys:
         report["rows"] = [dict(request=key, baseline=b, candidate=a) for key, b, a in rows]

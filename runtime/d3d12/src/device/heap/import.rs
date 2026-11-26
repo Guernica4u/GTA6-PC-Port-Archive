@@ -23,10 +23,11 @@ pub(super) fn trace_import_failure(source: &'static str, api: &'static str, size
 
 // This holder is also the key for the weak single-page import cache. Its
 // last native resource releases both the heap reference and the VA pin.
-// Field order is load-bearing: `native` must drop before `_shadow` unmaps
-// and before `_backing` lets XMem unmap the imported memory.
+// Field order is load-bearing: `native` and `extra_heaps` must drop before
+// `_shadow` unmaps and before `_backing` lets XMem unmap the imported memory.
 pub(in super::super) struct ImportedHeap {
     pub(super) native: ID3D12Heap,
+    extra_heaps: Vec<ID3D12Heap>,
     pub(super) _pin: ImportPin,
     _shadow: Option<Arc<super::shadow::ShadowPages>>,
     _backing: Option<super::backing::Hold>,
@@ -36,19 +37,121 @@ pub(in super::super) struct ImportedHeap {
 
 impl ImportedHeap {
     pub(super) fn direct(native: ID3D12Heap, pin: ImportPin, backing: super::backing::Backing) -> Self {
-        Self { native, _pin: pin, _shadow: None, _backing: backing.hold, memory: backing.address }
+        Self { native, extra_heaps: Vec::new(), _pin: pin, _shadow: None, _backing: backing.hold, memory: backing.address }
     }
 
     pub(super) fn shadowed(native: ID3D12Heap, pin: ImportPin, shadow: Arc<super::shadow::ShadowPages>,
         backing: super::backing::Backing) -> Self {
-        Self { native, _pin: pin, _shadow: Some(shadow), _backing: backing.hold, memory: backing.address }
+        Self { native, extra_heaps: Vec::new(), _pin: pin, _shadow: Some(shadow), _backing: backing.hold, memory: backing.address }
+    }
+
+    pub(super) fn scattered(
+        native: ID3D12Heap,
+        extra_heaps: Vec<ID3D12Heap>,
+        pin: ImportPin,
+        hold: super::backing::Hold,
+    ) -> Self {
+        Self {
+            native,
+            extra_heaps,
+            _pin: pin,
+            _shadow: None,
+            _backing: Some(hold),
+            memory: 0,
+        }
     }
 
     /// Whether a later import of the same guest pages, now backed by
     /// `memory`, can reuse this heap.
     pub(super) fn reusable_for(&self, memory: u64) -> bool {
-        self.is_live() && self.memory == memory
+        self.extra_heaps.is_empty() && self.is_live() && self.memory == memory
     }
+}
+
+/// Import a 64 KiB-aligned buffer whose XMem backings span multiple discrete
+/// host runs by mapping each piece heap into a `CreateReservedResource` buffer.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn import_scattered_buffer(
+    native_device: &ID3D12Device,
+    init_transition: &std::sync::Mutex<Option<super::super::allocation::InitTransition>>,
+    offset: u64,
+    desc: &D3D12_RESOURCE_DESC,
+    state: D3D12_RESOURCE_STATES,
+    runs: Vec<super::backing::BackingRun>,
+    hold: super::backing::Hold,
+    pin: ImportPin,
+    source: &'static str,
+    check_mirror: bool,
+) -> windows::core::Result<(ID3D12Resource, Arc<ImportedHeap>)> {
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC};
+    // Declare `_hold` before `heaps` and `resource` so error drops release
+    // `resource`, then `heaps`, and `_hold` last.
+    let _hold = hold;
+    let granularity = u64::from(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
+    if offset != 0
+        || runs.len() < 2
+        || desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
+        || desc.Width == 0
+    {
+        return Err(E_NOTIMPL.into());
+    }
+    let sized: ID3D12Device13 = native_device.cast().map_err(|_| E_NOTIMPL)?;
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+    if unsafe {
+        native_device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS,
+            (&raw mut options).cast(),
+            size_of_val(&options) as u32,
+        )
+    }
+    .is_err()
+        || options.TiledResourcesTier.0 < D3D12_TILED_RESOURCES_TIER_1.0
+    {
+        return Err(E_NOTIMPL.into());
+    }
+    let mut heaps = Vec::new();
+    heaps.try_reserve_exact(runs.len()).map_err(|_| E_OUTOFMEMORY)?;
+    for run in &runs {
+        let end = run.address.checked_add(run.bytes).ok_or(E_INVALIDARG)?;
+        validate_shared_range(run.address, end)?;
+        if check_mirror && super::shadow::contains_mapped_pages(run.address, run.bytes) {
+            return Err(E_NOTIMPL.into());
+        }
+        let native = unsafe { sized.OpenExistingHeapFromAddress1(run.address as _, run.bytes as usize) }
+            .map_err(|error| {
+                trace_import_failure(source, "scattered-sized", run.bytes, error.code());
+                error
+            })?;
+        let tiles = u32::try_from(run.bytes / granularity).map_err(|_| E_INVALIDARG)?;
+        heaps.push((native, tiles));
+    }
+    let reserved_desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Alignment: 0,
+        Width: desc.Width,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        Format: DXGI_FORMAT_UNKNOWN,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: D3D12_RESOURCE_FLAGS(desc.Flags.0 & super::super::format::HOST_FLAGS),
+    };
+    let mut resource = None;
+    unsafe { native_device.CreateReservedResource(&reserved_desc, state, None, &mut resource)? };
+    let resource: ID3D12Resource = resource.ok_or(E_POINTER)?;
+    super::super::allocation::map_reserved_tiles(native_device, init_transition, &resource, &heaps)?;
+    let mut iter = heaps.into_iter().map(|(heap, _)| heap);
+    let primary = iter.next().expect("scattered runs validated >= 2");
+    let extra_heaps: Vec<ID3D12Heap> = iter.collect();
+    let heap = Arc::new(ImportedHeap::scattered(primary, extra_heaps, pin, _hold));
+    if let Err(error) = attach_import(&resource, &heap) {
+        drop(resource);
+        return Err(error);
+    }
+    static SCATTERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    trace_buffer_path("imported_scattered", &SCATTERED, source, desc.Width);
+    Ok((resource, heap))
 }
 
 // Slot 44 places a tiled resource at a title-selected virtual address. An
@@ -85,7 +188,27 @@ pub(in super::super) fn import_buffer_with_heap(
     // Import the memory behind these pages: the address may be one of several
     // GPU aliases of it (see `backing`). Without XMem's backing exports this
     // is the address itself.
-    let backing = super::backing::acquire(base, size)?;
+    let backing = match super::backing::acquire_backing(base, size)? {
+        super::backing::AcquiredBacking::Contiguous(backing) => backing,
+        super::backing::AcquiredBacking::Scattered { runs, hold } => {
+            super::super::host_profile::report(device);
+            let check_mirror = super::super::host_profile::needs_mirror(
+                super::super::host_profile::section_import(device),
+            );
+            return import_scattered_buffer(
+                &device.native,
+                &device.state.init_transition,
+                offset,
+                desc,
+                state,
+                runs,
+                hold,
+                pin,
+                source,
+                check_mirror,
+            );
+        }
+    };
     let memory = backing.address;
     validate_shared_range(memory, memory.checked_add(size).ok_or(E_INVALIDARG)?)?;
     super::super::host_profile::report(device);
@@ -216,6 +339,9 @@ impl ImportedHeap {
     pub(in super::super) fn buffer_alias(self: &Arc<Self>, device: &ID3D12Device, offset: u64,
         width: u64, stride: u32, flags: D3D12_RESOURCE_FLAGS,
     ) -> windows::core::Result<(ID3D12Resource, u64)> {
+        if !self.extra_heaps.is_empty() {
+            return Err(E_NOTIMPL.into());
+        }
         let mut desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: width, Height: 1, DepthOrArraySize: 1,
             MipLevels: 1, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,

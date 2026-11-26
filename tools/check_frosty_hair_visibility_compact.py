@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import struct
 import subprocess
 import sys
@@ -98,7 +99,10 @@ def main():
     with TemporaryDirectory(dir=work) as temp:
         trial = Path(temp)
         # Keep the control isolated from the supplied prefix, including its settings.
-        subprocess.run(["cp", "-a", "--reflink=auto", args.prefix.resolve(), trial / "prefix"], check=True)
+        # Skip the rebuilt GPU caches; the trial builds its own.
+        shutil.copytree(args.prefix.resolve(), trial / "prefix",
+                        ignore=shutil.ignore_patterns("shadercache", "tuxbox_shader_cache"),
+                        symlinks=True)
         toolchain = Toolchain()
         source = ROOT / "tools/reference/hair-visibility-compact/guest.cpp"
         obj = toolchain.compile(source, trial, "/W4", "/WX", f"/I{ROOT / 'runtime/d3d12'}")

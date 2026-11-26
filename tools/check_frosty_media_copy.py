@@ -39,8 +39,11 @@ def main():
         temp.mkdir()
         runtime.mkdir(mode=0o700)
         prefix = trial / "prefix"
-        # Keep the supplied baseline prefix untouched.
-        subprocess.run(["cp", "-a", "--reflink=auto", str(args.prefix.resolve()), str(prefix)], check=True)
+        # Keep the supplied baseline prefix untouched. Skip the rebuilt GPU caches;
+        # the trial builds its own.
+        shutil.copytree(args.prefix.resolve(), prefix,
+                        ignore=shutil.ignore_patterns("shadercache", "tuxbox_shader_cache"),
+                        symlinks=True)
         shutil.copyfile(args.provider, trial / "d3d12_xs.dll")
         for lib, group in (("d3d12.dll", "vkd3d-proton"), ("d3d12core.dll", "vkd3d-proton"),
                            ("dxgi.dll", "dxvk")):
