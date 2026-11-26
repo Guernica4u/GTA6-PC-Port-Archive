@@ -694,9 +694,6 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
             console_cf: false,
             per_lane_only: false,
             view_marks: true,
-            target: super::Target::ANY,
-            console_cf: false,
-            per_lane_only: false,
         })
         .expect("lower")
     };
