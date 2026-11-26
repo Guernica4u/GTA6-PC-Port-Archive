@@ -105,6 +105,11 @@ struct KeyState {
 
 const _: () = assert!(size_of::<KeyState>() == 12 && size_of::<PadState>() == 28);
 
+/// One `VICTORY_KEYS` entry: the key, when it starts, and how long it is
+/// held (all from the start of input, the key a Windows virtual-key code).
+#[cfg(feature = "diagnostics")]
+type Scripted = (Duration, Duration, u8);
+
 /// Host input, or a fake in tests.
 trait Source: Send {
     /// The pad in host slot `slot`, `None` when the slot is empty.
@@ -1279,7 +1284,8 @@ mod host {
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
+        type Schedule = Vec<Scripted>;
+        static SCRIPT: LazyLock<(Instant, Schedule)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let mut parts = entry.split(':');
