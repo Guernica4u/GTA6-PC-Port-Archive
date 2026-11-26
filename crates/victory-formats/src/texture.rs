@@ -679,6 +679,23 @@ impl Layout {
         if tiled_len < self.size as usize || linear_len < need || row_pitch < bytes {
             return Err(Error::TooSmall);
         }
+        // Dense linear rows have no padding to preserve. Copy a whole plane,
+        // or the whole volume when both layouts also have adjacent planes.
+        // A mip chain separates depth slices by slice_size, not slice_bytes.
+        if self.desc.swizzle == Swizzle::LINEAR
+            && row_pitch == bytes
+            && m.pitch as usize * n == bytes
+        {
+            let base = (u64::from(first) * self.slice_size + m.offset) as usize;
+            if depth > 1 && self.slice_size == slice_bytes as u64 && depth_pitch == slice_bytes {
+                copy(base, 0, need);
+            } else {
+                for z in 0..depth as usize {
+                    copy(base + z * self.slice_size as usize, z * depth_pitch, slice_bytes);
+                }
+            }
+            return Ok(());
+        }
         let linear = self.desc.swizzle == Swizzle::LINEAR;
         // The row and depth contribute one common base to every column, so
         // the same contiguous runs repeat on every row, including mip tails.
@@ -1216,6 +1233,85 @@ mod tests {
         }
     }
 
+    /// Compare both copy directions with independent per-element addressing,
+    /// including padding and the gaps occupied by other mips and array slices.
+    #[test]
+    fn linear_copies_match_element_addresses() {
+        for dimension in [Dimension::Tex2d, Dimension::Tex3d] {
+            for n in [1, 2, 4, 8, 16] {
+                for width in [256 / n, 256 / n - 1, 256 / n + 1] {
+                    for mips in [1, 3] {
+                        let l = Layout::new(&Desc {
+                            dimension,
+                            depth: 4,
+                            ..desc(width, 5, mips, n, Swizzle::LINEAR)
+                        })
+                        .unwrap();
+                        for mip in 0..mips {
+                            let m = l.mips[mip as usize];
+                            for padding in [0, 13] {
+                                let active = m.width as usize * n as usize;
+                                let row = active + padding;
+                                let plane = row * m.height as usize + padding;
+                                let len = (m.depth as usize - 1) * plane
+                                    + (m.height as usize - 1) * row
+                                    + active;
+                                let linear: Vec<u8> =
+                                    (0..len).map(|i| (i ^ (i >> 8) ^ (i >> 16)) as u8).collect();
+                                let slices = if dimension == Dimension::Tex3d { 1 } else { 4 };
+                                for slice in 0..slices {
+                                    let mut expected = vec![0xcc; l.size as usize];
+                                    let mut back = vec![0xcc; len];
+                                    for z in 0..m.depth {
+                                        for y in 0..m.height {
+                                            for x in 0..m.width {
+                                                let t = l.offset(mip, x, y, slice + z).unwrap()
+                                                    as usize;
+                                                let at = z as usize * plane
+                                                    + y as usize * row
+                                                    + x as usize * n as usize;
+                                                let range = at..at + n as usize;
+                                                expected[t..t + n as usize]
+                                                    .copy_from_slice(&linear[range.clone()]);
+                                                back[range.clone()].copy_from_slice(&linear[range]);
+                                            }
+                                        }
+                                    }
+                                    let mut tiled = vec![0xcc; l.size as usize];
+                                    l.tile(&mut tiled, mip, slice, &linear, row, plane).unwrap();
+                                    assert_eq!(tiled, expected);
+                                    let mut actual = vec![0xcc; len];
+                                    l.detile(&tiled, mip, slice, &mut actual, row, plane)
+                                        .unwrap();
+                                    assert_eq!(actual, back);
+                                    // Validation must still happen before any write.
+                                    let mut short = vec![0x7b; len - 1];
+                                    assert_eq!(
+                                        l.detile(&tiled, mip, slice, &mut short, row, plane),
+                                        Err(Error::TooSmall)
+                                    );
+                                    assert!(short.iter().all(|&b| b == 0x7b));
+                                    let saved = tiled.clone();
+                                    assert_eq!(
+                                        l.tile(
+                                            &mut tiled,
+                                            mip,
+                                            slice,
+                                            &linear[..len - 1],
+                                            row,
+                                            plane
+                                        ),
+                                        Err(Error::TooSmall)
+                                    );
+                                    assert_eq!(tiled, saved);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     #[test]
     fn depth_stencil_is_two_planes() {
         let t = Texture::new(&TextureDesc {
