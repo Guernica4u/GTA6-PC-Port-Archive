@@ -481,6 +481,7 @@ fn has_side_effect(inst: &Inst) -> bool {
     let name = inst.name();
     matches!(inst.fields, Fields::Exp { .. })
         || matches!(inst.fields, Fields::Flat { .. }) && !name.starts_with("global_load_")
+        || matches!(inst.fields, Fields::Buffer { lds: true, .. })
         || name.contains("store")
         || name.contains("atomic")
         || name == "s_barrier"
@@ -1126,15 +1127,9 @@ impl<'a> Lower<'a> {
 
     /// An instruction inside a whole-wave section: the values that leave
     /// the section are made from what the simulation found them to be.
-    fn section_inst(&mut self, b: usize, i: usize, start: usize) -> Result<(), Stop> {
+    fn section_inst(&mut self, b: usize, i: usize, start: usize) {
         const UNKNOWN: Why = "a whole-wave section step the simulation does not follow";
         let inst = &self.x.p.blocks[b].insts[i];
-        if has_side_effect(inst) || self.x.st.discards.contains_key(&(b, i)) {
-            return Err(unsupported(
-                inst.machine.offset,
-                "a side effect in a whole-wave section",
-            ));
-        }
         for &(_, w) in &inst.writes {
             let val = if self.section_out.contains(&w) {
                 let shape = self.sections[&b][&start].shapes.get(&w).copied();
@@ -1147,7 +1142,6 @@ impl<'a> Lower<'a> {
             };
             self.vals.insert(w, val);
         }
-        Ok(())
     }
 
     /// A value a whole-wave section leaves, as DXIL wave operations over the
@@ -1388,7 +1382,14 @@ impl<'a> Lower<'a> {
                 self.mode16 = round16_after(&p.blocks[b].insts[i], self.mode16);
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
-                        self.section_inst(b, j, i)?;
+                        let inst = &p.blocks[b].insts[j];
+                        if has_side_effect(inst) || self.x.st.discards.contains_key(&(b, j)) {
+                            return Err(unsupported(
+                                inst.machine.offset,
+                                "a side effect in a whole-wave section",
+                            ));
+                        }
+                        self.section_inst(b, j, i);
                     }
                     i = end;
                     continue;
@@ -10966,6 +10967,14 @@ mod tests {
 
     /// Whether a synthetic compute program translates with these input registers.
     fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
+        lowers_structured(words, rsrc2, |_| {})
+    }
+
+    fn lowers_structured(
+        words: &[u32],
+        rsrc2: u32,
+        prepare: impl FnOnce(&mut structure::Structured),
+    ) -> Result<(), crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -10980,7 +10989,8 @@ mod tests {
             code,
         };
         let p = ir::build(&native.code, false, 256).unwrap();
-        let st = structure::structure(&p).unwrap();
+        let mut st = structure::structure(&p).unwrap();
+        prepare(&mut st);
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
         lower(&Parts {
@@ -11109,6 +11119,7 @@ mod tests {
         let barrier = [0xBF8A_0000]; // s_barrier
         let store = [0xE070_0000, 0x8002_0000]; // buffer_store_dword v0, off, s[8:11], 0
         let mov = 0x7E00_0301; // v_mov_b32 v0, v1
+        let load_lds = [0xE031_0000, 0x8002_0000]; // buffer_load_dword to LDS
 
         for effect in [barrier.as_slice(), store.as_slice()] {
             let outside = [&[mov, save, restore], effect].concat();
@@ -11128,6 +11139,38 @@ mod tests {
                 "{error}"
             );
         }
+        assert!(matches!(
+            lowers_valu(&[mov, save, load_lds[0], load_lds[1], restore]),
+            Err(crate::ShaderError::Unsupported {
+                offset: 36,
+                what: "a side effect in a whole-wave section",
+            })
+        ));
+    }
+
+    #[test]
+    fn whole_wave_sections_reject_structured_discard() {
+        let words = [
+            0xBE86_3DC1, // s_or_saveexec_b32 s6, -1
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0xBEFE_0306, // s_mov_b32 exec_lo, s6
+            S_ENDPGM,
+        ];
+        lowers(&words, 0).unwrap();
+        // Supply the structured discard annotation on an otherwise pure instruction.
+        let result = lowers_structured(&words, 0, |st| {
+            st.discards.insert((0, 1), structure::Bool::TRUE);
+        });
+        assert!(
+            matches!(
+                result,
+                Err(crate::ShaderError::Unsupported {
+                    offset: 4,
+                    what: "a side effect in a whole-wave section",
+                })
+            ),
+            "{result:?}"
+        );
     }
 
     #[test]
