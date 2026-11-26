@@ -23,7 +23,20 @@ use windows::core::s;
 
 use crate::host::{HostList, host, transition};
 
-const SOURCE: &str = r#"
+/// The groups of a mesh dispatch record, shared by the single clamp and the
+/// window's pass so the two cannot drift apart.
+macro_rules! mesh_groups {
+    () => {
+        r#"
+// Mesh dispatches: the console's are one-dimensional.
+uint3 mesh_groups(uint3 g) {
+    return uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+}
+"#
+    };
+}
+
+const SOURCE: &str = concat!(mesh_groups!(), r#"
 #define RS "RootConstants(num32BitConstants=4, b0), SRV(t0), UAV(u1), UAV(u0)"
 cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
 // The title's records, read only; the clamped ones go to the list's own.
@@ -60,9 +73,7 @@ uint clamped(uint at) {
         cost = g.x * g.y * g.z * 64;
         dest.Store3(at, g);
     } else {
-        // Mesh dispatches: the console's are one-dimensional.
-        uint3 g = args.Load3(at);
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+        uint3 g = mesh_groups(args.Load3(at));
         cost = g.x * g.y * g.z * 128;
         dest.Store3(at, g);
     }
@@ -113,7 +124,7 @@ void main(uint lane : SV_GroupIndex) {
         budget.Store(0, BUDGET - left);
     }
 }
-"#;
+"#);
 
 struct Clamp {
     root: ID3D12RootSignature,
@@ -304,7 +315,7 @@ const WINDOW_SOURCES: usize = 4;
 /// A table: a header of 4 words, then 8 words per draw.
 const TABLE_BYTES: u64 = 16 + 32 * WINDOW_ENTRIES as u64;
 
-const WINDOW_SOURCE: &str = r#"
+const WINDOW_SOURCE: &str = concat!(mesh_groups!(), r#"
 #define RS "SRV(t0), SRV(t1), SRV(t2), SRV(t3), SRV(t4), UAV(u1), UAV(u0)"
 // The host copies records are read from, only read.
 ByteAddressBuffer a0 : register(t0);
@@ -352,8 +363,7 @@ uint clamped(uint kind, uint source, uint from, uint to) {
         cost = g.x * g.y * g.z * 64;
         dest.Store3(to, g);
     } else {
-        uint3 g = uint3(word(source, from), word(source, from + 4), word(source, from + 8));
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+        uint3 g = mesh_groups(uint3(word(source, from), word(source, from + 4), word(source, from + 8)));
         cost = g.x * g.y * g.z * 128;
         dest.Store3(to, g);
     }
@@ -410,7 +420,7 @@ void main(uint lane : SV_GroupIndex) {
         budget.Store(0, BUDGET - left);
     }
 }
-"#;
+"#);
 
 fn window_clamp() -> Option<&'static Clamp> {
     static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
