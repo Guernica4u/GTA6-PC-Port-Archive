@@ -75,6 +75,9 @@ pub(crate) struct Lowered {
     /// Test builds: the property words of each handle annotation, in order.
     #[cfg(test)]
     pub annotations: Vec<(u32, u32)>,
+    /// Test builds: the headers each written block branches back to.
+    #[cfg(test)]
+    pub back_edges: Vec<Vec<usize>>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1786,6 +1789,8 @@ impl<'a> Lower<'a> {
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
             #[cfg(test)]
             has_half_wave_mask: self.s.m.has_i32_const(!31),
+            #[cfg(test)]
+            back_edges: self.s.m.back_edges(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -10752,12 +10757,24 @@ impl<'a> Lower<'a> {
     fn branch_term(&mut self, b: usize, cond: V, taken: usize, not_taken: usize) -> Term {
         // A back edge is taken only below the iteration limit.
         let back = |l: &Self, to: usize| l.counters.contains_key(&to) && l.rpo[to] <= l.rpo[b];
+        // An inner loop's latch that also continues the outer loop leaves
+        // for the outer header through a latch of its own, as DXC's loops
+        // do: dxil-spirv cannot take two back edges from one block when it
+        // flattens subgroup shuffles (HansKristian-Work/dxil-spirv#380).
+        let outer = (back(self, taken) && back(self, not_taken) && taken != not_taken).then(|| {
+            if self.rpo[taken] < self.rpo[not_taken] {
+                taken
+            } else {
+                not_taken
+            }
+        });
+        let counted = |l: &Self, to: usize| back(l, to) && Some(to) != outer;
         // (No `xor` of a compare: a loop exit testing one hung the
         // AMD driver.)
-        let cond = if back(self, taken) {
+        let cond = if counted(self, taken) {
             let ok = self.count_iteration(taken, pred::IULT);
             self.s.m.bin(self.cur, Bin::And, cond, ok)
-        } else if back(self, not_taken) {
+        } else if counted(self, not_taken) {
             let stop = self.count_iteration(not_taken, pred::IUGE);
             self.s.m.bin(self.cur, Bin::Or, cond, stop)
         } else {
@@ -10765,7 +10782,14 @@ impl<'a> Lower<'a> {
         };
         // Critical edges get a block of their own, so loops have
         // dedicated exits and preheaders as DXC emits them.
-        let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
+        let edge = |l: &mut Self, to: usize| {
+            if Some(to) == outer {
+                l.latch(b, to)
+            } else {
+                l.edge(b, to)
+            }
+        };
+        let (t, f) = (edge(self, taken), edge(self, not_taken));
         for (to, via) in [(taken, t), (not_taken, f)] {
             if !back(self, to) {
                 // From an edge block, or from here.
@@ -10987,8 +11011,9 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// A back edge to header `to` (a back edge keeps its block, no
-    /// critical-edge block): the count goes up; the result compares it with
+    /// A back edge to header `to` from the current block (the latch: a back
+    /// edge gets no critical-edge block, see [`Self::latch`] for the one
+    /// exception): the count goes up; the result compares it with
     /// [`LOOP_LIMIT`] by `p` (below: go on; at or above: stop).
     fn count_iteration(&mut self, to: usize, p: u8) -> V {
         let c = self.cur;
@@ -11034,6 +11059,21 @@ impl<'a> Lower<'a> {
         }
         let e = self.s.m.new_block();
         self.s.m.terminate(e, Term::Br(target));
+        self.edges.insert((from, to), e);
+        e
+    }
+
+    /// A latch of its own for the back edge from IR block `from` to header
+    /// `to`: it counts the iteration and goes on to `to`, or leaves the
+    /// program at the limit.
+    fn latch(&mut self, from: usize, to: usize) -> usize {
+        let e = self.s.m.new_block();
+        let cur = std::mem::replace(&mut self.cur, e);
+        let ok = self.count_iteration(to, pred::IULT);
+        self.cur = cur;
+        let abort = self.abort_block();
+        let header = self.block[to].expect("reachable");
+        self.s.m.terminate(e, Term::CondBr(ok, header, abort));
         self.edges.insert((from, to), e);
         e
     }

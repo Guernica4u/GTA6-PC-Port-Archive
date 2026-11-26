@@ -1424,3 +1424,30 @@ fn an_image_read_as_float_and_by_an_atomic_is_annotated_twice() {
         lowered.annotations
     );
 }
+
+/// A latch that branches back to both its loop's header and the outer
+/// loop's (the shape of a first-lane table offset loop) branches back to
+/// one header only: the outer back edge leaves through a latch of its own
+/// (dxil-spirv#380).
+#[test]
+fn a_latch_branches_back_to_one_header() {
+    let words = [
+        0xBE80_0380, // s_mov_b32 s0, 0
+        0xBF82_0007, // s_branch outer
+        0x8001_8101, // latch: s_add_u32 s1, s1, 1
+        0xBF06_8301, // s_cmp_eq_u32 s1, 3
+        0xBF85_0004, // s_cbranch_scc1 outer
+        0x8000_8100, // inner: s_add_u32 s0, s0, 1
+        0xBF06_8400, // s_cmp_eq_u32 s0, 4
+        0xBF85_0003, // s_cbranch_scc1 end
+        0xBF82_FFF9, // s_branch latch
+        0xBE81_0380, // outer: s_mov_b32 s1, 0
+        0xBF82_FFFA, // s_branch inner
+        S_ENDPGM,    // end
+    ];
+    let l = lower_with(&words, vec![], vec![]).unwrap();
+    let back = &l.back_edges;
+    assert!(back.iter().all(|b| b.len() <= 1), "{back:?}");
+    // Its own latch and the outer loop's.
+    assert_eq!(back.iter().filter(|b| !b.is_empty()).count(), 2);
+}
