@@ -1261,7 +1261,7 @@ impl<'a> Lower<'a> {
         {
             return Err("a wave reduction in a mesh shader");
         }
-        self.same_half(ACROSS)?;
+        self.reduction_meets()?;
         let c = self.cur;
         let &m = self
             .x
@@ -1326,6 +1326,7 @@ impl<'a> Lower<'a> {
                 )
             }
         };
+        let r = self.reduce_halves(op, prefix, arg, r, ident, float)?;
         Ok(if float { self.as_int(r) } else { r })
     }
 
@@ -1874,7 +1875,7 @@ impl<'a> Lower<'a> {
                     Some(&b) if b == self.cur_ir => self.cur,
                     Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
                 };
-                self.same_half("a lane mask read as data (wave64 on a 32-lane host)")?;
+                self.mask_meets(lo)?;
                 if !self.balloting.insert(lo) {
                     return Err("a lane mask whose lanes depend on its own value");
                 }
@@ -1888,6 +1889,7 @@ impl<'a> Lower<'a> {
                     .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
                 self.s.flags |= flags::WAVE_OPS;
                 let xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
+                let xy = self.mask_halves(at, xy)?;
                 self.ballots.insert(lo, xy);
                 xy
             }
@@ -6725,17 +6727,11 @@ impl<'a> Lower<'a> {
                 int(self, a)
             }
             "v_readfirstlane_b32" => {
-                // In halves the host wave's first lane is the console's only
-                // for a value the same in both halves, or where the group is
-                // one host wave.
-                if self.halves
-                    && !self.one_host_wave()
-                    && matches!(v.src.first(), Some(&Operand::Vector { reg, .. })
-                        if !inst.read(Reg::V(reg)).is_some_and(|x| self.alike.contains(&x)))
-                {
-                    return Err(halves::FIRST_ACROSS);
-                }
                 let a = s(self, 0)?;
+                // In halves the console's first lane may be the other half's.
+                if let Some(r) = self.first_lane(inst, a)? {
+                    return int(self, r);
+                }
                 // shortcut: without console lanes, the first lane of the host
                 // wave (whose waves are the driver's choice): the console's
                 // where the value is the same in every lane, what the compiler

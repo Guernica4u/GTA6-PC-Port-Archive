@@ -18,21 +18,22 @@
 //!   `v_writelane_b32` (the lane named takes the scalar) and the row a DPP
 //!   row mask names (rows 2 and 3 are the upper half's) are decided by the
 //!   console lane ([`Lower::console_lane`]);
-//! * across halves, traded: `v_readlane_b32` ([`Lower::lane_read`]). The
-//!   halves store what the other may read in group-shared memory and meet
-//!   at a group barrier, which is legal only where every thread of the group
-//!   gets there together ([`Exchange`]); elsewhere the read is refused;
-//! * across halves, refused: ballots (a mask read as data holds the other
-//!   half's lanes) and whole-wave reductions and prefix sums (SGPR spills
-//!   read back are not lane reads). In a group of 32 threads or fewer, which one host wave
-//!   holds whole, nothing is in the other half: its ballots' high dwords are
-//!   0 and its reductions run over every lane the console has, as on the
-//!   console, and a lane read of a constant lane below 32 is the host's;
-//! * `v_readfirstlane_b32` reads the host wave's first lane, which in the
-//!   upper half is console lane 32 or later: kept for a value the same in
-//!   every lane of the console wave ([`lane_uniform`], what the compiler
-//!   reads first lanes for) and in a group of 32 threads or fewer (one host
-//!   wave holds the whole console wave), refused otherwise ([`FIRST_ACROSS`]).
+//! * across halves, traded: `v_readlane_b32` ([`Lower::lane_read`]),
+//!   `v_readfirstlane_b32` ([`Lower::first_lane`]: the console's first lane
+//!   in EXEC, which may be in either half), lane masks read as data
+//!   ([`Lower::mask_halves`]: each half's ballot is a dword of the console's
+//!   mask) and whole-wave reductions and prefix sums
+//!   ([`Lower::reduce_halves`]: each half's part, combined). The halves
+//!   store their parts in group-shared memory and meet at a group barrier
+//!   ([`Lower::trade`]), which is legal only where every thread of the
+//!   group gets there together ([`Exchange`]); elsewhere they are refused;
+//! * a value the same in every lane of the console wave ([`lane_uniform`],
+//!   what the compiler reads first lanes for) is its own first lane, so its
+//!   `v_readfirstlane_b32` is the host wave's anywhere;
+//! * a group of 32 threads or fewer is one host wave, which holds its whole
+//!   console wave: nothing is in the other half, so its ballots' high dwords
+//!   are 0, its reductions and first lanes are the host wave's, and a lane
+//!   read of a constant lane below 32 is the host's.
 //!
 //! A refusal in a value no instruction ends up needing costs nothing (the
 //! lowering retries with that value missing), so a program is refused only
@@ -68,6 +69,9 @@ use super::*;
 
 /// Console lanes per host wave in halves.
 const HALF: u32 = 32;
+
+/// Dwords each half trades at most at once ([`Lower::trade`]).
+const WORDS: u32 = 2;
 
 impl Lower<'_> {
     /// Whether a wave64 program whose lanes follow the console's runs in
@@ -147,14 +151,21 @@ impl Lower<'_> {
             .is_some_and(|t| t.iter().product::<u32>() <= HALF)
     }
 
-    /// Refuses a read into the other half of the console wave in halves,
-    /// unless the group fits one host wave (no lane in the other half).
-    pub(super) fn same_half(&self, what: Why) -> Result<(), Why> {
-        if self.halves && !self.one_host_wave() {
-            Err(what)
-        } else {
-            Ok(())
-        }
+    /// Whether the halves of a console wave trade what one reads of the
+    /// other's lanes: in halves, unless the group fits one host wave (no
+    /// lane in the other half).
+    fn trades(&self) -> bool {
+        self.halves && !self.one_host_wave()
+    }
+
+    /// Whether every thread of the group meets at the IR block being
+    /// lowered ([`Exchange`]), where the halves may trade.
+    fn meets(&self) -> bool {
+        self.exchange
+            .meet
+            .get(self.cur_ir)
+            .copied()
+            .unwrap_or(false)
     }
 
     /// `v_readlane_b32` (`inst`) of `x` at `lane` in halves: `None` where the
@@ -193,50 +204,239 @@ impl Lower<'_> {
         self.across(x, lane).map(Some)
     }
 
-    /// Lane `lane`'s `x` in every lane of the console wave, traded through
-    /// group-shared memory: the first lane of each host wave stores its lane
-    /// `lane % 32`'s `x` in its half's slot; after a group barrier every lane
-    /// loads the slot of the half holding `lane`, and a second barrier keeps
-    /// the next trade from overwriting it first. Only where every thread of
-    /// the group meets ([`Exchange`]): a barrier one half skips hangs the GPU
-    /// (D3D12 leaves it undefined; NVIDIA waits for every thread).
+    /// Lane `lane`'s `x` in every lane of the console wave: each half reads
+    /// its lane `lane % 32` and the halves trade ([`Lower::trade`]); the half
+    /// holding `lane` gives the read.
     fn across(&mut self, x: V, lane: V) -> Result<V, Why> {
-        if !self
-            .exchange
-            .meet
-            .get(self.cur_ir)
-            .copied()
-            .unwrap_or(false)
-        {
+        if !self.meets() {
             return Err(APART);
         }
+        let c = self.cur;
+        let (k0, k1, k5, k31) = (
+            self.s.m.i32(0),
+            self.s.m.i32(1),
+            self.s.m.i32(5),
+            self.s.m.i32(31),
+        );
+        let low = self.s.m.bin(c, Bin::And, lane, k31);
+        let mine = self.read_lane(x, low);
+        let (lo, hi) = self.trade(c, &[(mine, 0)])?[0];
+        let half = self.s.m.bin(c, Bin::LShr, lane, k5);
+        let half = self.s.m.bin(c, Bin::And, half, k1);
+        let upper = self.s.m.cmp(c, pred::NE, half, k0);
+        Ok(self.s.m.select(c, upper, hi, lo))
+    }
+
+    /// Each half's `words` (word and identity; each word the same in every
+    /// lane of its host wave), traded through group-shared memory in DXIL
+    /// block `at` of an IR block where every thread of the group meets
+    /// ([`Exchange`]): every lane stores its half's words (one value per
+    /// word, so the stores agree), a group barrier, every lane loads both
+    /// halves' words, and a second barrier keeps the next trade from
+    /// overwriting them first. Per word, the low half's and the high half's;
+    /// a half without threads (in a group that ends inside a console wave's
+    /// low half) gives the identity. A barrier one half skips hangs the GPU
+    /// (D3D12 leaves it undefined; NVIDIA waits for every thread).
+    fn trade(&mut self, at: usize, words: &[(V, u32)]) -> Result<Vec<(V, V)>, Why> {
+        debug_assert!(words.len() <= WORDS as usize);
         let slots = self.slots()?;
         let f = self.relabelled_flat();
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
-        let (k1, k5, k6, k31) = (k(self, 1), k(self, 5), k(self, 6), k(self, 31));
+        let (k5, k6, kw, k2w) = (k(self, 5), k(self, 6), k(self, WORDS), k(self, 2 * WORDS));
+        let own = self.s.m.bin(at, Bin::LShr, f, k5);
+        let own = self.s.m.bin(at, Bin::Mul, own, kw);
+        for (i, &(x, _)) in words.iter().enumerate() {
+            let ki = k(self, i as u32);
+            let slot = self.s.m.bin(at, Bin::Add, own, ki);
+            let p = self.s.m.element(at, slots, slot);
+            self.s.m.store(at, p, x);
+        }
+        self.group_barrier(at);
+        let wave = self.s.m.bin(at, Bin::LShr, f, k6);
+        let low = self.s.m.bin(at, Bin::Mul, wave, k2w);
+        let high = self.s.m.bin(at, Bin::Add, low, kw);
+        // Only the last console wave's high half may have no threads.
+        let group = self.s.threads.map_or(64, |t| t.iter().product::<u32>());
+        let present = (!group.is_multiple_of(64) && group % 64 <= HALF).then(|| {
+            let (k64, n) = (k(self, 64), k(self, group - HALF));
+            let first = self.s.m.bin(at, Bin::Mul, wave, k64);
+            self.s.m.cmp(at, pred::IULT, first, n)
+        });
+        let mut traded = Vec::with_capacity(words.len());
+        for (i, &(_, ident)) in words.iter().enumerate() {
+            let ki = k(self, i as u32);
+            let load = |l: &mut Self, base: V| {
+                let slot = l.s.m.bin(at, Bin::Add, base, ki);
+                let p = l.s.m.element(at, slots, slot);
+                l.s.m.load(at, p)
+            };
+            let lo = load(self, low);
+            let mut hi = load(self, high);
+            if let Some(present) = present {
+                let id = k(self, ident);
+                hi = self.s.m.select(at, present, hi, id);
+            }
+            traded.push((lo, hi));
+        }
+        self.group_barrier(at);
+        Ok(traded)
+    }
+
+    /// `v_readfirstlane_b32` (`inst`) of `x` in halves: `None` where the host
+    /// wave's own first lane is the console's (not in halves, a group one
+    /// host wave holds, a scalar or a value the same in every lane of the
+    /// console wave), else the console's: the first lane in EXEC (the
+    /// instruction's guard), in either half, or lane 0 where EXEC holds none.
+    /// Each half reads its own first lane in EXEC (lane 0 with none) and its
+    /// ballot of EXEC, and the halves trade; refused where not every thread
+    /// meets.
+    pub(super) fn first_lane(&mut self, inst: &Inst, x: V) -> Result<Option<V>, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            return Ok(None);
+        };
+        let Some(&Operand::Vector { reg, .. }) = v.src.first() else {
+            return Ok(None);
+        };
+        if !self.trades()
+            || inst
+                .read(Reg::V(reg))
+                .is_some_and(|r| self.alike.contains(&r))
+        {
+            return Ok(None);
+        }
+        if !self.meets() {
+            return Err(FIRST_ACROSS);
+        }
+        let b = self.cur_ir;
+        let i = self.x.p.blocks[b]
+            .insts
+            .iter()
+            .position(|j| std::ptr::eq(j, inst))
+            .ok_or(FIRST_ACROSS)?;
+        let on = match self.guard(b, i)? {
+            Some(g) => g,
+            None => self.s.m.bool(true),
+        };
         let c = self.cur;
-        let low = self.s.m.bin(c, Bin::And, lane, k31);
-        let mine = self.read_lane(x, low);
-        let own = self.s.m.bin(c, Bin::LShr, f, k5);
-        let i1 = self.s.t.i1;
-        let first = self
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let ballot = self
             .s
-            .op(c, "waveIsFirstLane", Attr::NoUnwind, i1, 110, &[]);
-        let at = self.begin_guarded(Some(first));
-        let p = self.s.m.element(self.cur, slots, own);
-        self.s.m.store(self.cur, p, mine);
-        self.end_guarded(at, &[]);
-        self.group_barrier();
+            .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
+        self.s.flags |= flags::WAVE_OPS;
+        let ballot = self.s.m.extract(c, ballot, 0);
+        let k0 = self.s.m.i32(0);
+        let any = self.s.m.cmp(c, pred::NE, ballot, k0);
+        let low = self
+            .s
+            .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[ballot]);
+        let lane = self.s.m.select(c, any, low, k0);
+        let mine = self.read_lane(x, lane);
+        let traded = self.trade(c, &[(mine, 0), (ballot, 0)])?;
+        let ((x0, x1), (b0, b1)) = (traded[0], traded[1]);
+        let any0 = self.s.m.cmp(c, pred::NE, b0, k0);
+        let any1 = self.s.m.cmp(c, pred::NE, b1, k0);
+        let r = self.s.m.select(c, any1, x1, x0);
+        Ok(Some(self.s.m.select(c, any0, x0, r)))
+    }
+
+    /// Refuses lane mask `mask` read as data in halves unless every thread
+    /// of the group meets at the IR block writing it, where the halves trade
+    /// their ballots ([`Lower::mask_halves`]); program inputs are the entry's.
+    pub(super) fn mask_meets(&self, mask: Value) -> Result<(), Why> {
+        let b = self.def_block.get(&mask).copied().unwrap_or(0);
+        if self.trades() && !self.exchange.meet.get(b).copied().unwrap_or(false) {
+            return Err(MASK_APART);
+        }
+        Ok(())
+    }
+
+    /// The console mask's dwords from this host wave's ballot `xy`, taken in
+    /// DXIL block `at`: in halves each half's ballot is one of them, traded
+    /// there ([`Lower::mask_meets`]).
+    pub(super) fn mask_halves(&mut self, at: usize, xy: (V, V)) -> Result<(V, V), Why> {
+        if !self.trades() {
+            return Ok(xy);
+        }
+        Ok(self.trade(at, &[(xy.0, 0)])?[0])
+    }
+
+    /// Refuses a whole-wave reduction or prefix sum in halves where not
+    /// every thread of the group meets ([`Lower::reduce_halves`]).
+    pub(super) fn reduction_meets(&self) -> Result<(), Why> {
+        if self.trades() && !self.meets() {
+            return Err(REDUCTION_APART);
+        }
+        Ok(())
+    }
+
+    /// The console wave's `op` over its lanes (with `prefix`, the sum over
+    /// the lanes below each, and with `Some(true)` it too) from this half's
+    /// `r` of `arg` (f32 values where `float`), `ident` the identity: in
+    /// halves the halves trade their parts. A reduction combines both, low
+    /// half first; a prefix sum in the high half adds the low half's total.
+    pub(super) fn reduce_halves(
+        &mut self,
+        op: super::super::wave::Op,
+        prefix: Option<bool>,
+        arg: V,
+        r: V,
+        ident: u32,
+        float: bool,
+    ) -> Result<V, Why> {
+        use super::super::wave::Op;
+        if !self.trades() {
+            return Ok(r);
+        }
         let c = self.cur;
-        let wave = self.s.m.bin(c, Bin::LShr, f, k6);
-        let wave = self.s.m.bin(c, Bin::Shl, wave, k1);
-        let half = self.s.m.bin(c, Bin::LShr, lane, k5);
-        let half = self.s.m.bin(c, Bin::And, half, k1);
-        let slot = self.s.m.bin(c, Bin::Or, wave, half);
-        let p = self.s.m.element(c, slots, slot);
-        let r = self.s.m.load(c, p);
-        self.group_barrier();
-        Ok(r)
+        let bits = |l: &mut Self, x: V| if float { l.as_int(x) } else { x };
+        let value = |l: &mut Self, x: V| if float { l.as_float(x) } else { x };
+        if prefix.is_some() {
+            let (ty, sfx) = if float {
+                (self.s.t.f32, "f32")
+            } else {
+                (self.s.t.i32, "i32")
+            };
+            let (sum, unsigned) = (self.s.m.i8(0), self.s.m.i8(u8::from(!float)));
+            let total = self.s.op(
+                c,
+                &format!("waveActiveOp.{sfx}"),
+                Attr::NoUnwind,
+                ty,
+                119,
+                &[arg, sum, unsigned],
+            );
+            let total = bits(self, total);
+            let (low, _) = self.trade(c, &[(total, 0)])?[0];
+            let low = value(self, low);
+            let below = self.s.m.bin(c, Bin::Add, r, low);
+            let f = self.relabelled_flat();
+            let (k0, k32) = (self.s.m.i32(0), self.s.m.i32(HALF));
+            let half = self.s.m.bin(c, Bin::And, f, k32);
+            let upper = self.s.m.cmp(c, pred::NE, half, k0);
+            return Ok(self.s.m.select(c, upper, below, r));
+        }
+        let mine = bits(self, r);
+        let (lo, hi) = self.trade(c, &[(mine, ident)])?[0];
+        let (lo, hi) = (value(self, lo), value(self, hi));
+        let pick = |l: &mut Self, p: u8| {
+            let t = l.s.m.cmp(c, p, lo, hi);
+            l.s.m.select(c, t, lo, hi)
+        };
+        Ok(match op {
+            Op::AddU | Op::AddF => self.s.m.bin(c, Bin::Add, lo, hi),
+            Op::Or => self.s.m.bin(c, Bin::Or, lo, hi),
+            Op::And => self.s.m.bin(c, Bin::And, lo, hi),
+            Op::Xor => self.s.m.bin(c, Bin::Xor, lo, hi),
+            Op::MinU => pick(self, pred::IULT),
+            Op::MaxU => pick(self, pred::IUGT),
+            Op::MinI => pick(self, pred::SLT),
+            Op::MaxI => pick(self, pred::SGT),
+            Op::MinF => self.max_min(false, lo, hi),
+            Op::MaxF => self.max_min(true, lo, hi),
+            // 16-bit sums are refused in halves before they get here.
+            Op::AddH => return Err(REDUCTION_APART),
+        })
     }
 
     /// At the start of IR block `b`, after its phis: the group barrier where a
@@ -247,7 +447,7 @@ impl Lower<'_> {
             return;
         };
         if lds.at_entry.contains(&b) {
-            self.group_barrier();
+            self.group_barrier(self.cur);
             self.exchange.pending = None;
         } else {
             self.exchange.pending = Some(true);
@@ -263,7 +463,7 @@ impl Lower<'_> {
             .as_ref()
             .is_some_and(|l| l.before_exit.contains(&b))
         {
-            self.group_barrier();
+            self.group_barrier(self.cur);
         }
     }
 
@@ -271,42 +471,36 @@ impl Lower<'_> {
     /// barrier when an access since the last one may meet it (a write, or a
     /// read before this write), as the console's one wave orders them.
     pub(super) fn lds_order(&mut self, name: &str) {
-        let meets = self
-            .exchange
-            .meet
-            .get(self.cur_ir)
-            .copied()
-            .unwrap_or(false);
-        if self.exchange.lds.is_none() || !meets {
+        if self.exchange.lds.is_none() || !self.meets() {
             return;
         }
         let writes = !name.starts_with("ds_read");
         let pending = self.exchange.pending;
         if pending == Some(true) || writes && pending == Some(false) {
-            self.group_barrier();
+            self.group_barrier(self.cur);
             self.exchange.pending = None;
         }
         self.exchange.pending = Some(writes || self.exchange.pending == Some(true));
     }
 
     /// A group barrier ordering group-shared memory
-    /// (`GroupMemoryBarrierWithGroupSync`).
-    fn group_barrier(&mut self) {
+    /// (`GroupMemoryBarrierWithGroupSync`), in DXIL block `at`.
+    fn group_barrier(&mut self, at: usize) {
         let mode = self.s.m.i32(1 | 8);
         let void = self.s.t.void;
         self.s
-            .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
     }
 
-    /// The trade's group-shared slots, made once: a dword per half of each
-    /// console wave of the group, beside the program's own LDS and within
-    /// the host's 32 KiB.
+    /// The trade's group-shared slots, made once: [`WORDS`] dwords per half
+    /// of each console wave of the group, beside the program's own LDS and
+    /// within the host's 32 KiB.
     fn slots(&mut self) -> Result<V, Why> {
         if let Some(g) = self.exchange.slots {
             return Ok(g);
         }
         let group = self.s.threads.map_or(64, |t| t.iter().product::<u32>());
-        let dwords = 2 * group.div_ceil(64);
+        let dwords = 2 * WORDS * group.div_ceil(64);
         if self.s.lds_dwords + dwords > 8192 {
             return Err(
                 "a trade between 32-lane halves past the host's 32 KiB of group-shared memory",
@@ -320,6 +514,13 @@ impl Lower<'_> {
 
 /// Why a lane read stops in halves: the halves cannot meet there.
 pub(super) const APART: Why = "a lane read across 32-lane halves where not every thread of the group meets (wave64 on a 32-lane host)";
+
+/// Why a lane mask read as data stops in halves: the halves cannot meet
+/// where it is written to trade their ballots.
+const MASK_APART: Why = "a lane mask read as data, written where not every thread of the group meets (wave64 on a 32-lane host)";
+
+/// Why a whole-wave reduction or prefix sum stops in halves.
+const REDUCTION_APART: Why = "a wave reduction over both 32-lane halves where not every thread of the group meets (wave64 on a 32-lane host)";
 
 /// Trades between the two halves of each console wave: where they may
 /// meet, and the group-shared slots they trade through.
@@ -490,8 +691,9 @@ fn meeting(x: &Parts) -> Vec<bool> {
 }
 
 /// Why a first-lane read stops in halves: the console's first lane may be
-/// in the other half, and the value is not known to be the same there.
-pub(super) const FIRST_ACROSS: Why = "a first-lane read of a value that may differ between 32-lane halves (wave64 on a 32-lane host)";
+/// in the other half, the value is not known to be the same there, and the
+/// halves cannot meet to trade it.
+pub(super) const FIRST_ACROSS: Why = "a first-lane read of a value that may differ between 32-lane halves, where not every thread of the group meets (wave64 on a 32-lane host)";
 
 /// Every per-lane branch (by its block) with its region: the blocks
 /// reachable from it that do not post-dominate it, which only some lanes
