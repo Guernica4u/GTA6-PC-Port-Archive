@@ -317,6 +317,10 @@ impl State {
     /// own, made from the real states at its submission). Clears and copies
     /// are commands, recorded once in the segment they belong to.
     pub(crate) fn cut(&mut self, list: &HostList) {
+        // The state goes to a fresh host list: the ensured-targets memo names
+        // the old list's states generation, and the fresh one may read the
+        // same counter, so it must not survive the cut.
+        self.ensured = None;
         self.host_state_lost();
         self.fresh_tables.clear();
         self.root_slots.clear();
@@ -2067,6 +2071,32 @@ mod tests {
         // A title sampler heap stays whatever the views are.
         assert_eq!(State::wanted([0, 0x20], true), [MEMORY_HEAP, 0x20]);
     }
+    /// A segment cut hands the state to a fresh host list, whose states
+    /// generation may read the same as the old list's counter: the
+    /// ensured-targets memo must not survive the cut, or the new segment's
+    /// state map never enrolls the targets and a later transition reports no
+    /// previous state.
+    #[test]
+    fn a_cut_to_a_fresh_list_forgets_the_ensured_targets() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let first = host.new_list().unwrap();
+        let second = host.new_list().unwrap();
+        assert_eq!(
+            first.states_generation(),
+            second.states_generation(),
+            "two fresh lists read the same counter"
+        );
+        let mut state = State::default();
+        state.ensured = Some((vec![1], 0, first.states_generation()));
+        state.cut(&second);
+        assert!(
+            state.ensured.is_none(),
+            "the memo named the old list's generation"
+        );
+    }
+
     use crate::object::{HRESULT, S_OK};
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
     use windows::Win32::Graphics::Direct3D::ID3DBlob;
