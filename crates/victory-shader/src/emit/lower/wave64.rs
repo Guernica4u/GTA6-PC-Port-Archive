@@ -4,11 +4,10 @@
 //! A compute program that reads other lanes declares the console's wave
 //! size, so that host lane n is console lane n (see `console_lanes`). On a
 //! host of 32-lane waves the program declares `WaveSize(32)` instead and
-//! each console wave of 64 lanes becomes two host waves: thread ids are
-//! relabelled as before (the flat id is the host wave's first lane's,
-//! rounded down to 32, plus the host lane), so console wave `w` holds flat
-//! ids `64w..64w+63`, its lanes 0-31 one host wave and its lanes 32-63 the
-//! next. The console lane is the host lane plus 32 in the second half.
+//! each console wave of 64 lanes becomes two host waves. `Lower::console_flat`
+//! assigns each host wave an aligned run of 32 console thread ids. The host
+//! waves with ids `64w..64w+31` and `64w+32..64w+63` form console wave `w`.
+//! The console lane is the host lane plus 32 in the second half.
 //!
 //! What stays within a half is exact as it is: DPP (rows of 16, groups of
 //! 8 and 4), `ds_swizzle` (groups of 32 or 4), `v_writelane`, `v_mbcnt`,
@@ -187,28 +186,15 @@ impl Lower<'_> {
         if let Some(ids) = split.ids {
             return ids;
         }
+        // From the thread's console flat id (`Lower::console_flat`): each
+        // host wave holds one 32-aligned run of them, however the host laid
+        // the group out (an RTX 5070 Ti puts a 32x4 group's threads in 16 by
+        // 2 tiles, so the host's own flat ids would pair the wrong waves).
+        let f = self.console_flat();
         let e = self.s.entry;
-        let i32t = self.s.t.i32;
-        let flat = self.s.op(
-            e,
-            "flattenedThreadIdInGroup.i32",
-            Attr::ReadNone,
-            i32t,
-            96,
-            &[],
-        );
-        let first = self.s.op(
-            e,
-            "waveReadLaneFirst.i32",
-            Attr::NoUnwind,
-            i32t,
-            118,
-            &[flat],
-        );
-        self.s.flags |= flags::WAVE_OPS;
         let (k32, not63) = (self.s.m.i32(32), self.s.m.i32(!63));
-        let half = self.s.m.bin(e, Bin::And, first, k32);
-        let base = self.s.m.bin(e, Bin::And, first, not63);
+        let half = self.s.m.bin(e, Bin::And, f, k32);
+        let base = self.s.m.bin(e, Bin::And, f, not63);
         let ids = (half, base);
         self.split.as_mut().expect("a split program").ids = Some(ids);
         ids

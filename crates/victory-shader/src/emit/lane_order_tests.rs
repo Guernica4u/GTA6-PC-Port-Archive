@@ -456,3 +456,92 @@ fn programs_with_all_the_lds_keep_the_rounding() {
             .unwrap_or_else(|e| panic!("{label}: {e}"));
     }
 }
+
+/// A wave64 program split into 32-lane host waves keeps the console's
+/// waves in any group layout: each logical thread stores its console lane
+/// and its wave's active lane count at its own flat id. A 32x4 group can
+/// occupy 16x2 host tiles (RTX 5070 Ti), where the host's own flat ids
+/// paired the wrong host waves into a console wave. Regression shader by
+/// @0xkn0wh3r3, ported by @stem23456-coder (#1960, #3147).
+#[test]
+fn a_wave64_program_runs_as_the_console_runs_it_on_a_32_lane_host() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some((name, host)) = Host::hardware()
+        .into_iter()
+        .find(|(_, h)| h.wave_lanes().is_ok_and(|(min, max)| (min..=max).contains(&32)))
+    else {
+        eprintln!("no SM 6.6 hardware supporting 32-lane waves; skipped");
+        return;
+    };
+    let want: Vec<u32> = (0..128).flat_map(|id| [id % 64, 64]).collect();
+    for [x, y] in [[128u32, 1], [16, 8], [32, 4]] {
+        // In the 128x1 group v1 (thread id y) is zero, so an inline
+        // multiplier of 64 also gives the right row offset.
+        let code = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0A02,
+            0xFA00_0000, // s_load_dwordx4 s[40:43], s[4:5], 0x0
+            0xD765_0005,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v5, -1, 0
+            0xD766_0005,
+            0x0002_0AC1, // v_mbcnt_hi_u32_b32 v5, -1, v5
+            0xBE8A_107E, // s_bcnt1_i32_b64 s10, exec
+            0x7E0C_020A, // v_mov_b32 v6, s10
+            0x0B << 25 | 3 << 17 | 1 << 9 | (128 + x.min(64)), // v_mul_u32_u24 v3, x, v1
+            0x4A06_0700, // v_add_nc_u32 v3, v0, v3
+            0x3408_0683, // v_lshlrev_b32 v4, 3, v3
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xE070_1000,
+            0x800A_0504, // buffer_store_dword v5, v4, s[40:43], 0 offen
+            0xE070_1004,
+            0x800A_0604, // buffer_store_dword v6, v4, s[40:43], 0 offen offset:4
+            0xBF81_0000, // s_endpgm
+        ];
+        let mut native = marks_its_thread_native([x.min(64), y], 0);
+        native.wave64 = true;
+        native.io = StageIo::Cs(ComputeIo {
+            rsrc2: 1 << 1 | 1 << 11,
+            threads: [x, y, 1],
+        });
+        native.code = code.iter().flat_map(|w: &u32| w.to_le_bytes()).collect();
+        let l = super::synthetic_tests::lowered_for(&native, false)
+            .unwrap_or_else(|e| panic!("{name} {x}x{y}: lower for 32-lane waves: {e}"));
+        let cs = HostShader {
+            stage: HwStage::Cs,
+            dxil: l.dxil,
+            user_data: l.user_data,
+            samplers: l.samplers,
+            static_samplers: Vec::new(),
+            root_cbvs: l.root_cbvs,
+            root_srvs: l.root_srvs,
+            root_uavs: l.root_uavs,
+            memory: l.memory,
+            memory_writes: l.memory_writes,
+            view_addresses: l.view_addresses,
+            heap: l.heap,
+            heap_writes: l.heap_writes,
+            view_marks: l.view_marks,
+        };
+        let (root, pso) = host
+            .compute_pipeline(&cs)
+            .unwrap_or_else(|e| panic!("{name} {x}x{y}: {e}"));
+        let ud = vec![0u32; cs.user_data_dwords().max(1) as usize];
+        let mut out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(2 * x * y)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{name} {x}x{y}: {e}"));
+        let out = out.pop().expect("one UAV");
+        assert_eq!(out, want, "{name} {x}x{y}: console lane and wave lane count");
+    }
+}
