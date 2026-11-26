@@ -448,19 +448,55 @@ fn open_runs(g: &mut Guards, pages: &[usize]) {
     while i < pages.len() {
         let first = pages[i];
         i += 1;
-        if !g.protected.remove(&first) {
+        if !g.protected.contains(&first) {
             continue;
         }
+        // The run of consecutive pages we hold. The set is left alone until
+        // the kernel has taken the protection off: a page that only leaves it
+        // here would stay read-only for good (no tracker holds it any more),
+        // and the title's next write there would fault with nothing to take
+        // it - a removal under Wine (`crashbashash`).
         let mut last = first + 1;
-        while i < pages.len() && pages[i] == last && g.protected.remove(&last) {
+        while i < pages.len() && pages[i] == last && g.protected.contains(&last) {
             last += 1;
             i += 1;
         }
         let mut old = 0;
         // SAFETY: a block we made read-only (failing harmlessly if it is gone).
-        unsafe { VirtualProtect((first * PAGE) as *const _, (last - first) * PAGE, PAGE_READWRITE, &mut old) };
+        let whole = unsafe {
+            VirtualProtect((first * PAGE) as *const _, (last - first) * PAGE, PAGE_READWRITE, &mut old)
+        };
+        let mut opened = 0;
+        if whole != 0 {
+            for page in first..last {
+                g.protected.remove(&page);
+            }
+            opened = last - first;
+        } else {
+            // Windows refuses a range that crosses two allocations (487):
+            // one page at a time then, and a page the kernel still refuses
+            // stays in the set, so the next take (or the fault handler) tries
+            // again instead of writing with the page read-only.
+            for page in first..last {
+                let mut old = 0;
+                // SAFETY: as above, one page.
+                let ok = unsafe { VirtualProtect((page * PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old) };
+                if ok != 0 {
+                    g.protected.remove(&page);
+                    opened += 1;
+                }
+            }
+            if opened != last - first {
+                tracing::warn!(
+                    pages = last - first,
+                    opened,
+                    "guarded pages the kernel would not open one at a time"
+                );
+            }
+        }
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::OpenPages, (last - first) as u64);
+        crate::copystat::add(crate::copystat::C::OpenPages, opened as u64);
+        let _ = (opened, &mut old);
     }
 }
 
