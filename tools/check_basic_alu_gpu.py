@@ -206,6 +206,9 @@ SCALAR = {
     "s_sext_i32_i8": (1, lambda a: (((a & 0xff) - (0x100 if a & 0x80 else 0)) & M, None)),
     "s_sext_i32_i16": (1, lambda a: (((a & 0xffff) - (0x10000 if a & 0x8000 else 0)) & M, None)),
     "s_abs_i32": (1, lambda a: nonzero(abs(s32(a)) & M)),
+    # SCC is 1 before each instruction, so these two carry or borrow one in.
+    "s_addc_u32": (2, lambda a, b: ((a + b + 1) & M, int(a + b + 1 > M))),
+    "s_subb_u32": (2, lambda a, b: ((a - b - 1) & M, int(b + 1 > a))),
 }
 OUTPUTS = 8
 
@@ -365,6 +368,29 @@ def turns(function, at_zero):
     return model
 
 
+def cube(z_major, y_major, x_major):
+    """A cube map coordinate, chosen by the axis of largest magnitude as the manual lists it."""
+    def model(a, b, c):
+        x, y, z = (to_float(v) for v in (a, b, c))
+        if abs(z) >= abs(x) and abs(z) >= abs(y):
+            result = z_major(x, y, z)
+        elif abs(y) >= abs(x):
+            result = y_major(x, y, z)
+        else:
+            result = x_major(x, y, z)
+        return Float(to_bits(result))
+    return model
+
+
+def number_class(bits):
+    """The bit of `v_cmp_class_f32`'s mask that names this float's class."""
+    negative, magnitude = bits >> 31, bits & 0x7fffffff
+    if magnitude > 0x7f800000:
+        return 1 << ((magnitude >> 22) & 1)
+    kind = 0 if magnitude == 0x7f800000 else 1 if magnitude >= 0x00800000 else 2 if magnitude else 3
+    return 1 << (2 + kind if negative else 9 - kind)
+
+
 def median_float(a, b, c):
     values = [to_float(x) for x in (a, b, c)]
     if any(math.isnan(v) for v in values):
@@ -407,6 +433,12 @@ FLOATS = {
     "v_sin_f32": (1, turns(math.sin, 0.0)),
     "v_cos_f32": (1, turns(math.cos, 1.0)),
     "v_med3_f32": (3, median_float),
+    "v_cubeid_f32": (3, cube(lambda x, y, z: 5.0 if z < 0 else 4.0, lambda x, y, z: 3.0 if y < 0 else 2.0,
+                             lambda x, y, z: 1.0 if x < 0 else 0.0)),
+    "v_cubesc_f32": (3, cube(lambda x, y, z: -x if z < 0 else x, lambda x, y, z: x,
+                             lambda x, y, z: z if x < 0 else -z)),
+    "v_cubetc_f32": (3, cube(lambda x, y, z: -y, lambda x, y, z: -z if y < 0 else z, lambda x, y, z: -y)),
+    "v_cubema_f32": (3, cube(lambda x, y, z: 2.0 * z, lambda x, y, z: 2.0 * y, lambda x, y, z: 2.0 * x)),
     "v_rsq_f32": (1, arithmetic(lambda a, b, c: 1 / math.sqrt(a) if a > 0 else
                                 (math.copysign(INFINITY, a) if a == 0 else float("nan")), ulps=APPROXIMATE)),
     "v_rcp_iflag_f32": (1, arithmetic(lambda a, b, c: 1 / a if a else math.copysign(INFINITY, a), ulps=1)),
@@ -424,7 +456,7 @@ FLOATS = {
     "v_max_f32": (2, extreme(max, 2)),
     "v_min3_f32": (3, extreme(min, 3)),
     "v_max3_f32": (3, extreme(max, 3)),
-    "v_fma_f32": (3, lambda a, b, c: Float(fused(a, b, c))),
+    "v_fma_f32": (3, lambda a, b, c: multiply_add(a, b, c)),
     "v_floor_f32": (1, whole(math.floor)),
     "v_ceil_f32": (1, whole(math.ceil)),
     "v_trunc_f32": (1, whole(math.trunc)),
@@ -469,6 +501,7 @@ COMPARES = {
 }
 FLOAT_COMPARES = {f"v_cmp_{name}_f32": (2, float_relation(name))
                   for name in ("eq", "lt", "gt", "le", "ge", "lg", "o", "u", "neq", "nlt", "ngt", "nle", "nge")}
+FLOAT_COMPARES["v_cmp_class_f32"] = (2, lambda a, b, c: int(bool(number_class(a) & b)))
 # Comparisons into EXEC: 1 where the lane stays active.
 EXEC_COMPARES = {
     **{f"v_cmpx_{name}_u32": (2, lambda a, b, c, name=name: int(RELATIONS[name](a, b)))
@@ -486,12 +519,35 @@ SCALAR_COMPARES = {
 }
 
 
+# Instructions that change their destination, which holds the second input: (model).
+IN_PLACE = {
+    "s_bitset0_b32": lambda a, b: (b & ~(1 << (a & 31)) & M, None),
+    "s_bitset1_b32": lambda a, b: (b | 1 << (a & 31), None),
+}
+SIGNED_CONSTANT, UNSIGNED_CONSTANT = -2, 0xffff
+# Instructions with a 16-bit constant: (the constant, model of the first input).
+CONSTANT = {
+    "s_addk_i32": (-1234, lambda a: ((a - 1234) & M, int(signed_overflow(s32(a) - 1234)))),
+    "s_mulk_i32": (-3, lambda a: ((a * -3) & M, None)),
+}
+CONSTANT_COMPARES = {
+    **{f"s_cmpk_{name}_i32": (SIGNED_CONSTANT, lambda a, name=name: int(RELATIONS[name](s32(a), SIGNED_CONSTANT)))
+       for name in ("eq", "lg", "gt", "ge", "lt", "le")},
+    **{f"s_cmpk_{name}_u32": (UNSIGNED_CONSTANT, lambda a, name=name: int(RELATIONS[name](a, UNSIGNED_CONSTANT)))
+       for name in ("eq", "lg", "gt", "ge", "lt", "le")},
+}
+
+
 def is_float(name):
     return name in FLOATS or name in FLOAT_COMPARES or name in FLOAT_EXEC_COMPARES
 
 
 def count(name):
     """Result words one instruction produces: scalar ones also report SCC."""
+    if name in IN_PLACE:
+        return 1
+    if name in CONSTANT:
+        return 1 if CONSTANT[name][1](1)[1] is None else 2
     if name not in SCALAR:
         return 1
     return 1 if SCALAR[name][1](*[1] * SCALAR[name][0])[1] is None else 2
@@ -512,6 +568,17 @@ def lines_for(name, destination):
         return [f"{name} v{destination}, {sources}"]
     if name in COMPARES or name in FLOAT_COMPARES:
         return [f"{name} vcc_lo, v4, v5", f"v_cndmask_b32_e64 v{destination}, 0, 1, vcc_lo"]
+    if name in CONSTANT_COMPARES:
+        return ["v_readfirstlane_b32 s20, v4", f"{name} s20, {CONSTANT_COMPARES[name][0] & 0xffff:#x}",
+                "s_cselect_b32 s24, 1, 0", f"v_mov_b32_e32 v{destination}, s24"]
+    if name in CONSTANT or name in IN_PLACE:
+        # The destination starts as the first input, or the second where the first is an operand.
+        operand = f"{CONSTANT[name][0] & 0xffff:#x}" if name in CONSTANT else "s20"
+        program = ["v_readfirstlane_b32 s20, v4", f"v_readfirstlane_b32 s24, v{4 if name in CONSTANT else 5}",
+                   "s_cmp_eq_u32 s20, s20", f"{name} s24, {operand}"]
+        if count(name) == 2:
+            program += ["s_cselect_b32 s25, 1, 0", f"v_mov_b32_e32 v{destination + 1}, s25"]
+        return program + [f"v_mov_b32_e32 v{destination}, s24"]
     if name in SCALAR_COMPARES:
         return ["v_readfirstlane_b32 s20, v4", "v_readfirstlane_b32 s21, v5", f"{name} s20, s21",
                 "s_cselect_b32 s24, 1, 0", f"v_mov_b32_e32 v{destination}, s24"]
@@ -532,6 +599,11 @@ def results(name, values):
             return [table[name][1](*values)]
     if name in SCALAR_COMPARES:
         return [SCALAR_COMPARES[name][1](*values[:2])]
+    if name in CONSTANT_COMPARES:
+        return [CONSTANT_COMPARES[name][1](values[0])]
+    if name in CONSTANT or name in IN_PLACE:
+        value, flag = CONSTANT[name][1](values[0]) if name in CONSTANT else IN_PLACE[name](*values[:2])
+        return [value] if flag is None else [value, flag]
     arity, model = SCALAR[name]
     value, flag = model(*values[:arity])
     return [value] if flag is None else [value, flag]
@@ -592,7 +664,8 @@ def main():
         ap.error("choose a fresh receipt")
     a.work.mkdir(parents=True, exist_ok=False)
     rng = random.Random(0x414c5531)
-    every = [*OPERATIONS, *SCALAR, *COMPARES, *SCALAR_COMPARES, *EXEC_COMPARES, *FLOATS, *FLOAT_COMPARES,
+    every = [*OPERATIONS, *SCALAR, *IN_PLACE, *CONSTANT, *CONSTANT_COMPARES, *COMPARES, *SCALAR_COMPARES,
+             *EXEC_COMPARES, *FLOATS, *FLOAT_COMPARES,
              *FLOAT_EXEC_COMPARES]
     supported, refused = probe(every, a.emitter, a.llvm_mc)
     expected, chunks = {}, {}
