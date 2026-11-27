@@ -361,7 +361,10 @@ fn build_wave32_cs(pattern: MaskPattern, div: Divergence, op_words: &[u32]) -> H
     w.push(v_lshlrev_b32_imm(5, 2, 0));
     w.extend_from_slice(&buffer_store_dword_offen(2, 5, 4));
     w.push(S_ENDPGM);
+    try_build_crosslane_cs(&w, 32).expect("lower")
+}
 
+fn try_build_crosslane_cs(w: &[u32], size: u32) -> Result<HostShader, crate::ShaderError> {
     let code: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
     let decoded = gfx10::decode(&code).expect("decode synthetic RDNA2 program");
     assert_eq!(decoded.last().and_then(|i| i.name()), Some("s_endpgm"));
@@ -390,7 +393,7 @@ fn build_wave32_cs(pattern: MaskPattern, div: Divergence, op_words: &[u32]) -> H
         }],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 1 << 1,
-            threads: [32, 1, 1],
+            threads: [size, 1, 1],
         }),
         code,
     };
@@ -411,8 +414,7 @@ fn build_wave32_cs(pattern: MaskPattern, div: Divergence, op_words: &[u32]) -> H
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
-    })
-    .expect("lower");
+    })?;
 
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -439,7 +441,7 @@ fn build_wave32_cs(pattern: MaskPattern, div: Divergence, op_words: &[u32]) -> H
     } else {
         eprintln!("no dxil.dll; validation skipped");
     }
-    shader
+    Ok(shader)
 }
 
 fn wave32_hardware_info(host: &Host) -> Option<String> {
@@ -1292,4 +1294,45 @@ fn wave64_mask_operation_scc_reads_both_dwords() {
             .expect("dispatch");
         assert_eq!(out[0][..64], [want; 64], "lanes above {above}");
     }
+}
+
+fn mask_scc_test_program(body: &[u32]) -> Vec<u32> {
+    let mut w = vec![s_mov_b32(1, 0x80)];
+    w.extend(s_load_dwordx4(4, 0));
+    w.extend_from_slice(body);
+    w.push(v_lshlrev_b32_imm(5, 2, 0));
+    w.extend(buffer_store_dword_offen(2, 5, 4));
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn complement_sets_mask_scc_even_in_a_partial_wave() {
+    let body = mask_scc_selected(
+        vopc(V_CMP_GT_U32, INLINE_64, 0),
+        sop1(S_NOT_B32, 20, VCC_LO),
+    );
+    let shader = try_build_crosslane_cs(&mask_scc_test_program(&body), 16).unwrap();
+    if let Some((info, got)) = dispatch_wave32(&shader) {
+        assert_eq!(got[..16], [1; 16], "{info}");
+    }
+}
+
+#[test]
+fn a_mask_scc_used_as_data_and_branch_is_rejected() {
+    let body = [
+        vopc(V_CMP_GT_U32, INLINE_1, 0),
+        sop2(S_AND_B32, 20, VCC_LO, EXEC_LO),
+        sop2(S_CSELECT_B32, 21, INLINE_1, INLINE_2),
+        0xBF85_0001, // s_cbranch_scc1 -> move s21 to v2
+        sop1(S_MOV_B32, 21, INLINE_0),
+        v_mov_b32_s(2, 21),
+    ];
+    assert!(matches!(
+        try_build_crosslane_cs(&mask_scc_test_program(&body), 32),
+        Err(crate::ShaderError::Unsupported {
+            what: "a lane mask SCC read as both data and branch condition",
+            ..
+        })
+    ));
 }

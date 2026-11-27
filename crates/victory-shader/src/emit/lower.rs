@@ -424,12 +424,9 @@ fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     })
 }
 
-/// The SCC values of mask operations (bitwise scalar operations writing a
-/// lane mask, not EXEC: SCC is whether the result is not zero) that an
-/// instruction other than a branch reads, as an `s_cselect` of "some lane
-/// is set" (the console's FidelityFX passes wait in such loops). A branch
-/// on such an SCC is the lane's own bit (`structure`); these read the
-/// console's number tested for zero.
+/// Mask operations whose SCC is read as scalar data (e.g. by s_cselect).
+/// Direct branches on that same SCC are currently incompatible with this
+/// lowering because structurisation treats their condition as per lane.
 fn mask_sccs_read_as_data(p: &Program, st: &Structured) -> HashSet<Value> {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let bitwise = |name: &str| {
@@ -1853,6 +1850,15 @@ impl<'a> Lower<'a> {
     /// Whether lane mask `lo` (its low dword's value), as a number, is not
     /// zero: both dwords of a wave64 mask.
     fn mask_nonzero(&mut self, lo: Value) -> Result<V, Why> {
+        if self
+            .s
+            .threads
+            .is_some_and(|threads| !threads.iter().product::<u32>().is_multiple_of(self.wave()))
+        {
+            // A partial host wave cannot ballot guest bits outside the group.
+            let words = self.mask_number(lo)?;
+            self.ballots.insert(lo, words);
+        }
         let mut n = self.mask_dword(lo)?;
         if self.x.native.wave64 {
             // `mask_dword` keeps both dwords of the mask it made.
@@ -10217,10 +10223,19 @@ impl<'a> Lower<'a> {
     }
 
     fn exit(&mut self, b: usize) -> Result<(), Stop> {
-        let offset = self.x.p.blocks[b]
-            .insts
-            .last()
-            .map_or(self.x.p.blocks[b].offset, |i| i.machine.offset);
+        let block = &self.x.p.blocks[b];
+        let last = block.insts.last();
+        let offset = last.map_or(block.offset, |i| i.machine.offset);
+        if last.is_some_and(|i| {
+            matches!(i.name(), "s_cbranch_scc0" | "s_cbranch_scc1")
+                && i.read(Reg::Scc)
+                    .is_some_and(|scc| self.mask_sccs.contains(&scc))
+        }) {
+            return Err(unsupported(
+                offset,
+                "a lane mask SCC read as both data and branch condition",
+            ));
+        }
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
                 let ok = self.count_iteration(t, pred::IULT);
