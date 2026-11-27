@@ -718,7 +718,7 @@ fn bytes(data: &[u8], offset: u64, len: u64) -> Option<&[u8]> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const VS_CODE: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -788,6 +788,50 @@ mod tests {
         out.extend_from_slice(&(unpacked.len() as u64).to_le_bytes());
         out.extend_from_slice(stream);
         out
+    }
+
+    /// A synthetic compute container with one table of UAV descriptors.
+    #[cfg(windows)]
+    pub(crate) fn compute_uav_container(native: &NativeProgram) -> Vec<u8> {
+        let StageIo::Cs(io) = &native.io else { panic!("expected compute") };
+        let mut blob = fssm(&[(HwStage::Cs, &native.code)]);
+        let stage = stage_data_at(&blob, HwStage::Cs);
+        let record = stage - RECORD_SIZE as usize;
+        let put32 = |bytes: &mut [u8], at, word: u32| {
+            bytes[at..][..4].copy_from_slice(&word.to_le_bytes());
+        };
+        let put64 = |bytes: &mut [u8], at, word: u64| {
+            bytes[at..][..8].copy_from_slice(&word.to_le_bytes());
+        };
+        put32(&mut blob, record + RECORD_FLAGS, if native.wave64 { 0 } else { FLAG_WAVE32 });
+        put32(&mut blob, record + RECORD_REGS, u32::from(native.vgprs));
+        put32(&mut blob, stage + CS_RSRC2, io.rsrc2);
+        for (axis, count) in io.threads.into_iter().enumerate() {
+            put32(&mut blob, stage + CS_THREADS + axis * 4, count);
+        }
+        let layout = (blob.len() - FSSM_HEADER) as u64;
+        put64(&mut blob, record + RECORD_LAYOUT, layout);
+        put32(&mut blob, record + RECORD_COUNTS, native.layout.len() as u32);
+        for param in &native.layout {
+            assert_eq!(param.root, RootType::Table);
+            for field in [3, param.table_offset_dwords, param.sgprs, param.base_register] {
+                blob.extend_from_slice(&field.to_le_bytes());
+            }
+            blob.extend_from_slice(&[param.user_data, param.slot, 0, 0]);
+        }
+        let used = (blob.len() - FSSM_HEADER) as u64;
+        put64(&mut blob, record + RECORD_USED, used);
+        put32(&mut blob, record + RECORD_COUNTS + 4, native.used.len() as u32);
+        for uav in &native.used {
+            assert_eq!((uav.kind, uav.root), (ResourceType::Uav, RootType::Table));
+            for field in [0x0303, uav.table_offset_dwords, uav.lower_bound, uav.stride] {
+                blob.extend_from_slice(&field.to_le_bytes());
+            }
+            blob.extend_from_slice(&[uav.dwords, uav.user_data, uav.slot, 0]);
+        }
+        let payload_size = (blob.len() - FSSM_HEADER) as u64;
+        put64(&mut blob, 8, payload_size);
+        crate::dxbc::build(&[(crate::FourCC::DXIL, &part(&[(KIND_NATIVE, &xbch(&blob))]))])
     }
 
     /// `DXIL` part data: program header, XDAT index, then the blobs.

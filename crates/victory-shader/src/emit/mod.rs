@@ -109,6 +109,8 @@ mod valu_tests;
 mod waterfall_tests;
 #[cfg(all(test, windows))]
 mod wave64_tests;
+#[cfg(all(test, windows))]
+mod wave64_group_tests;
 mod wave;
 
 use crate::dxbc::{Container, FourCC};
@@ -429,6 +431,24 @@ fn emit_any(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    // A masked first-lane read can elect a lane in the other half, even
+    // when no instruction uses an explicit lane index. Try the exact paired
+    // form before accepting a host32 form for this case.
+    if native.stage == HwStage::Cs
+        && native.wave64
+        && lower::host_max_wave() == 32
+        && pairs_on()
+        && p.blocks.iter().enumerate().any(|(b, block)| {
+            block.insts.iter().enumerate().any(|(i, inst)| {
+                inst.name() == "v_readfirstlane_b32"
+                    && st.guards[b][i].is_some()
+                    && !inst.writes.first().is_some_and(|w| res.waterfall.reads.contains(&w.1))
+            })
+        })
+        && let Ok((shader, _)) = paired(c, native, p, io, res)
+    {
+        return Ok(shader);
+    }
     let r = emit_forms(c, native, p, st, io, res);
     // A console wave64 compute program on a host of 32-lane waves that no form above gives
     // the host (it still asks for 64-lane waves, or does not translate): once more in the
