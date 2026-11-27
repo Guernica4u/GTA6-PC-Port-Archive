@@ -1,14 +1,14 @@
 # VIctory-Belobug-AMD GitHub export
 
-Issues, pull requests and comments from `Belobug/VIctory-Belobug-AMD`, exported from the GitHub REST API on 2026-11-26.
+Issues, pull requests and comments from `Belobug/VIctory-Belobug-AMD`, exported from the GitHub REST API on 2026-11-27.
 
 Each file in `data/` is gzipped JSON Lines: one API object per line, unchanged.
 
 | File | Contents | Items |
 |---|---|---|
-| `issues_and_prs.jsonl.gz` | every issue and PR (title, body, labels, state, author) | 261 |
-| `pulls.jsonl.gz` | PR details (head and base branch, merge state) | 278 |
-| `issue_comments.jsonl.gz` | conversation comments on issues and PRs | 668 |
+| `issues_and_prs.jsonl.gz` | every issue and PR (title, body, labels, state, author) | 268 |
+| `pulls.jsonl.gz` | PR details (head and base branch, merge state) | 299 |
+| `issue_comments.jsonl.gz` | conversation comments on issues and PRs | 705 |
 | `review_comments.jsonl.gz` | inline code-review comments | 58 |
 | `labels.jsonl.gz` | labels | 10 |
 
