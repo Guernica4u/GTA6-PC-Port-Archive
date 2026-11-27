@@ -4,11 +4,29 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 pub(super) struct Slots {
     state: Mutex<State>,
-    retired: Mutex<VecDeque<(u64, Vec<Range<u32>>)>>,
+    retired: Mutex<Retired>,
+    has_ready: AtomicBool,
+}
+
+#[derive(Default)]
+struct Retired {
+    by_fence: VecDeque<(u64, Vec<Range<u32>>)>,
+    ready: Vec<Vec<Range<u32>>>,
+}
+
+impl Retired {
+    fn complete(&mut self, completed: u64) {
+        let count = self
+            .by_fence
+            .partition_point(|(fence, _)| *fence <= completed);
+        self.ready
+            .extend(self.by_fence.drain(..count).map(|(_, ranges)| ranges));
+    }
 }
 
 struct State {
@@ -38,7 +56,8 @@ impl Slots {
         }
         Self {
             state: Mutex::new(state),
-            retired: Mutex::new(VecDeque::new()),
+            retired: Mutex::new(Retired::default()),
+            has_ready: AtomicBool::new(false),
         }
     }
 
@@ -46,47 +65,49 @@ impl Slots {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn retired(&self) -> MutexGuard<'_, Retired> {
+        self.retired.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub(super) fn take(&self, count: u32, completed: Option<u64>) -> Take {
         let mut state = self.state();
-        if let Some(completed) = completed {
-            self.reclaim_in(&mut state, completed);
+        if completed.is_none()
+            && !self.has_ready.load(Ordering::Acquire)
+            && let Some(first) = state.take(count)
+        {
+            return Take::Slot(first);
         }
-        let Some(&(length, first)) = state.by_size.range((count, 0)..).next() else {
-            return Take::Short {
+        // Snapshot both queues together so a completed batch is visible
+        // either as ready ranges or through the fence an exhausted caller polls.
+        let (ready, fence) = {
+            let mut retired = self.retired();
+            if let Some(completed) = completed {
+                retired.complete(completed);
+            }
+            self.has_ready.store(false, Ordering::Release);
+            (
+                std::mem::take(&mut retired.ready),
+                retired.by_fence.front().map(|&(fence, _)| fence),
+            )
+        };
+        state.give_batches(ready);
+        match state.take(count) {
+            Some(first) => Take::Slot(first),
+            None => Take::Short {
                 free: state.free,
                 largest: state.by_size.last().map_or(0, |&(length, _)| length),
-                fence: self
-                    .retired
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .front()
-                    .map(|&(fence, _)| fence),
-            };
-        };
-        state.erase(first, length);
-        if count < length {
-            state.insert(first + count, length - count);
+                fence,
+            },
         }
-        state.free -= count;
-        Take::Slot(first)
     }
 
+    /// Publish completed batches for the next allocation. The relay moves
+    /// each batch as a whole and leaves the interval trees to the allocator.
     pub(super) fn reclaim(&self, completed: u64) {
-        self.reclaim_in(&mut self.state(), completed);
-    }
-
-    fn reclaim_in(&self, state: &mut State, completed: u64) {
-        // Keep the free ranges locked until this batch is visible to allocators.
-        // The submitter can append while the interval trees are being updated.
-        let gone = {
-            let mut retired = self.retired.lock().unwrap_or_else(|e| e.into_inner());
-            let count = retired.partition_point(|(fence, _)| *fence <= completed);
-            retired.drain(..count).collect::<Vec<_>>()
-        };
-        for (_, ranges) in gone {
-            for range in ranges {
-                state.give(range);
-            }
+        let mut retired = self.retired();
+        retired.complete(completed);
+        if !retired.ready.is_empty() {
+            self.has_ready.store(true, Ordering::Release);
         }
     }
 
@@ -101,6 +122,16 @@ impl Slots {
 }
 
 impl State {
+    fn take(&mut self, count: u32) -> Option<u32> {
+        let &(length, first) = self.by_size.range((count, 0)..).next()?;
+        self.erase(first, length);
+        if count < length {
+            self.insert(first + count, length - count);
+        }
+        self.free -= count;
+        Some(first)
+    }
+
     fn insert(&mut self, first: u32, length: u32) {
         self.by_start.insert(first, length);
         self.by_size.insert((length, first));
@@ -125,6 +156,25 @@ impl State {
             range.end += length;
         }
         self.insert(range.start, range.end - range.start);
+    }
+
+    /// Combine adjacent returns before updating the two interval indexes.
+    fn give_batches(&mut self, batches: Vec<Vec<Range<u32>>>) {
+        let mut ranges: Vec<_> = batches.into_iter().flatten().collect();
+        ranges.sort_unstable_by_key(|range| range.start);
+        let mut ranges = ranges.into_iter();
+        if let Some(mut joined) = ranges.next() {
+            for range in ranges {
+                debug_assert!(joined.end <= range.start);
+                if joined.end == range.start {
+                    joined.end = range.end;
+                } else {
+                    self.give(joined);
+                    joined = range;
+                }
+            }
+            self.give(joined);
+        }
     }
 }
 
@@ -156,10 +206,17 @@ impl Tables {
     }
 
     pub(crate) fn submitted(mut self, fence: u64) {
-        let mut retired = self.slots.retired.lock().unwrap_or_else(|e| e.into_inner());
+        let mut retired = self.slots.retired();
         // Submissions register their ranges under the host submission lock.
-        debug_assert!(retired.back().is_none_or(|(last, _)| *last <= fence));
-        retired.push_back((fence, std::mem::take(&mut self.ranges)));
+        debug_assert!(
+            retired
+                .by_fence
+                .back()
+                .is_none_or(|(last, _)| *last <= fence)
+        );
+        retired
+            .by_fence
+            .push_back((fence, std::mem::take(&mut self.ranges)));
     }
 }
 
@@ -233,6 +290,37 @@ mod tests {
         ));
         drop(recording);
         assert!(matches!(slots.take(8, Some(20)), Take::Slot(4)));
+    }
+
+    #[test]
+    fn a_concurrent_reclaim_keeps_completed_ranges_available() {
+        for _ in 0..32 {
+            let slots = Arc::new(Slots::new(12));
+            let mut recording = Vec::new();
+            for (first, fence) in [(0, 10), (4, 10), (8, 20)] {
+                assert!(matches!(slots.take(4, None), Take::Slot(slot) if slot == first));
+                Tables::keep(&mut recording, &slots, first..first + 4);
+                recording.pop().unwrap().submitted(fence);
+            }
+            let start = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    start.wait();
+                    slots.reclaim(10);
+                });
+                start.wait();
+                assert!(matches!(slots.take(8, Some(10)), Take::Slot(0)));
+            });
+            assert!(matches!(
+                slots.take(4, None),
+                Take::Short {
+                    fence: Some(20),
+                    ..
+                }
+            ));
+            slots.reclaim(20);
+            assert!(matches!(slots.take(4, None), Take::Slot(8)));
+        }
     }
 
     #[test]

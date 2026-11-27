@@ -224,43 +224,61 @@ pub(crate) fn kept_covers(from: usize, to: usize) -> bool {
 /// A copy of the submission's one asking's ranges ([`ask_once`]), for
 /// [`kept_covers_cached`]: taken once per asking, not looked up under the
 /// journal's lock for every refresh of the submission.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct KeptView {
     /// The [`ASK_END_GEN`] it was taken at (0: none).
     generation: u64,
     ahead: Vec<(usize, usize)>,
 }
 
-/// [`kept_covers`], from `view` while the asking it copied stands. Every
-/// change of the journal's `ahead` while an asking is kept comes with a new
-/// [`ASK_END_GEN`] ([`ask_once`] takes it before it asks, [`ask_once_end`]
-/// before it clears); `ask_ahead` and `ask_ahead_done` leave a kept asking
-/// alone. So the same generation, with the asking kept, is the same ranges.
-pub(crate) fn kept_covers_cached(view: &mut KeptView, from: usize, to: usize) -> bool {
-    use std::sync::atomic::Ordering::Acquire;
-    if !KEPT.load(Acquire) {
-        return false;
-    }
-    let generation = ASK_END_GEN.load(Acquire);
-    if view.generation != generation {
-        {
-            let j = journal();
-            if !j.kept || !KEPT.load(Acquire) {
+impl KeptView {
+    fn refresh(&mut self) -> bool {
+        use std::sync::atomic::Ordering::Acquire;
+        if !KEPT.load(Acquire) {
+            return false;
+        }
+        let generation = ASK_END_GEN.load(Acquire);
+        if self.generation != generation {
+            {
+                let j = journal();
+                if !j.kept || !KEPT.load(Acquire) {
+                    return false;
+                }
+                self.ahead.clear();
+                self.ahead.extend_from_slice(&j.ahead);
+            }
+            // Another asking began while this copy was taken.
+            if ASK_END_GEN.load(Acquire) != generation || !KEPT.load(Acquire) {
+                self.generation = 0;
                 return false;
             }
-            view.ahead.clear();
-            view.ahead.extend_from_slice(&j.ahead);
+            self.generation = generation;
         }
-        // (Another asking began meanwhile: this one is not the copy's.)
-        if ASK_END_GEN.load(Acquire) != generation || !KEPT.load(Acquire) {
-            view.generation = 0;
-            return kept_covers(from, to);
-        }
-        view.generation = generation;
-    } else if !KEPT.load(Acquire) {
-        return false;
+        KEPT.load(Acquire)
     }
-    covers(&view.ahead, from / PAGE, to.div_ceil(PAGE))
+
+    /// A read-only copy for workers that can run another refresh while
+    /// helping with nested work on the same thread.
+    pub(crate) fn snapshot(&mut self) -> Option<Self> {
+        self.refresh().then(|| self.clone())
+    }
+
+    /// Treat an answer that ended or was replaced as unknown. Every change
+    /// to a standing answer advances `ASK_END_GEN`.
+    pub(crate) fn covers_current(&self, from: usize, to: usize) -> bool {
+        use std::sync::atomic::Ordering::Acquire;
+        let current = || KEPT.load(Acquire) && ASK_END_GEN.load(Acquire) == self.generation;
+        current() && covers(&self.ahead, from / PAGE, to.div_ceil(PAGE)) && current()
+    }
+}
+
+/// [`kept_covers`], from a cache of the standing answer.
+pub(crate) fn kept_covers_cached(view: &mut KeptView, from: usize, to: usize) -> bool {
+    if view.refresh() {
+        covers(&view.ahead, from / PAGE, to.div_ceil(PAGE))
+    } else {
+        kept_covers(from, to)
+    }
 }
 
 fn write_generations(first: usize, count: usize) -> impl Iterator<Item = &'static std::sync::atomic::AtomicU64> {
@@ -3998,8 +4016,12 @@ mod tests {
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE) as *mut u8).write_volatile(1) };
         ask_once(&ranges);
+        let snapshot = KeptView::default().snapshot();
         let last = journal().written.get(&(p / PAGE + 1)).copied();
         ask_once_end();
+        if let Some(snapshot) = snapshot {
+            assert!(!snapshot.covers_current(p, p + 4 * PAGE));
+        }
         assert!(last.is_some_and(|last| last > copied), "{last:?} is not after {copied}");
         assert!(!kept());
         assert!(!kept_covers(p, p + 4 * PAGE));

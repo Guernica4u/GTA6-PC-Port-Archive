@@ -901,14 +901,18 @@ fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     // (The sort that finds what is in order already: they come as a few
     // stretches of tens of thousands in order, put behind one another.)
     ranges.sort();
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for (from, to) in ranges {
-        match out.last_mut() {
-            Some(last) if from <= last.1 => last.1 = last.1.max(to),
-            _ => out.push((from, to)),
+    let mut kept = 0;
+    for i in 0..ranges.len() {
+        let (from, to) = ranges[i];
+        if kept != 0 && from <= ranges[kept - 1].1 {
+            ranges[kept - 1].1 = ranges[kept - 1].1.max(to);
+        } else {
+            ranges[kept] = (from, to);
+            kept += 1;
         }
     }
-    out
+    ranges.truncate(kept);
+    ranges
 }
 
 /// Runs of pieces to hash again (`Host::card_before`), those that overlap
@@ -1750,10 +1754,38 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
     wide(jobs);
 }
 
+/// Take the scratch buffer out of the cache while using it. A worker that
+/// helps with nested refresh work then gets its own buffer.
+fn with_title_buffer<R>(work: impl FnOnce(&mut Vec<u8>) -> R) -> R {
+    thread_local! {
+        static TITLE: std::cell::Cell<Vec<u8>> = const { std::cell::Cell::new(Vec::new()) };
+    }
+    TITLE.with(|cache| {
+        let mut bytes = cache.take();
+        let result = work(&mut bytes);
+        cache.set(bytes);
+        result
+    })
+}
+
+#[test]
+fn nested_refreshes_own_separate_scratch_buffers() {
+    with_title_buffer(|outer| {
+        outer.clear();
+        outer.extend_from_slice(&[1, 2]);
+        with_title_buffer(|inner| inner.extend_from_slice(&[3, 4]));
+        assert_eq!(outer, &[1, 2]);
+    });
+}
+
 /// Calls `work` with every number under `n`, on the kept threads and on
 /// this one, the next number to whichever is free: for thousands of small
 /// pieces of work, where a job each ([`wide`]) is mostly the jobs' queue.
 pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) {
+    if n < 2 {
+        (0..n).for_each(work);
+        return;
+    }
     let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let work = Arc::new(work);
     let threads = (wide_threads() + 1).min(n);
@@ -4456,7 +4488,7 @@ impl Shadow {
             drop(before);
             drop(merging);
             if !changed.is_empty() {
-                crate::copystat_footprint::pending_wrote(self.id, self.start, self.len, changed.into_iter());
+                crate::copystat_footprint::pending_wrote(self.id, self.start, self.len, &changed);
             }
             {
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
@@ -4534,10 +4566,7 @@ impl Shadow {
         held: *mut u8,
         left: &std::sync::atomic::AtomicI64,
     ) -> Result<Option<(Vec<(usize, usize)>, Vec<(usize, usize)>)>, ()> {
-        thread_local! {
-            static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
-        }
-        TITLE.with_borrow_mut(|title| {
+        with_title_buffer(|title| {
             if title.len() < n.max(PAGE) {
                 title.resize(n.max(PAGE), 0);
             }
@@ -5017,9 +5046,6 @@ impl Shadow {
     /// 4 KiB that title memory and the CPU's side have alike are left as they
     /// are, and nothing of them is sent ([`land_echo`]).
     fn take_landed(&self, from: usize, to: usize) -> usize {
-        thread_local! {
-            static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
-        }
         let start = self.start as usize;
         let first = start / KERNEL_PAGE;
         // Runs of pages noted, and not noted (any more).
@@ -5042,7 +5068,7 @@ impl Shadow {
                 at = next;
             }
         }
-        TITLE.with_borrow_mut(|title| {
+        with_title_buffer(|title| {
             for (from, to, noted) in runs {
                 if !noted {
                     self.copy(from, to);
@@ -5078,10 +5104,6 @@ impl Shadow {
     /// Copies title memory `[from, to)` (inside the buffer) into the copy;
     /// `known`: the copy held it before ([`send_changed`]).
     fn take(&self, from: usize, to: usize, known: bool) -> usize {
-        thread_local! {
-            /// A page of title memory, as read.
-            static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
-        }
         let Some(card) = self.card.as_ref().filter(|_| self.changes_only.load(Ordering::Relaxed) || send_changed()) else {
             if known && self.card.is_some() && self.landing.load(Ordering::Acquire) && land_echo() && !crate::host::upcheck::on() {
                 return self.take_landed(from, to);
@@ -5103,7 +5125,7 @@ impl Shadow {
         // a chunk, not one a page.
         let mut sent = [0u64; 4];
         let mut card_runs: Vec<(usize, usize)> = Vec::new();
-        TITLE.with_borrow_mut(|chunk| {
+        with_title_buffer(|chunk| {
             let mut chunk_at = from;
             let mut chunk_end = from;
             let mut at = from;

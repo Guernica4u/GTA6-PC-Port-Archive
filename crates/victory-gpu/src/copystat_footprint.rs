@@ -84,10 +84,12 @@ impl Foot {
         }
     }
 
-    fn pending_wrote(&mut self, from: usize, to: usize) {
-        self.events[2] += 1;
-        for i in self.blocks_of(from, to) {
-            mark(&mut self.pending, i);
+    fn pending_wrote(&mut self, runs: usize, spans: &[(usize, usize)]) {
+        self.events[2] += runs as u64;
+        for &(from, to) in spans {
+            for i in from.min(self.blocks)..to.min(self.blocks) {
+                mark(&mut self.pending, i);
+            }
         }
     }
 
@@ -124,14 +126,34 @@ pub(crate) fn cpu_wrote(id: u64, start: u64, len: u64, from: usize, to: usize) {
     with(id, start, len, |f| f.cpu_wrote(from, to));
 }
 
-/// The title wrote these runs (offsets in the copy) in ranges flights may be
-/// writing.
-pub(crate) fn pending_wrote(id: u64, start: u64, len: u64, runs: impl Iterator<Item = (usize, usize)>) {
-    let mut runs = runs.peekable();
-    if runs.peek().is_none() {
+/// Collapse word runs to the 64 KiB blocks tracked by the report before
+/// taking the lock shared by the submitter and the copy-back workers.
+fn pending_blocks(start: u64, runs: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let block = 1usize << SHIFT;
+    let skew = start as usize % block;
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for &(from, to) in runs {
+        if from < to {
+            let (from, to) = ((from + skew) / block, (to + skew).div_ceil(block));
+            match spans.last_mut() {
+                Some(last) if from <= last.1 && last.0 <= to => {
+                    *last = (last.0.min(from), last.1.max(to));
+                }
+                _ => spans.push((from, to)),
+            }
+        }
+    }
+    spans
+}
+
+/// The title wrote these byte ranges (offsets in the copy) while flights
+/// may have been writing the same copy.
+pub(crate) fn pending_wrote(id: u64, start: u64, len: u64, runs: &[(usize, usize)]) {
+    if runs.is_empty() || !on() {
         return;
     }
-    with(id, start, len, |f| runs.for_each(|(a, b)| f.pending_wrote(a, b)));
+    let spans = pending_blocks(start, runs);
+    with(id, start, len, |f| f.pending_wrote(runs.len(), &spans));
 }
 
 /// Every ~10 s, from the frame line: the totals and the eight copies shaders
@@ -162,14 +184,15 @@ pub(crate) fn log() {
         *last = Some(Instant::now());
     }
     let window = WINDOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut all = FEET.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(all) = all.as_mut() else {
-        return;
+    let mut rows: Vec<(u64, [usize; 5], [u64; 3], u64, u64)> = {
+        let mut all = FEET.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(all) = all.as_mut() else {
+            return;
+        };
+        // Copies untouched for ten windows are gone.
+        all.retain(|_, f| window.saturating_sub(f.last) < 10);
+        all.iter().map(|(&id, f)| (id, f.totals(), f.events, f.start, f.len)).collect()
     };
-    // Copies untouched for ten windows are gone.
-    all.retain(|_, f| window.saturating_sub(f.last) < 10);
-    let mut rows: Vec<(u64, [usize; 5], [u64; 3], u64, u64)> =
-        all.iter().map(|(&id, f)| (id, f.totals(), f.events, f.start, f.len)).collect();
     rows.sort_by_key(|r| std::cmp::Reverse(r.1[1] + r.1[3]));
     let sum = |i: usize| rows.iter().map(|r| r.1[i]).sum::<usize>();
     tracing::info!(
@@ -216,7 +239,11 @@ mod tests {
         f.cpu_wrote(0x8000, 0x8010);
         f.cpu_wrote(0x1_8000, 0x1_8010);
         assert_eq!(f.totals()[2], 1);
-        f.pending_wrote(0, 0x8001);
+        let runs = [(0, 0x70), (0x10, 0x8001), (0x8004, 0x8008)];
+        let spans = pending_blocks(f.start, &runs);
+        assert_eq!(spans, [(0, 2)]);
+        f.pending_wrote(runs.len(), &spans);
+        assert_eq!(f.events[2], 3);
         assert_eq!(f.totals()[3], 2);
         assert_eq!(f.totals()[4], 2);
     }

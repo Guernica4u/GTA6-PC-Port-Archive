@@ -27,7 +27,7 @@ pub(super) fn own() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_OWN").is_none_or(|v| v != "0"))
 }
 
-/// Whether large 4-byte-aligned sends go through one bulk upload copy into a
+/// Whether fragmented 4-byte-aligned sends go through one bulk upload copy into a
 /// device-local staging buffer and the `BULK_SCATTER` compute shader, with
 /// `SCATTER` reading from device-local memory instead of over PCIe
 /// (`VICTORY_BULK_SCATTER`, on by default; `=0`: `CopyBufferRegion` + PCIe
@@ -39,6 +39,11 @@ fn bulk_scatter_on() -> bool {
 
 /// Runs up to this many bytes go as pairs.
 const SHORT: usize = 256;
+
+/// A contiguous send of at least one write-watch block goes directly to
+/// its destination. Staging it would use a copy operation anyway
+/// and add a scatter over the whole block.
+const DIRECT_BYTES: usize = 64 << 10;
 
 /// Maximum dwords copied per `BULK_SCATTER` threadgroup (64 threads × 4 dwords).
 const TILE_DWORDS: u32 = 256;
@@ -302,8 +307,9 @@ pub(super) fn give_back(mut memory: Memory) {
 }
 
 /// Since the last frame-rate line: bytes copied, runs copied, words stored,
-/// microseconds of taking them out of the CPU sides.
-pub(super) static STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// microseconds of taking them out of the CPU sides, direct copy bytes and
+/// staged bytes (including tile and pair records).
+pub(super) static STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 /// One tile descriptor read by `BULK_SCATTER`.
 #[repr(C)]
@@ -449,7 +455,7 @@ fn take_with(
                     chunk_start = short_ranges.len();
                     chunk_words = 0;
                 }
-            } else if bulk_scatter && a % 4 == 0 && len % 4 == 0 {
+            } else if bulk_scatter && len < DIRECT_BYTES && a % 4 == 0 && len % 4 == 0 {
                 // Keep src mod 16 equal to dst mod 16 so body tiles are 16-byte aligned.
                 let src_off = vram_at + (a & 15) as u64;
                 vram_at = (src_off + len as u64).next_multiple_of(16);
@@ -573,6 +579,8 @@ fn take_with(
     STATS[0].fetch_add(moves.iter().map(|m| m.2 as u64).sum(), Ordering::Relaxed);
     STATS[1].fetch_add(moves.len() as u64, Ordering::Relaxed);
     STATS[2].fetch_add(total_words, Ordering::Relaxed);
+    STATS[4].fetch_add(copies.iter().flat_map(|copy| &copy.runs).map(|run| run.2 as u64).sum(), Ordering::Relaxed);
+    STATS[5].fetch_add(vram_bytes, Ordering::Relaxed);
     crate::shadow::copy_all(moves);
     STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
 
@@ -812,7 +820,7 @@ mod tests {
         let scatter_pass = make_pass(&device, SCATTER, "test scatter").unwrap();
         let bulk_pass = make_pass(&device, BULK_SCATTER, "test bulk scatter").unwrap();
 
-        const DST_SIZE: usize = 8192;
+        const DST_SIZE: usize = 2 * DIRECT_BYTES;
         let mut expected = vec![0xAAu8; DST_SIZE];
         // Unaligned-mod-16 long run (> SHORT)
         let run1 = (0x104usize, 0x104usize + 260usize);
@@ -820,6 +828,7 @@ mod tests {
         let run2 = (0x1000usize, 0x1000usize + 2500usize);
         // Short run via SCATTER pairs
         let short_run = (0x20usize, 0x20usize + 16usize);
+        let direct_run = (DIRECT_BYTES, DST_SIZE);
 
         let mut fill_pattern = |range: (usize, usize), seed: u8| {
             for (i, byte) in expected[range.0..range.1].iter_mut().enumerate() {
@@ -829,6 +838,7 @@ mod tests {
         fill_pattern(run1, 0x11);
         fill_pattern(run2, 0x55);
         fill_pattern(short_run, 0x99);
+        fill_pattern(direct_run, 0x37);
 
         // Pack upload buffer: [init_sentinel(8192) | bulk_payloads | tiles | pairs]
         let mut upload_bytes = vec![0xAAu8; DST_SIZE];
@@ -868,6 +878,8 @@ mod tests {
             upload_bytes[dst + 4..dst + 8].copy_from_slice(&val.to_le_bytes());
         }
         let vram_payload_size = (pairs_off + pair_words * 8).next_multiple_of(16) as u64;
+        let direct_off = upload_bytes.len();
+        upload_bytes.extend_from_slice(&expected[direct_run.0..direct_run.1]);
 
         let upload = create_buffer(
             &device,
@@ -920,6 +932,7 @@ mod tests {
 
             // Seed card with 0xAA and populate VRAM staging via a single CopyBufferRegion.
             list.CopyBufferRegion(&card, 0, &upload, 0, DST_SIZE as u64);
+            list.CopyBufferRegion(&card, direct_run.0 as u64, &upload, direct_off as u64, DIRECT_BYTES as u64);
             list.CopyBufferRegion(&vram, 0, &upload, DST_SIZE as u64, vram_payload_size);
             list.ResourceBarrier(&[
                 transition(&vram, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
