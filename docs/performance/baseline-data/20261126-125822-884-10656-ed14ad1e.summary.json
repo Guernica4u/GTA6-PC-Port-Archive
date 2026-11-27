@@ -1,0 +1,333 @@
+{
+ "name": "20261126-125822-884-10656-ed14ad1e",
+ "sources": {
+  "csv": "C:\\Users\\mathe\\AppData\\Local/victory/runs\\20261126-125822-884-10656-ed14ad1e\\frametime.csv",
+  "log": "C:\\Users\\mathe\\AppData\\Local/victory/runs\\20261126-125822-884-10656-ed14ad1e\\victory.log"
+ },
+ "hardware": {
+  "cpu": "AMD Ryzen 7 5700X 8-Core Processor (16 logical processors)",
+  "gpu": "NVIDIA GeForce RTX 4070 (12012 MiB dedicated)",
+  "driver": "621.01 (32.0.16.2101)",
+  "ram": "32695 MiB",
+  "os": "Windows 11 Pro 25H2 (build 26200)",
+  "display": "2560x1440",
+  "version": "0.1.0"
+ },
+ "time_series": "frametime.csv (1 s windows, exact per-window mean and max)",
+ "label": {
+  "build": "release",
+  "console_profile": "series-x",
+  "dlss": "off",
+  "framegen": "off/unknown",
+  "resolution_switch": "default/unknown",
+  "panel": "unset",
+  "auto_a_switch": "unset",
+  "relay": "2",
+  "shader_cache": {
+   "hits": 3273,
+   "misses": 0
+  },
+  "shader_translations_in_log": 2842,
+  "passes_off_final": "unknown",
+  "gfx_methods_on_final": "unknown",
+  "ablation_events_in_log": 0,
+  "cache_state_hint": "shader-translation cache warm (misses=0)",
+  "n_switches_listed": 49,
+  "custom": null
+ },
+ "t_start_utc": "2026-11-26T15:58:26Z",
+ "phases": {
+  "t0_epoch_ms": 1795708706171.0,
+  "first_window_pipelines_being_made": 854.0,
+  "seconds_until_pipelines_made_done": 72.4,
+  "seconds_to_scene_draws_ge_100": 138.4,
+  "seconds_to_heavy_scene": 142.0,
+  "heavy_draws_threshold": 1000.0,
+  "stabilised_at_s": 200.8,
+  "stabilise_rule": "first window >= 30s after heavy-scene entry whose next 10 windows are all within +-25% of the median ms/frame of the second half of the heavy windows",
+  "ref_ms_second_half": 147.51,
+  "stabilised_after_entry_s": 58.8
+ },
+ "session": {
+  "windows": 311,
+  "frames": 4416,
+  "seconds": 361.4,
+  "fps_mean": 12.22,
+  "ms_mean": 81.84,
+  "ms_median_windowavg": 37.84,
+  "ms_p90_windowavg": 163.7,
+  "ms_p99_windowavg": 361.33,
+  "ms_median_reconstructed": 34.17,
+  "ms_p90_reconstructed": 149.25,
+  "ms_p99_reconstructed": 401.53,
+  "ms_worst_frame": 8399.66,
+  "fps_1pct_low_p99": 2.5,
+  "fps_1pct_low_mean_of_slowest": 0.8,
+  "window_max_ms_p50": 199.73,
+  "window_max_ms_p90": 461.85,
+  "tag": "whole session (boot, menu, load, play)",
+  "duration_s": 361.2
+ },
+ "heavy_scene": {
+  "windows": 183,
+  "frames": 1278,
+  "seconds": 210.3,
+  "fps_mean": 6.08,
+  "ms_mean": 164.52,
+  "ms_median_windowavg": 145.17,
+  "ms_p90_windowavg": 210.61,
+  "ms_p99_windowavg": 564.42,
+  "ms_median_reconstructed": 134.62,
+  "ms_p90_reconstructed": 230.19,
+  "ms_p99_reconstructed": 607.88,
+  "ms_worst_frame": 3346.32,
+  "fps_1pct_low_p99": 1.6,
+  "fps_1pct_low_mean_of_slowest": 0.7,
+  "window_max_ms_p50": 249.59,
+  "window_max_ms_p90": 491.05,
+  "tag": "windows with mean draws/frame >= 1000.0",
+  "stalls": {
+   "threshold_ms": 403.9,
+   "stall_windows": 31,
+   "stalled_ms_lower_bound": 26469.0,
+   "worst_ms": 3346.0,
+   "windows_total": 183,
+   "share_of_windows": 0.169,
+   "over_1000ms_windows": 6
+  }
+ },
+ "stalls_csv_windows": {
+  "threshold_ms": 200.0,
+  "stall_windows": 155,
+  "stalled_ms_lower_bound": 83772.0,
+  "worst_ms": 8400.0,
+  "windows_total": 311,
+  "share_of_windows": 0.498,
+  "over_1000ms_windows": 13
+ },
+ "steady": {
+  "windows": 168,
+  "frames": 1179,
+  "seconds": 191.9,
+  "fps_mean": 6.14,
+  "ms_mean": 162.76,
+  "ms_median_windowavg": 145.69,
+  "ms_p90_windowavg": 209.4,
+  "ms_p99_windowavg": 564.42,
+  "ms_median_reconstructed": 134.62,
+  "ms_p90_reconstructed": 230.19,
+  "ms_p99_reconstructed": 607.88,
+  "ms_worst_frame": 3346.32,
+  "fps_1pct_low_p99": 1.6,
+  "fps_1pct_low_mean_of_slowest": 0.8,
+  "window_max_ms_p50": 249.59,
+  "window_max_ms_p90": 491.05,
+  "tag": "after heavy-scene entry + 30 s (all windows)",
+  "stalls": {
+   "threshold_ms": 403.9,
+   "stall_windows": 26,
+   "stalled_ms_lower_bound": 21755.0,
+   "worst_ms": 3346.0,
+   "windows_total": 168,
+   "share_of_windows": 0.155,
+   "over_1000ms_windows": 5
+  }
+ },
+ "columns_heavy": {
+  "cpu_prepare_ms": 87.108,
+  "gpu_ms": 1.697,
+  "gpu_pct": 1.145,
+  "copies_ms": 32.831,
+  "copies_mb": 176.304,
+  "textures_ms": 7.099,
+  "textures_mb": 15.234,
+  "copyback_ms": 63.421,
+  "copyback_mb": 37.729,
+  "draws": 4883.448,
+  "dropped": 369.761,
+  "indirect": 0.0,
+  "heap_passes": 1.001,
+  "heap_ms": 58.109,
+  "texture_refresh_ms": 7.08,
+  "card_passes": 221.315,
+  "card_compares": 425.941,
+  "card_sent_mb": 29.614,
+  "card_ranges": 1768.853,
+  "card_pieces": 17438.184,
+  "card_fetched": 1417.037,
+  "card_fetched_mb": 83.857,
+  "card_waits": 13.274,
+  "card_wait_ms": 16.649,
+  "_gpu_pct_windows_nonzero": 27,
+  "_windows": 183,
+  "ram_mb_last": 17092.0,
+  "ram_mb_max": 18037.0,
+  "cpu_pct_mean": 34.0
+ },
+ "columns_session": {
+  "cpu_prepare_ms": 29.417,
+  "gpu_ms": 0.495,
+  "gpu_pct": 0.332,
+  "copies_ms": 10.767,
+  "copies_mb": 54.266,
+  "textures_ms": 3.946,
+  "textures_mb": 8.635,
+  "copyback_ms": 18.954,
+  "copyback_mb": 11.2,
+  "draws": 1440.933,
+  "dropped": 120.102,
+  "indirect": 0.0,
+  "heap_passes": 0.316,
+  "heap_ms": 18.611,
+  "texture_refresh_ms": 3.939,
+  "card_passes": 67.363,
+  "card_compares": 133.775,
+  "card_sent_mb": 10.538,
+  "card_ranges": 539.603,
+  "card_pieces": 5444.862,
+  "card_fetched": 422.355,
+  "card_fetched_mb": 24.95,
+  "card_waits": 4.227,
+  "card_wait_ms": 4.979,
+  "_gpu_pct_windows_nonzero": 28,
+  "_windows": 311,
+  "ram_mb_last": 17092.0,
+  "ram_mb_max": 18037.0,
+  "cpu_pct_mean": 25.7
+ },
+ "log": {
+  "seconds_logged": 364.8,
+  "warn_lines": 99,
+  "error_lines": 0,
+  "shader_translations": 2842,
+  "shader_translate_ms_total": 4955.0,
+  "stall_attribution": {
+   "watchdog_stalls": 32,
+   "watchdog_ms_total": 26170,
+   "watchdog_worst_ms": 7732,
+   "by_inside": {
+    "no section of ours (the title or the system is the wait)": {
+     "count": 24,
+     "ms": 20958,
+     "worst_ms": 7732
+    },
+    "lists' steps; present": {
+     "count": 2,
+     "ms": 1805,
+     "worst_ms": 1404
+    },
+    "flush of refreshes; present; relay: landing flights": {
+     "count": 1,
+     "ms": 1403,
+     "worst_ms": 1403
+    },
+    "lists' steps": {
+     "count": 1,
+     "ms": 401,
+     "worst_ms": 401
+    },
+    "relay: landing flights": {
+     "count": 1,
+     "ms": 401,
+     "worst_ms": 401
+    },
+    "heap pass: buffers; heap pass: textures by index; heap pass: whole-span refresh": {
+     "count": 1,
+     "ms": 401,
+     "worst_ms": 401
+    },
+    "lists' steps; relay: landing flights": {
+     "count": 1,
+     "ms": 401,
+     "worst_ms": 401
+    },
+    "heap pass: buffers; heap pass: whole-span refresh; submission: descriptor heap sync": {
+     "count": 1,
+     "ms": 400,
+     "worst_ms": 400
+    }
+   }
+  },
+  "per_frame_subsystems_heavy": {
+   "prep_split": {
+    "before_steps_ms": 18.986,
+    "lists_steps_ms": 26.608,
+    "flush_ms": 24.538,
+    "snapshots_ms": 0.0,
+    "card_copies_ms": 17.02,
+    "_lines": 194
+   },
+   "activity": {
+    "sub_lock_ms": 0.0,
+    "watch_deps_ms": 18.928,
+    "desc_sync_ms": 20.441,
+    "pending_views_ms": 0.038,
+    "gpu_handoff_ms": 2.966,
+    "gpu_settle_ms": 1.519,
+    "relay_ms": 70.104,
+    "present_ms": 4.505,
+    "buffer_views_ms": 75.065,
+    "texture_views_ms": 22.689,
+    "_lines": 195
+   },
+   "card_clock": {
+    "card_idle_ms": 109.803,
+    "card_busy_pct_by_count": 48.866,
+    "_lines": 194
+   },
+   "relay": {
+    "flights": 29.557,
+    "landings": 15.334,
+    "relay_wait_card_ms": 28.37,
+    "relay_wait_fetch_ms": 16.03,
+    "relay_landing_ms": 70.073,
+    "_lines": 194
+   },
+   "sent_ahead": {
+    "submissions_sent_ahead": 29.596,
+    "settles": 0.021,
+    "settle_wait_ms": 1.526,
+    "_lines": 194
+   },
+   "card_copies": {
+    "card_sent_up_mb": 28.428,
+    "card_ranges": 1696.051,
+    "card_pieces_compared": 17439.359,
+    "card_pieces_fetched": 1349.974,
+    "card_fetched_mb": 79.667,
+    "_lines": 39
+   },
+   "gpuspan": {
+    "span_frames": 7.149,
+    "gpu_title_lists_ms": 61.981,
+    "sends": 30.537,
+    "gpu_gap_ms": 110.042,
+    "gaps": 47.808,
+    "longest_gap_ms": 120.886,
+    "first_to_last_ms": 176.445,
+    "_lines": 195
+   },
+   "dstorage": {
+    "window_s": 5.214,
+    "requests": 2649.767,
+    "mb_per_s": 40.042,
+    "_lines": 43
+   }
+  },
+  "counters": {
+   "submissions_per_presented_frame": 29.53,
+   "presented_in_span": 1392,
+   "submissions_in_span": 41099
+  },
+  "dstorage_mb_per_s_peak": 295.4
+ },
+ "definitions": [
+  "stall window = CSV window whose slowest frame >= max(200 ms, 3 x the median ms/frame of its span) (threshold shown per span); stalled time is a lower bound (one max per window).",
+  "watchdog stall = a `stall:` log line group (same frame number); length = largest stalled_ms; cause = `inside:` text.",
+  "ms_*_windowavg: quantiles of the windows' mean ms/frame weighted by frames (hides tails).",
+  "ms_*_reconstructed: per window one frame at the logged max and the rest at the remaining mean; exact in frame count, total time and window max, a model in between. 1% low = 1000/P99 (fps_1pct_low_p99) and mean fps of the slowest 1% frames.",
+  "heavy scene = windows with mean draws/frame >= 1000.0; world entry = 3 consecutive such windows; \"stabilised\" rule in phases.",
+  "per_frame_subsystems_heavy = plain mean over log lines at/after world entry; each line is one window's per-frame figure; subsystem ms are summed over threads (they can exceed the frame time).",
+  "gpu_ms/gpu_pct (CSV) are 0 unless GPU timestamp spans are on; see columns_heavy._gpu_pct_windows_nonzero."
+ ]
+}
