@@ -339,10 +339,10 @@ pub(crate) enum Absent {
 static DROPPED_SPLIT: [std::sync::atomic::AtomicU64; 2] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
-/// The draws and dispatches counted by [`note_drop`] since the last call:
-/// `[refused, waiting]`, which adds up to the draws and dispatches without a
-/// host pipeline. A refused pipeline costs its draws every frame; one still
-/// being made costs them one frame.
+/// The draws, dispatches and indirect calls counted by [`note_drop`] since
+/// the last call: `[refused, waiting]`, which adds up to everything dropped
+/// for want of a host pipeline in either build. A refused pipeline costs its
+/// draws every frame; one still being made costs them one frame.
 #[cfg(windows)]
 pub(crate) fn take_dropped_split() -> [u64; 2] {
     [&DROPPED_SPLIT[0], &DROPPED_SPLIT[1]]

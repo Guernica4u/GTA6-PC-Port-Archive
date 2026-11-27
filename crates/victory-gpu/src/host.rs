@@ -3078,9 +3078,9 @@ impl Meter {
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
-                 dropped {dropped:.0} without a host pipeline ({refused:.0} refused, \
-                 {waiting:.0} waiting for one, {making} being made) and \
-                 {indirect:.0} indirect; {root_views:.0} root-view slots/frame",
+                 dropped {dropped:.0} without a host pipeline and {indirect:.0} indirect not run: \
+                 {refused:.0} refused, {waiting:.0} waiting for one, {making} being made \
+                 (both counts together); {root_views:.0} root-view slots/frame",
                 refused = refused as f64 / report_frames,
                 waiting = waiting as f64 / report_frames,
                 making = crate::pipeline::making()

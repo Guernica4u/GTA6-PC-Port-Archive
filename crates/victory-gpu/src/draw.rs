@@ -167,10 +167,11 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 /// [`not_run`] gave) and, with the diagnostics feature, marks it in the trace
 /// and notes it in the list.
 fn dropped(list: &HostList, pipeline: usize, kind: &str) {
-    count_dropped(pipeline, kind);
+    // Read `NOT_RUN` once, here, and share the reason with the trace: reading
+    // it a second time always gives "" because the first read clears it.
+    let why = count_dropped(pipeline, kind);
     #[cfg(feature = "diagnostics")]
     {
-        let why = NOT_RUN.with(|w| w.replace(""));
         list.note_op(|| {
             format!(
                 "DROPPED {kind} ({why}) {}",
@@ -182,11 +183,12 @@ fn dropped(list: &HostList, pipeline: usize, kind: &str) {
         }
     }
     #[cfg(not(feature = "diagnostics"))]
-    let _ = (list, kind);
+    let _ = (list, kind, why);
 }
 
-/// The counter side of [`dropped`], in every build.
-fn count_dropped(pipeline: usize, kind: &str) {
+/// The counter side of [`dropped`], in every build; returns the reason
+/// [`not_run`] gave ("" in builds without diagnostics).
+fn count_dropped(pipeline: usize, kind: &str) -> &'static str {
     #[cfg(feature = "diagnostics")]
     {
         let why = NOT_RUN.with(|w| w.replace(""));
@@ -195,12 +197,17 @@ fn count_dropped(pipeline: usize, kind: &str) {
                 "{kind}: {why} {}",
                 crate::pipeline::shaders_of(pipeline as This)
             ));
-            return;
+            return why;
         }
+        crate::pipeline::note_drop(pipeline as This);
+        why
     }
     #[cfg(not(feature = "diagnostics"))]
-    let _ = kind;
-    crate::pipeline::note_drop(pipeline as This);
+    {
+        let _ = kind;
+        crate::pipeline::note_drop(pipeline as This);
+        ""
+    }
 }
 
 #[cfg(feature = "diagnostics")]
@@ -1807,7 +1814,6 @@ impl State {
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => {
-                    crate::pipeline::note_drop(self.pipeline as This);
                     list.note_op(|| format!("DROPPED indirect kind {kind} (no host pipeline) {}", crate::pipeline::shaders_of(pipeline)));
                 }
                 Some(p) => why(&format!(
@@ -1816,6 +1822,11 @@ impl State {
                     p.mesh,
                     NOT_RUN.with(|w| w.replace(""))
                 )),
+            }
+            // Counted in every build, so the refused/waiting split covers
+            // indirect calls the same way with and without diagnostics.
+            if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
+                crate::pipeline::note_drop(self.pipeline as This);
             }
             return false;
         }
