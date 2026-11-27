@@ -253,6 +253,27 @@ fn f64_arithmetic_keeps_overlapping_source_pairs_distinct() {
 }
 
 #[test]
+fn f64_arithmetic_reads_a_single_pair_at_an_odd_dword() {
+    // v[2:3] receives root dwords 1 and 2. The other source is an
+    // inline constant, so no second register pair can mask the bug.
+    let cases = [
+        [0, 0x3FF8_0001, 0x3FF0_0000, 0],
+        [0, 0x1234_5678, 0x4000_0000, 0],
+        [0, 0x8765_4321, 0xBFF8_0000, 0],
+        [0, 0, 0x8000_0000, 0],
+    ];
+    for word in 0..2 {
+        let [op, src] = vop3(0x165, 6, vgpr(2), 240, 0); // v_mul_f64 v[6:7], v[2:3], 0.5
+        let shader = build_valu_cs(&[op, src, vop1(0x001, 0, vgpr(6 + word))]);
+        run_cases(&shader, &cases, |backend, case, inputs, actual| {
+            let value = f64::from_bits(u64::from(inputs[1]) | (u64::from(inputs[2]) << 32));
+            let expected = ((value * 0.5).to_bits() >> (32 * word)) as u32;
+            assert_eq!(actual, expected, "{backend}, case {case}, word {word}");
+        });
+    }
+}
+
+#[test]
 fn data_only_structured_srv_reads_its_bound_record_count() {
     // The second heap slot contains an SRV. Its only use is a read of dword 2.
     let mut load = s_load_dwordx4(12, 4);
