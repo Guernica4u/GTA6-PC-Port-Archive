@@ -41,6 +41,9 @@ mod scalar_bits;
 #[path = "tests/hlsl/instruction_inventory.rs"]
 mod instruction_inventory;
 #[cfg(test)]
+#[path = "tests/hlsl/buffer_loads.rs"]
+mod buffer_loads;
+#[cfg(test)]
 #[path = "tests/hlsl/raw_width.rs"]
 mod raw_width;
 #[cfg(test)]

@@ -92,6 +92,7 @@ CHECKS = {
                             extra=("--root-srv-remap",)),
     "pixel-code-offset": Check("check_pixel_code_offset",
                                capture=("pixel_embedded_table_offset_is_bounded_and_aligned", "--hlsl"), dxc=True),
+    "buffer-loads": Check("check_buffer_loads", capture=("buffer_loads_for_the_gpu_check", "--hlsl")),
     "buffer-count": Check("check_buffer_count",
                           capture=("buffer_record_counts_for_the_gpu_check", "--hlsl")),
     "descriptor-size": Check("check_descriptor_size",
