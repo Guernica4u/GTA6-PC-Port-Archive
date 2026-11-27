@@ -67,7 +67,15 @@ const IN_HALF: &[u32] = &[
 ];
 
 fn run(host: &Host, native: &crate::NativeProgram, groups: u32) -> Result<Vec<u32>, String> {
-    let target = host.target();
+    run_for(host, native, groups, host.target())
+}
+
+fn run_for(
+    host: &Host,
+    native: &crate::NativeProgram,
+    groups: u32,
+    target: super::Target,
+) -> Result<Vec<u32>, String> {
     let cs = emit_for(native, target).map_err(|e| e.to_string())?;
     // The validator, where one is installed: drivers take some modules it
     // refuses.
@@ -197,6 +205,32 @@ fn three_dimensional_groups_keep_the_consoles_lanes() {
             assert_eq!(out, want, "{name}: {threads:?} (split {split})");
             eprintln!("{name}: {threads:?} exact (split {split})");
         }
+    }
+}
+
+#[test]
+fn multidimensional_groups_assign_distinct_split_wave_blocks() {
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 device; skipped");
+        return;
+    };
+    if !host.target().runs(32) {
+        eprintln!("no wave32 device; skipped");
+        return;
+    }
+    let target = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    for threads in [[32, 2, 1], [32, 2, 2], [8, 8, 1], [4, 4, 4]] {
+        let p = program_3d(threads);
+        let cs = emit_for(&p, target).expect("translation");
+        assert_eq!(wave_size(&cs.dxil), Some(32), "{threads:?}");
+        let out = run_for(&host, &p, 1, target).unwrap_or_else(|e| panic!("{threads:?}: {e}"));
+        let n: u32 = threads.iter().product();
+        let want: Vec<_> = (0..n).map(|t| t ^ 31).collect();
+        assert_eq!(out, want, "{threads:?}");
+        eprintln!("{threads:?}: {n} exact split IDs");
     }
 }
 

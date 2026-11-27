@@ -12609,13 +12609,13 @@ impl<'a> Lower<'a> {
     /// Give each full host wave a distinct, aligned block of console IDs.
     /// A dense partial wave takes the last block. Lanes keep their native
     /// indices, so ballots and indexed reads still see the console lanes.
+    /// Each half of a split console wave takes its own 32-lane block.
     fn console_thread_prologue(&mut self) {
         let (Some([x, y, z]), Some(wave)) = (self.s.threads, self.s.wave_size) else {
             return;
         };
         let threads = x * y * z;
         if !self.console_lanes
-            || self.split
             || y == 1 && z == 1
             || threads <= wave
             // Partial thread dispatches still predicate on the host's IDs.
