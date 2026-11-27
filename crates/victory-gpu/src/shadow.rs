@@ -92,6 +92,12 @@ pub(crate) struct Shadow {
     slice: Option<Slice>,
     /// Monotonic use stamp for opt-in LRU eviction (`VICTORY_SHADOW_BUDGET_MB`).
     last_used: std::sync::atomic::AtomicU64,
+    /// How many ranges of the heaps' views of it write as unordered access
+    /// (`crate::bindless`): while any, what the shaders wrote stays only in
+    /// the copy and never goes back to title memory (bindless, "shortcut"
+    /// on [`crate::bindless::refresh`]), so the copy is not evicted: made
+    /// again from title memory, it would silently lose those bytes.
+    uav_ranges: std::sync::atomic::AtomicU32,
 }
 
 static USE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -271,6 +277,7 @@ impl Shadow {
             last_used: std::sync::atomic::AtomicU64::new(
                 USE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             ),
+            uav_ranges: std::sync::atomic::AtomicU32::new(0),
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -292,6 +299,24 @@ impl Shadow {
     /// Whether writes through views of this copy are marked.
     pub(crate) fn marked(&self) -> bool {
         self.marks.is_some()
+    }
+
+    /// A heap now views a range of it as unordered access
+    /// ([`Shadow::remove_uav_range`] when that range goes).
+    pub(crate) fn add_uav_range(&self) {
+        self.uav_ranges.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The range [`Shadow::add_uav_range`] counted went from its heap.
+    pub(crate) fn remove_uav_range(&self) {
+        let order = std::sync::atomic::Ordering::Relaxed;
+        let _ = self.uav_ranges.fetch_update(order, order, |n| Some(n.saturating_sub(1)));
+    }
+
+    /// Whether any heap views a range of it as unordered access: the bytes
+    /// shaders wrote there live only in the copy.
+    pub(crate) fn uav_written(&self) -> bool {
+        self.uav_ranges.load(std::sync::atomic::Ordering::Relaxed) > 0
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -1064,9 +1089,18 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 }
 
 fn shadow_budget_bytes_for(val: Option<&str>) -> Option<u64> {
-    val.and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&mb| mb > 0)
-        .map(|mb| mb.saturating_mul(1 << 20))
+    let val = val?;
+    let Ok(mb) = val.trim().parse::<u64>() else {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                value = val,
+                "VICTORY_SHADOW_BUDGET_MB is not a whole number of MiB: shadow budget off (logged once)"
+            )
+        });
+        return None;
+    };
+    (mb > 0).then(|| mb.saturating_mul(1 << 20))
 }
 
 fn shadow_budget_bytes() -> Option<u64> {
@@ -1081,8 +1115,17 @@ fn shadow_budget_bytes() -> Option<u64> {
 
 /// Evicts least-recently-used unreferenced `Shadow` buffer copies from
 /// [`BUFFERS`] until total live shadow bytes are at or below `budget`.
-/// Only copies with `Arc::strong_count == 1` and no pending GPU writebacks
-/// are eligible, so no active command list or descriptor slot is affected.
+/// Only copies with `Arc::strong_count == 1`, no pending GPU writebacks and
+/// no heap view of them with unordered access ([`Shadow::uav_written`]) are
+/// eligible, so no active command list or descriptor slot is affected and
+/// no bytes only the GPU wrote are lost.
+///
+/// Bytes of copies it cannot evict (held by page tables, `crate::memory`
+/// layouts, heaps or command lists; written through heap unordered access)
+/// stay in the total. When they alone are past the budget it is unreachable:
+/// the pass is skipped (evicting every evictable copy each frame and making
+/// it again churns) and warned once. A zero budget (only tests pass one; the
+/// knob treats it as off) still runs.
 fn evict_unused_with_budget(budget: u64) -> (usize, u64) {
     let mut evicted: Vec<Arc<Shadow>> = Vec::new();
     let mut freed_bytes = 0u64;
@@ -1100,7 +1143,7 @@ fn evict_unused_with_budget(budget: u64) -> (usize, u64) {
             .iter()
             .filter_map(|(&key, entry)| {
                 let s = entry.shadow.as_ref()?;
-                if Arc::strong_count(s) != 1 {
+                if Arc::strong_count(s) != 1 || s.uav_written() {
                     return None;
                 }
                 if !s.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
@@ -1116,13 +1159,28 @@ fn evict_unused_with_budget(budget: u64) -> (usize, u64) {
                 ))
             })
             .collect();
+        let evictable: u64 = candidates.iter().map(|&(_, _, len)| len).sum();
+        if budget > 0 && total - evictable > budget {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    budget,
+                    held = total - evictable,
+                    "shadow copies that cannot be evicted alone are past VICTORY_SHADOW_BUDGET_MB: eviction skipped (logged once)"
+                )
+            });
+            return (0, 0);
+        }
         candidates.sort_unstable_by_key(|&(stamp, _, _)| stamp);
         for (_, key, len) in candidates {
             if total <= budget {
                 break;
             }
             if let Some(entry) = map.get_mut(&key)
-                && entry.shadow.as_ref().is_some_and(|s| Arc::strong_count(s) == 1)
+                && entry
+                    .shadow
+                    .as_ref()
+                    .is_some_and(|s| Arc::strong_count(s) == 1 && !s.uav_written())
                 && let Some(shadow) = entry.shadow.take()
             {
                 total = total.saturating_sub(len);
@@ -1761,8 +1819,13 @@ pub(crate) mod tests {
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
     }
 
+    /// The budget tests evict from the shared [`BUFFERS`]: serialized so one
+    /// does not take the copy the other is about to check.
+    static BUDGET_TESTS: Mutex<()> = Mutex::new(());
+
     #[test]
     fn shadow_budget_evicts_lru_unreferenced_copies_and_keeps_held_ones() {
+        let _serial = BUDGET_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(shadow_budget_bytes_for(None), None);
         assert_eq!(shadow_budget_bytes_for(Some("0")), None);
         assert_eq!(shadow_budget_bytes_for(Some("512")), Some(512 << 20));
@@ -1794,6 +1857,64 @@ pub(crate) mod tests {
             "evicted shadow a slot cleared"
         );
         drop(sb);
+        unregister(a, a as u64);
+        unregister(b, b as u64);
+    }
+
+    /// A copy any heap views with unordered access may hold bytes only the
+    /// GPU wrote (bindless, `refresh`): evicting it and making it again from
+    /// title memory would lose them silently. It is not eligible while a
+    /// heap views it that way; once none does, it is again.
+    #[test]
+    fn shadow_budget_keeps_copies_heaps_write_with_unordered_access() {
+        let _serial = BUDGET_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let a = crate::watch::tests::pool(2);
+        let b = crate::watch::tests::pool(2);
+        let len = (2 * PAGE) as u64;
+        register(a, a as u64, len);
+        register(b, b as u64, len);
+        let sa = find(a as u64, len).expect("shadow a");
+        let sb = find(b as u64, len).expect("shadow b");
+        // A heap views `a` as unordered access: shaders' bytes live only in
+        // the copy now. `b` is unmarked.
+        sa.add_uav_range();
+        drop((sa, sb));
+        let (evicted, _) = evict_unused_with_budget(0);
+        assert!(evicted >= 1, "the unmarked copy is evicted");
+        {
+            let map = buffers();
+            let s = map
+                .get(&(a as u64, a))
+                .and_then(|e| e.shadow.as_ref())
+                .expect("a copy heaps write with unordered access is kept");
+            assert_eq!(Arc::strong_count(s), 1, "no other holder");
+            assert!(s.uav_written());
+            assert!(
+                s.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+                "nothing pending"
+            );
+            assert!(
+                map.get(&(b as u64, b)).is_some_and(|e| e.shadow.is_none()),
+                "the unmarked copy went"
+            );
+        }
+        // No heap views it with unordered access any more: it may go.
+        {
+            let map = buffers();
+            map.get(&(a as u64, a))
+                .and_then(|e| e.shadow.as_ref())
+                .expect("still there")
+                .remove_uav_range();
+        }
+        let (evicted, freed) = evict_unused_with_budget(0);
+        assert!(evicted >= 1 && freed >= len, "unmarked copy is evictable again");
+        assert!(
+            buffers().get(&(a as u64, a)).is_some_and(|e| e.shadow.is_none()),
+            "the copy went once no heap writes through it"
+        );
         unregister(a, a as u64);
         unregister(b, b as u64);
     }

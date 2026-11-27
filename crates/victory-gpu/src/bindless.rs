@@ -78,6 +78,18 @@ fn tally(counts: &mut BTreeMap<u64, u32>, at: u64, add: bool) {
     }
 }
 
+impl Drop for Inner {
+    /// A heap going takes all its ranges with it: each copy it viewed with
+    /// unordered access loses that heap's count ([`Shadow::remove_uav_range`]).
+    fn drop(&mut self) {
+        for (&(_, uav), (shadow, _, _)) in &self.ends {
+            if uav {
+                shadow.remove_uav_range();
+            }
+        }
+    }
+}
+
 impl Inner {
     fn count(&mut self, seen: &Seen, add: bool) {
         let step = |n: &mut u32| if add { *n += 1 } else { *n = n.saturating_sub(1) };
@@ -93,6 +105,8 @@ impl Inner {
                 }
                 // A range came or went: its copy's hull may change.
                 if (was == 0) != (now == 0) {
+                    // Its first range of this kind in this heap.
+                    let first = !self.ends.contains_key(&(key.0, key.3));
                     let ends = self
                         .ends
                         .entry((key.0, key.3))
@@ -103,6 +117,8 @@ impl Inner {
                         (Some(&from), Some(&to)) => Some((shadow.clone(), from, to - from, key.3, shadow.dirty_bit())),
                         _ => None,
                     };
+                    // Its last one in this heap.
+                    let last = hull.is_none();
                     match hull {
                         Some(hull) => {
                             self.hulls.insert((key.0, key.3), hull);
@@ -111,6 +127,17 @@ impl Inner {
                             self.ends.remove(&(key.0, key.3));
                             self.hulls.remove(&(key.0, key.3));
                         }
+                    }
+                    // While a heap views a range of the copy as unordered
+                    // access, the bytes its shaders write stay only in the
+                    // copy (`refresh`'s shortcut below): made again from
+                    // title memory, it would lose them, so it is kept from
+                    // eviction (`Shadow::uav_written`).
+                    if key.3 && first {
+                        shadow.add_uav_range();
+                    }
+                    if key.3 && last {
+                        shadow.remove_uav_range();
                     }
                 }
             }
@@ -310,6 +337,10 @@ impl Uploads {
 /// there. Copying back the whole unordered ranges after every submission
 /// (about 1 GB of them in the world) cost seconds per frame; the upgrade
 /// is shaders marking the pages they write (as `crate::memory` does).
+///
+/// Such a copy is therefore kept from eviction (`Shadow::uav_written`):
+/// made again from title memory after a budget pass gave it up, it would
+/// hold the title's bytes where the shaders' were.
 ///
 /// Copies the title has not written since they took it are passed by: a
 /// world submission's heaps reach ~9,000 copies, a few of them written.
