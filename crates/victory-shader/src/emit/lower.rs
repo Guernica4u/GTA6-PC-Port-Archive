@@ -12,7 +12,7 @@ use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{
-    Shader, VIEW_INTEGER, VIEW_SIGNED, VIEW_SRGB, VIEW_STRIDE_BITS, VIEW_STRIDES, flags,
+    Shader, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, flags,
 };
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
@@ -23,6 +23,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod srgb;
 
 type Why = &'static str;
 
@@ -4624,29 +4625,6 @@ impl<'a> Lower<'a> {
         self.raw_dword(table, at)
     }
 
-    /// IEC 61966-2-1 linear-to-sRGB transfer function for one float channel:
-    /// clamps to `[0, 1]` (NaN to 0), uses `12.92 * c` for `c <= 0.0031308`,
-    /// and `1.055 * exp2(log2(fmax(c, 1e-12)) / 2.4) - 0.055` otherwise.
-    fn linear_to_srgb(&mut self, v: V) -> V {
-        let c = self.unary(7, v);
-        let cur = self.cur;
-        let threshold = self.s.m.f32(0.003_130_8f32.to_bits());
-        let scale_lo = self.s.m.f32(12.92f32.to_bits());
-        let eps = self.s.m.f32(1e-12f32.to_bits());
-        let gamma = self.s.m.f32(2.4f32.to_bits());
-        let scale_hi = self.s.m.f32(1.055f32.to_bits());
-        let bias = self.s.m.f32(0.055f32.to_bits());
-        let lo = self.s.m.bin(cur, Bin::Mul, c, scale_lo);
-        let safe = self.binary(35, c, eps);
-        let lg = self.unary(23, safe);
-        let scaled = self.s.m.bin(cur, Bin::SDiv, lg, gamma);
-        let pw = self.unary(21, scaled);
-        let hi_mul = self.s.m.bin(cur, Bin::Mul, pw, scale_hi);
-        let hi = self.s.m.bin(cur, Bin::Sub, hi_mul, bias);
-        let is_lo = self.s.m.cmp(cur, pred::OLE, c, threshold);
-        self.s.m.select(cur, is_lo, lo, hi)
-    }
-
     /// Whether the typed buffer view a handle names has an integer format,
     /// and whether a signed one, from the view-stride table; `None` if the
     /// handle's heap index is not known.
@@ -8647,33 +8625,7 @@ impl<'a> Lower<'a> {
             }
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
-            if let Some(idx) = self.s.texture_uav_index(h) {
-                let word = self.view_word(idx);
-                let head = self.cur;
-                let bit = self.s.m.i32(VIEW_SRGB);
-                let zero = self.s.m.i32(0);
-                let masked = self.s.m.bin(head, Bin::And, word, bit);
-                let is_srgb = self.s.m.cmp(head, pred::NE, masked, zero);
-                let srgb_bb = self.s.m.new_block();
-                let merge_bb = self.s.m.new_block();
-                self.s
-                    .m
-                    .terminate(head, Term::CondBr(is_srgb, srgb_bb, merge_bb));
-                self.cur = srgb_bb;
-                let mut encoded = [vals[0]; 3];
-                for (slot, &v) in encoded.iter_mut().zip(&vals[..3]) {
-                    *slot = self.linear_to_srgb(v);
-                }
-                let srgb_end = self.cur;
-                self.s.m.terminate(srgb_end, Term::Br(merge_bb));
-                self.cur = merge_bb;
-                let f32t = self.s.t.f32;
-                for (val, enc) in vals[..3].iter_mut().zip(encoded) {
-                    let phi = self.s.m.phi(merge_bb, f32t);
-                    self.s.m.set_phi(phi, vec![(*val, head), (enc, srgb_end)]);
-                    *val = phi;
-                }
-            }
+            self.convert_srgb_uav_rgb(h, &mut vals[..3], Self::linear_to_srgb);
             let mut args = vec![h];
             args.extend(cs);
             args.extend(vals);
@@ -9074,15 +9026,23 @@ impl<'a> Lower<'a> {
         } else {
             (0..4).filter(|ch| dmask >> ch & 1 != 0).collect()
         };
-        let mut xs = Vec::new();
-        for ch in channels {
-            let x = self.s.m.extract(c, r, ch);
+        let mut vals: Vec<V> = channels
+            .iter()
+            .map(|&ch| self.s.m.extract(c, r, ch))
+            .collect();
+        if op == 66 && uav {
+            let rgb_count = channels.iter().take_while(|&&ch| ch < 3).count();
+            self.convert_srgb_uav_rgb(h, &mut vals[..rgb_count], Self::srgb_to_linear);
+        }
+        let cur = self.cur;
+        let mut xs = Vec::with_capacity(vals.len());
+        for x in vals {
             xs.push(if *d16 {
                 // shortcut: d16 results are taken as floats (rounded to
                 // nearest even); integer formats would keep 16 bits.
                 let i32t = self.s.t.i32;
                 self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[x])
+                    .op(cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[x])
             } else {
                 self.as_int(x)
             });
@@ -9094,8 +9054,8 @@ impl<'a> Lower<'a> {
                 .chunks(2)
                 .map(|p| match *p {
                     [lo, hi] => {
-                        let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
-                        self.s.m.bin(c, Bin::Or, lo, hi)
+                        let hi = self.s.m.bin(cur, Bin::Shl, hi, k16);
+                        self.s.m.bin(cur, Bin::Or, lo, hi)
                     }
                     _ => p[0],
                 })

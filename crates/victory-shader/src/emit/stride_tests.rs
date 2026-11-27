@@ -954,3 +954,74 @@ fn buffer_guard_redirects_slot_with_only_view_srgb_set() {
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
+
+/// User data: s0 a table with a 2D texture UAV, s1 a table with a raw buffer
+/// of float4 values. Each lane stores its float4 to `(lane, 0)`, loads it back
+/// via `image_load`, and stores it again.
+const TEXTURE_UAV_RMW_WAVE32: &[u32] = &[
+    0xBE84_0300, // s_mov_b32 s4, s0
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xF40C_0202,
+    0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], 0x0
+    0xBE86_0301, // s_mov_b32 s6, s1
+    0xBE87_0380, // s_mov_b32 s7, 0
+    0xF408_0403,
+    0xFA00_0000, // s_load_dwordx4 s[16:19], s[6:7], 0x0
+    0x3402_0084, // v_lshlrev_b32 v1, 4, v0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE038_1000,
+    0x8004_0201, // buffer_load_dwordx4 v[2:5], v1, s[16:19], 0 offen
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0x7E02_0280, // v_mov_b32 v1, 0
+    0xF020_1F08,
+    0x0002_0200, // image_store v[2:5], v[0:1], s[8:15] dmask:0xf dim:2D unorm
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xF000_1F08,
+    0x0002_0200, // image_load v[2:5], v[0:1], s[8:15] dmask:0xf dim:2D unorm
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xF020_1F08,
+    0x0002_0200, // image_store v[2:5], v[0:1], s[8:15] dmask:0xf dim:2D unorm
+    0xBF81_0000, // s_endpgm
+];
+
+/// Read-modify-write (`image_store -> image_load -> image_store`) on an sRGB
+/// texture UAV decodes `image_load` from sRGB to linear so the second store
+/// does not double-gamma-encode (linear `0.01` encodes to `~25` and stays `25`
+/// rather than `88`).
+#[test]
+fn texture_uav_srgb_read_modify_write_preserves_encoded_texel() {
+    let shader = build(
+        TEXTURE_UAV_RMW_WAVE32,
+        vec![param(RootType::Table, 0), param(RootType::Table, 1)],
+        vec![entry(ResourceType::Uav, 8, 0), entry(ResourceType::Srv, 4, 1)],
+        8,
+    );
+    let data: Vec<u32> = [0.01f32, 0.18, 0.5, 0.25].map(f32::to_bits).to_vec();
+    let views = [
+        View::TypedTextureUav(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 1, 1),
+        View::Buffer {
+            data: &data,
+            stride: Stride::Raw,
+        },
+    ];
+    let strides = view_strides(&views);
+    assert_eq!(strides, [VIEW_SRGB, 4]);
+    for (label, words) in run_tables(&shader, &views, strides.clone()) {
+        let bytes = words[0][0].to_le_bytes();
+        for c in 0..3 {
+            let want = (iec_linear_to_srgb(f32::from_bits(data[c])) * 255.0).round() as i32;
+            assert!(
+                (i32::from(bytes[c]) - want).abs() <= 1,
+                "{label} RMW ch {c}: got {}, want {want}",
+                bytes[c]
+            );
+        }
+        assert_eq!(bytes[0], 25, "{label} RMW linear 0.01 must stay 25 (not 88)");
+        let want_a = (0.25f32 * 255.0).round() as i32;
+        assert!(
+            (i32::from(bytes[3]) - want_a).abs() <= 1,
+            "{label} RMW alpha: got {}, want {want_a}",
+            bytes[3]
+        );
+    }
+}
