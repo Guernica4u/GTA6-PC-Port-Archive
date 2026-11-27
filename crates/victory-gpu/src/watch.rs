@@ -739,9 +739,9 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     // A range asking can have reset dirty bits whose answer is still being
     // published. Wait for it before replacing the standing answer.
     let _all = Asking::hold_all();
-    ask_once_end();
     {
         let mut j = journal_mut();
+        ask_once_end();
         if j.kept || !pieces.is_empty() {
             j.ahead.clear();
             j.kept = false;
@@ -4015,6 +4015,54 @@ mod tests {
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
+    #[test]
+    fn the_one_asking_waits_for_a_reset_to_be_journaled() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        if !once() {
+            return;
+        }
+        // SAFETY: a committed write-watched page, freed after both askers finish.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        let first = p / PAGE;
+        let (waited, noted) = std::thread::scope(|scope| {
+            let range = Asking::hold(first, first + 1);
+            // SAFETY: this is the test's committed page.
+            unsafe { (p as *mut u8).write_volatile(1) };
+            let pages = kernel_written(first, first + 1).expect("write-watched");
+            assert_eq!(pages, [(first, 1)]);
+            let (started, wait_started) = mpsc::channel();
+            let (done, wait_done) = mpsc::channel();
+            let submission = scope.spawn(move || {
+                started.send(()).unwrap();
+                ask_once(&[(p, p + PAGE)]);
+                done.send(()).unwrap();
+            });
+
+            wait_started.recv().unwrap();
+            let waited = matches!(wait_done.recv_timeout(Duration::from_millis(50)), Err(mpsc::RecvTimeoutError::Timeout));
+            let noted = {
+                let mut j = journal_mut();
+                let now = next_asking();
+                j.note(first, pages[0].1, now);
+                now
+            };
+            drop(range);
+            submission.join().unwrap();
+            (waited, noted)
+        });
+        ask_once_end();
+        let reported = journal().written.get(&first).copied();
+        // SAFETY: no asker is using this reservation anymore.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        assert!(waited, "the submission finished before the earlier answer was journaled");
+        assert_eq!(reported, Some(noted));
+    }
+
     /// The runtime maps a view and then tells us; a copy's refresh on another
     /// thread can guard it in between. Told, it is the title's to write: a
     /// block left read-only and forgotten would be an access violation in
@@ -5145,8 +5193,9 @@ mod many_askers_tests {
     use windows_sys::Win32::System::Memory::*;
 
     /// Threads that write pages and ask about overlapping ranges at the same
-    /// time: whoever wrote a page before asking is told of that write (by
-    /// its own asking or by one that took the kernel's answer before it).
+    /// time, with one more asker on a disjoint span of the same reservation.
+    /// Whoever wrote a page before asking is told of that write (by its own
+    /// asking or by one that took the kernel's answer before it).
     #[test]
     fn no_write_is_lost_between_askers() {
         const MEM_WRITE_WATCH: u32 = 0x20_0000;
@@ -5154,11 +5203,14 @@ mod many_askers_tests {
         const THREADS: usize = 8;
         // SAFETY: a reservation of our own, freed at the end.
         let at = unsafe {
-            VirtualAlloc(std::ptr::null(), PAGES * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+            VirtualAlloc(std::ptr::null(), 2 * PAGES * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
         } as usize;
         assert!(at != 0 && at.is_multiple_of(PAGE));
+        let start = std::sync::Barrier::new(THREADS + 1);
         std::thread::scope(|s| {
-            for t in 0..THREADS {
+            for t in 0..=THREADS {
+                let at = if t == THREADS { at + PAGES * PAGE } else { at };
+                let start = &start;
                 s.spawn(move || {
                     let mut last = [0u64; PAGES];
                     let mut seed = t as u64 * 7919 + 1;
@@ -5166,6 +5218,7 @@ mod many_askers_tests {
                         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
                         (seed >> 33) as usize % n
                     };
+                    start.wait();
                     for _ in 0..4000 {
                         let page = next(PAGES);
                         let from = page - next(page.min(12) + 1);
