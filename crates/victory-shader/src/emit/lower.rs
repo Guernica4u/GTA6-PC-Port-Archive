@@ -2811,9 +2811,11 @@ impl<'a> Lower<'a> {
         match v.omod {
             0 => {}
             k => {
-                // On gfx1035 an unscaled zero or denormal becomes +0.
-                // div:2 of the lowest normal binade gives a zero of its sign,
-                // even when rounding the half to f32 would give a normal.
+                // On the flushed result; an unscaled zero or denormal becomes +0
+                // (measured on RDNA2 by the Leonida project, gfx1031/gfx1036,
+                // with IEEE mode off). On gfx1035 (AnyPS5 #567), div:2 of the
+                // lowest normal binade gives a zero of its sign, even when
+                // rounding the half to f32 would give a normal.
                 let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(k)];
                 let c = self.cur;
                 let factor = self.s.m.f32(factor.to_bits());
