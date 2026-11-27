@@ -335,10 +335,7 @@ impl Shadow {
             // this submission's host bytes instead, so its later GPU writes
             // remain distinguishable from the title's.
             let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-            for page in address / PAGE..(address + len).div_ceil(PAGE) {
-                if !t.changed(page) {
-                    continue;
-                }
+            t.save_missing_host(address, address + len, |page| {
                 let (from, to) = ((page * PAGE).max(start), ((page + 1) * PAGE).min(end));
                 let mut bytes = vec![0; PAGE].into_boxed_slice();
                 // SAFETY: `from..to` is inside this copy's persistent mapping.
@@ -346,8 +343,8 @@ impl Shadow {
                     std::slice::from_raw_parts(self.data.add(from - start), to - from)
                 };
                 bytes[from - page * PAGE..to - page * PAGE].copy_from_slice(host);
-                t.save_host(page, bytes);
-            }
+                bytes
+            });
             return;
         }
         let (from, to) = self.inside(address, len);
