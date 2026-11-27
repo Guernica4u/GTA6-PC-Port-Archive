@@ -2057,7 +2057,7 @@ impl<'a> Lower<'a> {
     fn dot4_i8(&mut self, acc: V, a: V, b: V) -> V {
         let c = self.cur;
         let (ka, kb) = (self.s.m.known_i32(a), self.s.m.known_i32(b));
-        let (x, k) = match (ka, kb) {
+        let (x, kx, k) = match (ka, kb) {
             (None, None) => {
                 let i32_ty = self.s.t.i32;
                 return self.s.op(
@@ -2069,8 +2069,8 @@ impl<'a> Lower<'a> {
                     &[acc, a, b],
                 );
             }
-            (Some(k), None) => (b, k),
-            (_, Some(k)) => (a, k),
+            (Some(k), None) => (b, None, k),
+            (_, Some(k)) => (a, ka, k),
         };
         let mut dot = acc;
         for t in 0..4u8 {
@@ -2078,7 +2078,7 @@ impl<'a> Lower<'a> {
             if byte == 0 {
                 continue;
             }
-            let p = match self.s.m.known_i32(x) {
+            let p = match kx {
                 Some(x) => {
                     let p = i32::from((x >> (8 * t)) as i8) * byte;
                     self.s.m.i32(p as u32)
