@@ -11,7 +11,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
-use super::shader::{Shader, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, flags};
+use super::shader::{
+    Shader, VIEW_INTEGER, VIEW_SIGNED, VIEW_SRGB, VIEW_STRIDE_BITS, VIEW_STRIDES, flags,
+};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
@@ -4613,13 +4615,36 @@ impl<'a> Lower<'a> {
     }
 
     /// Dword `index` of the view-stride table: the stride and the format
-    /// kind bits ([`VIEW_INTEGER`], [`VIEW_SIGNED`]).
+    /// kind bits ([`VIEW_INTEGER`], [`VIEW_SIGNED`], [`VIEW_SRGB`]).
     fn view_word(&mut self, index: V) -> V {
         let c = self.cur;
         let four = self.s.m.i32(4);
         let at = self.s.m.bin(c, Bin::Mul, index, four);
         let table = self.s.root_srv_handle(VIEW_STRIDES);
         self.raw_dword(table, at)
+    }
+
+    /// IEC 61966-2-1 linear-to-sRGB transfer function for one float channel:
+    /// clamps to `[0, 1]` (NaN to 0), uses `12.92 * c` for `c <= 0.0031308`,
+    /// and `1.055 * exp2(log2(fmax(c, 1e-12)) / 2.4) - 0.055` otherwise.
+    fn linear_to_srgb(&mut self, v: V) -> V {
+        let c = self.unary(7, v);
+        let cur = self.cur;
+        let threshold = self.s.m.f32(0.003_130_8f32.to_bits());
+        let scale_lo = self.s.m.f32(12.92f32.to_bits());
+        let eps = self.s.m.f32(1e-12f32.to_bits());
+        let gamma = self.s.m.f32(2.4f32.to_bits());
+        let scale_hi = self.s.m.f32(1.055f32.to_bits());
+        let bias = self.s.m.f32(0.055f32.to_bits());
+        let lo = self.s.m.bin(cur, Bin::Mul, c, scale_lo);
+        let safe = self.binary(35, c, eps);
+        let lg = self.unary(23, safe);
+        let scaled = self.s.m.bin(cur, Bin::SDiv, lg, gamma);
+        let pw = self.unary(21, scaled);
+        let hi_mul = self.s.m.bin(cur, Bin::Mul, pw, scale_hi);
+        let hi = self.s.m.bin(cur, Bin::Sub, hi_mul, bias);
+        let is_lo = self.s.m.cmp(cur, pred::OLE, c, threshold);
+        self.s.m.select(cur, is_lo, lo, hi)
     }
 
     /// Whether the typed buffer view a handle names has an integer format,
@@ -5558,7 +5583,9 @@ impl<'a> Lower<'a> {
         let (iu, mask) = (self.s.m.undef(self.s.t.i32), self.s.m.i8(1));
         let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[table, at, iu, mask, four]);
         let x = self.s.m.extract(c, r, 0);
-        let stride = self.as_int(x);
+        let word = self.as_int(x);
+        let bits = self.s.m.i32(VIEW_STRIDE_BITS);
+        let stride = self.s.m.bin(c, Bin::And, word, bits);
         let zero = self.s.m.i32(0);
         let none = self.s.m.cmp(c, pred::EQ, stride, zero);
         // The null unordered access view sits just below the null SRV.
@@ -8620,6 +8647,33 @@ impl<'a> Lower<'a> {
             }
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
+            if let Some(idx) = self.s.texture_uav_index(h) {
+                let word = self.view_word(idx);
+                let head = self.cur;
+                let bit = self.s.m.i32(VIEW_SRGB);
+                let zero = self.s.m.i32(0);
+                let masked = self.s.m.bin(head, Bin::And, word, bit);
+                let is_srgb = self.s.m.cmp(head, pred::NE, masked, zero);
+                let srgb_bb = self.s.m.new_block();
+                let merge_bb = self.s.m.new_block();
+                self.s
+                    .m
+                    .terminate(head, Term::CondBr(is_srgb, srgb_bb, merge_bb));
+                self.cur = srgb_bb;
+                let mut encoded = [vals[0]; 3];
+                for (slot, &v) in encoded.iter_mut().zip(&vals[..3]) {
+                    *slot = self.linear_to_srgb(v);
+                }
+                let srgb_end = self.cur;
+                self.s.m.terminate(srgb_end, Term::Br(merge_bb));
+                self.cur = merge_bb;
+                let f32t = self.s.t.f32;
+                for (val, enc) in vals[..3].iter_mut().zip(encoded) {
+                    let phi = self.s.m.phi(merge_bb, f32t);
+                    self.s.m.set_phi(phi, vec![(*val, head), (enc, srgb_end)]);
+                    *val = phi;
+                }
+            }
             let mut args = vec![h];
             args.extend(cs);
             args.extend(vals);
