@@ -121,13 +121,14 @@ def instrument_paired(hlsl):
     if not start or "tb_pair" not in hlsl or "[WaveSize(32)]" not in hlsl or "WaveActiveBallot" not in hlsl:
         raise ValueError("fixture must take the paired translation")
     lanes = [f"(tb_first + tb_pair + {32 * half}u)" for half in (0, 1)]
-    load = "".join(f"    uint input{half} = output[{lanes[half]}];\n    v0__{half} = input{half} & 0x7fffffffu;\n"
+    load = "".join(f"    uint input{half} = output[{lanes[half]}];\n    v0__[{half}] = input{half} & 0x7fffffffu;\n"
                    for half in (0, 1))
     load += ("    exec_lo = WaveActiveBallot((input0 >> 31) != 0u).x;\n"
              "    exec_hi = WaveActiveBallot((input1 >> 31) != 0u).x;\n")
     stores = ""
     for half in (0, 1):
-        low, high, last = (f"v{n}__{half}" if re.search(rf"\bv{n}__{half}\b", hlsl) else "0u" for n in (10, 11, 12))
+        # A register the program never touches is not declared.
+        low, high, last = (f"v{n}__[{half}]" if re.search(rf"\bv{n}__\b", hlsl) else "0u" for n in (10, 11, 12))
         stores += (f"    output[64u + {lanes[half]}] = {low} | ({high} << 8u) | ((WaveGetLaneCount() * 2u) << 16u);\n"
                    f"    output[128u + {lanes[half]}] = {last};\n")
     hlsl = hlsl[:start.end()] + load + hlsl[start.end():]

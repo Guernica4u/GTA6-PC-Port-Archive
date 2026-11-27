@@ -353,13 +353,14 @@ def instrument(hlsl, threads):
     assert start and '[WaveSize(32)]' in hlsl, 'unexpected prologue'
     # A group holds whole console waves, or the started half of one.
     index = [f'(gid.x * {max(threads, 64)}u + tb_first + tb_pair + {32 * h}u)' for h in (0, 1)]
-    load = ''.join(f'    v0__{h} = tb_in.Load({index[h]} * 4u); v1__{h} = tb_pair + {32 * h}u; '
-                   f'v2__{h} = {index[h]} / 64u;\n' for h in (0, 1))
+    load = ''.join(f'    v0__[{h}] = tb_in.Load({index[h]} * 4u); v1__[{h}] = tb_pair + {32 * h}u; '
+                   f'v2__[{h}] = {index[h]} / 64u;\n' for h in (0, 1))
     stores = ''
     for column, register in enumerate(OUTPUTS):
         for h in (0, 1):
-            name = f'{register}__{h}' if register[0] == 'v' else register
-            value = name if re.search(rf'\b{name} = ', hlsl) else '0u'
+            name = f'{register}__[{h}]' if register[0] == 'v' else register
+            written = rf'\b{register}__\[\w+\] = ' if register[0] == 'v' else rf'\b{name} = '
+            value = name if re.search(written, hlsl) else '0u'
             stores += f'    tb_out.Store(({index[h]} * 4u + {column}u) * 4u, {value});\n'
     hlsl = hlsl[:start.end()] + load + hlsl[start.end():]
     if 'ResourceDescriptorHeap' in hlsl:

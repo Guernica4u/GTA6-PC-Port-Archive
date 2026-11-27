@@ -134,7 +134,7 @@ pub(super) fn prologue(em: &Emitter<'_>, header: &mut String, group_register: us
     let mut names = Vec::new();
     for register in &em.regs {
         if is_vector_register(register) {
-            names.push(format!("{register}__0 = 0u, {register}__1 = 0u"));
+            names.push(format!("{register}__[2] = {{0u, 0u}}"));
         } else if register == "tb_fp_mode" {
             names.push(format!("{register} = 0xc0u"));
         } else {
@@ -146,17 +146,30 @@ pub(super) fn prologue(em: &Emitter<'_>, header: &mut String, group_register: us
     let _ = writeln!(header, "    uint tb_pair = WaveGetLaneIndex(), tb_first = (gtid.x / 32u) * 64u;");
     for lane in 0..2 {
         let flat = format!("(tb_first + tb_pair + {}u)", 32 * lane);
-        let _ = writeln!(header, "    v0__{lane} = {flat} % {x}u; v1__{lane} = ({flat} / {x}u) % {y}u; v2__{lane} = {flat} / {}u;", x * y);
+        let _ = writeln!(header, "    v0__[{lane}] = {flat} % {x}u; v1__[{lane}] = ({flat} / {x}u) % {y}u; v2__[{lane}] = {flat} / {}u;", x * y);
     }
     let g = group_register;
     let _ = writeln!(header, "    s{} = gid.x; s{} = gid.y; s{} = gid.z;", g, g + 1, g + 2);
 }
 
-/// Whether the text after an identifier assigns to it (`=`, `+=`, `<<=` and the like, not `==`).
-fn assigns(after: &str) -> bool {
-    let after = after.trim_start();
-    !after.starts_with("==")
-        && ["=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="].iter().any(|op| after.starts_with(op))
+/// `code` with each vector register replaced by the copy of it that lane `tb_h` holds.
+fn lane_registers(code: &str) -> String {
+    let mut out = String::with_capacity(code.len() + code.len() / 4);
+    for line in code.lines() {
+        let mut at = 0;
+        // `identifiers` yields each name with the rest of its line.
+        for (word, after) in identifiers(line) {
+            let end = line.len() - after.len();
+            out.push_str(&line[at..end]);
+            if is_vector_register(word) {
+                out.push_str("__[tb_h]");
+            }
+            at = end;
+        }
+        out.push_str(&line[at..]);
+        out.push('\n');
+    }
+    out
 }
 
 fn is_vector_register(name: &str) -> bool {
@@ -233,7 +246,7 @@ fn read_lane(em: &mut Emitter<'_>, destination: &Opnd, source: &Opnd, leader: &s
     em.touch(source);
     let to = name(destination)?;
     let value = match source {
-        Opnd::Vgpr(n) => format!("{to} = tb_leader < 32u ? WaveReadLaneAt(v{n}__0, tb_leader) : WaveReadLaneAt(v{n}__1, tb_leader - 32u);"),
+        Opnd::Vgpr(n) => format!("{to} = tb_leader < 32u ? WaveReadLaneAt(v{n}__[0], tb_leader) : WaveReadLaneAt(v{n}__[1], tb_leader - 32u);"),
         other => format!("{to} = {};", r(other)?),
     };
     // A heap index read from a wave with no active lane becomes slot 0.
@@ -253,7 +266,7 @@ const MOVED: u16 = 60000;
 fn from_lane(register: u32, prefix: &str, lane: u32, partner: &str) -> [String; 3] {
     [
         format!("uint tb_from{lane} = {partner};"),
-        format!("uint tb_low{lane} = WaveReadLaneAt(v{register}__0, tb_from{lane} & 31u), tb_high{lane} = WaveReadLaneAt(v{register}__1, tb_from{lane} & 31u);"),
+        format!("uint tb_low{lane} = WaveReadLaneAt(v{register}__[0], tb_from{lane} & 31u), tb_high{lane} = WaveReadLaneAt(v{register}__[1], tb_from{lane} & 31u);"),
         format!("uint {prefix}{lane} = tb_from{lane} < 32u ? tb_low{lane} : tb_high{lane};"),
     ]
 }
@@ -344,7 +357,7 @@ fn permlane(em: &mut Emitter<'_>, ins: &Insn) -> Result<(), String> {
     // Both lanes are read before either is written. An inactive source keeps the destination.
     for lane in 0..2u32 {
         let active = lane_bit("exec_lo", "exec_hi", lane);
-        em.line(&format!("if ({active} != 0u && {}) v{to}__{lane} = tbp_{lane};", source_active(lane)));
+        em.line(&format!("if ({active} != 0u && {}) v{to}__[{lane}] = tbp_{lane};", source_active(lane)));
     }
     em.line("}");
     Ok(())
@@ -376,7 +389,7 @@ fn ds_swizzle(em: &mut Emitter<'_>, ins: &Insn) -> Result<(), String> {
     // Both lanes are read before either is written.
     for lane in 0..2u32 {
         let active = lane_bit("exec_lo", "exec_hi", lane);
-        em.line(&format!("if ({active} != 0u) v{to}__{lane} = tbs_{lane};"));
+        em.line(&format!("if ({active} != 0u) v{to}__[{lane}] = tbs_{lane};"));
     }
     em.line("}");
     Ok(())
@@ -411,8 +424,8 @@ pub(super) fn emit(em: &mut Emitter<'_>, idx: usize, ins: &Insn, is_ps: bool, br
         "v_writelane_b32" => {
             let Some(Opnd::Vgpr(n)) = destination else { return Err("paired wave64: writelane destination".into()) };
             let (value, lane) = (r(&ins.src[0])?, r(&ins.src[1])?);
-            em.line(&format!("if ((({lane}) & 63u) == tb_pair) v{n}__0 = {value};"));
-            em.line(&format!("if ((({lane}) & 63u) == tb_pair + 32u) v{n}__1 = {value};"));
+            em.line(&format!("if ((({lane}) & 63u) == tb_pair) v{n}__[0] = {value};"));
+            em.line(&format!("if ((({lane}) & 63u) == tb_pair + 32u) v{n}__[1] = {value};"));
             return Ok(());
         }
         "v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32" => {
@@ -421,7 +434,7 @@ pub(super) fn emit(em: &mut Emitter<'_>, idx: usize, ins: &Insn, is_ps: bool, br
             let mask = r(&ins.src[0])?;
             for lane in 0..2u32 {
                 let add = match &ins.src[1] {
-                    Opnd::Vgpr(a) => format!("v{a}__{lane}"),
+                    Opnd::Vgpr(a) => format!("v{a}__[{lane}]"),
                     other => r(other)?,
                 };
                 let below = match (m.ends_with("lo_u32_b32"), lane) {
@@ -431,7 +444,7 @@ pub(super) fn emit(em: &mut Emitter<'_>, idx: usize, ins: &Insn, is_ps: bool, br
                     (false, _) => "((1u << tb_pair) - 1u)",
                 };
                 let active = lane_bit("exec_lo", "exec_hi", lane);
-                em.line(&format!("if ({active} != 0u) v{n}__{lane} = {add} + countbits(({mask}) & {below});"));
+                em.line(&format!("if ({active} != 0u) v{n}__[{lane}] = {add} + countbits(({mask}) & {below});"));
             }
             return Ok(());
         }
@@ -515,12 +528,6 @@ pub(super) fn emit(em: &mut Emitter<'_>, idx: usize, ins: &Insn, is_ps: bool, br
     if used.is_empty() && written.is_empty() {
         return Ok(());
     }
-    let vectors: BTreeSet<&str> = used.iter().copied().filter(|w| is_vector_register(w)).collect();
-    // A register the code may change: assigned, or handed to a call that returns through it.
-    let returns = |line: &str| line.contains("Interlocked") || line.contains("GetDimensions") || line.contains("out ");
-    let changed: BTreeSet<&str> = identifiers(&code).filter(|(_, after)| assigns(after)).map(|(word, _)| word)
-        .chain(code.lines().filter(|line| returns(line)).flat_map(|line| identifiers(line).map(|(word, _)| word)))
-        .filter(|w| vectors.contains(w)).collect();
     // A lane needs its bit of a mask only if the code names the mask.
     let mut shadowed: Vec<[String; 2]> = read.iter().filter(|w| w.iter().any(|n| used.contains(n.as_str()))).cloned().collect();
     for words in &written {
@@ -538,49 +545,70 @@ pub(super) fn emit(em: &mut Emitter<'_>, idx: usize, ins: &Insn, is_ps: bool, br
     for words @ [low, high] in &shadowed {
         // A mask the instruction only writes starts clear and needs no copy.
         if read.contains(words) {
-            em.line(&format!("uint tbx_{low} = {low}, tbx_{high} = {high};"));
+            em.line(&format!("uint tbx_{low}[2] = {{{low}, {high}}};"));
         }
     }
     if !written.is_empty() && !shadowed.contains(&exec) {
         // Rebuilt masks keep to the lanes that were active.
-        em.line("uint tbx_exec_lo = exec_lo, tbx_exec_hi = exec_hi;");
+        em.line("uint tbx_exec_lo[2] = {exec_lo, exec_hi};");
     }
     for [low, _] in &written {
-        em.line(&format!("bool tbm_{low}_0 = false, tbm_{low}_1 = false;"));
+        em.line(&format!("bool tbm_{low}[2] = {{false, false}};"));
     }
-    for lane in 0..2u32 {
-        em.line("{");
-        for words @ [low, high] in &shadowed {
-            // A mask the instruction only writes starts clear in every lane.
-            let value = if gated && low == "exec_lo" {
-                format!("{} & tbw_{lane}", lane_bit("tbx_exec_lo", "tbx_exec_hi", lane))
-            } else if read.contains(words) {
-                lane_bit(&format!("tbx_{low}"), &format!("tbx_{high}"), lane)
-            } else {
-                "0u".into()
-            };
-            em.line(&format!("uint {low} = {value}, {high} = 0u;"));
+    // The code is written once and expanded for each lane the thread holds, on that
+    // lane's registers. A loop over the lanes costs DXC far more than two copies do.
+    let mut lane = String::new();
+    for words @ [low, high] in &shadowed {
+        // A mask the instruction only writes starts clear in every lane.
+        let bit = format!("(tbx_{low}[tb_h] >> tb_pair) & 1u");
+        let value = if gated && low == "exec_lo" {
+            format!("{bit} & (tb_h == 0u ? tbw_0 : tbw_1)")
+        } else if read.contains(words) {
+            bit
+        } else {
+            "0u".into()
+        };
+        // The upper word of a lane's own mask is zero; declare it only for code that names it.
+        if written.contains(words) || used.contains(high.as_str()) {
+            let _ = writeln!(lane, "    uint {low} = {value}, {high} = 0u;");
+        } else {
+            let _ = writeln!(lane, "    uint {low} = {value};");
         }
-        for vector in &vectors {
-            em.regs.insert((*vector).to_string());
-            em.line(&format!("uint {vector} = {vector}__{lane};"));
+    }
+    if moved.is_some() {
+        let _ = writeln!(lane, "    uint {} = tb_h == 0u ? tbd_0 : tbd_1;", name(&Opnd::Temp(MOVED))?);
+    }
+    for vector in used.iter().filter(|w| is_vector_register(w)) {
+        em.regs.insert((*vector).to_string());
+    }
+    lane.push_str(&lane_registers(&code));
+    for [low, _] in &written {
+        let _ = writeln!(lane, "    tbm_{low}[tb_h] = ({low} & 1u) != 0u;");
+    }
+    if lane.lines().any(|line| line.trim_start().starts_with('#')) {
+        // A directive cannot sit inside a macro.
+        for index in 0..2 {
+            em.line(&format!("{{ const uint tb_h = {index}u;"));
+            em.body.push_str(&lane);
+            em.line("}");
         }
-        if moved.is_some() {
-            em.line(&format!("uint {} = tbd_{lane};", name(&Opnd::Temp(MOVED))?));
-        }
-        em.body.push_str(&code);
-        for vector in &changed {
-            em.line(&format!("{vector}__{lane} = {vector};"));
-        }
-        for [low, _] in &written {
-            em.line(&format!("tbm_{low}_{lane} = ({low} & 1u) != 0u;"));
+    } else {
+        // A name of its own for each copy, so none needs undefining. An instruction can
+        // be written more than once, for each descriptor it may name.
+        let idx = em.tmp;
+        em.tmp += 1;
+        em.line(&format!("#define TB_L{idx}(tb_h) {{ \\"));
+        for line in lane.lines() {
+            em.body.push_str(line);
+            em.body.push_str(" \\\n");
         }
         em.line("}");
+        em.line(&format!("TB_L{idx}(0u) TB_L{idx}(1u)"));
     }
     for [low, high] in &written {
         // Inactive lanes write zero. A compare into EXEC already includes the old mask.
-        let (a, b) = (format!("WaveActiveBallot(tbm_{low}_0).x"), format!("WaveActiveBallot(tbm_{low}_1).x"));
-        em.line(&format!("{low} = {a} & tbx_exec_lo; {high} = {b} & tbx_exec_hi;"));
+        let (a, b) = (format!("WaveActiveBallot(tbm_{low}[0]).x"), format!("WaveActiveBallot(tbm_{low}[1]).x"));
+        em.line(&format!("{low} = {a} & tbx_exec_lo[0]; {high} = {b} & tbx_exec_lo[1];"));
     }
     em.line("}");
     Ok(())
