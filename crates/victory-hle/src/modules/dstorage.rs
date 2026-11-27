@@ -630,6 +630,14 @@ fn scheduler() -> Option<&'static Scheduler> {
         .as_ref()?;
     STARTED.call_once(|| {
         let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        // `VICTORY_DSTORAGE_WORKERS=<n>`: fewer workers than the CPU's threads (at most that many;
+        // the file handles stay one a CPU thread). On a Ryzen 7 5700X the title stopped itself
+        // at the start after a batch of reads whenever all sixteen ran freely.
+        let workers = std::env::var("VICTORY_DSTORAGE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .map_or(workers, |n| n.min(workers));
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
