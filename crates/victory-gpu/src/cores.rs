@@ -76,6 +76,7 @@ fn stage() -> u32 {
 /// the fast cores only, where the processor has two kinds. (A selection of
 /// processors is a preference the scheduler keeps unless nothing of it is
 /// free.) The title's threads are not asked for.
+#[allow(dead_code)]
 pub(crate) fn keep_on_fast_cores(what: &str) {
     ask(what, 1);
 }
