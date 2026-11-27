@@ -114,6 +114,8 @@ impl<'a> Emitter<'a> {
             msel: HashMap::new(),
             bsel: HashMap::new(),
             dsel_loads: HashMap::new(),
+            size_reads: BTreeSet::new(),
+            count_reads: BTreeMap::new(),
             dsel_runtime: HashMap::new(),
             dsel_moves: HashMap::new(),
             live: Vec::new(),

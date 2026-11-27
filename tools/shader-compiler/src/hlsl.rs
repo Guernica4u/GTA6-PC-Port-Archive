@@ -124,6 +124,8 @@ mod sampler_heap;
 mod lane_reads;
 mod heap_offsets;
 mod heap_origins;
+mod operand_fields;
+mod descriptor_size;
 use sampler_heap::DirectSampler;
 mod reflection_probe;
 mod wave_scan;
@@ -197,6 +199,8 @@ enum Sym {
     /// A PC-relative pointer into the shader's own code section (`s_getpc_b64` + offsets),
     /// used to read constant tables embedded after the program.
     Code,
+    /// See `descriptor_size`. Kept under `descriptor_size::KEY` + the register.
+    Size(descriptor_size::SizePart),
 }
 
 /// An image op whose texture and/or sampler register holds one of several descriptors.
@@ -337,6 +341,11 @@ struct Emitter<'a> {
     /// Descriptor loads `(base register, descriptor id)` and base-dword moves `(dst, src)`
     /// per instruction, for maintaining the run-time `tb_dsel<reg>` selectors.
     dsel_loads: HashMap<usize, (u16, u32)>,
+    /// Descriptors whose size fields the program reads (`descriptor_size`).
+    size_reads: BTreeSet<u32>,
+    /// Buffer descriptors whose record count the program reads, and whether some
+    /// read is certain (`descriptor_size`).
+    count_reads: BTreeMap<u32, bool>,
     dsel_runtime: HashMap<usize, (u16, u8, u8, u32)>,
     dsel_moves: HashMap<usize, (u16, u16)>,
     /// Registers read before written (entry ABI), from `live_in`.
