@@ -173,6 +173,9 @@ pub extern "system" fn XMemVirtualAlloc(
             );
         }
     }
+    if !at.is_null() && kind & MEM_COMMIT != 0 && kind & MEM_WRITE_WATCH != 0 {
+        touch_diag::track(at as usize, size);
+    }
     if base.is_null() {
         tracing::debug!(
             size,
@@ -1656,6 +1659,243 @@ pub mod low_guards {
                 VirtualFree(taken as *mut _, 0, MEM_RELEASE);
                 VirtualFree((hole + GRANULE) as *mut _, 0, MEM_RELEASE);
             }
+        }
+    }
+}
+
+/// Opt-in diagnostic (`VICTORY_XMEM_TOUCH_DIAG=1`) measuring how much of the
+/// title's committed write-watched `XMemVirtualAlloc` memory is ever written
+/// (`GetWriteWatch(0, ...)`, non-destructive so GPU write-watch state is never
+/// disturbed). Reports every 30 s alongside process commit and working set.
+mod touch_diag {
+    use std::collections::BTreeMap;
+    use std::ffi::c_void;
+    use std::sync::{LazyLock, Mutex, Once};
+    use std::time::Duration;
+
+    use windows_sys::Win32::System::Memory::{
+        GetWriteWatch, MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQueryEx,
+    };
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    const REPORT_INTERVAL: Duration = Duration::from_secs(30);
+    const PAGE_BYTES: usize = 4096;
+
+    static TRACKED: LazyLock<Mutex<BTreeMap<usize, usize>>> =
+        LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+    fn enabled_for(val: Option<&str>) -> bool {
+        val.is_some_and(|v| {
+            let v = v.trim();
+            !v.is_empty() && v != "0"
+        })
+    }
+
+    fn enabled() -> bool {
+        static ON: LazyLock<bool> = LazyLock::new(|| {
+            !cfg!(test) && enabled_for(std::env::var("VICTORY_XMEM_TOUCH_DIAG").ok().as_deref())
+        });
+        *ON
+    }
+
+    pub(super) fn track(base: usize, len: usize) {
+        if !enabled() || base == 0 || len == 0 {
+            return;
+        }
+        TRACKED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(base, len);
+        static SPAWN: Once = Once::new();
+        SPAWN.call_once(|| {
+            let _ = std::thread::Builder::new()
+                .name("xmem-touch-diag".into())
+                .spawn(reporter_loop);
+        });
+    }
+
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct TouchSummary {
+        regions: usize,
+        committed_bytes: usize,
+        touched_bytes: usize,
+        untouched_bytes: usize,
+    }
+
+    /// Inspects one write-watched committed region without resetting watch bits.
+    /// Returns `None` if the region has been freed or decommitted.
+    fn inspect_region(base: usize, len: usize) -> Option<(usize, usize)> {
+        let mut mbi = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: querying current process VA metadata only.
+        let queried = unsafe {
+            VirtualQueryEx(
+                GetCurrentProcess(),
+                base as *const c_void,
+                &mut mbi,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if queried == 0 || mbi.State != MEM_COMMIT || mbi.AllocationBase as usize != base {
+            return None;
+        }
+        let committed = mbi.RegionSize.min(len);
+        if committed == 0 {
+            return None;
+        }
+        let max_pages = committed.div_ceil(PAGE_BYTES).max(1);
+        let mut addrs = vec![std::ptr::null_mut::<c_void>(); max_pages];
+        let mut count = max_pages;
+        let mut granularity = 0u32;
+        // Flag 0 = non-destructive query (does not reset write-watch bits).
+        // SAFETY: `base..base+committed` is a live committed write-watched region.
+        let rc = unsafe {
+            GetWriteWatch(
+                0,
+                base as *const c_void,
+                committed,
+                addrs.as_mut_ptr(),
+                &mut count,
+                &mut granularity,
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+        let page = (granularity as usize).max(PAGE_BYTES);
+        let touched = count.saturating_mul(page).min(committed);
+        Some((committed, touched))
+    }
+
+    fn snapshot_map(tracked: &Mutex<BTreeMap<usize, usize>>) -> TouchSummary {
+        let entries: Vec<(usize, usize)> = tracked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(&b, &l)| (b, l))
+            .collect();
+        let mut summary = TouchSummary::default();
+        let mut stale = Vec::new();
+        for (base, len) in entries {
+            match inspect_region(base, len) {
+                Some((committed, touched)) => {
+                    summary.regions += 1;
+                    summary.committed_bytes = summary.committed_bytes.saturating_add(committed);
+                    summary.touched_bytes = summary.touched_bytes.saturating_add(touched);
+                }
+                None => stale.push(base),
+            }
+        }
+        summary.untouched_bytes = summary.committed_bytes.saturating_sub(summary.touched_bytes);
+        if !stale.is_empty() {
+            let mut g = tracked.lock().unwrap_or_else(|e| e.into_inner());
+            for base in stale {
+                g.remove(&base);
+            }
+        }
+        summary
+    }
+
+    fn process_memory() -> Option<(usize, usize)> {
+        let mut counters = PROCESS_MEMORY_COUNTERS::default();
+        // SAFETY: querying current process memory counters.
+        let ok = unsafe {
+            K32GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                &mut counters,
+                size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            )
+        };
+        (ok != 0).then_some((counters.PagefileUsage, counters.WorkingSetSize))
+    }
+
+    fn reporter_loop() {
+        loop {
+            std::thread::sleep(REPORT_INTERVAL);
+            let s = snapshot_map(&TRACKED);
+            if s.regions == 0 {
+                continue;
+            }
+            let to_mib = |b: usize| b as f64 / (1024.0 * 1024.0);
+            let untouched_pct = if s.committed_bytes > 0 {
+                (s.untouched_bytes as f64 / s.committed_bytes as f64) * 100.0
+            } else {
+                0.0
+            };
+            let (proc_commit, proc_ws) = process_memory().unwrap_or((0, 0));
+            tracing::info!(
+                regions = s.regions,
+                committed_mib = format_args!("{:.1}", to_mib(s.committed_bytes)),
+                touched_mib = format_args!("{:.1}", to_mib(s.touched_bytes)),
+                untouched_mib = format_args!("{:.1}", to_mib(s.untouched_bytes)),
+                untouched_pct = format_args!("{:.1}%", untouched_pct),
+                proc_commit_mib = format_args!("{:.1}", to_mib(proc_commit)),
+                proc_ws_mib = format_args!("{:.1}", to_mib(proc_ws)),
+                "xmem commit vs touched"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use windows_sys::Win32::System::Memory::{
+            MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+
+        #[test]
+        fn env_flag_defaults_off_and_accepts_non_zero() {
+            assert!(!enabled_for(None));
+            assert!(!enabled_for(Some("")));
+            assert!(!enabled_for(Some("0")));
+            assert!(enabled_for(Some("1")));
+            assert!(enabled_for(Some("true")));
+        }
+
+        #[test]
+        fn snapshot_counts_touched_vs_untouched_without_resetting_and_prunes_freed() {
+            const LEN: usize = 16 * PAGE_BYTES;
+            // SAFETY: fresh write-watched allocation for test.
+            let base = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    LEN,
+                    MEM_RESERVE | MEM_COMMIT | super::super::MEM_WRITE_WATCH,
+                    PAGE_READWRITE,
+                )
+            } as usize;
+            assert_ne!(base, 0);
+
+            let map = Mutex::new(BTreeMap::from([(base, LEN)]));
+            let before = snapshot_map(&map);
+            assert_eq!(before.regions, 1);
+            assert_eq!(before.committed_bytes, LEN);
+            assert_eq!(before.touched_bytes, 0);
+            assert_eq!(before.untouched_bytes, LEN);
+
+            // Touch 3 distinct 4 KiB pages.
+            // SAFETY: inside our committed LEN-byte allocation.
+            unsafe {
+                std::ptr::write_volatile(base as *mut u8, 1);
+                std::ptr::write_volatile((base + 2 * PAGE_BYTES) as *mut u8, 2);
+                std::ptr::write_volatile((base + 7 * PAGE_BYTES) as *mut u8, 3);
+            }
+            let after1 = snapshot_map(&map);
+            assert_eq!(after1.touched_bytes, 3 * PAGE_BYTES);
+            assert_eq!(after1.untouched_bytes, LEN - 3 * PAGE_BYTES);
+
+            // Second snapshot must report the same touched count (non-destructive query).
+            let after2 = snapshot_map(&map);
+            assert_eq!(after2, after1);
+
+            // Freeing the block prunes it cleanly on the next snapshot.
+            // SAFETY: ours.
+            assert_ne!(unsafe { VirtualFree(base as *mut c_void, 0, MEM_RELEASE) }, 0);
+            let freed = snapshot_map(&map);
+            assert_eq!(freed.regions, 0);
+            assert!(map.lock().unwrap().is_empty());
         }
     }
 }
