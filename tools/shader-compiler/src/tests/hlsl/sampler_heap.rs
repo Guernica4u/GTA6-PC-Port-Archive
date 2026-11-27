@@ -560,3 +560,26 @@ fn the_runtimes_private_root_srvs_leave_a_compute_roots_layout_alone() {
         }
     }
 }
+
+#[test]
+fn scalar_load_through_a_root_descriptor_address_is_refused() {
+    // A root SRV's address arrives in s7:s8 (user-data class 1). A scalar load
+    // through it reads the buffer's own words, not a descriptor of a table.
+    let words = [
+        0xbe800307, // s0 = s7
+        0xbe810308, // s1 = s8
+        0xf4000080, 0xfa000000, // s2 = [s0:1 + 0]
+        0x7e000202, // v0 = s2
+        0xbf810000,
+    ];
+    let mut ex = pixel(&words);
+    ex.stage = Stage::Compute;
+    ex.required_features = None;
+    ex.fssm = fssm(&[[1, 0, 2, 5, 0x307]], &[[0x100, 0, 5, 1, 0x30704]]);
+    ex.resources = vec![PsvResource { res_type: 4, space: 7, lower: 5, upper: 5 }];
+    assert!(refusal(&ex).contains("s_load at 0x8: base s7 is a root descriptor address"));
+    // The same load through a register no record names is a table fetch, as before.
+    ex.fssm = fssm(&[], &[]);
+    ex.resources.clear();
+    assert!(super::super::translate(&ex).is_ok());
+}

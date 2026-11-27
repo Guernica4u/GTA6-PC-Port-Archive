@@ -1,5 +1,5 @@
 //! Device memory heaps and resources sharing their native GPU allocation.
-mod backing;
+pub(in super::super) mod backing;
 mod import;
 mod shadow;
 mod virtual_place;
@@ -46,6 +46,63 @@ fn strict_buffer_import() -> bool {
 }
 
 const IMPORTED_HEAP: GUID = GUID::from_u128(0xc2a3c751_1d00_470c_8efd_5da145efd165);
+const IMPORTED_BACKING: GUID = GUID::from_u128(0x8e4b912c_7a3f_4d9e_b512_6c8a0f3d2e19);
+
+struct BackingGuard {
+    _shadow: Option<Arc<shadow::ShadowPages>>,
+    _backing: Option<backing::Hold>,
+}
+
+impl BackingGuard {
+    fn new(
+        shadow: Option<Arc<shadow::ShadowPages>>,
+        backing: Option<backing::Hold>,
+    ) -> Option<Arc<Self>> {
+        if shadow.is_none() && backing.is_none() {
+            return None;
+        }
+        Some(Arc::new(Self { _shadow: shadow, _backing: backing }))
+    }
+}
+
+unsafe extern "system" fn unknown_query<N, S>(
+    this: *mut Proxy<N, S>,
+    iid: *const GUID,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    unsafe { out.write(core::ptr::null_mut()) };
+    if iid.is_null() {
+        return E_POINTER;
+    }
+    if unsafe { iid.read_unaligned() } != windows::core::IUnknown::IID {
+        return windows::Win32::Foundation::E_NOINTERFACE;
+    }
+    unsafe {
+        crate::proxy::add_ref(this);
+        out.write(this.cast());
+    }
+    windows::Win32::Foundation::S_OK
+}
+
+fn attach_heap_guard(
+    heap: &ID3D12Heap,
+    guard: &Arc<BackingGuard>,
+) -> windows::core::Result<()> {
+    static GUARD_SLOTS: Slots<3> = [
+        crate::slot!(unknown_query::<(), Arc<BackingGuard>>),
+        crate::slot!(crate::proxy::add_ref::<(), Arc<BackingGuard>>),
+        crate::slot!(crate::proxy::release::<(), Arc<BackingGuard>>),
+    ];
+    let mut out = core::ptr::null_mut();
+    unsafe {
+        crate::proxy::allocate(&GUARD_SLOTS, &[], (), None, guard.clone(), &mut out).ok()?;
+        let marker = windows::core::IUnknown::from_raw(out);
+        heap.SetPrivateDataInterface(&IMPORTED_BACKING, &marker)
+    }
+}
 
 fn attach_import(resource: &ID3D12Resource, heap: &Arc<ImportedHeap>) -> windows::core::Result<()> {
     static MARKER: Slots<8> = child_slots::<ID3D12Heap, Arc<ImportedHeap>, 8>();
@@ -486,11 +543,12 @@ unsafe fn place_gpu_target(
         crate::diagnostics::watch("device-memory image", address, allocation.SizeInBytes, || format!(
             "{}x{}x{} format={} flags={:#x}", desc.Width, desc.Height, desc.DepthOrArraySize, desc.Format.0, desc.Flags.0));
         let footprint = address.checked_add(allocation.SizeInBytes).ok_or(E_INVALIDARG)?;
-        if validate_shared_range(address, footprint).is_err() {
+        if validate_shared_range(address, footprint).is_err() && !backing::is_backed_range(address, footprint) {
             let base = address & !0xffff;
             let end = footprint.saturating_add(0xffff) & !0xffff;
             if !commit_guest_pages(base, end.saturating_sub(base))
-                || validate_shared_range(address, footprint).is_err() {
+                || (validate_shared_range(address, footprint).is_err()
+                    && !backing::is_backed_range(address, footprint)) {
                 static RESERVED: std::sync::Once = std::sync::Once::new();
                 crate::diagnostics::log_once(&RESERVED, || format!(
                     "placed GPU image at {address:#x} is not committed guest memory; keeping a device image"));

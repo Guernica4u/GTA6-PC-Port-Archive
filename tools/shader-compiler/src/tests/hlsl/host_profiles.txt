@@ -46,3 +46,6 @@ lane-sum two-lanes cs_6_6 waves=32 4166906efc6338dd
 lane-sum-two-waves any-host cs_5_0 waves=64 4a53ee8efb91a78a
 lane-sum-two-waves wave32-host cs_6_6 waves=32 cd5dce9ebe5e393e
 lane-sum-two-waves two-lanes cs_6_6 waves=32 cd5dce9ebe5e393e
+lane-sum-half-wave any-host cs_6_6 waves=32 9644a4d364dc6b39
+lane-sum-half-wave wave32-host cs_6_6 waves=32 9644a4d364dc6b39
+lane-sum-half-wave two-lanes cs_6_6 waves=32 9644a4d364dc6b39
