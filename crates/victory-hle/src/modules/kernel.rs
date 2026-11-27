@@ -373,26 +373,27 @@ pub extern "system" fn VirtualFree(
     }
     let addr = address as usize;
     if free_type & MEM_RELEASE != 0 {
-        let span = crate::modules::xmem::query_allocation_span(addr);
+        let retired = crate::modules::xmem::FreeSnapshot::of(addr);
         let ok = host::virtual_free(address, size, free_type);
         if ok != 0 {
-            crate::modules::xmem::on_virtual_free_release(addr, span);
+            crate::modules::xmem::on_virtual_free_release(retired);
         }
         return ok;
     }
     if free_type & MEM_DECOMMIT != 0 {
         if size == 0 {
-            let span = crate::modules::xmem::query_allocation_span(addr);
+            let retired = crate::modules::xmem::FreeSnapshot::of(addr);
             let ok = host::virtual_free(address, size, free_type);
             if ok != 0 {
-                crate::modules::xmem::on_virtual_free_decommit_all(addr, span);
+                crate::modules::xmem::on_virtual_free_decommit_all(retired);
             }
             return ok;
         }
         crate::modules::xmem::commit_partial_boundaries(addr, size);
+        let generation = crate::modules::xmem::reservation_generation(addr);
         let ok = host::virtual_free(address, size, free_type);
         if ok != 0 {
-            crate::modules::xmem::on_virtual_free_decommit_interior(addr, size);
+            crate::modules::xmem::on_virtual_free_decommit_interior(addr, size, generation);
         }
         return ok;
     }

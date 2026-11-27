@@ -386,9 +386,9 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
             let addr = address as usize;
-            let span = query_allocation_span(addr);
+            let retired = FreeSnapshot::of(addr);
             if VirtualFree(address, 0, MEM_RELEASE) != 0 {
-                on_virtual_free_release(addr, span);
+                on_virtual_free_release(retired);
             }
             return;
         }
@@ -1737,27 +1737,47 @@ pub(crate) fn ensure_committed(address: usize, len: usize) {
     lazy_commit::ensure(address, len);
 }
 
-/// Queries the byte span of the allocation starting at `address` before a
-/// `VirtualFree(MEM_RELEASE)` or whole-allocation `VirtualFree(address, 0, MEM_DECOMMIT)`.
-pub(crate) fn query_allocation_span(address: usize) -> usize {
-    lazy_commit::allocation_span(address)
+/// The allocation a `VirtualFree` is about to retire, captured *before* the
+/// native call.
+///
+/// `MEM_RELEASE` makes the address reusable as soon as the native free
+/// returns, while the HLE cleanup hook runs afterwards: a replacement
+/// allocation can take the same address and record its lazy metadata in that
+/// window. The snapshot carries the admission generation so the hook retires
+/// only the metadata the freed allocation still owns (see [`lazy_commit`]).
+pub(crate) struct FreeSnapshot {
+    base: usize,
+    span: usize,
+    generation: Option<u64>,
+}
+
+impl FreeSnapshot {
+    pub(crate) fn of(address: usize) -> Self {
+        Self {
+            base: address,
+            span: lazy_commit::allocation_span(address),
+            generation: lazy_commit::reservation_generation(address),
+        }
+    }
 }
 
 /// Clears lazy-commit tracking and reservation metadata after a successful
-/// `VirtualFree(..., MEM_RELEASE)`.
-pub(crate) fn on_virtual_free_release(address: usize, span: usize) {
-    lazy_commit::forget_reservation(address);
-    if span > 0 {
-        lazy_commit::unmark_range(address, span);
-    }
+/// `VirtualFree(..., MEM_RELEASE)`, only while the snapshot still owns the
+/// address.
+pub(crate) fn on_virtual_free_release(retired: FreeSnapshot) {
+    lazy_commit::retire_release(retired.base, retired.span, retired.generation);
 }
 
 /// Clears lazy-commit tracking after a successful whole-allocation
 /// `VirtualFree(address, 0, MEM_DECOMMIT)`.
-pub(crate) fn on_virtual_free_decommit_all(address: usize, span: usize) {
-    if span > 0 {
-        lazy_commit::unmark_range(address, span);
-    }
+pub(crate) fn on_virtual_free_decommit_all(retired: FreeSnapshot) {
+    lazy_commit::retire_decommit_all(retired.base, retired.span, retired.generation);
+}
+
+/// Admission generation owning `address`, captured before a partial
+/// `MEM_DECOMMIT` so its post-call hook can prove ownership too.
+pub(crate) fn reservation_generation(address: usize) -> Option<u64> {
+    lazy_commit::reservation_generation(address)
 }
 
 /// Commits any partially overlapped 64 KiB lazy boundary blocks ahead of a
@@ -1768,9 +1788,14 @@ pub(crate) fn commit_partial_boundaries(address: usize, len: usize) {
 }
 
 /// Clears full 64 KiB lazy blocks strictly inside `[address, address + len)`
-/// after a successful `MEM_DECOMMIT`.
-pub(crate) fn on_virtual_free_decommit_interior(address: usize, len: usize) {
-    lazy_commit::unmark_aligned_interior(address, len);
+/// after a successful partial `MEM_DECOMMIT`, only while `generation` still
+/// owns the reservation (a concurrent release may have reused the address).
+pub(crate) fn on_virtual_free_decommit_interior(
+    address: usize,
+    len: usize,
+    generation: Option<u64>,
+) {
+    lazy_commit::retire_decommit_interior(address, len, generation);
 }
 
 /// Opt-in demand-commit (`VICTORY_XMEM_LAZY_COMMIT=1`, off by default) for large
@@ -1779,6 +1804,14 @@ pub(crate) fn on_virtual_free_decommit_interior(address: usize, len: usize) {
 /// `SEC_RESERVE` physical-page views: reserves without committing upfront and
 /// commits 64 KiB pages on first CPU touch via a lock-free atomic-state vectored
 /// exception handler, or ahead of kernel syscalls via [`ensure_committed`].
+///
+/// Ownership invariant: lazy marks and reservation records belong to one
+/// admission generation, never to an address. A successful `MEM_RELEASE`
+/// publishes its address for exact reuse *before* the HLE cleanup hook runs, so
+/// a replacement can be admitted at the same base in that window; retirement is
+/// therefore validated against the generation captured before the native free
+/// and never applied blindly by address (see `RESERVATIONS` and
+/// `retire_release`).
 mod lazy_commit {
     use std::collections::BTreeMap;
     use std::ffi::c_void;
@@ -1984,10 +2017,22 @@ mod lazy_commit {
     static REGIONS: LazyLock<RwLock<Vec<LazyRegion>>> = LazyLock::new(|| RwLock::new(Vec::new()));
     static REGIONS_NONEMPTY: AtomicBool = AtomicBool::new(false);
     static LAZY_COUNT: AtomicUsize = AtomicUsize::new(0);
-    /// Non-placeholder `XMemVirtualAlloc` reservations (`base -> end`) eligible
-    /// for two-step `MEM_COMMIT` lazy marking.
-    static RESERVATIONS: LazyLock<Mutex<BTreeMap<usize, usize>>> =
+
+    /// One admitted non-placeholder `XMemVirtualAlloc` reservation: where it
+    /// ends and the admission generation that owns its lazy metadata.
+    struct Reservation {
+        end: usize,
+        generation: u64,
+    }
+
+    /// Non-placeholder `XMemVirtualAlloc` reservations (`base -> entry`)
+    /// eligible for two-step `MEM_COMMIT` lazy marking. Generations are never
+    /// reused, so a post-free hook can prove the entry at the freed base is
+    /// still the allocation it captured, not a replacement admitted in the
+    /// native-free window.
+    static RESERVATIONS: LazyLock<Mutex<BTreeMap<usize, Reservation>>> =
         LazyLock::new(|| Mutex::new(BTreeMap::new()));
+    static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
     fn enabled_for(val: Option<&str>) -> bool {
         val.is_some_and(|v| {
@@ -2024,20 +2069,79 @@ mod lazy_commit {
             return;
         }
         let end = base.saturating_add(len.next_multiple_of(PAGE));
+        let generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
         RESERVATIONS
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(base, end);
+            .insert(base, Reservation { end, generation });
     }
 
-    pub(super) fn forget_reservation(base: usize) {
+    /// Admission generation owning `base`, or `None` when no reservation is
+    /// tracked there. Captured before a native free/decommit so its post-call
+    /// hook can validate ownership afterwards.
+    pub(super) fn reservation_generation(base: usize) -> Option<u64> {
         if base == 0 {
-            return;
+            return None;
         }
         RESERVATIONS
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(&base);
+            .get(&base)
+            .map(|reservation| reservation.generation)
+    }
+
+    /// Whether the captured generation still owns `base`. An untracked capture
+    /// (`None`, e.g. lazy marks without a reservation record) owns the address
+    /// only while no replacement has recorded a reservation there.
+    fn owns(
+        reservations: &BTreeMap<usize, Reservation>,
+        base: usize,
+        generation: Option<u64>,
+    ) -> bool {
+        match generation {
+            Some(generation) => reservations
+                .get(&base)
+                .is_some_and(|reservation| reservation.generation == generation),
+            None => !reservations.contains_key(&base),
+        }
+    }
+
+    /// Retires a successful `MEM_RELEASE`: its reservation record and lazy
+    /// marks, only while the captured generation still owns the address.
+    ///
+    /// Called after the native free, which may already have handed the address
+    /// to a replacement (`record_reservation` + `mark_range`). The reservation
+    /// lock stays held across the ownership check and the unmark while
+    /// admission records before it marks, so a replacement can only record
+    /// after this unmark and its marks always survive.
+    pub(super) fn retire_release(base: usize, span: usize, generation: Option<u64>) {
+        let mut reservations = RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner());
+        let owned = owns(&reservations, base, generation);
+        if owned {
+            reservations.remove(&base);
+        }
+        if owned && span > 0 {
+            unmark_range(base, span);
+        }
+    }
+
+    /// Clears lazy marks after a successful whole-allocation `MEM_DECOMMIT`.
+    /// The reservation survives (only its commits go), so the ownership check
+    /// only guards against a concurrent release/replacement of the address.
+    pub(super) fn retire_decommit_all(base: usize, span: usize, generation: Option<u64>) {
+        let reservations = RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner());
+        if span > 0 && owns(&reservations, base, generation) {
+            unmark_range(base, span);
+        }
+    }
+
+    /// Clears full 64 KiB lazy blocks strictly inside a successful partial
+    /// `MEM_DECOMMIT`, under the same ownership guard.
+    pub(super) fn retire_decommit_interior(base: usize, len: usize, generation: Option<u64>) {
+        let reservations = RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner());
+        if len > 0 && owns(&reservations, base, generation) {
+            unmark_aligned_interior(base, len);
+        }
     }
 
     pub(super) fn is_non_placeholder_reservation(base: usize, len: usize) -> bool {
@@ -2048,7 +2152,7 @@ mod lazy_commit {
             let g = RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner());
             g.range(..=base)
                 .next_back()
-                .is_some_and(|(_, &res_end)| res_end >= end)
+                .is_some_and(|(_, reservation)| reservation.end >= end)
         };
         if !tracked {
             return false;
@@ -2619,6 +2723,79 @@ mod lazy_commit {
             );
             assert!(!is_marked(base));
             assert!(!is_marked(base + 3 * PAGE));
+            assert!(!is_non_placeholder_reservation(base, LEN));
+        }
+
+        /// A retired `MEM_RELEASE` cleanup that runs after the host already
+        /// handed the address to a replacement must not erase the replacement's
+        /// reservation record or lazy marks.
+        #[test]
+        fn retired_release_cleanup_does_not_erase_reused_address_generation() {
+            const LEN: usize = PAGE;
+            // 1. A native reservation admitted by hand (cfg(test) disables
+            //    automatic lazy admission), then freed natively while its
+            //    production cleanup is paused. Other tests allocate in
+            //    parallel, so retry if one takes the freed hole first; a
+            //    fixed-address reservation either lands on `base` or fails.
+            let (base, retired) = loop {
+                // SAFETY: fresh reservation for the test.
+                let base = unsafe {
+                    VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE, PAGE_READWRITE)
+                } as usize;
+                assert_ne!(base, 0);
+                record_reservation(base, LEN);
+                mark_range(base, LEN);
+                let retired = super::super::FreeSnapshot::of(base);
+                // SAFETY: ours.
+                assert_ne!(unsafe { VirtualFree(base as *mut c_void, 0, MEM_RELEASE) }, 0);
+                // SAFETY: the address was just freed; the probe reserves it again.
+                let reused = unsafe {
+                    VirtualAlloc(base as *const c_void, LEN, MEM_RESERVE, PAGE_READWRITE)
+                } as usize;
+                if reused == base {
+                    break (base, retired);
+                }
+                // The hole was taken: retire this attempt's metadata and retry.
+                super::super::on_virtual_free_release(retired);
+            };
+
+            // 2. The replacement holds exactly the freed address; admit it like
+            //    the production two-step path (record, then mark).
+            record_reservation(base, LEN);
+            mark_range(base, LEN);
+            assert!(is_marked(base));
+
+            // Resume the first caller's cleanup: it must not touch the new owner.
+            super::super::on_virtual_free_release(retired);
+
+            let mut info = super::super::BasicInformation {
+                host: MEMORY_BASIC_INFORMATION::default(),
+                flags: 0,
+                tag_code: 0,
+                tag: [0; 4],
+            };
+            // SAFETY: returns the pseudo-handle for the current process.
+            let process = unsafe { GetCurrentProcess() };
+            assert_eq!(
+                super::super::XMemVirtualQuery(process, base as *const c_void, &mut info),
+                1
+            );
+            assert_eq!(
+                info.host.State, MEM_COMMIT,
+                "the replacement's lazy mark must survive the retired release cleanup"
+            );
+            assert_eq!(info.host.RegionSize, LEN);
+            assert!(
+                is_non_placeholder_reservation(base, LEN),
+                "the replacement's reservation record must survive too"
+            );
+
+            // The replacement still releases through the real hook, which
+            // retires the metadata the stale callback correctly left alone.
+            assert_ne!(
+                crate::modules::kernel::VirtualFree(base as *mut c_void, 0, MEM_RELEASE),
+                0
+            );
             assert!(!is_non_placeholder_reservation(base, LEN));
         }
 
