@@ -127,10 +127,7 @@ pub fn intersect(words: &[u32; 28], kind: u32, ray: &Ray, sort: bool) -> [u32; 4
         4 => boxes(&children(words), &boxes16(words), ray, sort),
         5 => boxes(&children(words), &boxes32(words), ray, sort),
         k @ 0..=3 => triangle(&triangle_vertices(words, k), ray).map(f32::to_bits),
-        // An instance or a procedural node: the hardware answers -1 in all
-        // four dwords (AMD GPURT IntersectCommon.hlsl: "User defined node.
-        // HW returns -1"); the traversal handles the node itself.
-        _ => [u32::MAX; 4],
+        _ => MISS.map(f32::to_bits),
     }
 }
 
@@ -199,8 +196,11 @@ pub fn boxes(children: &[u32; 4], boxes: &[[f32; 6]; 4], ray: &Ray, sort: bool) 
         }
         let enter = near[0].max(near[1]).max(near[2]);
         let leave = far[0].min(far[1]).min(far[2]);
-        // A box whose minimum x is NaN is switched off.
-        if !b[0].is_nan() && leave >= enter.max(0.0) && enter < ray.extent {
+        // A box whose minimum x is NaN is switched off. A child that is not
+        // there may have inverted infinite bounds, which every ray enters at
+        // minus infinity: it would be first of the sorted children and end
+        // the walk before them (DexNom/VIctory bc3cd4b0).
+        if children[n] != NONE && !b[0].is_nan() && leave >= enter.max(0.0) && enter < ray.extent {
             ids[n] = children[n];
             distances[n] = enter;
         }
@@ -289,6 +289,17 @@ pub fn half_to_f32(h: u16) -> f32 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// An empty slot's inverted infinite bounds do not come before the
+    /// children a ray enters (after DexNom/VIctory bc3cd4b0).
+    #[test]
+    fn an_empty_slot_is_never_entered() {
+        let inside = |x: f32| [x - 1.0, -1.0, -1.0, x + 1.0, 1.0, 1.0];
+        let (up, down) = (f32::INFINITY, f32::NEG_INFINITY);
+        let bounds = [inside(30.0), [up, up, up, down, down, down], inside(10.0), [up, up, up, down, down, down]];
+        let ray = Ray::new([0.0; 3], [1.0, 0.0, 0.0], 100.0);
+        assert_eq!(boxes(&[8, NONE, 16, NONE], &bounds, &ray, true), [16, 8, NONE, NONE]);
+    }
 
     /// The smallest 16-bit float not below `x` (`up`) or not above it.
     pub(crate) fn f32_to_half(x: f32, up: bool) -> u16 {
@@ -653,13 +664,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn instances_and_procedural_nodes_return_all_ones() {
-        // As the hardware (AMD GPURT IntersectCommon.hlsl: "User defined
-        // node. HW returns -1"): the traversal handles such a node itself.
+    fn instances_and_procedural_nodes_return_a_triangle_miss() {
         let node = triangles(&TRIANGLE, 9);
         let ray = Ray::new([0.0; 3], [0.0, 0.0, 1.0], 100.0);
         for k in [6, 7] {
-            assert_eq!(intersect(&node, k, &ray, true), [u32::MAX; 4]);
+            assert_eq!(intersect(&node, k, &ray, true), MISS.map(f32::to_bits));
         }
     }
 

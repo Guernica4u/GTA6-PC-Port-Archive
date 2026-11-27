@@ -55,29 +55,19 @@ pub const FIRST: u32 = 32;
 /// Not a pass over the module either: the lowering reads the dwords of one
 /// console load (`s_buffer_load_dwordx2` to `x16` from an SRV, a
 /// `global_load_dwordx2` to `x4`) by one call for every four of them, not
-/// by a call each (`lower.rs`, `raw_dwords`). NOT the same result on the card in every case: run 277
-/// had the water black with it (lead: a four-dword load whose last dwords
-/// lie past the view's end, which the card may answer with zeros for the
-/// whole call), so it stays off unless asked for.
+/// by a call each (`lower.rs`, `raw_dwords`). The same bytes are read.
+/// From fxceless/victory-fork c36971b2. On an RX 7900 XTX it is worth nothing:
+/// the yard's frame replayed turn by turn, dispatches and draws 18.47 -> 18.45
+/// ms (12 loops) and 18.23 -> 18.16 (5 loops): the driver joins the loads.
 pub const WIDE: u32 = 64;
 /// The passes over the module.
 pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
 /// Every pass.
 pub const ALL: u32 = MODULE | FIRST | WIDE;
-/// The passes that run when nothing says which: every one, [`WIDE`] (with
-/// the dead-dword masks of `narrow_raw_loads` and the view-end guard) and
-/// [`FAST`] too, the latter with `VICTORY_SHADER_FAST_BITS` 24 by default
-/// (no signed zeros, reciprocal: NaN and infinity tests kept; all flags gave
-/// black blotches in runs 354/355); `VICTORY_SHADER_OPT=127` drops FAST.
-pub const DEFAULT: u32 = ALL | FAST;
-/// Not a pass either: the 32-bit float binary operations are written with
-/// LLVM's unsafe-algebra fast-math flag, as an HLSL compiler writes them by
-/// default, so the driver may fuse a multiply and an add and turn a division
-/// by a constant into a multiply. Results may differ in the last bits and
-/// NaN/infinity checks may be folded away. In [`DEFAULT`]; `VICTORY_SHADER_OPT=63` is the passes
-/// without it, 255 every pass with it. Outside [`ALL`], so `127` stays
-/// "every pass" without it.
-pub const FAST: u32 = 128;
+/// The passes that run when nothing says which: every one but [`WIDE`],
+/// which no card has shown a gain for yet (`VICTORY_SHADER_OPT=127` asks
+/// for it).
+pub const DEFAULT: u32 = ALL & !WIDE;
 
 /// What the instructions a module writes use, of the features a shader
 /// declares by flag (the validator's "flags must match usage").
@@ -85,6 +75,8 @@ pub const FAST: u32 = 128;
 pub(crate) struct Usage {
     /// A wave or quad operation.
     pub wave_ops: bool,
+    /// A rasterizer ordered view.
+    pub rovs: bool,
     /// A 64-bit integer, as a result or an operand.
     pub int64: bool,
     /// A typed load of several components from a UAV.
@@ -410,13 +402,89 @@ impl Module {
     }
 
     /// An integer constant's width and value (the bits of that width).
-    fn int_k(&self, v: V) -> Option<(u32, u64)> {
+    pub(crate) fn int_k(&self, v: V) -> Option<(u32, u64)> {
         let V::Const(i) = v else { return None };
         let (ty, Const::Int(x)) = &self.consts[i as usize] else {
             return None;
         };
         let bits = self.int_bits(*ty)?;
         Some((bits, *x as u64 & mask(bits)))
+    }
+
+    /// The bits of a 32-bit float that is a constant, given as one or as a
+    /// cast of an integer constant.
+    pub(crate) fn float_k(&self, v: V) -> Option<f32> {
+        let (v, cast) = match v {
+            V::Inst(i) => match self.insts[i as usize].op {
+                Op::Cast(Cast::Bitcast, x) => (x, true),
+                _ => return None,
+            },
+            _ => (v, false),
+        };
+        let V::Const(i) = v else { return None };
+        match &self.consts[i as usize].1 {
+            Const::Float(bits) if !cast => Some(f32::from_bits(*bits)),
+            Const::Int(_) if cast => {
+                let (bits, x) = self.int_k(v)?;
+                (bits == 32).then_some(f32::from_bits(x as u32))
+            }
+            _ => None,
+        }
+    }
+
+    /// For a float that is a number and not an infinity whatever the program
+    /// reads: a power of two its magnitude does not pass.
+    pub(crate) fn bounded(&self, v: V, depth: u32) -> Option<f32> {
+        if let Some(k) = self.float_k(v) {
+            return k.is_finite().then(|| k.abs().max(1e-30).log2().ceil());
+        }
+        let V::Inst(i) = v else { return None };
+        let depth = depth.checked_sub(1)?;
+        let of = |v: V| self.bounded(v, depth);
+        // (A power that overflows, or might with rounding, is no bound.)
+        let held = |b: f32| (b < 126.0).then_some(b);
+        match &self.insts[i as usize].op {
+            Op::Cast(Cast::UiToFp | Cast::SiToFp, _) => Some(32.0),
+            Op::Cast(Cast::Bitcast, x) => match *x {
+                V::Inst(j) => match self.insts[j as usize].op {
+                    Op::Cast(Cast::Bitcast, y) if self.type_of(y) == self.type_of(v) => of(y),
+                    _ => None,
+                },
+                _ => None,
+            },
+            Op::Bin(Bin::Mul, a, b) => held(of(*a)? + of(*b)?),
+            Op::Bin(Bin::Add | Bin::Sub, a, b) => held(of(*a)?.max(of(*b)?) + 1.0),
+            Op::Select(_, a, b) => Some(of(*a)?.max(of(*b)?)),
+            Op::Call(_, args) => {
+                let (_, code) = self.int_k(*args.first()?)?;
+                match (code, &args[1..]) {
+                    // Saturated, a fraction, a cosine or sine (of a number).
+                    (7, [_]) => Some(0.0),
+                    (6, [x]) => of(*x),
+                    (22 | 12 | 13, [x]) => of(*x).map(|_| 0.0),
+                    (26..=29, [x]) => held(of(*x)? + 1.0),
+                    // Of two numbers; or one of them the other way round: the
+                    // minimum (36) of a constant and a maximum of another.
+                    (35 | 36, [a, b]) => match (of(*a), of(*b)) {
+                        (Some(x), Some(y)) => Some(x.max(y)),
+                        _ => {
+                            let other = if code == 35 { 36 } else { 35 };
+                            let (inner, k) = if self.float_k(*b).is_some() { (*a, *b) } else { (*b, *a) };
+                            let k = self.float_k(k).and_then(|_| of(k))?;
+                            let V::Inst(j) = inner else { return None };
+                            let Op::Call(_, inner) = &self.insts[j as usize].op else { return None };
+                            let (_, code) = self.int_k(*inner.first()?)?;
+                            let low = inner[1..].iter().find(|x| self.float_k(**x).is_some())?;
+                            (code == other).then_some(())?;
+                            Some(k.max(of(*low)?))
+                        }
+                    },
+                    (46, [a, b, c]) => held((of(*a)? + of(*b)?).max(of(*c)?) + 1.0),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
     }
 
     /// The constant `x` of the integer type `ty`, kept sign-extended as
@@ -972,7 +1040,6 @@ impl Module {
                 mark(&mut live, &mut work, v)
             });
         }
-        self.narrow_raw_loads(&live);
         for (b, blk) in self.blocks.iter_mut().enumerate() {
             if reached[b] {
                 blk.body.retain(|&i| live[i as usize]);
@@ -984,73 +1051,6 @@ impl Module {
         }
         self.drop_unused_functions();
         self.drop_unused_tables();
-    }
-
-    /// A live `dx.op.rawBufferLoad` whose result only live `Extract`s read,
-    /// of components 0 to 3, asks for components 0 up to the highest one
-    /// read and no more (its mask, argument 4). The same values reach every
-    /// read; dwords nothing reads are not asked for, so a load near a view's
-    /// end does not reach past it for them. Any other read of the result
-    /// (the status, component 4, or the whole value) leaves the mask alone.
-    fn narrow_raw_loads(&mut self, live: &[bool]) {
-        // Per load: the highest component read, or `None` once something
-        // else reads it.
-        let mut most: HashMap<u32, Option<u32>> = HashMap::new();
-        let loads: Vec<u32> = (0..self.insts.len() as u32)
-            .filter(|&i| {
-                live[i as usize]
-                    && matches!(&self.insts[i as usize].op, Op::Call(f, args)
-                        if args.len() == 6 && self.funcs[*f as usize].name.starts_with("dx.op.rawBufferLoad"))
-            })
-            .collect();
-        if loads.is_empty() {
-            return;
-        }
-        for &i in &loads {
-            most.insert(i, Some(0));
-        }
-        for (i, inst) in self.insts.iter().enumerate() {
-            if !live[i] {
-                continue;
-            }
-            match &inst.op {
-                Op::Extract(V::Inst(src), n) if most.contains_key(src) => {
-                    let entry = most.get_mut(src).unwrap();
-                    *entry = match *entry {
-                        Some(m) if *n <= 3 => Some(m.max(*n)),
-                        _ => None,
-                    };
-                }
-                op => for_each_operand(op, |v| {
-                    if let V::Inst(src) = v
-                        && let Some(entry) = most.get_mut(&src)
-                    {
-                        *entry = None;
-                    }
-                }),
-            }
-        }
-        for i in loads {
-            let Some(Some(m)) = most.get(&i).copied() else {
-                continue;
-            };
-            let want = (1u8 << (m + 1)) - 1;
-            let Op::Call(_, args) = &self.insts[i as usize].op else {
-                continue;
-            };
-            let V::Const(c) = args[4] else { continue };
-            let Const::Int(old) = self.consts[c as usize].1 else {
-                continue;
-            };
-            // Only ever fewer components, never a different set.
-            if (old as u8) & want != want || old as u8 == want {
-                continue;
-            }
-            let mask = self.i8(want);
-            if let Op::Call(_, args) = &mut self.insts[i as usize].op {
-                args[4] = mask;
-            }
-        }
     }
 
     /// See [`Usage`]: over the blocks reached from the entry.
@@ -1099,6 +1099,8 @@ impl Module {
                         Some((_, 0)) => u.heap_views = true,
                         _ => u.heap_samplers = true,
                     }
+                } else if name == "annotateHandle" {
+                    u.rovs |= annotation(V::Inst(i)).is_some_and(|(kind, _)| kind & 0x2000 != 0);
                 } else if name.starts_with("atomic") && name.ends_with(".i64") {
                     u.atomic64 = true;
                 } else if name.starts_with("textureLoad") || name.starts_with("bufferLoad") {
@@ -1270,47 +1272,6 @@ mod tests {
         m.terminate(b, Term::Ret);
         m.optimise(DEAD);
         assert_eq!(body(&m, b), 3, "the load, the add and the store");
-        m.write();
-    }
-
-    /// A raw load of four dwords of which only the first two are read asks
-    /// for two; one whose status (component 4) is read keeps its mask.
-    #[test]
-    fn raw_loads_ask_only_for_the_dwords_read() {
-        let mut m = Module::default();
-        let (i32t, i8t, f32t, void) = (m.int(32), m.int(8), m.float(), m.void());
-        let ret = m.named_struct("dx.types.ResRet.f32", vec![f32t, f32t, f32t, f32t, i32t]);
-        let fty = m.func_ty(ret, vec![i32t, i32t, i32t, i32t, i8t, i32t]);
-        m.ptr(fty);
-        let load = m.function("dx.op.rawBufferLoad.f32", fty, Some(Attr::ReadOnly), false);
-        let sty = m.func_ty(void, vec![f32t]);
-        m.ptr(sty);
-        let store = m.function("dx.op.store", sty, Some(Attr::NoUnwind), false);
-        let main_ty = m.func_ty(void, vec![]);
-        m.ptr(main_ty);
-        m.function("main", main_ty, None, true);
-        let b = m.new_block();
-        let (op, zero, four, all) = (m.i32(139), m.i32(0), m.i32(4), m.i8(15));
-        let narrowed = m.call(b, load, vec![op, zero, zero, zero, all, four]);
-        let kept = m.call(b, load, vec![op, zero, four, zero, all, four]);
-        for (r, n) in [(narrowed, 0), (narrowed, 1), (kept, 0)] {
-            let x = m.extract(b, r, n);
-            m.call(b, store, vec![x]);
-        }
-        let status = m.extract(b, kept, 4);
-        let as_f = m.cast(b, Cast::Bitcast, status, f32t);
-        m.call(b, store, vec![as_f]);
-        m.terminate(b, Term::Ret);
-        m.optimise(DEAD);
-        let mask = |m: &Module, v: V| {
-            let V::Inst(i) = v else { unreachable!() };
-            let Op::Call(_, args) = &m.insts[i as usize].op else { unreachable!() };
-            let V::Const(c) = args[4] else { unreachable!() };
-            let Const::Int(k) = m.consts[c as usize].1 else { unreachable!() };
-            k
-        };
-        assert_eq!(mask(&m, narrowed), 3, "components 0 and 1");
-        assert_eq!(mask(&m, kept), 15, "its status is read");
         m.write();
     }
 

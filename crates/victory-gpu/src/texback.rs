@@ -8,8 +8,8 @@
 //! the title read those two kinds), and boats sank.
 //!
 //! For textures of the kinds in `VICTORY_TEXTURE_BACK` (comma-separated
-//! `<width>x<height>f<format>`; `1` for the four water formats found by
-//! the upstream trace), a list in which shaders write one copies it
+//! `<width>x<height>f<format>`; unset or `1`: the four water formats found by
+//! the upstream trace; `0`: none), a list in which shaders write one copies it
 //! into a read-back buffer of ours when it closes, and once the list has run
 //! the texels are tiled into the texture's title memory in the console's
 //! layout, as the console's GPU would have left them.
@@ -26,29 +26,14 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::object::This;
 
-/// A kind of texture copied back: width, height and format
-/// (`VICTORY_TEXTURE_BACK`'s `256x256f41`).
-type Kind = (u64, u32, u32);
-
-#[cfg(test)]
-thread_local! {
-    pub(crate) static TEST_KINDS: std::cell::Cell<Option<&'static [Kind]>> =
-        const { std::cell::Cell::new(None) };
-}
-
 /// The kinds copied back: (width, height, format).
-fn kinds() -> &'static [Kind] {
-    #[cfg(test)]
-    if let Some(kinds) = TEST_KINDS.get() {
-        return kinds;
-    }
-    static KINDS: OnceLock<Vec<Kind>> = OnceLock::new();
+fn kinds() -> &'static [(u64, u32, u32)] {
+    static KINDS: OnceLock<Vec<(u64, u32, u32)>> = OnceLock::new();
     KINDS.get_or_init(|| {
         const DEFAULT: &str = "256x256f41,256x256f16,64x64f16,128x128f36";
         let list = match std::env::var("VICTORY_TEXTURE_BACK").as_deref() {
-            Ok("1") => DEFAULT.to_owned(),
+            Ok("1") | Err(_) => DEFAULT.to_owned(),
             Ok(spec) => spec.to_owned(),
-            Err(_) => String::new(),
         };
         let kinds: Vec<(u64, u32, u32)> = list
             .split(',')
@@ -137,12 +122,6 @@ impl Target {
     }
 
     pub(crate) fn owner(&self) -> usize { self.ticket.owner }
-
-    /// Whether the ticket is still valid: the texture's memory has not been
-    /// reused or remapped since it was registered. A stale target is
-    /// re-registered so the read-back tracks the memory the texture is in
-    /// now, not where it was when it was last written.
-    pub(crate) fn fresh(&self) -> bool { self.ticket.valid.load(Ordering::Acquire) }
 }
 
 /// The readback resources and the allocation the pixels belong to.
@@ -199,9 +178,6 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
         total = total.max(footprint.Offset.checked_add(pitched)?);
     }
     let buffer = host.read_back_buffer(total)?;
-    // With device-removed data on: a page fault in it, alive or freed, is
-    // reported under this name (it was "unnamed").
-    crate::host::name_frame(&buffer, || format!("texback read-back buffer of {total} bytes"));
     for (i, footprint) in footprints.iter().enumerate() {
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
