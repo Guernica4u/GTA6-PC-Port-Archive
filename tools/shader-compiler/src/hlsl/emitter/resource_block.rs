@@ -307,6 +307,15 @@ impl<'a> Emitter<'a> {
                             ))
                         }
                     };
+                    // A root descriptor's address is not a table pointer: a load
+                    // through it reads the buffer's own words, and treating it as
+                    // a descriptor fetch would leave the destination unwritten.
+                    if root_address_sgprs(self.ex).contains(&table) {
+                        return Err(format!(
+                            "s_load at {:#x}: base s{table} is a root descriptor address, not a table pointer",
+                            ins.offset
+                        ));
+                    }
                     if (ins.raw.get(1).copied().unwrap_or(0) >> 25) != 0x7d {
                         let soff = (ins.raw[1] >> 25) as u16;
                         // A pixel wave includes helper lanes, which host wave intrinsics skip:
