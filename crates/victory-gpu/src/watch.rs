@@ -401,6 +401,7 @@ fn runtime_pages_with_probe(start: usize, end: usize, views: bool, fast: bool) -
     // query or probe always falls back to the original classification.
     let aligned = start & !(4096 - 1);
     if fast && end.saturating_sub(aligned) >= 4 * 1024 * 1024 {
+        // SAFETY: this plain Windows information structure accepts zero initialization.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: the query only writes the supplied information structure.
         let queried = unsafe { VirtualQuery(aligned as *const _, &mut info, size_of_val(&info)) };
