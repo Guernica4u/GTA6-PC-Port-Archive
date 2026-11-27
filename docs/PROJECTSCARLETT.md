@@ -887,3 +887,55 @@ unless the staged file matches the local build. This does not rebuild or
 replace a DLL, prove which source revision produced the local build, or
 inspect modules actually loaded by Wine. Record the build revision and
 driver separately.
+
+### Identify a slow slot-62 compute pipeline request
+
+With diagnostic logging enabled, slow `CreatePipelineState #N CS ...`
+messages include `request=<key> bytes=<size>`. The short CS hash still
+identifies the original guest program, while the full request key names
+the actual selected translation (`<key>.cso` in the shader cache), including
+a root-specific request or its `_w32` variant. `request=original` means the
+original bytecode was passed to the host, not a translated cache entry.
+Set `TUXBOX_TRACE_PIPELINE_REQUESTS=1` to also record starts and finishes of
+short attempts. The identifier after `#` is local to the process.
+Times include any compile-slot wait and the host pipeline call; they do not
+isolate the driver. This currently covers the Xbox slot-62 compute factory,
+not all graphics or pipeline-stream paths. Share keys and sizes only, not
+title shader files or private raw logs.
+
+
+To test the memory-pressure hypothesis in issue #231, sample the actual
+guest process (not the UMU parent) during the cold launch:
+
+```sh
+python tools/sample_process_cpu.py PID --seconds 300 --interval 1 --output cold-memory.jsonl
+```
+
+The samples share the existing UTC nanosecond timestamp and include host
+available RAM, total/free/used swap, guest RSS, peak RSS and guest swap in
+KiB. Missing fields are null. Compare timestamps with the pipeline log;
+neither a large swap value nor a slow pipeline alone establishes causation.
+The sampler does not attribute host memory to individual driver threads.
+Keep detailed samples local; share aggregate memory observations.
+
+### Investigating compute loop guards after a device loss
+
+Compare the exact same recorded requests against two xshader builds without
+executing title programs or modifying a cache:
+
+```sh
+python tools/audit_shader_guards.py REQUESTS --baseline OLD_XSHADER --candidate NEW_XSHADER --json guard-summary.json
+```
+
+This reports the number of compute translations with the generic structured
+loop guard (65,536) or block dispatcher guard (1,000,000), including newly
+admitted compute programs. It also counts dispatchers without that generic
+guard, and persistent PC-range dispatchers separately. The range check is
+not an iteration limit. The report includes aggregate before/after shape
+transitions, including existing compute translations that gain or lose a
+generic guard. Both emitters use private digest-verified
+copies of each input, with the original request mode (including `.wave32`).
+Use `--select` with an exact local worklist, or `--include-keys` for local
+per-request attribution. The default report omits request keys and paths.
+These are static emitted sites, not executed iterations, timing or evidence
+that a particular loop caused a GPU fault. Keep per-request reports private.
