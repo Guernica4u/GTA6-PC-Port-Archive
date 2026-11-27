@@ -230,12 +230,12 @@ pub(crate) fn gpu_bound(at: usize, len: usize) {
 /// the list): its pages are not read in place for [`COPY_FRAMES`] frames,
 /// until what the card did of it has landed.
 pub(crate) fn copy_bound(at: usize, len: usize) {
-    let stamp = stamp(crate::frame::current());
+    let now = stamp(crate::frame::current());
     for page in pages(at, len).into_iter().flatten() {
         let mark = &PAGE_MARKS[page];
         let was = mark.load(Ordering::Relaxed);
-        if was != FOR_GOOD && was != stamp {
-            mark.store(stamp, Ordering::Relaxed);
+        if was != FOR_GOOD && was != now {
+            mark.store(now, Ordering::Relaxed);
         }
     }
 }
@@ -247,7 +247,7 @@ fn written_by_no_shader(at: u64, len: u64) -> bool {
     let marked = |page: usize| match PAGE_MARKS[page].load(Ordering::Relaxed) {
         0 => false,
         FOR_GOOD => true,
-        stamp => u64::from(now.wrapping_sub(stamp)) <= COPY_FRAMES,
+        copied => u64::from(now.wrapping_sub(copied)) <= COPY_FRAMES,
     };
     if pages(at as usize, len as usize).into_iter().flatten().any(marked) {
         return false;
