@@ -1116,6 +1116,30 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn region_probe_does_not_reset_write_watch() {
+        use windows_sys::Win32::System::Memory::GetWriteWatch;
+        let p = pool(256);
+        // SAFETY: the last page belongs to this committed allocation.
+        unsafe { ((p + 255 * PAGE) as *mut u8).write_volatile(1) };
+        let query = || {
+            let (mut address, mut count, mut granularity) = (0usize, 1usize, 0u32);
+            // SAFETY: one output slot, valid committed write-watched range, no reset.
+            let status = unsafe {
+                GetWriteWatch(0, p as *const _, 256 * PAGE, (&raw mut address).cast(), &mut count, &mut granularity)
+            };
+            (status, count, address)
+        };
+        let before = query();
+        assert_eq!(before, (0, 1, p + 255 * PAGE));
+        assert_eq!(
+            runtime_pages_with_probe(p, p + 256 * PAGE, false, true),
+            runtime_pages_with_probe(p, p + 256 * PAGE, false, false)
+        );
+        assert_eq!(query(), before);
+        free(p);
+    }
+
+    #[test]
     #[ignore = "manual synthetic timing; no fixed speedup assertion"]
     fn region_probe_benchmark() {
         for n in [16, 64, 256, 1024, 4096] {
