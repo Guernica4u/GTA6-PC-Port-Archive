@@ -322,6 +322,14 @@ pub(crate) fn may_hurry(w: &Waited) -> bool {
     make::may_hurry(w)
 }
 
+/// Whether the pending pipeline `w` has no answer yet (neither made nor
+/// refused): only such a writer still leaves what it wrote stale, so only
+/// it counts against [`crate::feeds`]'s cap on one resource's writers.
+#[cfg(windows)]
+pub(crate) fn pending(w: &Waited) -> bool {
+    make::being_made(w)
+}
+
 /// Puts the pending pipelines in `feeders`, nearest first, at the head of
 /// the workers' queue: the frame's dropped passes whose writes the
 /// presented image reads ([`crate::feeds`]).

@@ -20,11 +20,14 @@
 //! What it must not find is the world's content. Reads are kept per pass,
 //! not per pipeline: a pipeline many passes share (a blit) would join
 //! every one of their inputs. And a resource with more than [`FAN_IN_MAX`]
-//! dropped writers is not followed to them: that is a target hundreds of
-//! draws fill (depth, a geometry buffer, a shadow map), missing some of its
-//! objects, not one a single pass leaves wholly stale. Taking those (666
-//! pipelines in one round) put them ahead of the pipelines the queue would
-//! have made next, and the world went dark again for a minute.
+//! dropped writers still to be made is not followed to them: that is a
+//! target hundreds of draws fill (depth, a geometry buffer, a shadow map),
+//! missing some of its objects, not one a single pass leaves wholly stale.
+//! Only writers whose pipelines are still pending count: a target a frame
+//! dropped hundreds of draws into, most of whose pipelines have been made
+//! since, is stale for the few left, and they go first. Taking the hundreds
+//! (666 pipelines in one round) put them ahead of the pipelines the queue
+//! would have made next, and the world went dark again for a minute.
 //!
 //! Resources only, by title object: buffers and views a shader indexes in
 //! the heap itself are not followed. A frame's passes are taken in the
@@ -44,10 +47,12 @@ use crate::pipeline::Waited;
 /// past this.
 const NOTES_MAX: usize = 1 << 20;
 
-/// Dropped writers of one resource, at most, for the walk to take them: a
-/// pass a frame has only one or a few of (lighting, a resolve) leaves the
-/// resource stale; hundreds (geometry into depth or a geometry buffer)
-/// leave objects missing.
+/// Dropped writers of one resource still to be made, at most, for the walk
+/// to take them: a pass a frame has only one or a few of (lighting, a
+/// resolve) leaves the resource stale; hundreds still pending (geometry
+/// into depth or a geometry buffer) leave objects missing. A writer whose
+/// pipeline was made (or refused) since no longer leaves the resource
+/// stale, and neither counts against this nor goes first.
 const FAN_IN_MAX: usize = 4;
 
 /// Pipelines put first per present, at most (nearest the image first).
@@ -115,9 +120,10 @@ impl<T> Graph<T> {
     }
 
     /// The dropped pipelines whose writes reach `images` through passes
-    /// that ran, nearest first; resources with more than [`FAN_IN_MAX`]
-    /// dropped writers give none.
-    fn feeding(&self, images: &[usize]) -> Vec<&T> {
+    /// that ran, nearest first; a resource with more than [`FAN_IN_MAX`]
+    /// writers still pending (`pending` says which pipelines are) gives
+    /// none, and it gives only the still-pending ones.
+    fn feeding(&self, images: &[usize], pending: impl Fn(usize) -> bool) -> Vec<&T> {
         let (mut seen, mut walked, mut found) = (HashSet::new(), HashSet::new(), HashSet::new());
         let mut out = Vec::new();
         let mut next: VecDeque<usize> = images.iter().copied().collect();
@@ -125,12 +131,13 @@ impl<T> Graph<T> {
             if !seen.insert(r) {
                 continue;
             }
-            if let Some(d) = self.dropped_writers.get(&r)
-                && d.len() <= FAN_IN_MAX
-            {
-                let mut d: Vec<usize> = d.iter().copied().filter(|p| found.insert(*p)).collect();
-                d.sort_unstable();
-                out.extend(d.iter().filter_map(|p| self.dropped.get(p)));
+            if let Some(d) = self.dropped_writers.get(&r) {
+                let mut waiting: Vec<usize> = d.iter().copied().filter(|&p| pending(p)).collect();
+                if waiting.len() <= FAN_IN_MAX {
+                    waiting.retain(|p| found.insert(*p));
+                    waiting.sort_unstable();
+                    out.extend(waiting.iter().filter_map(|p| self.dropped.get(p)));
+                }
             }
             for &pass in self.ran.get(&r).into_iter().flatten() {
                 if walked.insert(pass) {
@@ -212,17 +219,25 @@ pub(crate) fn presented(images: &[usize]) -> Vec<Waited> {
     if g.dropped.is_empty() {
         return Vec::new();
     }
-    g.feeding(images)
-        .into_iter()
-        .filter(|w| crate::pipeline::may_hurry(w))
-        .take(HURRY_MAX)
-        .cloned()
-        .collect()
+    g.feeding(images, |p| {
+        g.dropped.get(&p).is_some_and(crate::pipeline::pending)
+    })
+    .into_iter()
+    .filter(|w| crate::pipeline::may_hurry(w))
+    .take(HURRY_MAX)
+    .cloned()
+    .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{FAN_IN_MAX, Graph, NOTES_MAX};
+
+    /// Every writer's pipeline is still pending, as in a frame where none
+    /// has been made yet.
+    fn every(_: usize) -> bool {
+        true
+    }
 
     /// Frames of a deferred renderer while pipelines are made. In the
     /// first, the lighting resolve and the shadow pass are dropped; the
@@ -249,10 +264,10 @@ mod tests {
             g.dropped(16, || "particles", &[particles]);
             g
         };
-        assert_eq!(frame(false).feeding(&[image]), [&"resolve"]);
-        assert_eq!(frame(true).feeding(&[image]), [&"shadows"]);
-        assert_eq!(frame(false).feeding(&[particles]), [&"particles"]);
-        assert!(frame(false).feeding(&[42]).is_empty());
+        assert_eq!(frame(false).feeding(&[image], every), [&"resolve"]);
+        assert_eq!(frame(true).feeding(&[image], every), [&"shadows"]);
+        assert_eq!(frame(false).feeding(&[particles], every), [&"particles"]);
+        assert!(frame(false).feeding(&[42], every).is_empty());
     }
 
     /// Two dropped passes at different distances: the nearer comes first.
@@ -263,7 +278,7 @@ mod tests {
         g.ran(&[5], &[2]);
         g.dropped(6, || "far", &[5]);
         g.dropped(7, || "near", &[3]);
-        assert_eq!(g.feeding(&[9]), [&"near", &"far"]);
+        assert_eq!(g.feeding(&[9], every), [&"near", &"far"]);
     }
 
     /// The pass writing the image itself, dropped, is found; a dropped
@@ -273,7 +288,7 @@ mod tests {
         let mut g = Graph::default();
         g.dropped(1, || "upscale", &[7]);
         g.dropped(2, || "unknown", &[]);
-        assert_eq!(g.feeding(&[7]), [&"upscale"]);
+        assert_eq!(g.feeding(&[7], every), [&"upscale"]);
         assert!(!g.dropped.contains_key(&2));
     }
 
@@ -284,7 +299,7 @@ mod tests {
         let mut g = Graph::default();
         g.ran(&[5], &[5, 7]);
         g.dropped(2, || "feeder", &[5]);
-        assert_eq!(g.feeding(&[7]), [&"feeder"]);
+        assert_eq!(g.feeding(&[7], every), [&"feeder"]);
     }
 
     /// A target many dropped draws write (depth, a geometry buffer) is not
@@ -298,7 +313,7 @@ mod tests {
         }
         g.dropped(10, || "resolve", &[lit]);
         g.ran(&[depth, lit], &[image]);
-        assert_eq!(g.feeding(&[image]), [&"resolve"]);
+        assert_eq!(g.feeding(&[image], every), [&"resolve"]);
     }
 
     /// One pipeline used by two passes (a blit): the walk follows only the
@@ -310,7 +325,7 @@ mod tests {
         g.ran(&[bloom], &[image]);
         g.ran(&[unread], &[unrelated]);
         g.dropped(9, || "unread's writer", &[unread]);
-        assert!(g.feeding(&[image]).is_empty());
+        assert!(g.feeding(&[image], every).is_empty());
     }
 
     /// A null descriptor (`resource == 0`) names nothing: a pass binding
@@ -324,7 +339,7 @@ mod tests {
         g.dropped(99, || "unrelated_dropped", &[unrelated_tex]);
         g.ran(&[unrelated_tex], &[0]);
         g.ran(&[0], &[image]);
-        assert!(g.feeding(&[image]).is_empty());
+        assert!(g.feeding(&[image], every).is_empty());
         assert_eq!(g.ran.keys().copied().collect::<Vec<_>>(), [image]);
         assert_eq!(g.reads, [Vec::<usize>::new()], "the null read is not kept");
     }
@@ -351,5 +366,44 @@ mod tests {
         g.dropped(4, || "late", &[3]);
         g.ran(&[6], &[7]);
         assert!(g.dropped.is_empty() && !g.ran.contains_key(&7));
+    }
+
+    /// A target 81 dropped draws wrote (a depth buffer a frame of geometry
+    /// fills), whose pipelines were made as the frame went on: the three
+    /// still pending are taken, though more than [`FAN_IN_MAX`] writers
+    /// were recorded (the reviewer's case). Made writers do not widen
+    /// admission: with more than [`FAN_IN_MAX`] *pending* writers the
+    /// target is still not followed.
+    #[test]
+    fn writers_made_since_do_not_fill_the_cap() {
+        let (depth, image) = (1, 2);
+        let mut g = Graph::default();
+        for draw in 100..100 + 81 {
+            g.dropped(draw, || draw, &[depth]);
+        }
+        g.ran(&[depth], &[image]);
+        let pending = [178, 179, 180];
+        assert_eq!(
+            g.feeding(&[image], |p| pending.contains(&p)),
+            [&178, &179, &180]
+        );
+        // The 78 made writers leave the target as it is; the three still
+        // pending leave it stale, and only they are taken.
+        assert!(g.feeding(&[image], |_| false).is_empty());
+    }
+
+    /// A writer whose pipeline the workers refused (no host pipeline) has
+    /// its answer: it is not pending, so it neither fills the cap nor is
+    /// taken, and the one still-pending writer of the target is.
+    #[test]
+    fn refused_writers_neither_fill_the_cap_nor_are_taken() {
+        let (depth, image) = (1, 2);
+        let mut g = Graph::default();
+        for draw in 100..100 + FAN_IN_MAX + 1 {
+            g.dropped(draw, || draw, &[depth]);
+        }
+        g.ran(&[depth], &[image]);
+        let last = 100 + FAN_IN_MAX;
+        assert_eq!(g.feeding(&[image], |p| p == last), [&last]);
     }
 }
