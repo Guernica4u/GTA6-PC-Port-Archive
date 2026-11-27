@@ -1286,6 +1286,7 @@ mod host {
                 return PadState::default();
             }
             // F2 toggles cursor lock so the user can free the mouse if needed.
+            // SAFETY: plain key-state query (VK_F2 = 0x71).
             let f2 = unsafe { GetAsyncKeyState(0x71) } < 0;
             if f2 && !self.f2_down {
                 self.mouse_unlocked = !self.mouse_unlocked;
@@ -1297,8 +1298,10 @@ mod host {
             if self.mouse_unlocked {
                 return PadState::default();
             }
+            // SAFETY: plain query returning the foreground window (may be null).
             let hwnd = unsafe { GetForegroundWindow() };
             let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            // SAFETY: `rect` is valid writable storage; null `hwnd` safely returns 0.
             if unsafe { GetWindowRect(hwnd, &mut rect) } == 0
                 || rect.right - rect.left < 100
                 || rect.bottom - rect.top < 100
@@ -1309,17 +1312,20 @@ mod host {
             let cx = (rect.left + rect.right) / 2;
             let cy = (rect.top + rect.bottom) / 2;
             if !self.mouse_centered {
+                // SAFETY: plain cursor warp to the foreground window's center.
                 unsafe { SetCursorPos(cx, cy) };
                 self.mouse_centered = true;
                 return PadState::default();
             }
             let mut cur = POINT { x: cx, y: cy };
+            // SAFETY: `cur` is valid writable storage.
             if unsafe { GetCursorPos(&mut cur) } == 0 {
                 return PadState::default();
             }
             let dx = (cur.x - cx) as f32;
             let dy = (cur.y - cy) as f32;
             if cur.x != cx || cur.y != cy {
+                // SAFETY: plain cursor re-centering after reading delta.
                 unsafe { SetCursorPos(cx, cy) };
             }
             let sens = *SENS.get_or_init(|| {
@@ -1329,7 +1335,9 @@ mod host {
                     .filter(|v| v.is_finite() && *v > 0.0)
                     .unwrap_or(0.045)
             });
+            // SAFETY: plain key-state query (VK_LBUTTON = 0x01).
             let lmb = unsafe { GetAsyncKeyState(0x01) } < 0;
+            // SAFETY: plain key-state query (VK_RBUTTON = 0x02).
             let rmb = unsafe { GetAsyncKeyState(0x02) } < 0;
             PadState {
                 right_x: (dx * sens).clamp(-1.0, 1.0),
