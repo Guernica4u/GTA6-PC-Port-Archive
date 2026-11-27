@@ -183,6 +183,21 @@ fn init(device: &ID3D12Device) -> Option<Dlss> {
     Some(Dlss { params, feature: None })
 }
 
+/// LOCAL (11/27): `VICTORY_DLSS_BEFORE_SL=1` (default off, untested): NGX is started for DLSS
+/// super resolution before Streamline starts it for frame generation. NGX is one per process and
+/// looks for its features once, in the folders of whoever starts it first: Streamline's start
+/// looked only in its own folder, so DLSS SR was never found afterwards (`crate::fg::start`).
+pub(crate) fn start_before_streamline(device: &ID3D12Device) {
+    if std::env::var_os("VICTORY_DLSS_BEFORE_SL").is_none_or(|v| v != "1")
+        || std::env::var_os("VICTORY_UPSCALE").is_none_or(|v| v != "dlss")
+    {
+        return;
+    }
+    let mut guard = DLSS.lock().unwrap_or_else(|e| e.into_inner());
+    let ok = guard.get_or_insert_with(|| init(device)).is_some();
+    tracing::info!(ok, "DLSS: NGX started before Streamline (VICTORY_DLSS_BEFORE_SL=1)");
+}
+
 /// Records DLSS over `inputs` into `list`; false if it could not (the caller
 /// stretches instead). The list's descriptor heaps and root state are the
 /// SDK's afterwards: the caller replays the title's.
@@ -304,7 +319,9 @@ pub(crate) fn record(device: &ID3D12Device, list: &ID3D12GraphicsCommandList, in
     }
     // LOCAL (11/26): DLSS Frame Generation's inputs (`VICTORY_FRAME_GEN`), in the state the
     // upscale read them in.
-    if crate::fg::active() {
+    // (With `VICTORY_FG_ANY_UPSCALE` on, the default, `crate::list::upscale_now` hands them over
+    // for every upscale instead.)
+    if crate::fg::active() && !crate::fg::any_upscale() {
         crate::fg::tag(
             [render[0].min(in_w), render[1].min(in_h)],
             [jit * inputs.jitter[0], jit * inputs.jitter[1]],

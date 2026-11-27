@@ -943,7 +943,7 @@ pub(super) fn upscale_now(this: This, up: &Upscale) -> bool {
                 frame_ms: up.frame_ms,
             };
             done = crate::dlss::record(&host.device, &list.list, &inputs);
-            if done {
+            if done && !crate::fg::any_upscale() {
                 // LOCAL (11/26): frame generation's depth and motion vectors (crate::fg).
                 crate::fg::note_titles(up.depth, up.motion);
             }
@@ -953,6 +953,23 @@ pub(super) fn upscale_now(this: This, up: &Upscale) -> bool {
         }
         if done {
             crate::texture::host_written(output);
+            // LOCAL (11/27): frame generation's constants and buffers from every upscale, the
+            // stretch too (crate::fg::any_upscale).
+            if crate::fg::active() && crate::fg::any_upscale() {
+                // SAFETY: a live resource.
+                let c = unsafe { from.GetDesc() };
+                crate::fg::from_upscale(
+                    up.render,
+                    [c.Width as u32, c.Height],
+                    up.jitter,
+                    up.motion_scale,
+                    up.near,
+                    up.far,
+                    up.reset,
+                    up.depth,
+                    up.motion,
+                );
+            }
         }
         state.replay(list);
     });

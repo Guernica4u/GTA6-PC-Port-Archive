@@ -7,8 +7,9 @@
 //! - [`start`] (from the presenter, before its swap chain): `slInit`, `slSetD3DDevice`, Reflex
 //!   low latency, and the factory upgraded to Streamline's proxy, so that the swap chain made
 //!   from it is the proxy that generates frames at `Present`.
-//! - [`tag`] (from the DLSS upscale, `crate::dlss::record`): the frame's constants and its depth
-//!   and motion vectors (copied by Streamline on that list: `eOnlyValidNow`).
+//! - [`tag`] (from every title upscale, DLSS or stretch, through [`from_upscale`]; with
+//!   `VICTORY_FG_ANY_UPSCALE=0` only from a DLSS upscale, `crate::dlss::record`): the frame's
+//!   constants and its depth and motion vectors, handed to Streamline at the next present.
 //! - [`present_start`] / [`present_end`] around the proxy's `Present`.
 //!
 //! The title gives no camera matrices: they are made from a 60 degree field of view, the
@@ -146,6 +147,10 @@ pub(crate) fn start(device: &ID3D12Device, factory: IDXGIFactory2) -> IDXGIFacto
     if wanted() == 0 {
         return factory;
     }
+    #[cfg(feature = "dlss")]
+    if STATE.get().is_none() {
+        crate::dlss::start_before_streamline(device);
+    }
     let state = STATE.get_or_init(|| match init(device) {
         Ok(s) => {
             tracing::info!(frames = wanted() + 1, "frame generation: Streamline started");
@@ -198,6 +203,50 @@ pub(crate) fn tag(render: [u32; 2], jitter: [f32; 2], mv_pixels: [f32; 2], near:
     let (depth, motion) = latest.as_ref().map_or((0, 0), |l| (l.depth, l.motion));
     *latest = Some(Latest { depth, motion, render, jitter, mv_pixels, near, far, reset });
     TAGGED.store(true, Ordering::Relaxed);
+}
+
+/// LOCAL (11/27): `VICTORY_FG_ANY_UPSCALE` (default on; `0`: the old way, only after a DLSS upscale).
+/// Frame generation's inputs are taken from every upscale the title asks for, the stretch too.
+/// Before this they came only from a DLSS upscale that worked, and with Streamline started first
+/// NGX never finds DLSS super resolution (`SuperSampling.Available` 0: Streamline's NGX start
+/// looked only in its own folder), so every upscale was a stretch, `slSetConstants` was never
+/// called and DLSS-G dropped every frame ("missing common constants", r t1-dlssperf-fg4).
+pub(crate) fn any_upscale() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FG_ANY_UPSCALE").is_none_or(|v| v != "0"))
+}
+
+/// [`tag`] and [`note_titles`] from the title's upscale description (`crate::list::upscale_now`),
+/// with the signs the DLSS upscale would use (`VICTORY_DLSS_MV_SIGN`, `VICTORY_DLSS_JITTER_SIGN`).
+/// `colour` is the colour input's size, the render size when the title gives none.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn from_upscale(
+    render: [u32; 2],
+    colour: [u32; 2],
+    jitter: [f32; 2],
+    motion_scale: [f32; 2],
+    near: f32,
+    far: f32,
+    reset: bool,
+    depth: u64,
+    motion: u64,
+) {
+    if state().is_none() {
+        return;
+    }
+    let env = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.0);
+    let (mv, jit) = (env("VICTORY_DLSS_MV_SIGN"), env("VICTORY_DLSS_JITTER_SIGN"));
+    let scale = |s: f32| if s == 0.0 { 1.0 } else { s };
+    let size = |i: usize| if render[i] == 0 { colour[i] } else { render[i].min(colour[i].max(1)) };
+    tag(
+        [size(0), size(1)],
+        [jit * jitter[0], jit * jitter[1]],
+        [mv * scale(motion_scale[0]), mv * scale(motion_scale[1])],
+        near,
+        far,
+        reset,
+    );
+    note_titles(depth, motion);
 }
 
 /// The title's depth and motion vectors the DLSS upscale read (`crate::list::upscale_now`).
