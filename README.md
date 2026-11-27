@@ -60,8 +60,16 @@
   SDK, `D3D12Core.dll`, about 22 MB from nuget.org). It goes into a `D3D12`
   folder beside `victory.exe`. `victory.exe get-d3d12` does the same by hand.
   The file is checked against Microsoft's signature and the tested SHA-256.
-  If Direct3D returns `0x887E0003` and the local DLL is missing, Victory downloads
-  it automatically before starting the game. This can also happen on Windows 11.
+  With no local DLL, Victory starts with Windows' built-in runtime. If Direct3D
+  still returns `0x887E0003`, Victory downloads the DLL automatically before
+  starting the game. An existing Agility SDK DLL (for example 1.618 or 1.620)
+  is used at its own version. Before v2026.11.27.4 it had to be 1.614, or
+  Windows refused Direct3D 12 with the same error.
+- C: drive full? Set `VICTORY_HOME` to another folder, once, in a command
+  prompt: `setx VICTORY_HOME D:\victory`. Then start victory.exe from a new
+  window. Settings, saves, caches, logs and the downloads all go there
+  instead of `%LOCALAPPDATA%\victory`. To keep what you have, move that
+  folder's contents there first.
 - You need Windows 10 or 11, 32 GB of RAM or more, an SSD and an NVIDIA
   GeForce RTX card with a recent driver. This repository and its releases
   contain no game files.

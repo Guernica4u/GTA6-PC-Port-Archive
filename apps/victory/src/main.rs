@@ -26,11 +26,69 @@ use clap::{Parser, Subcommand, ValueEnum};
 /// older: Windows 10's stops at shader model 6.5, and the translated shaders
 /// are 6.6 (`victory play` fetches it there; 2026-11-27, an RTX 3060 on
 /// Windows 10 22H2 had every pipeline refused). Without the folder, nothing changes.
+///
+/// A `D3D12Core.dll` there of another version (other forks' guides put 1.618
+/// or 1.620 there) made Windows refuse Direct3D 12 altogether, "the D3D12 SDK
+/// version configuration of the host exe is invalid" (0x887E0003; 2026-11-27,
+/// an RTX 5080 and an RTX 3080 Ti on Windows 11): [`match_d3d12_core`] asks
+/// for the version of the file that is there, before Direct3D 12 is loaded.
+///
+/// Without the folder, it asks for [`OS_RUNTIME`]: Windows' own runtime,
+/// whatever its version. Asking for 614 there made a Windows 11 whose own
+/// runtime is older (22H2, build 22623, 11-27) look for 1.614 in the missing
+/// folder and refuse Direct3D 12 the same way (0x887E0003; releases before
+/// v2026.11.27.2, which asked for nothing, ran there).
+/// (An atomic: the same bytes as a `u32`, in memory that can be written.)
 #[cfg(windows)]
 #[unsafe(no_mangle)]
 #[used]
 #[allow(non_upper_case_globals)]
-pub static D3D12SDKVersion: u32 = 614;
+pub static D3D12SDKVersion: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(614);
+
+/// The Agility SDK version of a `D3D12Core.dll` (its file version is
+/// `1.<sdk>.<patch>.0`, e.g. 1.614.1.0): from the file's VS_FIXEDFILEINFO.
+fn agility_version(dll: &[u8]) -> Option<u32> {
+    let signature = 0xFEEF_04BD_u32.to_le_bytes();
+    let at = dll.windows(4).position(|w| w == signature)?;
+    let most = u32::from_le_bytes(dll.get(at + 8..at + 12)?.try_into().ok()?);
+    let (major, minor) = (most >> 16, most & 0xffff);
+    (major == 1 && minor >= 600).then_some(minor)
+}
+
+/// The version asked for where no `D3D12\D3D12Core.dll` is beside this
+/// program: the first Agility SDK's (1.4), at or below every Windows that
+/// reads `D3D12SDKVersion`, so Windows keeps its own runtime.
+#[cfg(windows)]
+const OS_RUNTIME: u32 = 4;
+
+/// Asks Windows for the Agility SDK version of the `D3D12\D3D12Core.dll`
+/// beside this program, or for its own runtime where there is none. First
+/// thing in `main`, and again after `victory play` fetched the file: Windows
+/// reads `D3D12SDKVersion` when Direct3D 12 is first used.
+#[cfg(windows)]
+pub(crate) fn match_d3d12_core() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(core) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("D3D12").join("D3D12Core.dll")))
+    else {
+        return;
+    };
+    let Ok(bytes) = std::fs::read(&core) else {
+        D3D12SDKVersion.store(OS_RUNTIME, Relaxed);
+        return;
+    };
+    match agility_version(&bytes) {
+        Some(v) => {
+            if v != 614 {
+                println!("{} is the D3D12 Agility SDK 1.{v}: asking Windows for that version.", core.display());
+            }
+            D3D12SDKVersion.store(v, Relaxed);
+        }
+        None => {
+            D3D12SDKVersion.store(OS_RUNTIME, Relaxed);
+            println!("{} is not a D3D12 Agility SDK runtime Windows can use: Windows' own is used.", core.display());
+        }
+    }
+}
 
 /// `D3D12SDKPath`'s value: a pointer to a C string.
 #[cfg(windows)]
@@ -258,6 +316,11 @@ enum Console {
 }
 
 fn main() -> Result<()> {
+    #[cfg(windows)]
+    match_d3d12_core();
+    // Before anything else can take the address space it needs.
+    #[cfg(windows)]
+    victory_hle::reserve_upload_space();
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if std::env::var_os("VICTORY_AUDIO_CAPTURE").is_some() {
@@ -426,6 +489,30 @@ fn show_config() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// A D3D12Core.dll's VS_FIXEDFILEINFO: signature, structure version, then
+    /// the file version's high and low words (1.620.2.0 here).
+    fn core_bytes(major: u32, minor: u32) -> Vec<u8> {
+        let mut b = vec![0u8; 40];
+        for w in [0xFEEF_04BD_u32, 0x0001_0000, (major << 16) | minor, 2 << 16] {
+            b.extend_from_slice(&w.to_le_bytes());
+        }
+        b.extend_from_slice(&[0u8; 16]);
+        b
+    }
+
+    #[test]
+    fn agility_versions_are_read_from_the_file() {
+        assert_eq!(super::agility_version(&core_bytes(1, 620)), Some(620));
+        assert_eq!(super::agility_version(&core_bytes(1, 614)), Some(614));
+        // Windows' own D3D12Core.dll (10.0.x) and files without the structure are not one.
+        assert_eq!(super::agility_version(&core_bytes(10, 0)), None);
+        assert_eq!(super::agility_version(&[0u8; 64]), None);
+        assert_eq!(super::agility_version(&core_bytes(1, 620)[..48]), None);
+    }
 }
 
 /// Paths given on the command line, or the configured game + test titles.

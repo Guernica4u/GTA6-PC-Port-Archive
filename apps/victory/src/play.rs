@@ -195,8 +195,11 @@ pub(crate) fn preload(exe: &Path) {
     }
 }
 
-/// `%LOCALAPPDATA%\victory`.
+/// `%LOCALAPPDATA%\victory`, or the folder `VICTORY_HOME` names.
 fn home() -> Result<PathBuf> {
+    if let Some(home) = victory_core::config::home_override() {
+        return Ok(home);
+    }
     let base = std::env::var_os("LOCALAPPDATA").context("no %LOCALAPPDATA% to keep settings and logs in")?;
     Ok(PathBuf::from(base).join("victory"))
 }
@@ -705,7 +708,11 @@ fn check_shader_model() -> Result<()> {
         println!("Microsoft's Direct3D 12 runtime comes from nuget.org (about 22 MB) and goes into {}.", to.display());
         if !probe.needs_download_confirmation() || confirm_d3d12_download() {
             match fetch_d3d12(&to) {
-                Ok(()) => match shader_model() {
+                Ok(()) => match {
+                    // This process is yet to load Direct3D 12: it asks for the file now there.
+                    crate::match_d3d12_core();
+                    shader_model()
+                } {
                     Some(ShaderModelProbe::Model(major, minor)) if (major, minor) >= needed => {
                         println!("Shader model {major}.{minor} with Microsoft's runtime. Starting the game.");
                         return Ok(());
