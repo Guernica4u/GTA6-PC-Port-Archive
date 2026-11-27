@@ -9,10 +9,10 @@ pub(super) struct Gate {
 }
 
 pub(super) fn pause(p: &Arc<Pending>) {
-    if let Some(gate) = WORKER.get() {
-        if gate.taken.send(p.clone()).is_ok() {
-            let _ = gate.resume.lock().unwrap().recv();
-        }
+    if let Some(gate) = WORKER.get()
+        && gate.taken.send(p.clone()).is_ok()
+    {
+        let _ = gate.resume.lock().unwrap().recv();
     }
 }
 
