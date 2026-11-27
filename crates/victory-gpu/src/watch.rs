@@ -1056,17 +1056,74 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[ignore = "manual synthetic timing; no fixed speedup assertion"]
-    fn region_probe_benchmark() {
-        let p = pool(4096);
-        for fast in [false, true, true, false] {
-            let start = std::time::Instant::now();
-            for _ in 0..100 {
-                std::hint::black_box(runtime_pages_with_probe(p, p + 4096 * PAGE, false, fast));
+    fn region_probe_matches_baseline_for_dirty_and_partial_ranges() {
+        for n in [1, 63, 64, 65, 128, 512] {
+            let p = pool(n);
+            for page in 0..n {
+                // SAFETY: each address lies in the test's committed allocation.
+                unsafe { ((p + page * PAGE) as *mut u8).write_volatile(1) };
             }
-            eprintln!("region probe fast={fast}: {:?}", start.elapsed());
+            for (start, end) in [(p, p + n * PAGE), (p + 17, p + n * PAGE - 19)] {
+                for views in [false, true] {
+                    assert_eq!(
+                        runtime_pages_with_probe(start, end, views, true),
+                        runtime_pages_with_probe(start, end, views, false),
+                        "dirty range {n} pages, views={views}"
+                    );
+                }
+            }
+            free(p);
+        }
+    }
+
+    #[test]
+    fn region_probe_matches_baseline_for_mixed_commit_states() {
+        // SAFETY: a fresh write-watched reservation owned by this test.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), 256 * PAGE, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        for offset in [0, 128 * PAGE] {
+            // SAFETY: commit only inside the reservation.
+            assert_ne!(unsafe {
+                VirtualAlloc((p + offset) as *const _, 64 * PAGE, MEM_COMMIT, PAGE_READWRITE)
+            } as usize, 0);
+        }
+        for views in [false, true] {
+            assert_eq!(
+                runtime_pages_with_probe(p, p + 256 * PAGE, views, true),
+                runtime_pages_with_probe(p, p + 256 * PAGE, views, false)
+            );
         }
         free(p);
+    }
+
+    #[test]
+    #[ignore = "manual synthetic timing; no fixed speedup assertion"]
+    fn region_probe_benchmark() {
+        for n in [16, 64, 256, 1024, 4096] {
+            let p = pool(n);
+            for dirty in [false, true] {
+                if dirty {
+                    for page in 0..n {
+                        // SAFETY: each address lies inside the committed allocation.
+                        unsafe { ((p + page * PAGE) as *mut u8).write_volatile(1) };
+                    }
+                }
+                assert_eq!(
+                    runtime_pages_with_probe(p, p + n * PAGE, false, true),
+                    runtime_pages_with_probe(p, p + n * PAGE, false, false)
+                );
+                for fast in [false, true, true, false] {
+                    let start = std::time::Instant::now();
+                    for _ in 0..100 {
+                        std::hint::black_box(runtime_pages_with_probe(p, p + n * PAGE, false, fast));
+                    }
+                    eprintln!("region probe pages={n} dirty={dirty} fast={fast}: {:?}", start.elapsed());
+                }
+            }
+            free(p);
+        }
     }
 
     /// Everything is changed at first; after taking, only what is written
@@ -1136,6 +1193,12 @@ pub(crate) mod tests {
                 }
             })
             .expect("a free window");
+        for views in [false, true] {
+            assert_eq!(
+                runtime_pages_with_probe(base, base + WINDOW, views, true),
+                runtime_pages_with_probe(base, base + WINDOW, views, false)
+            );
+        }
         let t = track(base, WINDOW, true).expect("the pool is tracked");
         let taken = t.take(base, base + WINDOW);
         assert!(taken.iter().any(|&(a, b)| a <= pool && pool + PAGE <= b), "{taken:x?}");
