@@ -180,6 +180,9 @@ pub(crate) fn sync_heaps() {
             continue;
         };
         let step = u64::from(step);
+        // The highest slot of a written page past the host heap's count, if
+        // any (a page's resolution: the title wrote somewhere on that page).
+        let mut past: Option<u32> = None;
         for (from, to) in written.take(start as usize, usize::MAX) {
             // By page: one with nothing mapped (the title unmaps heap pages
             // too) holds no records.
@@ -190,6 +193,10 @@ pub(crate) fn sync_heaps() {
                     continue;
                 }
                 let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
+                let last = last.min(u64::from(heap.desc.count));
+                if last > u64::from(host.count()) {
+                    past = past.max(Some(last as u32 - 1));
+                }
                 // Slots past the host heap's count have no host slot at all
                 // (HostHeap::mirror refuses them), so they are left out of the
                 // read too: where the host caps its heap (NVIDIA, below the
@@ -204,10 +211,9 @@ pub(crate) fn sync_heaps() {
                 host.sync_slots(first, last, start, step);
             }
         }
-        // The heap's highest title slot, where the host has no slot for it:
-        // the scan above leaves it out, and HostHeap::mirror reports the
-        // refusal once per new highest index seen.
-        if let Some(highest) = heap.desc.count.checked_sub(1).filter(|&i| i >= host.count()) {
+        // That slot has no host slot: the scan above leaves it out, and
+        // HostHeap::mirror reports the refusal once per new highest index.
+        if let Some(highest) = past {
             host.mirror(highest, start + u64::from(highest) * step, false);
         }
     }
