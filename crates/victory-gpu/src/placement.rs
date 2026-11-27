@@ -161,14 +161,21 @@ impl Heaps {
     /// The pending ranges are reaped only when no heap holds the range, so
     /// placing into a heap does not walk them.
     fn allocate(&mut self, device: &ID3D12Device, size: u64, align: u64) -> Option<(ID3D12Heap, Placement)> {
+        if let Some(room) = self.reserved(size, align) {
+            return Some(room);
+        }
+        self.new_heap(device, size, align)
+    }
+
+    /// The range [`Heaps::allocate`] takes from a heap that has room, reaping
+    /// the pending ranges once when none does: what a placement pays before
+    /// it needs a new heap, and the part of it that needs no device.
+    fn reserved(&mut self, size: u64, align: u64) -> Option<(ID3D12Heap, Placement)> {
         if let Some(room) = self.take_room(size, align) {
             return Some(room);
         }
         self.reap();
-        if let Some(room) = self.take_room(size, align) {
-            return Some(room);
-        }
-        self.new_heap(device, size, align)
+        self.take_room(size, align)
     }
 
     /// A new heap with a range of `size` bytes taken from it.
@@ -217,7 +224,6 @@ pub(crate) fn place(device: &ID3D12Device, desc: &D3D12_RESOURCE_DESC) -> Option
     let size = info.SizeInBytes.next_multiple_of(ALIGN);
     let mut heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     let heaps = heaps.get_or_insert_with(Heaps::default);
-    heaps.reap();
     heaps.allocate(device, size, info.Alignment.max(ALIGN))
 }
 
@@ -403,5 +409,23 @@ mod tests {
         let mut free = BTreeMap::from([(k, 10 * k)]);
         assert_eq!(take(&mut free, k, 4 * k), Some(4 * k));
         assert_eq!(free, BTreeMap::from([(k, 3 * k), (5 * k, 6 * k)]));
+    }
+
+    /// [`Heaps::reserved`] reaps the pending ranges only when no heap has
+    /// room, so a placement into a heap with room does not walk them.
+    #[test]
+    fn a_placement_into_a_heap_with_room_does_not_reap() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let mut heaps = Heaps::default();
+        let _ = heaps.allocate(&host.device, ALIGN, ALIGN).unwrap();
+        let reaps = heaps.reaps;
+        let (_, a) = heaps.reserved(ALIGN, ALIGN).unwrap();
+        assert_eq!(a.offset, ALIGN, "the range after the first");
+        assert_eq!(heaps.reaps, reaps, "room in a heap: nothing reaped");
+        heaps.heaps[0].free.clear();
+        assert!(heaps.reserved(ALIGN, ALIGN).is_none(), "no room left");
+        assert_eq!(heaps.reaps, reaps + 1, "no room: one reap, then a new heap");
     }
 }
