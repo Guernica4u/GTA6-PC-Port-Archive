@@ -34,6 +34,15 @@
 //! upload memory, sent up, merged or waited for: the card reads the title's
 //! bytes when it runs, as the console's does.
 //!
+//! Alignment (2026-11-27, branch `perf/raw-constants`): a constant buffer
+//! VIEW needs its address on 256 bytes on the host; the title places its
+//! constants on 16, so 6,185 of 6,556 views a frame could not be bound here
+//! (run play-20261127-111731). The translation now reads every constant
+//! buffer as raw bytes (`victory_shader::emit::HostShader::root_cbvs`, and
+//! the raw twin of a table's slot), whose views need 4 bytes (root SRVs,
+//! [`ROOT_ALIGN`]) or 16 (raw views in slots, [`TABLE_ALIGN`]): the caller
+//! says which ([`constants`]' `align`).
+//!
 //! "No shader writes it", per 4 KiB page ([`PAGE_MARKS`]): no read-back
 //! into title memory was ever recorded for it ([`gpu_bound`]: for good), no
 //! title buffer copy into it was recorded in the last [`COPY_FRAMES`]
@@ -79,6 +88,19 @@ const MOST: u64 = 512 << 20;
 
 /// The most bytes a constant buffer view reads (4,096 vectors).
 const CONSTANTS_MOST: u64 = 64 << 10;
+
+/// The alignment a root constant buffer needs to be read in place: it is a
+/// raw root SRV (`victory_shader::emit::HostShader::root_cbvs`), whose
+/// address needs 4 bytes.
+pub(crate) const ROOT_ALIGN: u64 = 4;
+
+/// The alignment a constant buffer in a table needs to be read in place: it
+/// is read through the raw twin of its slot, a raw view, which begins on 16
+/// bytes (`crate::descriptor::host::HostHeap::constant_align`).
+pub(crate) const TABLE_ALIGN: u64 = 16;
+
+/// The alignment a constant buffer view needs (heaps without raw twins).
+pub(crate) const VIEW_ALIGN: u64 = 256;
 
 /// Frames before memory that could not be opened is asked about again
 /// (pages of a stretch may not be committed yet).
@@ -137,8 +159,10 @@ static PAGE_MARKS: [AtomicU32; PAGES] = [const { AtomicU32::new(0) }; PAGES];
 // section, not committed, no view of it could be made, the host refused, no
 // buffer could be placed; regions forgotten because the title mapped other
 // pages there. Then, since the last line: constant buffer views bound in
-// place and their bytes; not, because not 256-aligned, because a shader
-// writes a page of it, because outside every region; fills of upload memory
+// place and their bytes; not, because not aligned, because a shader
+// writes a page of it, because outside every region (not aligned: off the
+// 4 or 16 bytes the raw view it is read through needs, or the 256 of a
+// CBV where the host keeps no raw twins); fills of upload memory
 // read out of ported memory on the CPU and their bytes; title buffer copies
 // on the CPU that touch it and their bytes.
 const OPENED: usize = 0;
@@ -160,16 +184,19 @@ const COPIES: usize = 15;
 const COPY_BYTES: usize = 16;
 static STATS: [AtomicU64; 17] = [const { AtomicU64::new(0) }; 17];
 
-/// A constant buffer view of `len` bytes at title address `address`, read
-/// in place: the buffer to bind and hold (the caller's list and slot keep
-/// it), and the host address of `address` in it (256-aligned). `None`: bind
-/// the card copy or fill upload memory, as before. In place only if the
-/// view's bytes (`len` rounded up to 256, 64 KiB at most) lie in a region
-/// and no shader writes any of their pages.
-pub(crate) fn constants(address: u64, len: u64) -> Option<(ID3D12Resource, u64)> {
+/// A constant buffer of `len` bytes at title address `address`, read in
+/// place: the buffer to bind and hold (the caller's list and slot keep it),
+/// and the host address of `address` in it (on `align` bytes: what the view
+/// the caller binds needs, [`ROOT_ALIGN`], [`TABLE_ALIGN`] or
+/// [`VIEW_ALIGN`]). `None`: bind the card copy or fill upload memory, as
+/// before. In place only if the view's bytes (`len` rounded up to 256, 64
+/// KiB at most: what a CBV of it shows) lie in a region and no shader writes
+/// any of their pages.
+pub(crate) fn constants(address: u64, len: u64, align: u64) -> Option<(ID3D12Resource, u64)> {
     if len == 0 || address >= LOW {
         return None;
     }
+    debug_assert!(align.is_power_of_two());
     let size = len.min(CONSTANTS_MOST).next_multiple_of(256);
     let end = address.checked_add(size)?;
     if end > LOW {
@@ -177,7 +204,7 @@ pub(crate) fn constants(address: u64, len: u64) -> Option<(ID3D12Resource, u64)>
     }
     // Regions begin on 64 KiB and their buffer with them: the host address
     // is aligned as the title's is.
-    if address % 256 != 0 {
+    if address % align != 0 {
         if touches(address as usize, size as usize) {
             STATS[MISALIGNED].fetch_add(1, Ordering::Relaxed);
         }
@@ -189,7 +216,7 @@ pub(crate) fn constants(address: u64, len: u64) -> Option<(ID3D12Resource, u64)>
     };
     // SAFETY: a live buffer.
     let gpu = unsafe { whole.GetGPUVirtualAddress() } + (address - start);
-    if gpu % 256 != 0 {
+    if gpu % align != 0 {
         STATS[MISALIGNED].fetch_add(1, Ordering::Relaxed);
         return None;
     }
@@ -446,7 +473,7 @@ pub(crate) fn log(frames: f64) {
     let per = |at: usize| taken[at - READ];
     tracing::info!(
         "renderer port 1: {} regions of the title's graphics memory in place ({} MB); per frame: {:.0} constant views read in place ({:.1} KB: \
-         nothing refreshed, filled or waited for), not in place: {:.0} not 256-aligned, {:.0} on pages shaders write, {:.0} outside the regions; \
+         nothing refreshed, filled or waited for), not in place: {:.0} not aligned for their raw view (4 root, 16 table), {:.0} on pages shaders write, {:.0} outside the regions; \
          on the CPU {:.0} fills read out of them ({:.1} KB), {:.1} buffer copies touching them ({:.1} KB); since the start not opened: \
          {} not one stretch of a section, {} not committed, {} no view, {} by the host, {} no buffer; {} regions forgotten (other pages mapped there)",
         s[OPENED],
@@ -477,10 +504,10 @@ mod tests {
     /// with bytes.
     #[test]
     fn only_memory_below_4_gib_is_read_in_place() {
-        assert!(constants(0xe1c80_0000, 256).is_none());
-        assert!(constants(0xffff_ff00, 0x1000).is_none());
-        assert!(constants(0x3431_0000, 0).is_none());
-        assert!(constants(u64::MAX - 255, 16).is_none());
+        assert!(constants(0xe1c80_0000, 256, TABLE_ALIGN).is_none());
+        assert!(constants(0xffff_ff00, 0x1000, TABLE_ALIGN).is_none());
+        assert!(constants(0x3431_0000, 0, TABLE_ALIGN).is_none());
+        assert!(constants(u64::MAX - 255, 16, ROOT_ALIGN).is_none());
     }
 
     /// A page a write on the card is bound for is the shaders' for good;

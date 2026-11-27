@@ -3746,8 +3746,26 @@ impl HostHeap {
         }
     }
 
+    /// The alignment a constant buffer's host address needs for a slot of
+    /// this heap ([`HostHeap::constant_at`]): 16 where the heap keeps raw
+    /// twins (shaders read constant buffers as raw bytes through the twin,
+    /// `victory_shader::emit::raw_views`), else the 256 of a CBV.
+    pub(crate) fn constant_align(&self) -> u64 {
+        if self.twins.is_empty() {
+            crate::port::VIEW_ALIGN
+        } else {
+            crate::port::TABLE_ALIGN
+        }
+    }
+
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
-    /// memory, `size` bytes at `gpu` of `buffer`, which the slot holds.
+    /// memory, `size` bytes at `gpu` of `buffer`, which the slot holds, and
+    /// its raw twin a raw view of the same bytes (the view's size: `size`
+    /// rounded up to 256, at most 64 KiB, cut at the buffer's end), which is
+    /// what translated shaders read (`victory_shader::emit::raw_views`).
+    /// `gpu` needs [`HostHeap::constant_align`]: off 256 bytes (the title's
+    /// constants in place, `crate::port`, lie on 16) the slot itself is a
+    /// null view (a CBV cannot begin there) and the twin alone shows them.
     ///
     /// The list holds it too, until it is reset; the slot shows it until it
     /// is made again, and a shader that picks the slot by an index it
@@ -3759,29 +3777,39 @@ impl HostHeap {
         static HOLDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let holds = *HOLDS.get_or_init(|| std::env::var_os("VICTORY_SLOT_HOLDS").is_none_or(|v| v != "0"));
         let Some(host) = host() else { return };
+        let bytes = constant_bytes(size);
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
-            SizeInBytes: constant_bytes(size),
+            SizeInBytes: bytes,
+        };
+        let view = if gpu.is_multiple_of(256) {
+            desc
+        } else {
+            // A zero location makes a null view.
+            D3D12_CONSTANT_BUFFER_VIEW_DESC::default()
         };
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
             host.device
-                .CreateConstantBufferView(Some(&desc), self.at(index))
+                .CreateConstantBufferView(Some(&view), self.at(index))
         };
         self.put(index);
-        // A program that reads it as raw bytes reads its twin.
-        let twin = self.twin(index).filter(|_| desc.SizeInBytes > 0);
-        if let Some(twin) = twin {
+        // A program reads it as raw bytes through its twin.
+        let twin = self.twin(index).filter(|_| bytes > 0);
+        let made = twin.is_some_and(|twin| {
             // SAFETY: a live buffer that holds the range.
-            let first = (gpu - unsafe { buffer.GetGPUVirtualAddress() }) / 4;
+            let offset = gpu - unsafe { buffer.GetGPUVirtualAddress() };
+            let Some(range) = raw_view_range(buffer, offset, u64::from(bytes), &RAW_SRV_CUTS) else {
+                return false;
+            };
             let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
                 Format: DXGI_FORMAT_R32_TYPELESS,
                 ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
                 Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
                 Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                     Buffer: D3D12_BUFFER_SRV {
-                        FirstElement: first,
-                        NumElements: desc.SizeInBytes / 4,
+                        FirstElement: range.first,
+                        NumElements: range.elements,
                         StructureByteStride: 0,
                         Flags: D3D12_BUFFER_SRV_FLAG_RAW,
                     },
@@ -3789,8 +3817,18 @@ impl HostHeap {
             };
             // SAFETY: as above, and a slot of our heaps.
             unsafe { host.device.CreateShaderResourceView(buffer, Some(&raw), twin) };
+            true
+        });
+        if twin.is_some() && !made {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    gpu = format_args!("{gpu:#x}"),
+                    "a constant buffer's raw twin could not be made (off 16 bytes or past its buffer): it reads zeros"
+                );
+            });
         }
-        self.twin_made(index, twin.is_some());
+        self.twin_made(index, made);
         self.write_stride(index, 0);
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
@@ -4927,7 +4965,18 @@ fn make_twinned(
         &View::Constant(address, size) => {
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
-            if gpu % 256 != 0 {
+            let bytes = constant_bytes(size);
+            // The twin is a raw view of the same bytes: translated shaders
+            // read constant buffers (picked from the heap, or in a table the
+            // draw did not make afresh) as raw bytes through it
+            // (`victory_shader::emit::raw_views`). It needs 16 bytes, the
+            // CBV 256.
+            // SAFETY: a live buffer.
+            let offset = gpu - unsafe { shadow.buffer.GetGPUVirtualAddress() };
+            let range = twin
+                .filter(|_| bytes > 0)
+                .and_then(|_| raw_view_range(&shadow.buffer, offset, u64::from(bytes), &RAW_SRV_CUTS));
+            if !gpu.is_multiple_of(256) && range.is_none() {
                 once!(
                     address = format_args!("{address:#x}"),
                     "constant buffer not 256-byte aligned on the host"
@@ -4936,13 +4985,36 @@ fn make_twinned(
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
-                SizeInBytes: constant_bytes(size),
+                SizeInBytes: bytes,
             };
             // SAFETY: slots of our heap; the range lies in the host copy.
             unsafe {
-                device.CreateConstantBufferView(Some(&desc), at);
+                if gpu.is_multiple_of(256) {
+                    device.CreateConstantBufferView(Some(&desc), at);
+                } else {
+                    // A zero location makes a null view: only the twin shows it.
+                    device.CreateConstantBufferView(Some(&D3D12_CONSTANT_BUFFER_VIEW_DESC::default()), at);
+                }
                 if let Some(twin) = twin {
-                    device.CreateConstantBufferView(Some(&desc), twin);
+                    match range {
+                        Some(range) => {
+                            let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                                Format: DXGI_FORMAT_R32_TYPELESS,
+                                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                    Buffer: D3D12_BUFFER_SRV {
+                                        FirstElement: range.first,
+                                        NumElements: range.elements,
+                                        StructureByteStride: 0,
+                                        Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                                    },
+                                },
+                            };
+                            device.CreateShaderResourceView(&shadow.buffer, Some(&raw), twin);
+                        }
+                        None => null_buffer_view(twin),
+                    }
                 }
             }
             Some(Some(shadow.buffer.clone()))

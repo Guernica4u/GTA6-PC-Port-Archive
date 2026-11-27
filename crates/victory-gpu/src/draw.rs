@@ -1133,15 +1133,19 @@ pub(crate) fn dispatched() -> u64 {
 /// texture, and [`crate::descriptor::RtvRecord::key`].
 type TargetKey = (usize, (usize, [u32; 7]));
 
-/// The host address of a root view: its buffer's host copy, or for a
-/// constant buffer not 256-byte aligned there (the console needs 16) a
-/// copy in upload memory.
-/// shortcut: a root view has no size; constant buffers are taken as 64 KiB
-/// (cut at their buffer's end), other views as all that is left of their
-/// buffer. (They were taken as 1 MiB: 1,452 of the 2,021 mesh vertex
-/// streams of a cutscene frame reach further, and what lay past the first
-/// megabyte was never brought up to date - meshes without bodies, exploded
-/// triangles. `VICTORY_ROOT_VIEW_MB` sets a limit again.)
+/// The host address of a root view: a raw root SRV's (constant buffers are
+/// read as raw bytes too, `victory_shader::emit::HostShader::root_cbvs`),
+/// which needs 4 bytes, not the 256 of a CBV. For constants: the title's
+/// memory itself where `crate::port` reads them in place (nothing refreshed,
+/// filled or waited for); else the buffer's host copy; a copy in upload
+/// memory only for an address not on 4 bytes.
+/// shortcut: a root view has no size: constant buffers are taken as 64 KiB
+/// (cut at their buffer's end; the shader reads zeros past 64 KiB), other
+/// views as all that is left of their buffer. (They were taken as 1 MiB:
+/// 1,452 of the 2,021 mesh vertex streams of a cutscene frame reach further,
+/// and what lay past the first megabyte was never brought up to date -
+/// meshes without bodies, exploded triangles. `VICTORY_ROOT_VIEW_MB` sets a
+/// limit again.)
 fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
@@ -1153,7 +1157,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     // Constants no shader writes, in the title's graphics heap: read where
     // the title wrote them (`crate::port`), with nothing refreshed, filled
     // or waited for. The list holds the buffer.
-    if !srv && let Some((buffer, gpu)) = crate::port::constants(address, 1 << 16) {
+    if !srv && let Some((buffer, gpu)) = crate::port::constants(address, 1 << 16, crate::port::ROOT_ALIGN) {
         list.keep(&buffer);
         return Some(gpu);
     }
@@ -1162,7 +1166,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         .left(address)
         .min(if srv { limit } else { 1 << 16 });
     let gpu = shadow.gpu(address);
-    if srv || gpu % 256 == 0 {
+    if srv || gpu % crate::port::ROOT_ALIGN == 0 {
         shadow.refresh(list, address, len);
         #[cfg(feature = "diagnostics")]
         crate::book::root(gpu, len);
@@ -2148,13 +2152,14 @@ impl State {
                             None,
                         ));
                     }
+                    // Constant buffers too: the translation reads them as
+                    // raw bytes through a root SRV (`root_view`).
                     // SAFETY: an open list; the address is in live memory.
                     unsafe {
-                        match (compute, srv) {
-                            (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
-                            (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
-                            (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
-                            (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
+                        if compute {
+                            l.SetComputeRootShaderResourceView(param, gpu);
+                        } else {
+                            l.SetGraphicsRootShaderResourceView(param, gpu);
                         }
                     }
                 }
@@ -4481,10 +4486,12 @@ impl State {
     }
 
     /// The descriptors a shader reads through tables. Tables holding a
-    /// constant buffer are made afresh for the draw in dynamic slots, with
-    /// the constant data copied to upload memory when the list is
-    /// submitted: the host wants constant buffers 256-byte aligned, the
-    /// console only 16. Returns those tables' new byte offsets by root
+    /// constant buffer are made afresh for the draw in dynamic slots. The
+    /// shaders read constant buffers as raw bytes through the slots' raw
+    /// twins (16 bytes, where a CBV needs 256 and the console only 16): one
+    /// in the title's graphics heap that no shader writes is shown where the
+    /// title wrote it (`crate::port`); any other has its data copied to
+    /// upload memory when the list is submitted. Returns those tables' new byte offsets by root
     /// parameter; the other tables' slots are made from the title's.
     ///
     /// Within a list, the same table holding the same descriptors is made
@@ -4715,7 +4722,12 @@ impl State {
                         // themselves (`crate::port`); the slot and the list
                         // hold the buffer. Else a fill of upload memory at
                         // submission, as before.
-                        if let Some((buffer, gpu)) = crate::port::constants(address, u64::from(size)) {
+                        // Shaders read it as raw bytes through the slot's raw
+                        // twin (`victory_shader::emit::raw_views`), which
+                        // needs 16 bytes where its CBV needs 256: a slot off
+                        // 256 gets a null CBV and the twin alone
+                        // (`HostHeap::constant_at`).
+                        if let Some((buffer, gpu)) = crate::port::constants(address, u64::from(size), host.constant_align()) {
                             list.keep(&buffer);
                             host.constant_at(index, &buffer, gpu, size);
                             continue;
