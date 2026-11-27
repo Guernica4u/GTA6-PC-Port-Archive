@@ -11,7 +11,7 @@ Every instruction the decoder names, from [AMD's machine-readable instruction se
 ## Summary
 
 - 1,085 instructions in 1,398 encodings.
-- 372 are used by the recorded shaders; a GPU check runs 251 of those.
+- 372 are used by the recorded shaders; a GPU check runs 260 of those.
 - 210 encodings have no translation, and 186 are unproven: alone they need a bound resource or a stage, and no recorded shader uses them.
 
 | Family | Encodings | Translates | Seen translating | Nothing to emit | Unproven | Not translated | Used | Used without a GPU check |
@@ -21,7 +21,7 @@ Every instruction the decoder names, from [AMD's machine-readable instruction se
 | [Scalar, one operand (SOP1)](#scalar-one-operand-sop1) | 65 | 44 | 0 | 2 | 13 | 6 | 24 | 4 |
 | [Scalar compare (SOPC)](#scalar-compare-sopc) | 18 | 16 | 0 | 0 | 2 | 0 | 12 | 0 |
 | [Program control (SOPP)](#program-control-sopp) | 37 | 11 | 0 | 6 | 1 | 19 | 12 | 1 |
-| [Scalar memory (SMEM)](#scalar-memory-smem) | 20 | 0 | 5 | 5 | 0 | 10 | 9 | 5 |
+| [Scalar memory (SMEM)](#scalar-memory-smem) | 20 | 0 | 5 | 5 | 0 | 10 | 9 | 1 |
 | [Vector, two operands (VOP2)](#vector-two-operands-vop2) | 50 | 49 | 0 | 0 | 0 | 1 | 38 | 9 |
 | [Vector, one operand (VOP1)](#vector-one-operand-vop1) | 81 | 72 | 0 | 1 | 0 | 8 | 41 | 10 |
 | [Vector compare (VOPC)](#vector-compare-vopc) | 190 | 190 | 0 | 0 | 0 | 0 | 61 | 16 |
@@ -29,7 +29,7 @@ Every instruction the decoder names, from [AMD's machine-readable instruction se
 | [Interpolation (VINTRP)](#interpolation-vintrp) | 3 | 0 | 3 | 0 | 0 | 0 | 3 | 3 |
 | [Group memory (DS)](#group-memory-ds) | 123 | 36 | 0 | 0 | 0 | 87 | 17 | 13 |
 | [Flat, global and scratch memory (FLAT)](#flat-global-and-scratch-memory-flat) | 54 | 0 | 5 | 0 | 0 | 49 | 5 | 5 |
-| [Untyped buffers (MUBUF)](#untyped-buffers-mubuf) | 75 | 2 | 25 | 0 | 48 | 0 | 25 | 20 |
+| [Untyped buffers (MUBUF)](#untyped-buffers-mubuf) | 75 | 2 | 25 | 0 | 48 | 0 | 25 | 15 |
 | [Typed buffers (MTBUF)](#typed-buffers-mtbuf) | 16 | 0 | 4 | 0 | 12 | 0 | 4 | 4 |
 | [Images (MIMG)](#images-mimg) | 130 | 0 | 21 | 0 | 109 | 0 | 21 | 16 |
 | [Export (EXP)](#export-exp) | 1 | 0 | 1 | 0 | 0 | 0 | 1 | 0 |
@@ -41,14 +41,8 @@ Most used first. Each needs a check before it can be trusted.
 | Instruction | Recorded shaders |
 | --- | ---: |
 | `s_inst_prefetch` | 44,348 |
-| `s_buffer_load_dwordx4` | 38,501 |
-| `s_buffer_load_dwordx2` | 36,397 |
-| `s_buffer_load_dwordx8` | 25,251 |
-| `buffer_load_dwordx2` | 25,203 |
-| `s_buffer_load_dwordx16` | 25,005 |
 | `v_fma_mix_f32` | 19,544 |
 | `tbuffer_load_format_xy` | 18,506 |
-| `buffer_load_dwordx3` | 13,984 |
 | `v_interp_p1_f32` | 13,513 |
 | `v_interp_p2_f32` | 13,513 |
 | `v_cvt_pkrtz_f16_f32` | 12,303 |
@@ -59,19 +53,16 @@ Most used first. Each needs a check before it can be trusted.
 | `v_fma_mixlo_f16` | 8,396 |
 | `v_pack_b32_f16` | 7,538 |
 | `buffer_store_format_xyzw` | 6,550 |
-| `buffer_load_format_xyz` | 6,430 |
 | `v_interp_p2_f16` | 5,435 |
 | `tbuffer_load_format_xyz` | 5,231 |
 | `s_wqm_b32` | 5,089 |
 | `v_interp_mov_f32` | 4,326 |
-| `buffer_load_format_xy` | 4,272 |
 | `image_sample_d` | 3,149 |
 | `buffer_atomic_umin` | 2,388 |
 | `s_andn2_wrexec_b64` | 2,225 |
 | `v_fma_mixhi_f16` | 1,946 |
 | `buffer_store_dwordx3` | 1,530 |
 | `image_atomic_or` | 1,094 |
-| `buffer_load_format_xyzw` | 1,075 |
 | `image_atomic_umin` | 1,066 |
 | `buffer_store_dwordx4` | 1,048 |
 | `image_sample_b` | 1,034 |
@@ -398,10 +389,10 @@ Most used first. Each needs a check before it can be trusted.
 | `s_scratch_load_dwordx2` | 0x6 | **No** | — | — |
 | `s_scratch_load_dwordx4` | 0x7 | **No** | — | — |
 | `s_buffer_load_dword` | 0x8 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 40,775 |
-| `s_buffer_load_dwordx2` | 0x9 | Yes, in recorded shaders | — | 36,397 |
-| `s_buffer_load_dwordx4` | 0xa | Yes, in recorded shaders | — | 38,501 |
-| `s_buffer_load_dwordx8` | 0xb | Yes, in recorded shaders | — | 25,251 |
-| `s_buffer_load_dwordx16` | 0xc | Yes, in recorded shaders | — | 25,005 |
+| `s_buffer_load_dwordx2` | 0x9 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 36,397 |
+| `s_buffer_load_dwordx4` | 0xa | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 38,501 |
+| `s_buffer_load_dwordx8` | 0xb | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 25,251 |
+| `s_buffer_load_dwordx16` | 0xc | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 25,005 |
 | `s_gl1_inv` | 0x1f | **No** | — | — |
 | `s_dcache_inv` | 0x20 | **No** | — | — |
 | `s_memtime` | 0x24 | **No** | — | — |
@@ -1408,9 +1399,9 @@ Most used first. Each needs a check before it can be trusted.
 | Instruction | Opcode | Translator | GPU check | Recorded shaders |
 | --- | --- | --- | --- | ---: |
 | `buffer_load_format_x` | 0x0 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 20,976 |
-| `buffer_load_format_xy` | 0x1 | Yes, in recorded shaders | — | 4,272 |
-| `buffer_load_format_xyz` | 0x2 | Yes, in recorded shaders | — | 6,430 |
-| `buffer_load_format_xyzw` | 0x3 | Yes, in recorded shaders | — | 1,075 |
+| `buffer_load_format_xy` | 0x1 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 4,272 |
+| `buffer_load_format_xyz` | 0x2 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 6,430 |
+| `buffer_load_format_xyzw` | 0x3 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 1,075 |
 | `buffer_store_format_x` | 0x4 | Unproven: mubuf: s8 not a buffer descriptor (None) | — | — |
 | `buffer_store_format_xy` | 0x5 | Unproven: mubuf: s8 not a buffer descriptor (None) | — | — |
 | `buffer_store_format_xyz` | 0x6 | Unproven: mubuf: s8 not a buffer descriptor (None) | — | — |
@@ -1420,9 +1411,9 @@ Most used first. Each needs a check before it can be trusted.
 | `buffer_load_ushort` | 0xa | Unproven: mubuf: s8 not a buffer descriptor (None) | — | — |
 | `buffer_load_sshort` | 0xb | Unproven: mubuf: s8 not a buffer descriptor (None) | — | — |
 | `buffer_load_dword` | 0xc | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 31,035 |
-| `buffer_load_dwordx2` | 0xd | Yes, in recorded shaders | — | 25,203 |
+| `buffer_load_dwordx2` | 0xd | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 25,203 |
 | `buffer_load_dwordx4` | 0xe | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 23,179 |
-| `buffer_load_dwordx3` | 0xf | Yes, in recorded shaders | — | 13,984 |
+| `buffer_load_dwordx3` | 0xf | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 13,984 |
 | `buffer_store_byte` | 0x18 | Unproven: mubuf: s8 not a buffer descriptor (None) | — | — |
 | `buffer_store_byte_d16_hi` | 0x19 | Unproven: mubuf: s8 not a buffer descriptor (None) | — | — |
 | `buffer_store_short` | 0x1a | Unproven: mubuf: s8 not a buffer descriptor (None) | — | — |
