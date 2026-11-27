@@ -1021,6 +1021,10 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    #[cfg(test)]
+    if tests::refusing_copies() {
+        return None;
+    }
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
     let key = map
@@ -1316,6 +1320,23 @@ pub(crate) fn near(va: u64) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    thread_local! {
+        /// Whether [`find`] refuses to make copies on its thread: as when no
+        /// host copy can be allocated (a refused buffer view,
+        /// `crate::descriptor::host`).
+        static REFUSE_COPIES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    pub(crate) fn refusing_copies() -> bool {
+        REFUSE_COPIES.with(std::cell::Cell::get)
+    }
+
+    /// Makes [`find`] refuse copies on this thread (`refuse`) or make them
+    /// again.
+    pub(crate) fn refuse_copies(refuse: bool) {
+        REFUSE_COPIES.with(|c| c.set(refuse));
+    }
 
     /// A shader's read mark of heap slot `slot` in the bitmap of shaders
     /// that use title memory (`memory`) or of the others.
