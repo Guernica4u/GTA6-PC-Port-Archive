@@ -571,7 +571,10 @@ pub(crate) fn pipeline(
     let wide = HSTRING::from(name);
     let Some(library) = library().filter(|_| !STATIC_SAMPLERS.get()) else {
         MADE.fetch_add(1, Ordering::Relaxed);
-        return create();
+        let made_at = std::time::Instant::now();
+        let pso = create();
+        record(if STATIC_SAMPLERS.get() { Kind::StaticSamplers } else { Kind::Made }, made_at);
+        return pso;
     };
     let began = std::time::Instant::now();
     let loaded = {
@@ -586,6 +589,7 @@ pub(crate) fn pipeline(
     let refused = match loaded {
         Ok(pso) => {
             LOADED.fetch_add(1, Ordering::Relaxed);
+            record(Kind::Loaded, began);
             crate::host::trail(|| {
                 let label = LABEL.with(|l| l.borrow().clone());
                 format!("pipeline library: loaded {label} in {:.1} ms", began.elapsed().as_secs_f64() * 1e3)
@@ -595,10 +599,12 @@ pub(crate) fn pipeline(
         Err(e) => e,
     };
     // Compiled outside any lock: compiles take up to seconds.
+    let made_at = std::time::Instant::now();
     let pso = {
         let _call = call("make", name);
         create()?
     };
+    record(Kind::Made, made_at);
     MADE.fetch_add(1, Ordering::Relaxed);
     crate::host::trail(|| {
         let label = LABEL.with(|l| l.borrow().clone());
@@ -666,7 +672,8 @@ pub(crate) fn save(now: bool) {
     };
     // Through `used`: a process that asked for none yet (`victory shaders`)
     // must not write the earlier runs' list over with nothing.
-    let used: Vec<String> = used().iter().flatten().cloned().collect();
+    let used: Vec<String> = ordered(used().iter().flatten().cloned().collect());
+    let order = order_text();
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
@@ -685,7 +692,8 @@ pub(crate) fn save(now: bool) {
     let slow: Vec<String> = slow_ones().iter().flatten().map(|(key, ms)| format!("{key} {ms}")).collect();
     let written = library_written
         .and_then(|()| write_atomically(&dir.join(SLOW_FILE), slow.join("\n").as_bytes()))
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
+        .and_then(|()| write_atomically(&dir.join(ORDER_FILE), order.as_bytes()));
     match written {
         Ok(()) => tracing::info!(
             bytes,
@@ -697,6 +705,7 @@ pub(crate) fn save(now: bool) {
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
     }
+    log_summary(false);
 }
 
 /// Writes the library's `size` serialised bytes to the file `tmp`: through
@@ -777,6 +786,13 @@ pub(crate) fn slow(key: &str) -> bool {
 
 /// The title pipeline with `key` took `ms` to make.
 pub(crate) fn note_time(key: &str, ms: u64) {
+    {
+        let mut now = NOW.lock().unwrap_or_else(|e| e.into_inner());
+        let now = now.get_or_insert_default();
+        if now.ms.len() < EARLY_MAX || now.ms.contains_key(key) {
+            now.ms.insert(key.to_owned(), ms.min(u64::from(u32::MAX)) as u32);
+        }
+    }
     if ms < SLOW_MS {
         return;
     }
@@ -822,6 +838,15 @@ pub(crate) fn wanted_early(key: &str) -> bool {
 
 /// A draw or dispatch requested the title pipeline with `key`.
 pub(crate) fn note_used(key: &str) {
+    {
+        let mut now = NOW.lock().unwrap_or_else(|e| e.into_inner());
+        let now = now.get_or_insert_default();
+        if now.order.len() < EARLY_MAX && now.seen.insert(key.to_owned()) {
+            now.order.push(key.to_owned());
+            // The order file is written with the next save.
+            USED_CHANGED.store(true, Ordering::Relaxed);
+        }
+    }
     let mut used = used();
     let set = used.get_or_insert_with(HashSet::new);
     if set.len() < EARLY_MAX && set.insert(key.to_owned()) {
@@ -829,9 +854,177 @@ pub(crate) fn note_used(key: &str) {
     }
 }
 
+/// Title pipelines in the order a run first drew or dispatched with them,
+/// and the milliseconds each took to make (all of them, not only the slow
+/// ones), one `key ms` a line, the first used first. The early list beside
+/// it holds the same keys in the same order, so a build that reads it as a
+/// set does as before; a missing or odd order file only means no order is
+/// known (the title's creation order, as before).
+const ORDER_FILE: &str = "pipeline-order.txt";
+
+/// What this run has seen: keys in first-use order, and make times.
+#[derive(Default)]
+struct Now {
+    order: Vec<String>,
+    seen: HashSet<String>,
+    ms: std::collections::HashMap<String, u32>,
+}
+
+static NOW: Mutex<Option<Now>> = Mutex::new(None);
+
+type Earlier = std::collections::HashMap<String, (u64, u32)>;
+
+/// Parses [`ORDER_FILE`]: key to (place in the order, ms).
+fn parse_order(text: &str) -> Earlier {
+    let mut map = Earlier::new();
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(key) = parts.next() else { continue };
+        let ms = parts.next().and_then(|m| m.parse().ok()).unwrap_or(0);
+        let rank = map.len() as u64;
+        map.entry(key.to_owned()).or_insert((rank, ms));
+    }
+    map
+}
+
+/// The order the earlier runs first used pipelines in.
+fn previous() -> &'static Earlier {
+    static PREVIOUS: OnceLock<Earlier> = OnceLock::new();
+    PREVIOUS.get_or_init(|| {
+        let text = DIR.get().and_then(|d| std::fs::read_to_string(d.join(ORDER_FILE)).ok()).unwrap_or_default();
+        let map = parse_order(&text);
+        tracing::info!(pipelines = map.len(), "title pipelines with a recorded first-use order");
+        map
+    })
+}
+
+/// Where the title pipeline with `key` came in the earlier runs' order of
+/// first use: lower is sooner; `u64::MAX` if not known.
+pub(crate) fn rank(key: &str) -> u64 {
+    previous().get(key).map_or(u64::MAX, |&(rank, _)| rank)
+}
+
+/// The earlier runs' keys, in their order.
+fn before() -> Vec<&'static String> {
+    let mut before: Vec<(&String, u64)> = previous().iter().map(|(k, &(r, _))| (k, r)).collect();
+    before.sort_by_key(|&(_, r)| r);
+    before.into_iter().map(|(k, _)| k).collect()
+}
+
+/// The keys of `used` in first-use order: this run's first, then the earlier
+/// runs' that this one has not used (in their order), then the rest.
+fn ordered(used: HashSet<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(used.len());
+    let mut put = HashSet::new();
+    let now = NOW.lock().unwrap_or_else(|e| e.into_inner());
+    let this_run = now.as_ref().map_or(&[][..], |n| &n.order[..]);
+    for key in this_run.iter().chain(before()) {
+        if used.contains(key) && put.insert(key.clone()) {
+            out.push(key.clone());
+        }
+    }
+    let mut rest: Vec<&String> = used.iter().filter(|k| !put.contains(*k)).collect();
+    rest.sort();
+    out.extend(rest.into_iter().cloned());
+    out
+}
+
+/// The text of [`ORDER_FILE`] for a save: this run's pipelines in the order
+/// they were first used, then the earlier runs' others in theirs.
+fn order_text() -> String {
+    let now = NOW.lock().unwrap_or_else(|e| e.into_inner());
+    let this_run = now.as_ref().map_or(&[][..], |n| &n.order[..]);
+    let ms_of = |key: &str| {
+        now.as_ref().and_then(|n| n.ms.get(key).copied()).or_else(|| previous().get(key).map(|p| p.1)).unwrap_or(0)
+    };
+    let mut lines: Vec<String> = Vec::new();
+    let mut put = HashSet::new();
+    for key in this_run.iter().chain(before()) {
+        if lines.len() >= EARLY_MAX {
+            break;
+        }
+        if put.insert(key.as_str()) {
+            lines.push(format!("{key} {}", ms_of(key)));
+        }
+    }
+    lines.join("\n")
+}
+
+/// What a host pipeline cost, by how it came about.
+#[derive(Clone, Copy)]
+enum Kind {
+    /// Loaded from the pipeline library.
+    Loaded,
+    /// Compiled by the host driver (its own cache on disk may make that quick).
+    Made,
+    /// Compiled by the driver and kept out of the library for its static
+    /// samplers ([`with_static_samplers`]).
+    StaticSamplers,
+}
+
+const KINDS: [&str; 3] = ["loaded from the library", "made", "made, static samplers (never in the library)"];
+
+static TIMES: Mutex<[Vec<u32>; 3]> = Mutex::new([Vec::new(), Vec::new(), Vec::new()]);
+
+fn record(kind: Kind, began: std::time::Instant) {
+    let ms = began.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+    TIMES.lock().unwrap_or_else(|e| e.into_inner())[kind as usize].push(ms);
+}
+
+/// Count, p50, p90, p99, max and total of `ms`.
+fn percentiles(ms: &[u32]) -> (usize, u32, u32, u32, u32, u64) {
+    let mut sorted = ms.to_vec();
+    sorted.sort_unstable();
+    let at = |p: usize| sorted.get(sorted.len().saturating_sub(1) * p / 100).copied().unwrap_or(0);
+    (sorted.len(), at(50), at(90), at(99), sorted.last().copied().unwrap_or(0), sorted.iter().map(|&m| u64::from(m)).sum())
+}
+
+/// One line per kind of host pipeline made in this run, release builds too:
+/// how many, and how long each took (p50, p90, p99, max, total thread
+/// time). The static-sampler line tells whether the driver's own cache
+/// makes those compiles quick. Without `force`, at most once a minute and
+/// only if more were made since.
+pub(crate) fn log_summary(force: bool) {
+    static LAST: Mutex<Option<(std::time::Instant, usize)>> = Mutex::new(None);
+    let times = TIMES.lock().unwrap_or_else(|e| e.into_inner());
+    let total: usize = times.iter().map(Vec::len).sum();
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if total == 0 || last.is_some_and(|(at, seen)| total == seen || (!force && at.elapsed().as_secs() < 60)) {
+            return;
+        }
+        *last = Some((std::time::Instant::now(), total));
+    }
+    for (what, ms) in KINDS.iter().zip(times.iter()) {
+        if ms.is_empty() {
+            continue;
+        }
+        let (count, p50, p90, p99, max, sum) = percentiles(ms);
+        tracing::info!(count, p50_ms = p50, p90_ms = p90, p99_ms = p99, max_ms = max, total_s = sum / 1000, "host pipelines {what}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn order_file_gives_ranks_and_survives_odd_lines() {
+        let map = parse_order("aa 10\n\nbb\nbad line extra\naa 99\ncc 7");
+        assert_eq!(map["aa"], (0, 10));
+        assert_eq!(map["bb"], (1, 0));
+        assert_eq!(map["bad"].0, 2);
+        assert_eq!(map["cc"], (3, 7));
+        assert!(parse_order("").is_empty());
+        assert_eq!(rank("never seen"), u64::MAX);
+    }
+
+    #[test]
+    fn percentiles_of_make_times() {
+        assert_eq!(percentiles(&[]), (0, 0, 0, 0, 0, 0));
+        let ms: Vec<u32> = (1..=100).collect();
+        assert_eq!(percentiles(&ms), (100, 50, 90, 99, 100, 5050));
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
