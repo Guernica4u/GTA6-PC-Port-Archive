@@ -209,6 +209,8 @@ mod diff_tests;
 mod flow_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+#[cfg(all(test, windows))]
+mod lod_tests;
 mod lower;
 #[cfg(all(test, windows))]
 mod quad_read_tests;
