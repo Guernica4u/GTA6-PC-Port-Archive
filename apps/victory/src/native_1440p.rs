@@ -24,13 +24,53 @@ const STOCK_SDR_MODE: [u8; 16] = [0, 15, 0, 0, 112, 8, 0, 0, 60, 0, 0, 0, 1, 0, 
 const SCANOUT_RESERVATION: u32 = 0x0247_ad4a;
 const TEMPORAL_SCALE: u32 = 0x028f_1e7e;
 const UI_VIEWPORT_LOAD: u32 = 0x0580_48d4;
-/// The interface's screen object answers its size with two getters,
-/// `mov eax, [global]; ret`: 0x4f21f10 the width (0x92d7924), 0x4f21f00 the
-/// height (0x92d7928), the output's 2560x1440. Every movie slot takes its
-/// rectangle from them (0x4f21b90, through 0x4f21e60) and lays out in it,
-/// with sizes made for 3840x2160: the HUD came out 1.5 times too big. They
-/// read the legacy UI size (3840x2160 at 0xa9438ec) instead. Each: the
-/// getter, its stock target, the legacy one.
+/// The interface's screen size (0x92d7924, width then height) is the
+/// output's 2560x1440. The movie slots take their rectangle from it through
+/// two getters (`mov eax, [global]; ret`: 0x4f21f10 the width, 0x4f21f00 the
+/// height, through 0x4f21b90) and lay out in it with sizes made for
+/// 3840x2160: the HUD came out 1.5 times too big. Those loads read the
+/// legacy UI size (3840x2160 at 0xa9438ec) instead. The global itself stays
+/// the output's: the map's terrain, its fog and what the cursor points at
+/// are worked out from it, as the 4K output shows them. Each: the load
+/// (`mov eax, [rip+disp]`), its stock target, the legacy one.
+const UI_SCREEN_LOADS: [(u32, u32, u32); 2] = [
+    (0x04f2_1f10, 0x092d_7924, 0x0a94_38ec),
+    (0x04f2_1f00, 0x092d_7928, 0x0a94_38f0),
+];
+/// The map's cursor is placed on the interface by 0xb19260, which turns its
+/// position (a fraction of the screen) into pixels with the screen size
+/// (`GetScreenSize(&w, &h)`, `call [rax+0x30]` at 0xb19a4b): with the
+/// output's size it sat at 2/3 of the centre. That call goes to a copy of
+/// `GetScreenSize` (0xcab820) that answers the legacy size, in the int3
+/// padding after 0x55ff283 (a `ret`; the next function starts at 0x55ff2c0).
+const UI_MAP_CURSOR_CALL: u32 = 0x00b1_9a43;
+const UI_LEGACY_SIZE_FN: u32 = 0x055f_f290;
+const UI_LEGACY_SIZE: u32 = 0x0a94_38ec;
+/// After snapping to a point of interest the cursor's position comes from
+/// its own object (+0x140, pixels), which the interface is bound to: the
+/// title sets it (0x23246d0) from a fraction times `GetScreenSizeF`
+/// (0x22da840, called at 0x232478d) and reads it back as a fraction with
+/// the same (0x2324351). Those two calls go to a copy that answers the
+/// [3840.0, 2160.0] constant, in the int3 padding after the legacy size
+/// copy, so that the bound position is the interface's. The four reads the
+/// map's logic makes of it (what lies under the cursor 0x232415d, near it
+/// 0x2324f1d, where it points in the world 0x2322fec, and the position
+/// handed to the map's controller 0x23240fa) each call a stub that reads it
+/// and scales it back by 2/3 to the output's pixels. The stubs live in the
+/// int3 padding past the end of the code section's used size (0x5f40966,
+/// filled out to its raw size, which is mapped with it).
+const UI_SCREEN_SIZE_F: u32 = 0x022d_a840;
+const UI_SCREEN_SIZE_F_LEGACY: u32 = 0x055f_f2b0;
+const UI_CURSOR_SIZE_CALLS: [u32; 2] = [0x0232_4351, 0x0232_478d];
+const UI_CURSOR_STUBS: u32 = 0x05f4_0970;
+/// Each read: where, its 8 bytes (`vmovsd xmmN, [reg+0x140]`), and the
+/// `vmulps xmmN, xmmN, [rip+disp]` opcode bytes that scale it.
+const UI_CURSOR_READS: [(u32, [u8; 8], [u8; 4]); 4] = [
+    (0x0232_415d, [0xc5, 0xfb, 0x10, 0xb1, 0x40, 0x01, 0, 0], [0xc5, 0xc8, 0x59, 0x35]),
+    (0x0232_4f1d, [0xc5, 0xfb, 0x10, 0x87, 0x40, 0x01, 0, 0], [0xc5, 0xf8, 0x59, 0x05]),
+    (0x0232_40fa, [0xc5, 0xfb, 0x10, 0x87, 0x40, 0x01, 0, 0], [0xc5, 0xf8, 0x59, 0x05]),
+    (0x0232_2fec, [0xc5, 0xfb, 0x10, 0x86, 0x40, 0x01, 0, 0], [0xc5, 0xf8, 0x59, 0x05]),
+];
 /// Scaleform then gets 3840x2160 movie viewports in a 2560x1440 buffer
 /// and leaves out what lies past it: 0x13cba40 builds the buffer size from
 /// `vmovsd xmm0, [rsi+0xa0]`, which reads the [3840.0, 2160.0] at 0x615a3ec
@@ -46,10 +86,6 @@ const UI_CANVAS_SIZE: u32 = 0x0615_a3ec;
 /// at 0x55e8280), which gives the legacy UI size for the output's.
 const UI_TARGET_SIZE_LOAD: u32 = 0x0539_15bc;
 const UI_TARGET_SIZE_CAVE: u32 = 0x055e_8250;
-const UI_SCREEN_GETTERS: [(u32, u32, u32); 2] = [
-    (0x04f2_1f10, 0x092d_7924, 0x0a94_38ec),
-    (0x04f2_1f00, 0x092d_7928, 0x0a94_38f0),
-];
 
 /// Patches `image` for a 2560x1440 output; the scene is drawn at 2560x1440,
 /// or at 1920x1080 with `render_1080p`. Returns the scene's size.
@@ -103,14 +139,15 @@ pub(super) fn prepare(image: &mut PreparedImage, render_1080p: bool) -> Result<(
     viewport[4..].copy_from_slice(&displacement.to_le_bytes());
 
     if ui_screen {
-        for (at, stock, legacy) in UI_SCREEN_GETTERS {
-            let getter = field::<7>(image, at)?;
-            let disp = i32::from_le_bytes(getter[2..6].try_into()?);
+        let rel = |end: u32, to: u32| (to.wrapping_sub(end) as i32).to_le_bytes();
+        for (at, stock, legacy) in UI_SCREEN_LOADS {
+            let load = field::<6>(image, at)?;
+            let disp = i32::from_le_bytes(load[2..].try_into()?);
             ensure!(
-                getter[..2] == [0x8b, 0x05] && getter[6] == 0xc3 && (at + 6).wrapping_add_signed(disp) == stock,
-                "unexpected interface screen size getter"
+                load[..2] == [0x8b, 0x05] && (at + 6).wrapping_add_signed(disp) == stock,
+                "unexpected interface screen size load"
             );
-            getter[2..6].copy_from_slice(&(legacy.wrapping_sub(at + 6) as i32).to_le_bytes());
+            load[2..].copy_from_slice(&rel(at + 6, legacy));
         }
         ensure!(
             *field::<8>(image, UI_CANVAS_SIZE)? == [0, 0, 0x70, 0x45, 0, 0, 0x07, 0x45],
@@ -121,10 +158,72 @@ pub(super) fn prepare(image: &mut PreparedImage, render_1080p: bool) -> Result<(
         load[3] = 0x05; // modrm: xmm0, [rip+disp32]
         load[4..].copy_from_slice(&(UI_CANVAS_SIZE.wrapping_sub(UI_BUFFER_SIZE_LOAD + 8) as i32).to_le_bytes());
 
+        // mov rax, [r13]; vaddps xmm6, xmm0, xmm1; call [rax+0x30] becomes
+        // vaddps xmm6, xmm0, xmm1; call legacy size; xchg ax, ax
+        let call = field::<11>(image, UI_MAP_CURSOR_CALL)?;
+        ensure!(
+            *call == [0x49, 0x8b, 0x45, 0x00, 0xc5, 0xf8, 0x58, 0xf1, 0xff, 0x50, 0x30],
+            "unexpected map cursor size call"
+        );
+        call[..4].copy_from_slice(&[0xc5, 0xf8, 0x58, 0xf1]);
+        call[4] = 0xe8;
+        call[5..9].copy_from_slice(&rel(UI_MAP_CURSOR_CALL + 9, UI_LEGACY_SIZE_FN));
+        call[9..].copy_from_slice(&[0x66, 0x90]);
+        let mut sizer = Vec::with_capacity(18);
+        sizer.extend_from_slice(&[0x8b, 0x05]); // mov eax, [rip+legacy width]
+        sizer.extend_from_slice(&rel(UI_LEGACY_SIZE_FN + 6, UI_LEGACY_SIZE));
+        sizer.extend_from_slice(&[0x89, 0x02, 0x8b, 0x05]); // mov [rdx], eax; mov eax, [rip+legacy height]
+        sizer.extend_from_slice(&rel(UI_LEGACY_SIZE_FN + 14, UI_LEGACY_SIZE + 4));
+        sizer.extend_from_slice(&[0x41, 0x89, 0x00, 0xc3]); // mov [r8], eax; ret
+        let free = field::<18>(image, UI_LEGACY_SIZE_FN)?;
+        ensure!(free.iter().all(|&b| b == 0xcc), "unexpected padding for the legacy size function");
+        free.copy_from_slice(&sizer);
+
+        // GetScreenSizeF's copy: mov rax, [rip+[3840.0, 2160.0]]; mov [rdx], rax; ret
+        let mut sizer_f = vec![0x48, 0x8b, 0x05];
+        sizer_f.extend_from_slice(&rel(UI_SCREEN_SIZE_F_LEGACY + 7, UI_CANVAS_SIZE));
+        sizer_f.extend_from_slice(&[0x48, 0x89, 0x02, 0xc3]);
+        let free = field::<11>(image, UI_SCREEN_SIZE_F_LEGACY)?;
+        ensure!(free.iter().all(|&b| b == 0xcc), "unexpected padding for the legacy float size function");
+        free.copy_from_slice(&sizer_f);
+        for at in UI_CURSOR_SIZE_CALLS {
+            let call = field::<5>(image, at)?;
+            ensure!(
+                call[0] == 0xe8 && call[1..] == rel(at + 5, UI_SCREEN_SIZE_F),
+                "unexpected map cursor size call"
+            );
+            call[1..].copy_from_slice(&rel(at + 5, UI_SCREEN_SIZE_F_LEGACY));
+        }
+        // [2/3, 2/3, 0, 0], then one stub per distinct read:
+        // vmovsd xmmN, [reg+0x140]; vmulps xmmN, xmmN, [scale]; ret
+        let mut stubs: Vec<u8> = [2560.0f32 / 3840.0, 1440.0 / 2160.0, 0.0, 0.0].iter().flat_map(|f| f.to_le_bytes()).collect();
+        let mut entries: Vec<([u8; 8], u32)> = Vec::new();
+        for (_, load, scale) in UI_CURSOR_READS {
+            if entries.iter().any(|(l, _)| *l == load) {
+                continue;
+            }
+            let at = UI_CURSOR_STUBS + stubs.len() as u32;
+            entries.push((load, at));
+            stubs.extend_from_slice(&load);
+            stubs.extend_from_slice(&scale);
+            stubs.extend_from_slice(&rel(at + 16, UI_CURSOR_STUBS));
+            stubs.push(0xc3);
+        }
+        let free = section_tail(image, UI_CURSOR_STUBS, stubs.len())?;
+        ensure!(free.iter().all(|&b| b == 0xcc), "unexpected padding for the map cursor stubs");
+        free.copy_from_slice(&stubs);
+        for (at, load, _) in UI_CURSOR_READS {
+            let stub = entries.iter().find(|(l, _)| *l == load).map(|(_, a)| *a).context("map cursor stub")?;
+            let read = field::<8>(image, at)?;
+            ensure!(*read == load, "unexpected map cursor position read");
+            read[0] = 0xe8;
+            read[1..5].copy_from_slice(&rel(at + 5, stub));
+            read[5..].copy_from_slice(&[0x0f, 0x1f, 0x00]);
+        }
+
         // The size read becomes a jump into the cave, which reads it, and
         // takes the legacy one instead when it is the output's.
         let back = UI_TARGET_SIZE_LOAD + 5;
-        let rel = |from: u32, to: u32| (to.wrapping_sub(from) as i32).to_le_bytes();
         let mut cave = Vec::with_capacity(44);
         cave.extend_from_slice(&[0xc5, 0x7a, 0x7e, 0x50, 0x38]); // vmovq xmm10, [rax+0x38]
         cave.extend_from_slice(&[0x81, 0x78, 0x38]); // cmp dword [rax+0x38], WIDTH
@@ -136,7 +235,7 @@ pub(super) fn prepare(image: &mut PreparedImage, render_1080p: bool) -> Result<(
         cave.extend_from_slice(&[0x0f, 0x85]); // jne back
         cave.extend_from_slice(&rel(UI_TARGET_SIZE_CAVE + 31, back));
         cave.extend_from_slice(&[0xc5, 0x7a, 0x7e, 0x15]); // vmovq xmm10, [rip+legacy size]
-        cave.extend_from_slice(&rel(UI_TARGET_SIZE_CAVE + 39, UI_SCREEN_GETTERS[0].2));
+        cave.extend_from_slice(&rel(UI_TARGET_SIZE_CAVE + 39, UI_LEGACY_SIZE));
         cave.push(0xe9); // jmp back
         cave.extend_from_slice(&rel(UI_TARGET_SIZE_CAVE + 44, back));
         let free = field::<44>(image, UI_TARGET_SIZE_CAVE)?;
@@ -213,6 +312,21 @@ pub(super) fn prepare_upscaler(image: &mut PreparedImage, mode: Mode) -> Result<
     Ok(())
 }
 
+/// `len` bytes at `rva` within a section's raw data, past its used size
+/// too (`field` stops there): the padding the file maps with it.
+fn section_tail(image: &mut PreparedImage, rva: u32, len: usize) -> Result<&mut [u8]> {
+    let offset = image
+        .info
+        .sections
+        .iter()
+        .find_map(|s| {
+            let delta = rva.checked_sub(s.rva)?;
+            (delta as usize + len <= s.file_size as usize).then(|| s.file_offset as usize + delta as usize)
+        })
+        .context("section padding missing")?;
+    image.bytes.get_mut(offset..offset + len).context("incomplete section padding")
+}
+
 fn field<const N: usize>(image: &mut PreparedImage, rva: u32) -> Result<&mut [u8; N]> {
     let offset = image.info.rva_to_file_offset(rva).context("display profile field missing")? as usize;
     image
@@ -248,6 +362,15 @@ mod tests {
             let disp = i32::from_le_bytes(load[4..].try_into().unwrap());
             assert_eq!(UI_VIEWPORT_LOAD.wrapping_add(8).wrapping_add_signed(disp), SDR_MODE);
             assert_eq!(field::<1>(&mut image, UI_TARGET_SIZE_LOAD).unwrap()[0], 0xe9);
+            assert_eq!(field::<1>(&mut image, UI_MAP_CURSOR_CALL + 4).unwrap()[0], 0xe8);
+            for (at, _, _) in UI_CURSOR_READS {
+                assert_eq!(field::<1>(&mut image, at).unwrap()[0], 0xe8);
+            }
+            assert_eq!(section_tail(&mut image, UI_CURSOR_STUBS + 16, 1).unwrap()[0], 0xc5);
+            for (at, _, legacy) in UI_SCREEN_LOADS {
+                let disp = i32::from_le_bytes(field::<6>(&mut image, at).unwrap()[2..].try_into().unwrap());
+                assert_eq!((at + 6).wrapping_add_signed(disp), legacy);
+            }
             // Patched once, the image is no longer the stock one: refused.
             assert!(prepare(&mut image, render_1080p).is_err());
         }
