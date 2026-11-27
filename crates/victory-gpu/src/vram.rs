@@ -91,7 +91,10 @@ unsafe impl Sync for WriteOnly {}
 impl WriteOnly {
     /// Writes `bytes` at offset `at`, cut to the mapping.
     pub(crate) fn write(&self, at: usize, bytes: &[u8]) {
-        let n = bytes.len().min(self.len.saturating_sub(at));
+        if at >= self.len {
+            return;
+        }
+        let n = bytes.len().min(self.len - at);
         // SAFETY: inside the mapping (cut above); nothing reads through it.
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.at.add(at), n) };
     }
@@ -101,7 +104,10 @@ impl WriteOnly {
     /// writes back did not run ([`stop`]), so that what they wrote is not
     /// lost. Returns the bytes read.
     pub(crate) fn read_back(&self, at: usize, out: &mut [u8]) -> usize {
-        let n = out.len().min(self.len.saturating_sub(at));
+        if at >= self.len {
+            return 0;
+        }
+        let n = out.len().min(self.len - at);
         // SAFETY: inside the mapping (cut above); the GPU is done writing
         // it (the submission's fence was seen).
         unsafe { std::ptr::copy_nonoverlapping(self.at.add(at), out.as_mut_ptr(), n) };
@@ -489,6 +495,23 @@ pub(crate) fn log(frames: f64) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn bar_mapping_access_stays_within_its_bounds() {
+        let mut bytes = [1, 2, 3, 4];
+        let bar = WriteOnly { at: bytes.as_mut_ptr(), len: bytes.len() };
+        let mut out = [0, 0];
+        for at in [bytes.len(), bytes.len() + 1, usize::MAX] {
+            bar.write(at, &[9, 9]);
+            assert_eq!(bar.read_back(at, &mut out), 0);
+        }
+        assert_eq!(bytes, [1, 2, 3, 4]);
+        assert_eq!(out, [0, 0]);
+        bar.write(3, &[5, 6]);
+        assert_eq!(bar.read_back(3, &mut out), 1);
+        assert_eq!(bytes, [1, 2, 3, 5]);
+        assert_eq!(out, [5, 0]);
+    }
 
     /// A test's budget and use by others than the copies, in bytes, in
     /// place of DXGI's.

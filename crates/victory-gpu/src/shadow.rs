@@ -383,7 +383,8 @@ impl Shadow {
             IN_VRAM.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let tracked = crate::watch::track_copy(start as usize, len as usize, true);
-        let marks = tracked.as_ref().and_then(|_| marks().take(pages(start, len)));
+        let page_count = pages(start, len);
+        let marks = tracked.as_ref().and_then(|_| marks().take(page_count));
         let shadow = Arc::new(Shadow {
             buffer,
             data,
@@ -399,7 +400,7 @@ impl Shadow {
             vram,
         });
         if let Some(base) = marks {
-            self::marks().owners.insert(base, Arc::downgrade(&shadow));
+            self::marks().owners.insert(base, (page_count, Arc::downgrade(&shadow)));
         }
         shadow
     }
@@ -895,8 +896,8 @@ struct Marks {
     free: BTreeMap<u32, u32>,
     /// Bits handed out at some time: those past it are clear.
     end: u32,
-    /// The copy holding each run, by its first bit.
-    owners: BTreeMap<u32, std::sync::Weak<Shadow>>,
+    /// The length and copy holding each run, by its first bit.
+    owners: BTreeMap<u32, (u32, std::sync::Weak<Shadow>)>,
 }
 
 static MARKS: Mutex<Marks> = Mutex::new(Marks {
@@ -1135,13 +1136,14 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
 /// The copy holding bit `n` of the written-pages bitmap, and the title
 /// address of the page it stands for.
 fn page_of(m: &Marks, n: u32) -> Option<(Arc<Shadow>, usize)> {
-    let (&base, copy) = m.owners.range(..=n).next_back()?;
-    let copy = copy.upgrade()?;
+    let (&base, (len, copy)) = m.owners.range(..=n).next_back()?;
     let k = n - base;
-    (k < pages(copy.start, copy.len)).then(|| {
-        let page = (((copy.start >> 16) + u64::from(k)) << 16) as usize;
-        (copy, page)
-    })
+    if k >= *len {
+        return None;
+    }
+    let copy = copy.upgrade()?;
+    let page = (((copy.start >> 16) + u64::from(k)) << 16) as usize;
+    Some((copy, page))
 }
 
 /// After a submission ran, before anything reads the copies: what its
