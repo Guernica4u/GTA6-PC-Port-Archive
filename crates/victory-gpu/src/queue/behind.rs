@@ -937,7 +937,8 @@ pub(super) fn present(
     LANE.push(this as usize, [Job::Present(texture, overlay, shown)]);
     let began = Instant::now();
     let _waiting = crate::timeline::span("a present waits for the one before it to be sent");
-    LANE.wait_presents(frames_most());
+    let most = if crate::memory::take_sizes_frame() { 0 } else { frames_most() };
+    LANE.wait_presents(most);
     STATS[AT_PRESENT].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
 }
 

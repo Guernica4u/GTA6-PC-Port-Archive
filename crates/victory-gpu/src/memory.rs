@@ -435,6 +435,23 @@ impl Memory {
         }
     }
 
+    /// Coalesces sorted `pages` into contiguous runs and calls [`Memory::bring`]
+    /// on each run.
+    fn bring_pages(&mut self, pages: &[u64]) {
+        let Some(&first) = pages.first() else { return };
+        let (mut run_start, mut run_end) = (first, first + 1);
+        for &page in &pages[1..] {
+            if page == run_end {
+                run_end += 1;
+            } else {
+                self.bring(run_start, run_end);
+                run_start = page;
+                run_end = page + 1;
+            }
+        }
+        self.bring(run_start, run_end);
+    }
+
     /// Looks at some of the pages and packed structures again.
     fn look_again(&mut self) {
         let mut sweep_pages = Vec::new();
@@ -450,22 +467,9 @@ impl Memory {
                 }
             }
         }
-        if !sweep_pages.is_empty() {
-            sweep_pages.sort_unstable();
-            sweep_pages.dedup();
-            let mut run_start = sweep_pages[0];
-            let mut run_end = run_start + 1;
-            for &page in &sweep_pages[1..] {
-                if page == run_end {
-                    run_end += 1;
-                } else {
-                    self.bring(run_start, run_end);
-                    run_start = page;
-                    run_end = page + 1;
-                }
-            }
-            self.bring(run_start, run_end);
-        }
+        sweep_pages.sort_unstable();
+        sweep_pages.dedup();
+        self.bring_pages(&sweep_pages);
         for _ in 0..self.packed_order.len().div_ceil(SWEEP) {
             self.packed_sweep = (self.packed_sweep + 1) % self.packed_order.len();
             let address = self.packed_order[self.packed_sweep];
@@ -700,20 +704,7 @@ impl Memory {
                 mapped.push(page);
             }
         }
-        if !mapped.is_empty() {
-            let mut run_start = mapped[0];
-            let mut run_end = run_start + 1;
-            for &page in &mapped[1..] {
-                if page == run_end {
-                    run_end += 1;
-                } else {
-                    self.bring(run_start, run_end);
-                    run_start = page;
-                    run_end = page + 1;
-                }
-            }
-            self.bring(run_start, run_end);
-        }
+        self.bring_pages(&mapped);
         self.stats.faults += pages.len() as u64;
         // Each is an access that read 0 or was dropped.
         static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
