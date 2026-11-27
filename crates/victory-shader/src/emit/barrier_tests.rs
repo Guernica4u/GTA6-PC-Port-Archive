@@ -16,6 +16,10 @@
 //!   balanced (console mode: branches decided for the wave, vector
 //!   instructions guarded by EXEC).
 
+use windows::Win32::Graphics::Direct3D12::{
+    D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+};
+
 use super::host::{Dispatch, Host, Root, View};
 use super::{HostShader, lower, validator};
 use crate::native::{
@@ -329,8 +333,35 @@ fn build(words: &[u32]) -> HostShader {
     }
 }
 
+/// The wave size `shader` requires (its `PSV0` minimum and maximum lane
+/// counts, equal when set by `WaveSize`), if any.
+fn required_wave(shader: &HostShader) -> Option<u32> {
+    let c = crate::dxbc::Container::parse(&shader.dxil).ok()?;
+    let d = c.part(crate::dxbc::FourCC::PSV0)?.data;
+    let word = |at: usize| Some(u32::from_le_bytes(d.get(at..at + 4)?.try_into().ok()?));
+    let (min, max) = (word(20)?, word(24)?);
+    (min == max && min != 0).then_some(min)
+}
+
+/// The adapter's wave lane counts (`WaveLaneCountMin..=WaveLaneCountMax`).
+fn lanes(host: &Host) -> (u32, u32) {
+    let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: a capability query on a live device, into a structure of the
+    // size given.
+    unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut o).cast(),
+            size_of_val(&o) as u32,
+        )
+    }
+    .expect("OPTIONS1");
+    (o.WaveLaneCountMin, o.WaveLaneCountMax)
+}
+
 /// Lowers, validates and runs `words` on the hardware adapter and WARP;
-/// each must complete and store `want(thread)` per thread.
+/// each must complete and store `want(thread)` per thread. An adapter
+/// whose waves cannot be the size the program requires is skipped.
 fn runs_as_the_console(name: &str, words: &[u32], want: impl Fn(u32) -> u32) {
     let shader = build(words);
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -342,12 +373,25 @@ fn runs_as_the_console(name: &str, words: &[u32], want: impl Fn(u32) -> u32) {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let mut ran = 0;
+    let (mut ran, mut wave_skipped) = (0, false);
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
+        // A program that keeps the console's lanes requires their wave size
+        // (`WaveSize`), which D3D12 refuses (`E_INVALIDARG`) on an adapter
+        // whose waves are of another size: the system WARP's are 4 lanes.
+        let (min, max) = lanes(&host);
+        if let Some(wave) = required_wave(&shader)
+            && !(min..=max).contains(&wave)
+        {
+            eprintln!(
+                "{name}, {label}: needs {wave}-lane waves, the adapter runs {min}..{max}; skipped"
+            );
+            wave_skipped = true;
+            continue;
+        }
         let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
         let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         let out = host
@@ -365,7 +409,11 @@ fn runs_as_the_console(name: &str, words: &[u32], want: impl Fn(u32) -> u32) {
         assert_eq!(out[0][..THREADS as usize], want[..], "{name}, {label}");
         ran += 1;
     }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+    // With WARP alone (CI), a program of the console's wave size runs nowhere.
+    assert!(
+        ran > 0 || wave_skipped,
+        "neither hardware nor WARP SM 6.6 device available"
+    );
 }
 
 /// The programs decode to the instructions they are meant to be.
