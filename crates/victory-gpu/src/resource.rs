@@ -2503,6 +2503,42 @@ mod tests {
         assert_eq!(slot::<Release>(h, 0x10)(h), 0);
     }
 
+    /// A texture read that found no writer at its memory finds none again
+    /// while another thread holds the texture map's lock (as a title thread
+    /// making or releasing a texture does): it does not wait for that lock.
+    #[cfg(windows)]
+    #[test]
+    fn a_texture_read_with_no_writer_does_not_wait_for_the_texture_map() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let h = heap(1 << 20);
+        let (desc, iid, mut read) = (texture(64, 64, 71, 1), &RESOURCE_IIDS[0], null);
+        assert_eq!(
+            create_placed(null, h, 0, &desc, 0, null.cast(), iid, &mut read),
+            S_OK
+        );
+        let at = read as usize;
+        // Another test making or releasing a texture in the same bucket of
+        // memory between the first read and taking the lock makes the read
+        // look again: tried a few times.
+        let unlocked = (0..3).any(|_| {
+            assert_eq!(alias_source(read), None, "alone at its memory");
+            let map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
+            let (done, found) = std::sync::mpsc::channel();
+            let none = move || done.send(alias_source(at as This).is_none()).unwrap();
+            let reader = std::thread::spawn(none);
+            let in_time = found.recv_timeout(std::time::Duration::from_millis(500));
+            drop(map);
+            reader.join().unwrap();
+            in_time == Ok(true)
+        });
+        assert!(unlocked, "the read waited for the texture map's lock");
+        assert_eq!(slot::<Release>(read, 0x10)(read), 0);
+        assert_eq!(slot::<Release>(h, 0x10)(h), 0);
+    }
+
     /// Host textures the GPU writes (render target, depth, unordered access)
     /// are never given up, and the title releasing its texture frees its
     /// host texture (nothing else holds it); one fed from title memory is
