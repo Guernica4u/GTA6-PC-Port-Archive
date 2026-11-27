@@ -31,3 +31,7 @@ jobs:
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
         run: cargo test --workspace --locked
+
+      # Fork-only benchmark; remove before upstream submission.
+      - name: Synthetic write-watch benchmark (release)
+        run: cargo test --release --locked -p victory-gpu --lib watch::tests::region_probe_benchmark -- --exact --ignored --nocapture --test-threads=1
