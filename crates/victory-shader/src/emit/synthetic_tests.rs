@@ -675,6 +675,7 @@ fn a_compare_mask_joined_with_data_on_the_skip_edge_is_0_there() {
                 )
                 .unwrap_or_else(|e| panic!("{label}: {name} dispatch failed: {e}"));
             assert_eq!(out[0], want, "{label}: {name}");
+            eprintln!("{label}: {name} readback matched on 32 lanes");
         };
         check(
             "compare",

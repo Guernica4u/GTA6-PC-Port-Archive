@@ -110,7 +110,8 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     if let Err(ShaderError::Unsupported { what, .. }) = &result
         && matches!(
             *what,
-            "a lane mask holding lanes elsewhere read as data"
+            LANE_MASK
+                | "a lane mask holding lanes elsewhere read as data"
                 | "a lane-mask join of an untracked mask"
                 | "a register joining a lane mask and data, read as data"
                 | "v_permlane16_b32"

@@ -122,6 +122,11 @@ fn program() -> HostShader {
         w.extend(buffer_store_dword(5, 8, output));
         w.extend(buffer_store_dword(7, 8, output + 4));
     }
+    // A full numeric descriptor read keeps the CBV's base word.
+    w.extend(s_load(3, 28, 4, 0x60));
+    w.push(S_WAITCNT_ALL);
+    w.push(v_mov_b32(5, 28));
+    w.extend(buffer_store_dword(5, 8, 56));
     w.push(S_ENDPGM);
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -303,7 +308,7 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
                             (3, Root::View { srv: true, data: view_addresses.clone() }),
                         ],
                         views: &[
-                            View::RawUav(14),
+                            View::RawUav(15),
                             View::Memory(&memory),
                             View::Pair,
                             View::NullPair,
@@ -330,7 +335,8 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
                     0,
                     0,
                     0,
-                    0
+                    0,
+                    0xDEAD_BEEF,
                 ],
                 "{label}: reads"
             );
@@ -347,6 +353,7 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
                 .collect();
             assert_eq!(marked, [(far >> 28) as usize, entry, entry + 1], "{label}: pages");
         }
+        eprintln!("{label}: view-address numeric words and pointer reads matched");
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");

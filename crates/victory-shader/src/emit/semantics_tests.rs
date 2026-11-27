@@ -582,12 +582,13 @@ fn wave32_scalar_write_order_across_exec_branches() {
     let mut body = Vec::from(vop3(0x0C5, 20, [int(0), v(1), 0], NONE));
     body.extend(vop3(0x0C5, 30, [int(0), v(2), 0], NONE));
     body.extend([
-        sop1(0x3C, 24, s(30)),         // save EXEC, then keep the selected lanes
-        0xBF88_0002,                   // skip the first arm if EXEC is empty
-        0xB014_0531,                   // s_movk_i32 s20, 0x0531
-        vop1(0x01, 7, s(20)),          // keep the first arm's per-lane write
+        sop1(0x03, 29, int(11)), // distinguish a suppressed scalar write from 37
+        sop1(0x3C, 24, s(30)),   // save EXEC, then keep the selected lanes
+        0xBF88_0002,             // skip the first arm if EXEC is empty
+        0xB014_0531,             // s_movk_i32 s20, 0x0531
+        vop1(0x01, 7, s(20)),    // keep the first arm's per-lane write
         sop2(0x14, 126, s(24), s(30)), // EXEC = saved & ~selected
-        sop1(0x03, 29, int(37)),       // runs even if the second arm is empty
+        sop1(0x03, 29, int(37)), // runs even if the second arm is empty
         0xBF88_0001,
         0xB014_7528,            // s_movk_i32 s20, 0x7528
         sop1(0x03, 126, s(24)), // restore EXEC
@@ -610,6 +611,52 @@ fn wave32_scalar_write_order_across_exec_branches() {
         let last = if mask == u32::MAX { 0x0531 } else { 0x7528 };
         let first = if mask >> lane & 1 != 0 { 0x0531 } else { 0 };
         [last, last >> lane & 1, first, 37]
+    });
+}
+
+/// A nested SAVEEXEC starts with a sparse mask. Complementing the selection
+/// alone would enable lanes outside the outer region. The second wave also
+/// distinguishes a scalar move under empty EXEC from its previous value.
+#[test]
+fn wave32_nested_saved_exec_excludes_outer_lanes() {
+    let mut body = Vec::from(vop3(0x0C5, 22, [int(0), v(1), 0], NONE));
+    body.extend(vop3(0x0C5, 30, [int(0), v(2), 0], NONE));
+    body.extend(vop3(0x0C5, 20, [int(0), v(3), 0], NONE));
+    body.extend([
+        sop1(0x03, 29, int(11)), // visible if the later scalar move is suppressed
+        sop1(0x3C, 26, s(22)),   // save full EXEC and enter the outer region
+        sop1(0x3C, 24, s(30)),   // save the outer EXEC and select its inner lanes
+        0xBF88_0001,             // skip the scalar complement if none are selected
+        sop1(0x07, 20, s(20)),
+        sop2(0x14, 126, s(24), s(30)), // EXEC = outer & ~selected
+        sop1(0x03, 29, int(37)),
+        vop1(0x01, 7, int(1)), // only lanes left in the outer region can write
+        sop1(0x03, 28, EXEC_LO), // record that mask, including zero
+        sop1(0x03, 126, s(26)), // restore every lane for the readback
+        vop1(0x01, 5, s(20)),
+        vop1(0x01, 6, s(28)),
+        vop1(0x01, 8, s(29)),
+    ]);
+    let outer = [0x8000_0005u32, 0x0001_000A];
+    let inner = [0x8000_0001u32, 0x0001_000A];
+    let inputs: [[u32; 4]; 64] = std::array::from_fn(|t| {
+        let (w, l) = (t / 32, t % 32);
+        [
+            outer[w] >> l & 1,
+            inner[w] >> l & 1,
+            u32::from(l.is_multiple_of(2)),
+            0,
+        ]
+    });
+    // RDNA2 §§3.3, 12.1, 12.3: only lane 2 survives in wave 0; none
+    // survives in wave 1. Scalar s29 changes from 11 to 37 in both.
+    check_wave32("Wave32 nested saved EXEC", &body, &inputs, |t| {
+        [
+            0xAAAA_AAAA,
+            if t < 32 { 4 } else { 0 },
+            u32::from(t == 2),
+            37,
+        ]
     });
 }
 
