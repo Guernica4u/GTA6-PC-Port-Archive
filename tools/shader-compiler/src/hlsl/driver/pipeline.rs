@@ -533,7 +533,7 @@ fn translate_outputs_once_impl(ex: &ShaderExtract, feeds_ps: Option<&InputInterp
                     return Err(reason);
                 }
                 match lockstep::prove(&em.insns, width) {
-                    Some(votes) => em.lockstep = Some(votes),
+                    Some(proof) => em.lockstep = Some(proof),
                     None => {
                         // Lockstep cannot prove this program; lower the totals that
                         // wave_sum rejects on control flow to WaveActiveSum, a

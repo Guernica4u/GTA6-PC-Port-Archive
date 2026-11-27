@@ -10,7 +10,7 @@ impl<'a> Emitter<'a> {
         for line in mask_ballots::capture(self, idx) {
             self.line(&line);
         }
-        if let Some(vote) = self.lockstep.as_ref().and_then(|votes| votes.get(&idx)).cloned() {
+        if let Some(vote) = self.lockstep.as_ref().and_then(|proof| proof.votes.get(&idx)).cloned() {
             let mask = r(&vote.mask)?;
             if vote.count {
                 let dst = ins.dst.first().ok_or("missing lane count destination")?;

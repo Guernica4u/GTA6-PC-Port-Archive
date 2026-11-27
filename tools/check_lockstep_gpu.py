@@ -5,9 +5,11 @@ Each synthetic wave32 program branches on a lane mask, then runs a reduction
 behind a mask branch, which the translator can only express by branching with
 the whole wave. One program also runs as a ray tracing resolve shader, whose
 interleaved loops go through the block dispatcher, and another exchanges lanes
-in that mode. Two more read a lane inside a loop that lanes leave at different
-times: a sum for each distinct key, and a read of lanes that have already left.
-The reference models the console: one program counter per wave,
+in that mode. Others count the lanes of a mask, find its first, retire lanes
+with a write to EXEC, and read the lane a mask elects. Two more read a lane
+inside a loop that lanes leave at different times: a sum for each distinct key,
+and a read of lanes that have already left. The reference models the console:
+one program counter per wave,
 shared scalar registers and per-lane vector writes under EXEC. Only the
 translator's input and output are instrumented. No game data is needed.
 """
@@ -77,6 +79,23 @@ BODIES = {
                  "v_add_nc_u32_e32 v10, 1, v10", label("empty"), "s_mov_b32 exec_lo, s10",
                  "s_add_u32 s22, s22, 1", "s_cmp_lt_u32 s20, 3", branch("s_cbranch_scc1", "outer"),
                  "s_cmp_lt_u32 s22, 6", branch("s_cbranch_scc1", "inner")],
+    # A mask filled behind a branch on a mask, then read as a number: its lanes
+    # counted, its first found, and those below each lane counted.
+    "counted": ["s_mov_b32 s11, 0", COMPARE, branch("s_cbranch_vccz", "none"), "s_and_b32 s11, vcc_lo, exec_lo",
+                label("none"), "s_bcnt1_i32_b32 s20, s11", "s_ff1_i32_b32 s21, s11",
+                "v_mbcnt_lo_u32_b32 v10, s11, 0"],
+    # The lanes a block left out, taken from EXEC and its saved copy at once.
+    "others": [COMPARE, "s_and_saveexec_b32 s10, vcc_lo", "v_mov_b32_e32 v10, 5", "s_andn2_wrexec_b32 s11, s10",
+               branch("s_cbranch_scc0", "done"), "s_mov_b32 s20, 9", "v_mov_b32_e32 v10, 6", label("done"),
+               "s_bcnt1_i32_b32 s21, s11", "s_mov_b32 exec_lo, s10"],
+    # EXEC restored from a register that one path left a number in. Nothing runs
+    # under it before the next restore.
+    "stale": ["s_mov_b32 s10, exec_lo", COMPARE, branch("s_cbranch_vccz", "kept"), "s_mov_b32 s10, 5",
+              label("kept"), "s_mov_b32 exec_lo, s10", "s_mov_b32 exec_lo, s12", "s_mov_b32 s20, 4",
+              "v_mov_b32_e32 v10, s20"],
+    # The first running lane, and the value that lane holds.
+    "first": ["s_and_b32 s11, s12, exec_lo", "s_ff1_i32_b32 s11, s11", "v_readlane_b32 s21, v0, s11",
+              "s_mov_b32 s20, s11"],
 }
 
 
@@ -232,6 +251,20 @@ def model(name, active, values):
             v10 = [v10[i] + int(taken[i]) for i in lanes]
             s22 += 1
             at = "outer" if s20 < 3 else "inner" if s22 < 6 else None
+    elif name == "counted":
+        s20 = sum(taken)
+        s21 = taken.index(True) if some else 0xffffffff
+        v10 = [sum(taken[:i]) if active[i] else 0 for i in lanes]
+    elif name == "others":
+        others = [active[i] and not taken[i] for i in lanes]
+        s20, s21 = 9 * any(others), sum(others)
+        v10 = [5 if taken[i] else 6 if others[i] else 0 for i in lanes]
+    elif name == "stale":
+        s20 = 4
+        v10 = [4 if active[i] else 0 for i in lanes]
+    elif name == "first":
+        s20 = active.index(True) if any(active) else 0xffffffff
+        s21 = values[s20 & (WIDTH - 1)]
     elif name != "none":
         raise ValueError(name)
     total = sum(v for v, a in zip(values, active) if a) & 0xffffffff if any(active) else 0
