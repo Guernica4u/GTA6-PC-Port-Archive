@@ -48,6 +48,15 @@ pub(crate) struct Shadow {
     /// a range holds in part cannot say so in `copied`. Locked inside
     /// `copied`'s lock.
     ranged: Mutex<[(usize, usize, u64); 2]>,
+    /// Of pages taken in part (by index, as `copied`): the asking after
+    /// which each 4 KiB part was last taken whole ([`stamp_taken`]). Without
+    /// it a page a refresh held only in part (at a range's end, beside a
+    /// range shaders may be writing) kept the note of its last whole take,
+    /// and once the title wrote any of it the refresh took its part again
+    /// at every refresh, written or not, until one took it whole: beside
+    /// the ranges flights keep declaring that was never. Locked inside
+    /// `copied`'s lock; `ranged`'s is never held while it is taken.
+    parts_taken: Mutex<crate::watch::PartsTaken>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
@@ -2806,22 +2815,223 @@ mod piece_tests {
 /// merged nor a reason to settle; the refresh leaves such ranges alone, and
 /// shaders read zeros there (fxceless/victory-fork#206: missing geometry
 /// with `VICTORY_LATE_WAIT`/`VICTORY_RELAY`).
-fn stale_pages_in(base: usize, copied: &[u64], a: usize, e: usize, written: &[(usize, u64)]) -> Vec<usize> {
+///
+/// Of a page taken in part since (`parts`, [`stamp_taken`]) only the 4 KiB
+/// parts that hold bytes of `[a, e)` count, each by its own note; `each`
+/// gives a written page's parts' writes ([`crate::watch::part_writes`]),
+/// asked only of such pages.
+fn stale_pages_in(
+    base: usize,
+    copied: &[u64],
+    parts: &crate::watch::PartsTaken,
+    a: usize,
+    e: usize,
+    written: &[(usize, u64)],
+    each: &dyn Fn(usize) -> Option<[u64; PARTS]>,
+) -> Vec<usize> {
     (a / PAGE..e.div_ceil(PAGE))
         .filter(|&page| page >= base)
-        .filter(|&page| match copied.get(page - base) {
-            None => false,
-            Some(0) => true,
-            Some(&at) => written
-                .binary_search_by_key(&page, |&(p, _)| p)
-                .is_ok_and(|i| written[i].1 > at),
+        .filter(|&page| {
+            let Some(&at) = copied.get(page - base) else {
+                return false;
+            };
+            let write = written.binary_search_by_key(&page, |&(p, _)| p).map_or(0, |i| written[i].1);
+            if at != 0 && write <= at {
+                return false;
+            }
+            let Some(stamps) = parts.get(&(page - base)) else {
+                return true;
+            };
+            let writes = if write == 0 { None } else { each(page) };
+            parts_within(page, a, e).any(|k| {
+                let at = at.max(stamps[k]);
+                at == 0 || (write != 0 && writes.map_or(write, |w| w[k]) > at)
+            })
         })
         .collect()
 }
 
+/// The parts of a page: 4 KiB each, as the kernel names them.
+const PARTS: usize = crate::watch::PARTS;
+
+/// [`crate::watch::part_writes`] of one page.
+fn one_part_writes(page: usize) -> Option<[u64; PARTS]> {
+    crate::watch::part_writes(&[page]).pop().flatten()
+}
+
+/// Since the last line, of refreshes that looked at title memory
+/// ([`Shadow::copy_stale`]): how many, how many took something, the bytes of
+/// parts never taken before, the bytes of parts taken again (written
+/// since), and the ends of ranges that held a page in part.
+static REFRESHED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// For the frame-rate line, every few seconds: what the refreshes took
+/// ([`REFRESHED`]) and how the questions to the journal were answered, per
+/// second of `seconds`.
+pub(crate) fn refreshed_line(seconds: f64) {
+    let r: Vec<f64> = REFRESHED.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / seconds).collect();
+    let [asks, ranges] = [0, 1].map(|i| crate::watch::COVER_ASKS[i].swap(0, Ordering::Relaxed) as f64);
+    if r[0] == 0.0 {
+        return;
+    }
+    tracing::info!(
+        "refreshes that looked at title memory, per second: {:.0}, {:.0} of them took something; {:.1} MB never taken before, \
+         {:.1} MB taken again (written since; 4 KiB parts where the kernel names them, else 64 KiB pages); {:.0} ends of ranges \
+         in the middle of a page (their parts are noted one by one); questions answered from the submissions' askings {:.0}, \
+         {:.1} ranges asked on average (looked for by halves)",
+        r[0],
+        r[1],
+        r[2] / 1e6,
+        r[3] / 1e6,
+        r[4],
+        asks / seconds,
+        ranges / asks.max(1.0),
+    );
+}
+
+/// The parts of page `page` (a page number) that hold bytes of `[a, b)`.
+fn parts_within(page: usize, a: usize, b: usize) -> std::ops::Range<usize> {
+    let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(b));
+    if lo >= hi {
+        return 0..0;
+    }
+    (lo - page * PAGE) / KERNEL_PAGE..(hi - page * PAGE).div_ceil(KERNEL_PAGE)
+}
+
+/// Part `k` of page `page`, cut to `[start, end)` (the buffer).
+fn part_span(page: usize, k: usize, start: usize, end: usize) -> (usize, usize) {
+    ((page * PAGE + k * KERNEL_PAGE).max(start), (page * PAGE + (k + 1) * KERNEL_PAGE).min(end))
+}
+
+/// What a refresh of `[from, to)` takes ([`Shadow::copy_stale`]): runs
+/// (from, to, whether the copy held them before), in order. The range lies
+/// in the buffer `[start, end)`, whose first page is `base`. A 4 KiB part is
+/// taken if it was never taken whole, or was written after it last was: its
+/// note is the latest of its page's (`copied`), its own (`parts`) and that of
+/// a range taken whole that holds `[from, to)` (`ranged`, or 0); its writes
+/// are its page's in `written` (pages in order and their last write, as
+/// `crate::watch::writes` gives them) or, where the journal tells a page's
+/// parts apart, those in `each` (by page of `written`).
+///
+/// As before parts were noted: a page never taken is taken whole, a page
+/// taken and written since in the parts written (all of it where they are
+/// not known, `by_parts`).
+#[allow(clippy::too_many_arguments)]
+fn stale_runs(
+    from: usize,
+    to: usize,
+    (_, _, base): (usize, usize, usize),
+    copied: &[u64],
+    parts: &crate::watch::PartsTaken,
+    ranged: u64,
+    written: &[(usize, u64)],
+    each: &[Option<[u64; PARTS]>],
+) -> Vec<(usize, usize, bool)> {
+    let mut runs: Vec<(usize, usize, bool)> = Vec::new();
+    let mut push = |a: usize, b: usize, known: bool| {
+        if a >= b {
+            return;
+        }
+        match runs.last_mut() {
+            Some(last) if last.1 == a && last.2 == known => last.1 = b,
+            _ => runs.push((a, b, known)),
+        }
+    };
+    if from >= to {
+        return runs;
+    }
+    let mut writes = written.iter().zip(each.iter().map(Some).chain(std::iter::repeat(None))).peekable();
+    let mut stamps_of = parts.range((from / PAGE).saturating_sub(base)..).peekable();
+    for page in from / PAGE..=(to - 1) / PAGE {
+        while writes.next_if(|((p, _), _)| *p < page).is_some() {}
+        let (write, each) = match writes.next_if(|((p, _), _)| *p == page) {
+            Some((&(_, w), e)) => (w, e.copied().flatten()),
+            None => (0, None),
+        };
+        let i = page - base;
+        while stamps_of.next_if(|s| *s.0 < i).is_some() {}
+        let stamps = stamps_of.next_if(|s| *s.0 == i).map(|s| s.1);
+        let taken = copied[i].max(ranged);
+        let (lo, hi) = ((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
+        match stamps {
+            None if taken != 0 && write <= taken => {}
+            None if taken == 0 => push(lo, hi, false),
+            _ => {
+                for k in parts_within(page, lo, hi) {
+                    let (a, b) = part_span(page, k, lo, hi);
+                    let at = taken.max(stamps.map_or(0, |s| s[k]));
+                    let w = if write == 0 { 0 } else { each.map_or(write, |e| e[k]) };
+                    if at == 0 || w > at {
+                        push(a, b, at != 0);
+                    }
+                }
+            }
+        }
+    }
+    runs
+}
+
+/// `[from, to)` (inside the buffer `[start, end)`, whose first page is
+/// `base`) is in the copy as title memory had it at asking `now`: each page
+/// it holds whole is noted so in `copied`, and of each page it holds in part,
+/// each 4 KiB part it holds whole in `parts`. A page all of whose parts are
+/// noted later than the page is noted at the earliest of them, and its parts'
+/// notes go once none is later than the page's.
+fn stamp_taken(
+    from: usize,
+    to: usize,
+    (start, end, base): (usize, usize, usize),
+    copied: &mut [u64],
+    parts: &mut crate::watch::PartsTaken,
+    now: u64,
+) {
+    if from >= to {
+        return;
+    }
+    for page in from / PAGE..=(to - 1) / PAGE {
+        let i = page - base;
+        let Some(at) = copied.get_mut(i) else {
+            continue;
+        };
+        if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+            *at = (*at).max(now);
+        } else {
+            let mut stamped = false;
+            let mut stamps = parts.get(&i).copied().unwrap_or([0; PARTS]);
+            for k in 0..PARTS {
+                let (a, b) = part_span(page, k, start, end);
+                if a < b && a >= from && b <= to {
+                    stamps[k] = stamps[k].max(now);
+                    stamped = true;
+                }
+            }
+            if stamped {
+                parts.insert(i, stamps);
+            }
+        }
+        let Some(stamps) = parts.get(&i) else {
+            continue;
+        };
+        let held = (0..PARTS)
+            .filter(|&k| {
+                let (a, b) = part_span(page, k, start, end);
+                a < b
+            })
+            .map(|k| stamps[k].max(*at))
+            .min()
+            .unwrap_or(*at);
+        *at = (*at).max(held);
+        if stamps.iter().all(|&t| t <= *at) {
+            parts.remove(&i);
+        }
+    }
+}
+
 /// `runs` (from, to, whether the copy held it before), cut in those of pages
 /// held before (`pages`: page number and asking, in order) to the parts of
-/// each page that were written since (`parts`: a bit for each 4 KiB).
+/// each page that were written since (`parts`: a bit for each 4 KiB). (What
+/// [`stale_runs`] does now, kept for its test as the way it was.)
+#[cfg(test)]
 fn by_parts(runs: Vec<(usize, usize, bool)>, pages: &[(usize, u64)], parts: &[u16]) -> Vec<(usize, usize, bool)> {
     const PART: usize = PAGE / 16;
     if parts.iter().all(|&p| p == u16::MAX) {
@@ -2934,10 +3144,108 @@ mod stale_tests {
         // Page 0x101 was never taken; page 0x102 was written after it was
         // taken, page 0x103 before.
         let written = [(0x102, 6), (0x103, 4)];
-        assert_eq!(stale_pages_in(base, &copied, at(0x100), at(0x104), &written), [0x101, 0x102]);
+        let none = crate::watch::PartsTaken::new();
+        let whole = |_: usize| None;
+        assert_eq!(stale_pages_in(base, &copied, &none, at(0x100), at(0x104), &written, &whole), [0x101, 0x102]);
         // Part of a page counts as the page; pages outside the copy do not.
-        assert_eq!(stale_pages_in(base, &copied, at(0x101) + 8, at(0x101) + 16, &[]), [0x101]);
-        assert!(stale_pages_in(base, &copied, at(0x104), at(0x106), &[(0x104, 9)]).is_empty());
+        assert_eq!(stale_pages_in(base, &copied, &none, at(0x101) + 8, at(0x101) + 16, &[], &whole), [0x101]);
+        assert!(stale_pages_in(base, &copied, &none, at(0x104), at(0x106), &[(0x104, 9)], &whole).is_empty());
+        // Page 0x101 never taken whole, its part 0 taken at 7: what lies in
+        // part 0 is as it was, what lies in part 1 never was taken.
+        let mut parts = crate::watch::PartsTaken::new();
+        let mut stamps = [0; PARTS];
+        stamps[0] = 7;
+        parts.insert(1, stamps);
+        assert!(stale_pages_in(base, &copied, &parts, at(0x101) + 8, at(0x101) + 16, &[], &whole).is_empty());
+        assert_eq!(stale_pages_in(base, &copied, &parts, at(0x101) + 8, at(0x101) + 5000, &[], &whole), [0x101]);
+        // Page 0x102 written at 6 in part 3 alone, part 0 taken at 7 since.
+        parts.insert(2, stamps);
+        let each = |_: usize| {
+            let mut w = [0; PARTS];
+            w[3] = 6;
+            Some(w)
+        };
+        assert!(stale_pages_in(base, &copied, &parts, at(0x102), at(0x102) + 100, &written, &each).is_empty());
+        assert_eq!(stale_pages_in(base, &copied, &parts, at(0x102), at(0x103), &written, &each), [0x102]);
+    }
+}
+
+#[cfg(test)]
+mod part_notes_tests {
+    use super::*;
+
+    const K: usize = KERNEL_PAGE;
+
+    /// Without notes of parts the runs are those of the pages, cut to the
+    /// parts written, as `by_parts` cut them.
+    #[test]
+    fn runs_without_notes_of_parts_are_as_before() {
+        let base = 10;
+        let (start, end) = (base * PAGE, 15 * PAGE);
+        let copied = [5, 5, 0, 0, 6];
+        let none = crate::watch::PartsTaken::new();
+        let written = [(10, 6), (11, 6), (14, 6)];
+        let mut p10 = [0; PARTS];
+        p10[1] = 6;
+        p10[15] = 6;
+        let each = [Some(p10), None, Some([6; PARTS])];
+        let (from, to) = (10 * PAGE + K + 100, 14 * PAGE + 9 * K + 7);
+        let runs = stale_runs(from, to, (start, end, base), &copied, &none, 0, &written, &each);
+        let before = by_parts(
+            vec![(from, 12 * PAGE, true), (12 * PAGE, 14 * PAGE, false)],
+            &[(10, 5), (11, 5)],
+            &[1 << 1 | 1 << 15, u16::MAX],
+        );
+        assert_eq!(runs, before);
+        // Page 14, taken at 6 and written at 6: as it was.
+        assert!(stale_runs(14 * PAGE, 15 * PAGE, (start, end, base), &copied, &none, 0, &written, &each).is_empty());
+        // A range taken whole later than the writes: nothing.
+        assert!(stale_runs(from, to - 8 * K, (start, end, base), &copied, &none, 9, &written, &each).is_empty());
+    }
+
+    /// A page taken in part is taken again only where it was written since,
+    /// or never taken; and once all of it is taken it is noted whole.
+    #[test]
+    fn a_page_taken_in_part_is_not_taken_again_unwritten() {
+        let base = 0;
+        let (start, end) = (0, 2 * PAGE);
+        let mut copied = [0u64, 0];
+        let mut parts = crate::watch::PartsTaken::new();
+        // Page 0 written whole at 3; taken from part 2 on to the middle of
+        // page 1 (beside a range shaders write).
+        let written = [(0, 3), (1, 3)];
+        let each = [None, None];
+        let (from, to) = (2 * K + 10, PAGE + 5 * K + 1);
+        let runs = stale_runs(from, to, (start, end, base), &copied, &parts, 0, &written, &each);
+        assert_eq!(runs, [(from, to, false)]);
+        stamp_taken(from, to, (start, end, base), &mut copied, &mut parts, 4);
+        assert_eq!(copied, [0, 0]);
+        // Part 2 begins before `from`; parts 3..16 of page 0, 0..5 of page 1.
+        assert_eq!(parts[&0][2], 0);
+        assert_eq!(parts[&0][3], 4);
+        assert_eq!(parts[&1][4], 4);
+        assert_eq!(parts[&1][5], 0);
+        // Nothing written since: taken again, only what never was.
+        let runs = stale_runs(2 * K, PAGE + 5 * K, (start, end, base), &copied, &parts, 0, &written, &each);
+        assert_eq!(runs, [(2 * K, 3 * K, false)]);
+        // Part 7 of page 0 written at 5 (the journal tells it apart).
+        let mut p0 = [3; PARTS];
+        p0[7] = 5;
+        let written = [(0, 5), (1, 3)];
+        let each = [Some(p0), None];
+        let runs = stale_runs(3 * K, PAGE + 5 * K, (start, end, base), &copied, &parts, 0, &written, &each);
+        assert_eq!(runs, [(7 * K, 8 * K, true)]);
+        // Taken whole at last: noted as a page, the parts' notes gone.
+        stamp_taken(0, PAGE, (start, end, base), &mut copied, &mut parts, 6);
+        assert_eq!(copied[0], 6);
+        assert!(!parts.contains_key(&0));
+        // Page 1's parts all taken one by one: noted whole at the earliest.
+        stamp_taken(PAGE, PAGE + 4 * K, (start, end, base), &mut copied, &mut parts, 7);
+        stamp_taken(PAGE + 5 * K, 2 * PAGE, (start, end, base), &mut copied, &mut parts, 8);
+        // (Part 4 was taken at 4, above.)
+        assert_eq!(copied[1], 4);
+        stamp_taken(PAGE + 4 * K, PAGE + 5 * K, (start, end, base), &mut copied, &mut parts, 9);
+        assert_eq!(copied[1], 7);
     }
 }
 
@@ -3178,6 +3486,7 @@ impl Shadow {
             len,
             copied: Mutex::new(vec![0; pages as usize]),
             ranged: Mutex::default(),
+            parts_taken: Mutex::default(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             flights: Mutex::default(),
@@ -3705,7 +4014,10 @@ impl Shadow {
         let base = start / PAGE;
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         busy.into_iter().any(|(a, e)| match crate::watch::asked(a, e) {
-            Some((_, written)) => !stale_pages_in(base, &copied, a, e, &written).is_empty(),
+            Some((_, written)) => {
+                let parts = self.parts_taken.lock().unwrap_or_else(|e| e.into_inner());
+                !stale_pages_in(base, &copied, &parts, a, e, &written, &one_part_writes).is_empty()
+            }
             None => true,
         })
     }
@@ -3766,7 +4078,8 @@ impl Shadow {
             };
             let stale: Vec<usize> = {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                stale_pages_in(base, &copied, a, e, &written)
+                let parts = self.parts_taken.lock().unwrap_or_else(|e| e.into_inner());
+                stale_pages_in(base, &copied, &parts, a, e, &written, &one_part_writes)
             };
             if stale.is_empty() {
                 continue;
@@ -3835,21 +4148,20 @@ impl Shadow {
                     runs.iter().map(|&(r, m)| (lo - start + r, lo - start + r + m)),
                 );
                 self.card_changed_runs(runs.into_iter().map(|(r, m)| (lo - start + r, lo - start + r + m)));
-                // Taken, if the range holds all of the page that is in the
-                // copy; else the rest of it is the refresh's, which notes
-                // only whole pages, and the page is looked at again.
-                if lo < hi && (stale[i] * PAGE).max(start) >= a && ((stale[i] + 1) * PAGE).min(end) <= e {
-                    taken.push(stale[i]);
+                // Taken: the page if the range holds all of it that is in
+                // the copy, else the parts of it the range holds whole; the
+                // rest of it is the refresh's.
+                if lo < hi {
+                    taken.push((lo, hi));
                 }
             }
             drop(before);
             drop(merging);
             {
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                for page in taken {
-                    if let Some(at) = copied.get_mut(page - base) {
-                        *at = now;
-                    }
+                let mut parts = self.parts_taken.lock().unwrap_or_else(|e| e.into_inner());
+                for (lo, hi) in taken {
+                    stamp_taken(lo, hi, (start, end, base), &mut copied, &mut parts, now);
                 }
             }
             if over.into_inner() {
@@ -3979,7 +4291,9 @@ impl Shadow {
             return false;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to));
+        let ranged = self.ranged(from, to);
+        let parts = self.parts_taken.lock().unwrap_or_else(|e| e.into_inner());
+        let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, &parts, ranged);
         #[cfg(feature = "diagnostics")]
         if same {
             use crate::copystat::{C, add};
@@ -4083,61 +4397,36 @@ impl Shadow {
         }
     }
 
-    /// Copies the pages of `[from, to)` written after their last copy
-    /// (`written`: last writes by page, in page order; `now`: this
-    /// asking), whole pages within the buffer.
+    /// Copies the parts of `[from, to)` written after their last copy
+    /// (`written`: last writes by page, in page order; `now`: this asking):
+    /// 4 KiB parts where the journal tells them apart, else whole pages,
+    /// within the buffer ([`stale_runs`]); then notes what the range holds
+    /// as taken ([`stamp_taken`]).
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
-        let base = self.start as usize / PAGE;
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let buffer = (start, end, start / PAGE);
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let mut writes = written.iter().peekable();
-        // Pages the range holds in part are never noted in `copied`, and
-        // were copied again at every refresh of the range, written or not:
-        // of the heap's buffer views alone two ends for each of 4,400
-        // copies, every frame. A range that was taken whole, and not written
-        // since, is as it was.
+        // A range that was taken whole, and not written since, is as it was
+        // (of the heap's buffer views alone two ends for each of 4,400
+        // copies, every frame, were copied again before it was known).
         let ranged = if crate::watch::light() { self.ranged(from, to) } else { 0 };
-        let (mut runs, mut run) = (Vec::new(), None::<(usize, bool)>);
-        // Pages taken before and written since: in the order of their runs.
-        let mut again_at: Vec<(usize, u64)> = Vec::new();
-        let last = (to - 1) / PAGE;
-        for page in from / PAGE..=last {
-            let write = match writes.peek() {
-                Some(&&(p, w)) if p == page => {
-                    writes.next();
-                    w
-                }
-                _ => 0,
-            };
-            let at = &mut copied[page - base];
-            let taken = (*at).max(ranged);
-            if taken == 0 || write > taken {
-                // A page only partly in the range is copied in part: it
-                // stays stale for the rest.
-                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                    *at = now;
-                }
-                // Cut where pages taken before meet pages never taken.
-                let again = taken != 0;
-                if again {
-                    again_at.push((page, taken));
-                }
-                if let Some((first, known)) = run
-                    && known != again
-                {
-                    runs.push(((first * PAGE).max(from), (page * PAGE).min(to), known));
-                    run = None;
-                }
-                run.get_or_insert((page, again));
-            } else if let Some((first, known)) = run.take() {
-                runs.push(((first * PAGE).max(from), (page * PAGE).min(to), known));
-            }
+        let mut parts = self.parts_taken.lock().unwrap_or_else(|e| e.into_inner());
+        let pages: Vec<usize> = written.iter().map(|w| w.0).collect();
+        let each = crate::watch::part_writes(&pages);
+        let runs = stale_runs(from, to, buffer, &copied, &parts, ranged, written, &each);
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let [never, again] = [false, true].map(|known| runs.iter().filter(|r| r.2 == known).map(|r| (r.1 - r.0) as u64).sum::<u64>());
+            REFRESHED[0].fetch_add(1, Relaxed);
+            REFRESHED[1].fetch_add(u64::from(!runs.is_empty()), Relaxed);
+            REFRESHED[2].fetch_add(never, Relaxed);
+            REFRESHED[3].fetch_add(again, Relaxed);
+            REFRESHED[4].fetch_add(u64::from(from % PAGE != 0) + u64::from(to % PAGE != 0 && to != end), Relaxed);
         }
-        // Cut to the range: next to it shaders may be writing the copy.
-        if let Some((first, known)) = run {
-            runs.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to), known));
-        }
-        let runs = by_parts(runs, &again_at, &crate::watch::parts_written(&again_at));
+        // Noted before the bytes go in, under the same lock: no other refresh
+        // of the copy looks at the notes before they are.
+        stamp_taken(from, to, buffer, &mut copied, &mut parts, now);
+        drop(parts);
         let bytes = self.take_all(runs);
         if crate::watch::light() {
             // All of the range is in the copy as of this asking.
