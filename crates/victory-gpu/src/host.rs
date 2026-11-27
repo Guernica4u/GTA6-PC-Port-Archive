@@ -3065,7 +3065,10 @@ impl Host {
         let mut reads: Vec<VramRead> = Vec::new();
         for list in runs {
             for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len, _, _) = step
+                // Marked ranges of tracked copies keep no snapshot
+                // (`Shadow::writing`): they go back by their marks, whose
+                // pages `vram_ran` reads back.
+                if let Step::GpuWrite(shadow, address, len, false, _) = step
                     && seen.insert((std::sync::Arc::as_ptr(shadow) as usize, *address, *len))
                     && let Some((cpu_ptr, base, start, buf_len)) = shadow.vram_readback()
                 {
