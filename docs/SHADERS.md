@@ -168,6 +168,12 @@ A [GPU check](../tools/check_mask_ballots_gpu.py) compares both widths with a mo
 
 Most wave reduction refusals come from programs over 6,000 instructions, where the translator doesn't try its one-lane-per-wave form. In a trial on an earlier set of 1,442 such compute shaders, removing that limit translated 1,211. Six sampled outputs compiled in 2 to 12 seconds with DXC optimization off, and mostly produced 1 to 2 MB of DXIL. Large compiles in a recorded run took the driver 6 minutes or more, so the limit stays until the generated code compiles faster. The outputs weren't tested in a game.
 
+### Lanes counted by key
+
+Ray binning counts the lanes of a wave by a key each lane holds. The console serves one key per pass of a loop: it sums the lanes that hold the first remaining lane's key across the wave, and one of them adds the count to a buffer. The loop ends when a mask of the remaining lanes is empty, which a thread that holds only its own bit can't tell, so these programs were refused. When a loop has exactly that shape, the translator now has every counting lane add 1 at its own key ([rewrite](../tools/shader-compiler/src/hlsl/rewrite/key_counts.rs)). The buffer ends the same, no lane reads another, and the host's wave width doesn't matter. The loop stays as it was if anything reads a register it leaves different, or if another instruction uses the counters, since they pass through values the console's never hold. The rewrite is a last resort: a program the translator handles any other way keeps that translation. A 32-lane program, for example, keeps the wave together for the loop's lane reads ([retry](../tools/shader-compiler/src/hlsl/lockstep.rs)), so it is not rewritten.
+
+On 27,116 recorded ProjectScarlett requests, four more translate, all `CS_ScreenProbes_TraceRays_Fallback`, and every other request gives the same result or the same output byte for byte. A [GPU check](../tools/check_key_counts_gpu.py) compares 12 cases of a synthetic 64-lane loop with a model of the console, for groups of one and two waves. This hasn't been tested in the game.
+
 ### 64-lane programs on 32-lane hosts
 
 Many console compute programs need all 64 lanes of a wave, and a host such as an NVIDIA card runs at most 32. When the [host profile](USAGE.md#host-profile) shows that, the provider asks the compiler for a second translation of the program (`--wave32-host`), cached beside the ordinary one as `<hash>_w32`. A 64-lane host never asks, so it keeps the ordinary translation.
