@@ -1317,11 +1317,32 @@ mod host {
             (Instant::now(), keys.collect())
         });
         let (start, keys) = &*SCRIPT;
-        let now = start.elapsed();
+        active_script(keys, start.elapsed())
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn active_script(keys: &[Scripted], now: Duration) -> Vec<u8> {
         keys.iter()
-            .filter(|&&(at, hold, _)| (at..at + hold).contains(&now))
+            .filter(|&&(at, hold, _)| now.checked_sub(at).is_some_and(|elapsed| elapsed < hold))
             .map(|&(_, _, vk)| vk)
             .collect()
+    }
+
+    #[cfg(all(test, feature = "diagnostics"))]
+    #[test]
+    fn scripted_hold_ends_are_exclusive_even_near_duration_max() {
+        let step = Duration::from_nanos(1);
+        let at = Duration::MAX - step;
+        let keys = [
+            (at, step * 2, b'W'),
+            (at, step, b'A'),
+            (at, Duration::ZERO, b'B'),
+        ];
+
+        assert!(active_script(&keys, Duration::ZERO).is_empty());
+        assert!(active_script(&keys, at - step).is_empty());
+        assert_eq!(active_script(&keys, at), b"WA");
+        assert_eq!(active_script(&keys, Duration::MAX), b"W");
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
