@@ -5,8 +5,11 @@ impl<'a> Emitter<'a> {
     /// Broadcast the first active lane to a scalar register.
     pub(in crate::hlsl) fn emit_readfirstlane(&mut self, s: &[Opnd], d: Opnd) -> Result<(), String> {
         let value = r(&s[0])?;
+        // A heap index read from a wave with no active lane becomes slot 0.
+        let index = self.heap_index_reads.contains(&self.cur_idx);
         if self.resolve_wave32 {
-            return self.ws(&d, &format!("WaveReadLaneAt({value}, exec_lo == 0u ? 0u : uint(firstbitlow(exec_lo)))"));
+            let read = format!("WaveReadLaneAt({value}, exec_lo == 0u ? 0u : uint(firstbitlow(exec_lo)))");
+            return self.ws(&d, &if index { format!("exec_lo == 0u ? 0u : {read}") } else { read });
         }
         if self.ex.stage == Stage::Mesh || (self.is_cs && compute_group(self.ex) == [1, 1, 1]) {
             return self.ws(&d, &value);
@@ -23,7 +26,8 @@ impl<'a> Emitter<'a> {
         self.tmp += 1;
         self.line("#if __SHADER_TARGET_MAJOR >= 6");
         self.line(&format!("uint t{t} = WaveActiveMin((exec_lo & 1u) ? WaveGetLaneIndex() : 0xffffffffu);"));
-        self.ws(&d, &format!("WaveReadLaneAt({value}, t{t} == 0xffffffffu ? 0u : t{t})"))?;
+        let read = format!("WaveReadLaneAt({value}, t{t} == 0xffffffffu ? 0u : t{t})");
+        self.ws(&d, &if index { format!("t{t} == 0xffffffffu ? 0u : {read}") } else { read })?;
         self.line("#else");
         self.ws(&d, &value)?;
         self.line("#endif");

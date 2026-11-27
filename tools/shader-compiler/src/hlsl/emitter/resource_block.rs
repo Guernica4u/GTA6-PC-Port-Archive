@@ -261,6 +261,12 @@ impl<'a> Emitter<'a> {
                             .filter(|s| heap_origins::tracked(*s)),
                         _ => None,
                     };
+                    // Judged again on each visit: the last one sees the block's final state.
+                    if matches!(word, Some(Sym::HeapDescriptor(..) | Sym::HeapSamplerIndex(_))) {
+                        self.heap_index_reads.insert(idx);
+                    } else {
+                        self.heap_index_reads.remove(&idx);
+                    }
                     if let Some(d) = ins.dst.first().and_then(sg) {
                         if let Some(heap) = heap.or(word) {
                             // readfirstlane copies one lane's byte offset into an SGPR.
