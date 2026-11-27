@@ -34,6 +34,9 @@ param(
     [switch]$Windowed,
     # Raise the game process to High priority once it is up.
     [switch]$High,
+    # Translate every shader and make the known pipelines ahead (`victory preload`, with these switches), then
+    # play: once per new build or driver, so that the first run does not stutter (play-foxhound.ps1 -Preload).
+    [switch]$Preload,
     # Any other switch, as play-foxhound.ps1's -More.
     [hashtable]$More = @{}
 )
@@ -81,4 +84,5 @@ if (-not $Windowed) {
 }
 Write-Host ("Small PC: Series S, DLSS {0}, frame generation {1}, textures {2} % (skip {3} level(s) >= {4}), pool {5}, BAR {6} MB, targets {7} MB" -f `
         $Dlss, $(if ($NoFrameGen) { 'off' } else { '2x' }), $RoomPct, $SkipLevels, $SkipMin, $(if ($Pool) { 'on' } else { 'off' }), $BarMB, $TargetsMB)
+if ($Preload) { $fg.Preload = $true }
 & (Join-Path $PSScriptRoot 'play-foxhound.ps1') -Exe $Exe -SeriesS -Dlss $Dlss -More $set @fg

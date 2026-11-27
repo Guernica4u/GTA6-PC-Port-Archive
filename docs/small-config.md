@@ -221,6 +221,7 @@ comes from `game_dir` in `victory.toml` (or `VICTORY_GAME_DIR`, or `-Exe`).
 | `-TargetsMB <MB>` | 1536 | `VICTORY_CARD_ROOM_FOR_TARGETS_MB` | render target reserve (step 4) |
 | `-Windowed` | full screen | | leave the window as it is |
 | `-High` | normal | | High process priority once the game is up |
+| `-Preload` | off | | `victory preload` with these switches first (every shader translated, the known pipelines made, the loading ones stored in the pipeline library), then the game; once per new build or driver |
 | `-More @{...}` | | any | any other switch, as `play-foxhound.ps1 -More` |
 
 Things to know:
@@ -228,7 +229,10 @@ Things to know:
 - The F1 menu's saved choices (`victory-settings.txt`) still go over these at every start. On such a PC do not
   switch the console to Series X or frame generation above 2x from the menu; delete the file to go back.
 - On a 16 GB PC, close the browser and other large programs before starting: every GB of RAM is paging avoided.
-- The first start after a new build stutters while pipelines are made, as everywhere.
+- The first start after a new build or driver stutters while pipelines are made. `PLAY_SMALL.cmd -Preload` makes
+  them first, with the same switches (the translations depend on them): on the test machine 88,608 pipelines in
+  22 minutes plus 5,462 into the pipeline library, 38.6 minutes in all, once. Stopped, it goes on where it was. The
+  NVIDIA driver keeps its cache per program path: keep `target\release\victory.exe` where it is.
 - A 6 GB card would start from `-SkipMin 1024 -RoomPct 75`, or `-NoFrameGen`; not tested.
 
 ## What is left, and ideas
