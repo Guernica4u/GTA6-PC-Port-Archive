@@ -281,7 +281,7 @@ fn full_mask_program(em: &Emitter<'_>) -> bool {
         && !em.insns.iter().any(|op| {
             (op.mnemonic.starts_with("tb_")
                 && !matches!(op.mnemonic.as_str(), ray_resolve::READ_LANE | super::mixed_lane::WRITE_LANE))
-                || op.enc == Enc::Ds
+                || (op.enc == Enc::Ds && op.mnemonic != "ds_swizzle_b32")
                 || matches!(
                     op.mnemonic.as_str(),
                     "s_barrier" | "s_sendmsg" | "s_sendmsghalt"

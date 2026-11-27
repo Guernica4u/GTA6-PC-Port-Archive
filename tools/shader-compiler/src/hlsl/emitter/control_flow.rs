@@ -458,7 +458,7 @@ impl<'a> Emitter<'a> {
     pub(in crate::hlsl) fn emit_body_dispatch(&mut self, is_ps: bool, entry: usize) -> Result<(), String> {
         // Per-invocation dispatch cannot guarantee whole-wave arrival at a vote.
         if !self.reduction_execz_guards.is_empty() {
-            return Err("wave reduction EXECZ vote in a block-dispatched program".into());
+            return Err(lockstep::DISPATCHED_VOTE.into());
         }
         if !self.wave_bounded_latches.is_empty() {
             return Err("bounded wave reduction in a block-dispatched program".into());

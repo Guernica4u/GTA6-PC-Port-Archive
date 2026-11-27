@@ -330,7 +330,7 @@ struct Emitter<'a> {
     reduction_execz_guards: BTreeSet<usize>,
     /// Set when every branch is a decision of the whole wave (see `lockstep`),
     /// with the condition codes to vote after the instructions that set them.
-    lockstep: Option<BTreeMap<usize, lockstep::Vote>>,
+    lockstep: Option<lockstep::Proof>,
     /// Structured loop latches with a verified guest trip bound.
     wave_bounded_latches: BTreeSet<usize>,
     portable_wave64: bool,

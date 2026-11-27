@@ -656,7 +656,9 @@ impl<'a> Emitter<'a> {
                 } else if matches!(s[0], Opnd::ExecLo | Opnd::ExecHi) && !self.resolve_wave32 {
                     // Each invocation holds only its own EXEC bit; the guest reads the wave mask.
                     format!("WaveActiveBallot((exec_lo & 1u) != 0u).{}", if s[0] == Opnd::ExecLo { "x" } else { "y" })
-                } else { mask_ballots::word(self, self.cur_idx, &s[0]).unwrap_or(a) };
+                } else {
+                    mask_ballots::word(self, self.cur_idx, &s[0]).or_else(|| lockstep::word(self, self.cur_idx, &s[0], false)).unwrap_or(a)
+                };
                 self.line(&format!("uint t{t} = countbits({a} & {});", low_mask(lane)));
                 self.line("#else");
                 self.line(&format!("uint t{t} = 0u;"));
