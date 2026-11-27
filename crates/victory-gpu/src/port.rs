@@ -34,11 +34,16 @@
 //! upload memory, sent up, merged or waited for: the card reads the title's
 //! bytes when it runs, as the console's does.
 //!
-//! "No shader writes it", per 4 KiB page: no landing ever put shader
-//! output there (`crate::watch::landed_lately` over all frames) and no
-//! write on the card bound for it was recorded ([`gpu_bound`]: copies done
-//! at their place on the card, read-backs into title memory). A page leaves
-//! that class at the first such write and never returns.
+//! "No shader writes it", per 4 KiB page ([`PAGE_MARKS`]): no read-back
+//! into title memory was ever recorded for it ([`gpu_bound`]: for good), no
+//! title buffer copy into it was recorded in the last [`COPY_FRAMES`]
+//! frames ([`copy_bound`]: such a copy may be done on the card, in front of
+//! the lists, `crate::host`'s `card_steps`, or at its place in the list,
+//! and lands in title memory after the flight), and no landing put shader
+//! output there in the last [`LANDED_FRAMES`] frames
+//! (`crate::watch::landed_lately`, the window `fill_is_titles` has used by
+//! default: skinning outputs land every frame and stay the card's; a ring
+//! page a copy wrote once comes back).
 //!
 //! Why our own view: a heap opened from an address holds the pages it was
 //! opened on: the title could not unmap, decommit or protect them while it
@@ -55,7 +60,7 @@
 //! before it lands (the same as `crate::host`'s `fill_is_titles`).
 
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows_sys::Win32::System::Memory as mem;
@@ -81,6 +86,18 @@ const RETRY_FRAMES: u64 = 600;
 
 /// 4 KiB pages below [`LOW`].
 const PAGES: usize = (LOW / 4096) as usize;
+
+/// Frames a page a title buffer copy was recorded into is not read in place
+/// ([`copy_bound`]): the copy's flight lands within them (the relay keeps
+/// one or two frames in the air; `crate::host`'s `placed_lately` trusts
+/// two).
+const COPY_FRAMES: u64 = 8;
+
+/// Frames a page shader output landed in is not read in place.
+const LANDED_FRAMES: u64 = 600;
+
+/// [`PAGE_MARKS`]' mark of a page the card writes for good.
+const FOR_GOOD: u32 = u32::MAX;
 
 /// A stretch of title memory opened as a heap through a view of ours, and
 /// one buffer placed over all of it.
@@ -109,9 +126,11 @@ static TRIED: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
 /// The host refused to open a stretch: none is asked for again.
 static REFUSED: AtomicBool = AtomicBool::new(false);
 
-/// A bit per 4 KiB page below [`LOW`]: a write on the card bound for it was
-/// recorded ([`gpu_bound`]).
-static GPU_PAGES: [AtomicU64; PAGES / 64] = [const { AtomicU64::new(0) }; PAGES / 64];
+/// Per 4 KiB page below [`LOW`]: 0 nothing; [`FOR_GOOD`] a write on the
+/// card is bound for it ([`gpu_bound`]); else the frame (low 32 bits, at
+/// least 1) a title buffer copy into it was last recorded ([`copy_bound`]).
+/// 4 MB of address space, of which only the pages written are memory.
+static PAGE_MARKS: [AtomicU32; PAGES] = [const { AtomicU32::new(0) }; PAGES];
 
 // What [`STATS`] holds. Since the start: regions opened, their bytes; asks
 // that could not open one because the memory is not one stretch of a
@@ -183,34 +202,57 @@ pub(crate) fn constants(address: u64, len: u64) -> Option<(ID3D12Resource, u64)>
     Some((whole, gpu))
 }
 
-/// A write on the card bound for title memory `[at, at + len)` was
-/// recorded (a copy at its place, a read-back): its pages are no longer
-/// read in place ([`constants`]).
-pub(crate) fn gpu_bound(at: usize, len: usize) {
+/// The pages below [`LOW`] of `[at, at + len)`, if any.
+fn pages(at: usize, len: usize) -> Option<std::ops::RangeInclusive<usize>> {
     let (at, end) = (at as u64, (at as u64).saturating_add(len as u64).min(LOW));
-    if len == 0 || at >= end {
-        return;
-    }
-    for page in (at / 4096) as usize..=((end - 1) / 4096) as usize {
-        let bit = 1u64 << (page % 64);
-        let word = &GPU_PAGES[page / 64];
-        if word.load(Ordering::Relaxed) & bit == 0 {
-            word.fetch_or(bit, Ordering::Relaxed);
+    (len > 0 && at < end).then(|| (at / 4096) as usize..=((end - 1) / 4096) as usize)
+}
+
+/// [`PAGE_MARKS`]' mark of a copy recorded in `frame`: 1 to
+/// [`FOR_GOOD`] - 1.
+fn stamp(frame: u64) -> u32 {
+    (frame % u64::from(FOR_GOOD - 1)) as u32 + 1
+}
+
+/// A write on the card bound for title memory `[at, at + len)` was
+/// recorded (a read-back): its pages are never read in place again
+/// ([`constants`]).
+pub(crate) fn gpu_bound(at: usize, len: usize) {
+    for page in pages(at, len).into_iter().flatten() {
+        if PAGE_MARKS[page].load(Ordering::Relaxed) != FOR_GOOD {
+            PAGE_MARKS[page].store(FOR_GOOD, Ordering::Relaxed);
         }
     }
 }
 
-/// Whether no shader writes a page of `[at, at + len)` (below [`LOW`],
-/// `len` > 0): none was bound for one on the card, and no landing ever
-/// put shader output in one.
+/// A title buffer copy into `[at, at + len)` was recorded (done on the CPU
+/// at submission, on the card in front of the lists, or at its place in
+/// the list): its pages are not read in place for [`COPY_FRAMES`] frames,
+/// until what the card did of it has landed.
+pub(crate) fn copy_bound(at: usize, len: usize) {
+    let stamp = stamp(crate::frame::current());
+    for page in pages(at, len).into_iter().flatten() {
+        let mark = &PAGE_MARKS[page];
+        let was = mark.load(Ordering::Relaxed);
+        if was != FOR_GOOD && was != stamp {
+            mark.store(stamp, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Whether no shader or copy on the card writes a page of `[at, at + len)`
+/// (below [`LOW`], `len` > 0), as [`PAGE_MARKS`] and the landings tell.
 fn written_by_no_shader(at: u64, len: u64) -> bool {
-    let (first, last) = ((at / 4096) as usize, ((at + len - 1) / 4096) as usize);
-    if (first..=last).any(|page| GPU_PAGES[page / 64].load(Ordering::Relaxed) >> (page % 64) & 1 != 0) {
+    let now = stamp(crate::frame::current());
+    let marked = |page: usize| match PAGE_MARKS[page].load(Ordering::Relaxed) {
+        0 => false,
+        FOR_GOOD => true,
+        stamp => u64::from(now.wrapping_sub(stamp)) <= COPY_FRAMES,
+    };
+    if pages(at as usize, len as usize).into_iter().flatten().any(marked) {
         return false;
     }
-    // Over every frame so far: a page a landing wrote into once is the
-    // shaders' for good.
-    !crate::watch::landed_lately(at as usize, len as usize, u64::MAX)
+    !crate::watch::landed_lately(at as usize, len as usize, LANDED_FRAMES)
 }
 
 /// The region holding `[at, end)`: its whole buffer and start, opened if
@@ -452,9 +494,17 @@ mod tests {
         assert!(!written_by_no_shader(at + 0x1000, 0x100));
         assert!(written_by_no_shader(at, 0x1000));
         assert!(written_by_no_shader(at + 0x2000, 0x1000));
+        // A copy recorded into a page: not read in place this frame.
+        assert!(written_by_no_shader(at + 0x4000, 0x100));
+        copy_bound(at as usize + 0x4080, 0x20);
+        assert!(!written_by_no_shader(at + 0x4000, 0x100));
+        assert!(written_by_no_shader(at + 0x5000, 0x100));
         // Past the memory read in place: nothing noted, nothing panics.
         gpu_bound(0xffff_f000, 0x10_0000);
         gpu_bound(0x1_0000_0000, 0x1000);
+        copy_bound(0x1_0000_0000, 0x1000);
+        assert_eq!(stamp(0), 1);
+        assert_ne!(stamp(u64::from(u32::MAX)), FOR_GOOD);
     }
 
     /// A stretch of a reserved section, mapped as `xmem` maps physical

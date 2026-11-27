@@ -7228,6 +7228,9 @@ impl HostList {
 
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
+        // `card_steps` may do it on the card, landing after the flight:
+        // constants there are not read in place meanwhile (`crate::port`).
+        crate::port::copy_bound(dst as usize, len);
         let mut deferred = self.deferred();
         COPIES_JOINED[0].fetch_add(1, Ordering::Relaxed);
         // A copy that goes on where the one recorded just before it ended,

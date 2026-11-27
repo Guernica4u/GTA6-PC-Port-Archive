@@ -48,18 +48,23 @@ so that for the common classes there is nothing to notice, move or wait for.
 | **C2 GPU-written** | skinning outputs, compute UAV results, title GPU copies (copies at their place) | **V: VRAM** (existing card copy) | views as today | landing of what the card compare finds (existing); C2 pages never resolve to T |
 | **C3 static/heavy read** | geometry, index data, structured buffers, textures | **V: VRAM** (existing card copy, uploaded once) | views as today | write watch only to notice the rare rewrite (refresh finds "nothing new") |
 
-The oracle that separates C1 from C2 is per 4 KiB page and has two inputs, both already true facts, not guesses:
+The oracle that separates C1 from C2 is per 4 KiB page and has three inputs, all facts the layer already has:
 
-- **Landed ever** (`watch.rs:1931 LANDED`, `watch.rs:2046 landed_lately`): every page any landing wrote into, fed by
-  `watch::landing` (`land.rs:616`, `shadow.rs:2398`) and `watch::landed_beside` (`land.rs:528`), aliases included.
-  The card compare finds real writes inside declared ranges, so this is the set of pages shaders actually wrote.
-- **GPU-bound at record time** (new, `port.rs` `GPU_PAGES`): destinations of title copies done on the card
-  (`host/place.rs:61 note_placed`) and of read-backs into title memory (`host.rs:7338 defer_read_back`), noted when
-  recorded, before they land, so the window "written on the card, not landed yet" is covered.
+- **Landed lately** (`watch.rs:1931 LANDED`, `watch.rs:2046 landed_lately`, window 600 frames): every page a landing
+  wrote into, fed by `watch::landing` (`land.rs:616`, `shadow.rs:2398`) and `watch::landed_beside` (`land.rs:528`),
+  aliases included. The card compare finds real writes inside declared ranges. 600 frames is the window the shipped
+  `fill_is_titles` default already reads title memory under (`host.rs:2944`); skinning outputs land every frame and so
+  never leave C2, while a ring page written once by a title copy returns to C1.
+- **Copy-bound at record time** (new, `port.rs` `PAGE_MARKS` stamp, 8 frames): destinations of every title buffer copy
+  as it is recorded (`host.rs` `defer_copy`, `host/place.rs:61 note_placed`). Such a copy may be done on the card
+  (`host/card_steps.rs` stage 2, or at its place in the list) and land after the flight; the stamp covers "written on
+  the card, not landed yet" (the relay keeps one or two frames in the air; `placed_lately` trusts two).
+- **GPU-bound for good** (new, `PAGE_MARKS` = `u32::MAX`): destinations of read-backs into title memory
+  (`host.rs:7338 defer_read_back`).
 
-An access resolves to T only if **every page it can read is in neither set**, the address is in an opened port
+An access resolves to T only if **no page it can read is marked by any of them**, the address is in an opened port
 region, the CBV's rounded size fits in the region, and the host address is 256-aligned. Anything else takes the old
-path, unchanged. Classification is monotone: a page moves C1 -> C2 and never back (the safe direction).
+path, unchanged.
 
 ### The mixed 174 MB buffer
 
@@ -84,8 +89,8 @@ read C1 pages (a skinning pass that reads bone matrices from the ring through it
 title CPU writes constants ──► title memory (= T) ──► GPU reads via CBV at execution (PCIe snoop, L2-cached)
                                     │ (nothing noticed, sent, filled, merged or waited for)
 title CPU writes geometry ───► title memory ──write watch──► refresh ──► V (once; "nothing new" afterwards)
-shader writes (UAV) ─────────► V ──card compare──► land ──► title memory ──► LANDED pages (= C2 forever)
-title GPU copy at its place ─► V ──► land later; GPU_PAGES noted at record (= C2 forever)
+shader writes (UAV) ─────────► V ──card compare──► land ──► title memory ──► LANDED pages (= C2 for 600 frames)
+title buffer copy (any kind) ► CPU at submission, or V (card step / at its place) ──► land; stamped at record (C2 for 8 frames)
 ```
 
 Per frame this removes, for C1 accesses: the 64 KiB `Shadow::refresh` per aligned root CBV (`draw.rs:1159`), the
@@ -133,7 +138,9 @@ Kept, and why (honest scope):
 
 | Risk | Mitigation |
 |---|---|
-| First-ever shader write to a page that a CBV in the same or a later in-flight list reads (not landed yet, not declared at record) | Same accepted risk as the shipped `fill_is_titles` default (`host.rs:2925-2943`, `!landed_lately(600)`), with a stricter oracle (ever + record-time GPU pages). The page becomes C2 at its first landing. Log: "renderer port 1 ... fell back: N written by shaders". |
+| First-ever shader write to a page that a CBV in the same or a later in-flight list reads (not landed yet, not declared at record) | Same accepted risk, same window, as the shipped `fill_is_titles` default (`host.rs:2925-2943`, `!landed_lately(600)`), plus the record-time copy stamps. The page becomes C2 at its first landing. If it shows (a constant one frame old in cutscenes), `LANDED_FRAMES` in `port.rs` set to `u64::MAX` makes landed pages the shaders' for good. Log: "renderer port 1 ... N on pages shaders write". |
+| A title copy whose flight lands more than 8 frames after it was recorded | `COPY_FRAMES` (`port.rs`); the relay keeps 1-2 frames in the air. Raise it if `VICTORY_SUBMIT_FRAMES` is raised. |
+| A draw recorded *before* a title copy in the same list reads the copy's new bytes (the CPU copy runs at submission, ahead of the list) | Same write-after-read ordering the ring discipline excludes (the ring advances to a new place each time); the copy stamp is set at record and any CBV recorded after it falls back. |
 | The title rewrites a ring slot while the GPU still reads it (ring discipline assumed from the console) | That is the console's own contract (its GPU reads at execution too); our fences are signalled no earlier than the GPU's completion plus landing. Port #1's header already assumed it. If constants flicker: check "constants read in place" against the frame line, then disable by making `port::constants` return `None` (one line). |
 | Region cannot be opened (lazy/soft views not committed, not one stretch, host refusal) | Falls back to the old path; retried every 600 frames for uncommitted/not-a-stretch; a host refusal disables T for the run. The log line counts each reason. |
 | 185 MB of PC memory locked while the region stands | Bounded by `MOST` (512 MiB); the title keeps the heap for the process lifetime. |
@@ -172,4 +179,7 @@ Kept, and why (honest scope):
 3. `draw`: root and table CBVs resolve to the title-memory home first; `note_placed` and `defer_read_back` mark
    their pages; `VICTORY_FILL_TITLE` removed (its default kept);
 4. `shadow`: write-combined copies >= 1 MiB keep shader writes on the card by default (`VICTORY_WC_NO_BACK`,
-   `_MIN_KB` removed from code, launcher, `play.rs` and menu).
+   `_MIN_KB` removed from code, launcher, `play.rs` and menu);
+5. `port`: the page oracle per 4 KiB page (`PAGE_MARKS`): read-backs for good, every title buffer copy for 8 frames
+   from its recording (`defer_copy`, `note_placed`: copies done on the card by `card_steps` or at their place land
+   after their flight), landings for 600 frames.
