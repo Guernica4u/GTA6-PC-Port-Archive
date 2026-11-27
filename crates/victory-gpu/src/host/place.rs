@@ -59,6 +59,9 @@ static LATELY: Mutex<Vec<(usize, usize, u64)>> = Mutex::new(Vec::new());
 static ANY_LATELY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn note_placed(dst: usize, len: usize) {
+    // Bytes the card writes there: never constants read in place again
+    // (`crate::port`), from this recording on.
+    crate::port::gpu_bound(dst, len);
     let frame = crate::frame::current();
     let mut lately = LATELY.lock().unwrap_or_else(|e| e.into_inner());
     lately.retain(|e| e.2 + 1 >= frame);

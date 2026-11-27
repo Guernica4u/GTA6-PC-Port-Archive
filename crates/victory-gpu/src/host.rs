@@ -2922,9 +2922,11 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
 
 /// Whether a small fill of upload memory, or copy of a title buffer, goes on without waiting for
 /// flights when the title itself wrote the memory since they were given it
-/// (on by default; `VICTORY_FILL_TITLE=0` turns it off. It was off until the
+/// (always; the switch `VICTORY_FILL_TITLE` is gone. It was off until the
 /// 480-byte constants ring was found to drain the card once a frame: 43-59 ms of a
-/// 70-84 ms frame, docs/performance/AGENT_REPORTS/06-cpu-threading.md).
+/// 70-84 ms frame, docs/performance/AGENT_REPORTS/06-cpu-threading.md). Constants
+/// 256-aligned in the title's graphics heap are no fill at all any more: they
+/// are read in place (`crate::port::constants`); this is for the rest.
 ///
 /// The title's 174 MB heap is declared written as a whole (a root view has
 /// no size), and the title keeps a ring of constants in it: one fill of 480
@@ -2943,9 +2945,7 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
 /// for the first time, is read as it was before that flight.
 fn fill_is_titles(src: usize, len: usize) -> bool {
     const SMALL: usize = 64 << 10;
-    static ON: OnceLock<bool> = OnceLock::new();
-    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_TITLE").is_none_or(|v| v != "0"));
-    on && len <= SMALL && (crate::watch::written_since_taken(src, len) || !crate::watch::landed_lately(src, len, 600))
+    len <= SMALL && (crate::watch::written_since_taken(src, len) || !crate::watch::landed_lately(src, len, 600))
 }
 
 /// Diagnostics: the waits for flights, by what waited, why it was not done
@@ -7336,6 +7336,8 @@ impl HostList {
     /// to title memory at `dst`, pitched `pitch`. The buffer lives until
     /// the list is reset.
     pub(crate) fn defer_read_back(&self, buffer: ID3D12Resource, dst: *mut u8, [row, rows, pitch]: [usize; 3]) {
+        // The card's bytes go there: not constants read in place (`crate::port`).
+        crate::port::gpu_bound(dst as usize, rows.saturating_sub(1).saturating_mul(pitch).saturating_add(row));
         self.deferred().backs.push((buffer, dst as usize, [row, rows, pitch]));
     }
 
