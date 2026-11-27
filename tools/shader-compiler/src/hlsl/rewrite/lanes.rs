@@ -184,7 +184,7 @@ fn dead_after(
 
 /// Active source operands of `ins`, excluding unused `Sgpr(0)` padding slots
 /// that the generic VOP3 decoder emits for 1- and 2-operand VOP1/VOP2/VOPC forms.
-fn active_srcs(ins: &Insn) -> &[Opnd] {
+pub(super) fn active_srcs(ins: &Insn) -> &[Opnd] {
     if ins.enc != Enc::Vop3 {
         return &ins.src;
     }

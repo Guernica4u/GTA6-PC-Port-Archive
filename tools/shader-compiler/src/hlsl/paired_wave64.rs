@@ -19,12 +19,29 @@ use super::*;
 
 /// Translate a wave64 compute program for hosts with 32-lane waves.
 pub fn translate_paired_wave64(ex: &ShaderExtract) -> Result<Translated, String> {
+    let first = paired_once(ex);
+    if first.is_ok() {
+        return first;
+    }
+    // As for the ordinary translation, the per-key count rewrite is a last resort.
+    let mut insns = disassemble(&ex.isa);
+    if lower_local_pc_transfers(&mut insns).is_err() {
+        return first;
+    }
+    match with_key_counts(&insns, || paired_once(ex)) {
+        Some(Ok(retried)) => Ok(retried),
+        _ => first,
+    }
+}
+
+fn paired_once(ex: &ShaderExtract) -> Result<Translated, String> {
     let threads = compute_group(ex).into_iter().try_fold(1u32, u32::checked_mul).unwrap_or(0);
     if threads == 0 || !(threads % 64 == 0 || threads == HALF_WAVE) || threads > 2048 {
         return Err("paired wave64 needs whole console waves, or half of one, and at most 2048 threads".into());
     }
     let mut insns = disassemble(&ex.isa);
     lower_local_pc_transfers(&mut insns)?;
+    let key_counts = if rewriting() { lower_key_counts(&mut insns) } else { Vec::new() };
     let mut em = Emitter::new(ex, insns);
     em.paired = true;
     em.required_wave_size = Some(32);
@@ -35,6 +52,7 @@ pub fn translate_paired_wave64(ex: &ShaderExtract) -> Result<Translated, String>
     if !em.resolve_packed(None)? {
         em.resolve_resources()?;
     }
+    counters_are_private(&em, &key_counts)?;
     em.infer_tbuf_types();
     if em.packed.is_none() && !em.uav_uint.is_empty() {
         em.resolve_wide_image_atomics()?;
