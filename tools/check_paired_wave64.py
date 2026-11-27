@@ -5,6 +5,8 @@ Each synthetic wave64 program uses lane masks, lane reads, row exchanges, shared
 memory or interleaved loops. It is translated for 32-lane waves and run, and
 every lane's registers are compared with a model of the console: one program
 counter and one set of scalar registers per wave, vector writes under EXEC.
+The programs also run in groups of 32 threads, which fill half a console wave:
+its other 32 lanes never start, and count only where a program widens EXEC.
 Only the translator's input and output are instrumented. No game data is needed.
 """
 import argparse
@@ -81,6 +83,15 @@ PROGRAMS = {
     'masks': ['v_cmp_lt_u32_e32 vcc, 0x3e8, v0', 's_not_b64 s[14:15], vcc', 's_and_b64 s[14:15], s[14:15], exec',
               's_bcnt1_i32_b64 s20, s[14:15]', 's_ff1_i32_b64 s21, s[14:15]', 's_or_saveexec_b64 s[10:11], -1',
               'v_cndmask_b32_e64 v10, 0, v1, s[14:15]', 's_mov_b64 exec, s[10:11]', 'v_add_nc_u32_e32 v11, 1, v1'],
+    # A sum over all 64 lanes, as a console compiler reduces a wave: lanes outside
+    # EXEC add zero, groups of eight, rows, the two rows of a half, the two halves.
+    'reduce': ['s_or_saveexec_b64 s[10:11], -1', 'v_cndmask_b32_e64 v10, 0, v0, s[10:11]',
+               'v_add_nc_u32 v10, v10, v10 dpp8:[1,0,3,2,5,4,7,6]', 'v_add_nc_u32 v10, v10, v10 dpp8:[2,3,0,1,6,7,4,5]',
+               'v_add_nc_u32 v10, v10, v10 dpp8:[4,5,6,7,0,1,2,3]',
+               'v_add_nc_u32_dpp v10, v10, v10 row_ror:8 row_mask:0xf bank_mask:0xf', 's_mov_b32 s30, 0',
+               'v_permlanex16_b32 v11, v10, s30, s30', 'v_add_nc_u32_e32 v10, v11, v10', 'v_readlane_b32 s14, v10, 32',
+               'v_add_nc_u32_e32 v10, s14, v10', 'v_readlane_b32 s20, v10, 0', 's_mov_b64 exec, s[10:11]',
+               's_bcnt1_i32_b64 s21, exec'],
 }
 
 
@@ -123,9 +134,10 @@ def split(text):
 
 class Wave:
     """One console wave: shared scalars and masks, per-lane vector registers."""
-    def __init__(self, inputs, group):
+    def __init__(self, inputs, group, started=64):
         self.s = [0] * 128
-        self.vcc, self.exec, self.scc = 0, M64, 0
+        # Lanes past the group's threads hold registers but never start.
+        self.vcc, self.exec, self.scc = 0, (1 << started) - 1, 0
         self.lds = {}
         self.v = [[0] * 64 for _ in range(64)]
         self.v[0], self.v[1], self.v[2] = list(inputs), list(range(64)), [group] * 64
@@ -275,8 +287,8 @@ def step(w, text):
     for l, result in results.items(): w.v[dst][l] = result
 
 
-def model(items, inputs, group):
-    w = Wave(inputs, group)
+def model(items, inputs, group, started=64):
+    w = Wave(inputs, group, started)
     labels = {item[1]: at for at, item in enumerate(items) if not isinstance(item, str) and item[0] == 'label'}
     at = steps = 0
     while at < len(items):
@@ -294,7 +306,8 @@ def model(items, inputs, group):
 def instrument(hlsl, threads):
     start = re.search(r'^    s\d+ = gid\.x; s\d+ = gid\.y; s\d+ = gid\.z;\n', hlsl, re.M)
     assert start and '[WaveSize(32)]' in hlsl, 'unexpected prologue'
-    index = [f'(gid.x * {threads}u + tb_first + tb_pair + {32 * h}u)' for h in (0, 1)]
+    # A group holds whole console waves, or the started half of one.
+    index = [f'(gid.x * {max(threads, 64)}u + tb_first + tb_pair + {32 * h}u)' for h in (0, 1)]
     load = ''.join(f'    v0__{h} = tb_in.Load({index[h]} * 4u); v1__{h} = tb_pair + {32 * h}u; '
                    f'v2__{h} = {index[h]} / 64u;\n' for h in (0, 1))
     stores = ''
@@ -322,9 +335,12 @@ def inputs(rng):
 
 
 def selected():
-    """Each program in one console wave per group, and some in four."""
+    """Each program in one console wave per group, some in four, and most in half of one."""
     single = [(name, body, 64) for name, body in PROGRAMS.items()]
-    return single + [(f"{name}_x4", PROGRAMS[name], 256) for name in ("saveexec", "waterfall", "permlane", "dispatch")]
+    four = [(f"{name}_x4", PROGRAMS[name], 256) for name in ("saveexec", "waterfall", "permlane", "dispatch")]
+    # Shared memory nothing wrote is undefined, and half the lanes never write.
+    half = [(f"{name}_half", body, 32) for name, body in PROGRAMS.items() if name != "shared"]
+    return single + four + half
 
 
 def main(argv=None):
@@ -356,8 +372,8 @@ def main(argv=None):
             if name.startswith("shared"):
                 data = [word | 0x80000000 for word in data]
             (trial / f"{name}.input").write_bytes(struct.pack(f"<{len(data)}I", *data))
-            expected[name] = [model(items, data[w * 64:w * 64 + 64], w) for w in range(WAVES)]
-            cases.append(f"{name} {name} {name}.input {WAVES * 64 // threads} {WAVES * 64}\n")
+            expected[name] = [model(items, data[w * 64:w * 64 + 64], w, min(threads, 64)) for w in range(WAVES)]
+            cases.append(f"{name} {name} {name}.input {WAVES * 64 // max(threads, 64)} {WAVES * 64}\n")
         (trial / "cases.txt").write_text("".join(cases))
         exe, status, fields = run_gpu_guest(
             ROOT / "tools/reference/independent-shaders/wave_pairs.cpp", "wave-pairs.exe", trial, work,
