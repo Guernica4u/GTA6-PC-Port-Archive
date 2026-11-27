@@ -48,6 +48,19 @@ enum Val {
     Missing(Why),
 }
 
+/// How a constant buffer is read ([`Lower::constant_view`]).
+#[derive(Debug, Clone, Copy)]
+enum ConstantView {
+    /// As raw bytes through this handle (a raw view of the host): byte 0 is
+    /// the title's address. With a size, bytes at or past it read zeros by
+    /// the code's own test (a root view has no size); without one, the
+    /// view's own size bounds the reads (zeros past it).
+    Raw(V, Option<u32>),
+    /// Through a constant buffer view (a table's, when the host keeps no raw
+    /// twins of its view slots).
+    Cbuffer(V),
+}
+
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
     /// Bit n: immediate sampler n is a comparison sampler.
@@ -6689,13 +6702,13 @@ impl<'a> Lower<'a> {
             let raw = self.end_guarded(at, &raw);
             let other = self.s.m.cmp(self.cur, pred::EQ, stride, zero);
             let at = self.begin_guarded(Some(other));
-            let h = self.handle(site, src, false, (13, 0x1_0000))?;
+            let view = self.constant_view(site, src)?;
             let mut both = Vec::new();
             for (k, &r) in raw.iter().enumerate() {
                 let b = self.cur;
                 let off = self.s.m.i32(4 * k as u32);
                 let a = self.s.m.bin(b, Bin::Add, addr, off);
-                let x = self.cbuffer_dword(h, a);
+                let x = self.constant_dword(view, a);
                 both.push((x, r));
             }
             let both = self.end_guarded(at, &both);
@@ -6752,7 +6765,18 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        let h = self.handle(site, src, false, (13, 0x1_0000))?;
+        let h = match self.constant_view(site, src)? {
+            ConstantView::Cbuffer(h) => h,
+            raw => {
+                for k in 0..count {
+                    let off = self.s.m.i32(4 * k);
+                    let a = self.s.m.bin(c, Bin::Add, addr, off);
+                    let x = self.constant_dword(raw, a);
+                    self.write(inst, Reg::S(code + k as u8), x, None);
+                }
+                return Ok(());
+            }
+        };
         let constant = match addr {
             V::Const(_)
                 if matches!(soffset, Operand::Scalar { code: NULL, .. }) && extra.is_none() =>
@@ -7248,6 +7272,94 @@ impl<'a> Lower<'a> {
         x
     }
 
+    /// How the constant buffer `src` read at `site` is read: as raw bytes
+    /// wherever the host can bind a raw view of it, which needs 4 bytes (root
+    /// descriptors) or 16 (view slots) where a constant buffer view needs
+    /// 256. The console's constants lie on 16, mostly not on 256: as raw
+    /// bytes the host reads them where the title wrote them (`victory-gpu`
+    /// `port`) instead of copying each into upload memory per draw.
+    ///
+    /// - A root constant buffer: the root SRV `t<slot>`
+    ///   ([`super::shader::Shader::root_constants_handle`]) at the title's
+    ///   address; zeros past [`super::shader::ROOT_CONSTANT_BYTES`].
+    /// - One in a table, or picked from the heap: the raw twin of its slot
+    ///   ([`Lower::raw_twin`]), which the host makes as a raw view of the
+    ///   constant buffer view's bytes (its size rounded to 256, as the view's)
+    ///   wherever it makes such a view; zeros past it.
+    /// - Without raw twins ([`super::shader::raw_views`] 0): the constant
+    ///   buffer view, as before.
+    fn constant_view(&mut self, site: Site, src: &Source) -> Result<ConstantView, Why> {
+        if self.root_copy.is_none()
+            && let Source::Built { address, .. } = src
+            && let Some(rp) = self.x.native.layout.get(address.param).copied()
+            && rp.root == RootType::Descriptor
+        {
+            let kind = self
+                .x
+                .native
+                .used
+                .iter()
+                .find(|u| u.user_data == rp.user_data)
+                .map(|u| u.kind);
+            if matches!(kind, Some(ResourceType::Cbv) | None) {
+                let h = self.s.root_constants_handle(rp.slot);
+                return Ok(ConstantView::Raw(h, Some(super::shader::ROOT_CONSTANT_BYTES)));
+            }
+        }
+        let in_heap = |leaf: &&Source| {
+            let (Source::Loaded { load, .. } | Source::Fetched { load, .. }) = leaf else {
+                return false;
+            };
+            self.scalar
+                .get(load)
+                .and_then(|a| self.x.native.layout.get(a.param))
+                .is_some_and(|p| matches!(p.root, RootType::Table | RootType::ResourceHeap))
+        };
+        if super::shader::raw_views() != 0 && src.leaves().iter().all(in_heap) {
+            let h = self.handle(site, src, false, (11, 0))?;
+            return Ok(ConstantView::Raw(h, None));
+        }
+        Ok(ConstantView::Cbuffer(self.handle(site, src, false, (13, 0x1_0000))?))
+    }
+
+    /// The dword at a computed byte address `a` of a constant buffer read as
+    /// [`Lower::constant_view`] says. As the console's: the address's low
+    /// two bits are not looked at.
+    fn constant_dword(&mut self, view: ConstantView, a: V) -> V {
+        let (h, most) = match view {
+            ConstantView::Cbuffer(h) => return self.cbuffer_dword(h, a),
+            ConstantView::Raw(h, most) => (h, most),
+        };
+        let c = self.cur;
+        let dword = self.s.m.i32(!3u32);
+        let mut at = self.s.m.bin(c, Bin::And, a, dword);
+        let zero = self.s.m.i32(0);
+        // A root view has no size: nothing past the bytes a constant buffer
+        // shows is read at all.
+        let inside = most.map(|n| {
+            let n = self.s.m.i32(n);
+            self.s.m.cmp(c, pred::IULT, at, n)
+        });
+        if let Some(inside) = inside {
+            at = self.s.m.select(c, inside, at, zero);
+        }
+        let (u, mask, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i8(1), self.s.m.i32(4));
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, at, u, mask, al],
+        );
+        let x = self.s.m.extract(c, r, 0);
+        let x = self.as_int(x);
+        match inside {
+            Some(inside) => self.s.m.select(self.cur, inside, x, zero),
+            None => x,
+        }
+    }
+
     /// `channels` channels of the element at byte `off` of raw buffer `h`,
     /// converted from the GFX10 buffer format `format` as the hardware's
     /// typed loads do (channels past the format's read 0, 0, 0, 1).
@@ -7698,8 +7810,10 @@ impl<'a> Lower<'a> {
                     .find(|u| u.user_data == rp.user_data)
                     .map(|u| u.kind);
                 match (rp.root, kind, props.0) {
+                    // Root constant buffers are read as raw bytes
+                    // (`constant_view`), never through a view of this kind.
                     (RootType::Descriptor, Some(ResourceType::Cbv) | None, 13) => {
-                        Ok(self.s.root_cbv_handle(rp.slot))
+                        Err("a root constant buffer read through a constant buffer view")
                     }
                     (RootType::Descriptor, Some(ResourceType::Srv), 11) => {
                         Ok(self.s.root_srv_handle(rp.slot))
@@ -7757,9 +7871,11 @@ impl<'a> Lower<'a> {
     /// for a buffer read as raw bytes, through a table or picked from the
     /// heap itself (or picked and read as a constant buffer), the host's raw
     /// twin of that slot ([`super::shader::raw_views`]), whose reads end where
-    /// the view does. Everything else (textures, typed buffers, tables'
-    /// constant buffers) stays in place. And whether it is a twin's (inside
-    /// the host's heap).
+    /// the view does. Constant buffers (tables' and picked ones) are read as
+    /// raw bytes this way too ([`Lower::constant_view`]): the host makes the
+    /// twin of a constant buffer's slot a raw view of its bytes. Everything
+    /// else (textures, typed buffers) stays in place. And whether it is a
+    /// twin's (inside the host's heap).
     ///
     /// Tables too: a view that does not begin on 16 bytes cannot be raw, and
     /// a pixel program of the main pass (3711fdad456538a1, stopped at in the
@@ -12257,7 +12373,7 @@ impl<'a> Lower<'a> {
             // A constant buffer read per lane (a dynamically indexed array).
             // shortcut: the console's CBV descriptor is taken to have a 16-byte
             // stride, as the vector loads of whole rows suggest.
-            let h = self.handle(site, src, false, (13, 0x1_0000))?;
+            let view = self.constant_view(site, src)?;
             let byte = match index {
                 Some(i) => {
                     let sixteen = self.s.m.i32(16);
@@ -12272,7 +12388,7 @@ impl<'a> Lower<'a> {
             for k in 0..count {
                 let four = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, byte, four);
-                let x = self.cbuffer_dword(h, a);
+                let x = self.constant_dword(view, a);
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());

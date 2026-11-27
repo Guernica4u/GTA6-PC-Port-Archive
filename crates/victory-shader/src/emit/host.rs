@@ -157,7 +157,8 @@ impl Host {
                 ShaderVisibility: vis,
             })
             .collect();
-        // By slot, then kind: 0 CBV, 1 SRV, 2 UAV.
+        // By slot, then kind: 0 constant buffer (read as raw bytes, an SRV
+        // too), 1 SRV, 2 UAV.
         let mut views: Vec<(u8, u8)> = stages
             .iter()
             .flat_map(|(s, _)| {
@@ -171,9 +172,8 @@ impl Host {
         for (slot, kind) in views {
             params.push(D3D12_ROOT_PARAMETER1 {
                 ParameterType: match kind {
-                    1 => D3D12_ROOT_PARAMETER_TYPE_SRV,
                     2 => D3D12_ROOT_PARAMETER_TYPE_UAV,
-                    _ => D3D12_ROOT_PARAMETER_TYPE_CBV,
+                    _ => D3D12_ROOT_PARAMETER_TYPE_SRV,
                 },
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
                     Descriptor: D3D12_ROOT_DESCRIPTOR1 {
@@ -624,8 +624,9 @@ pub enum Root {
         sampler: bool,
         index: usize,
     },
-    /// A root CBV (or with `srv`, a root SRV) over a buffer of these
-    /// dwords ([`Host::dispatch`] only).
+    /// A root constant buffer (or with `srv`, a root SRV) over a buffer of
+    /// these dwords ([`Host::dispatch`] only); both are bound as raw root
+    /// SRVs (translated shaders read constant buffers as raw bytes).
     View {
         srv: bool,
         data: Vec<u32>,
@@ -1486,14 +1487,11 @@ impl Host {
                         at.ptr += (index * size) as u64;
                         list.SetComputeRootDescriptorTable(*param, at);
                     }
-                    Root::View { srv, data } => {
+                    Root::View { data, .. } => {
+                        // Root constant buffers are raw views too.
                         let b = upload(data)?;
                         let va = b.GetGPUVirtualAddress();
-                        if *srv {
-                            list.SetComputeRootShaderResourceView(*param, va);
-                        } else {
-                            list.SetComputeRootConstantBufferView(*param, va);
-                        }
+                        list.SetComputeRootShaderResourceView(*param, va);
                         keep.push(b);
                     }
                 }

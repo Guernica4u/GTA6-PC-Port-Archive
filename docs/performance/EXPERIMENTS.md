@@ -330,3 +330,53 @@ remaining shares are `hosted()` and the shadow `Arc`s above. Check: the thin lin
 descriptor line. Risks: `ReadMostly` writers now take 32 locks (a new view, or the release of a resource with
 entries): fine at hundreds a second, slower than before at a burst of tens of thousands; epochs are no longer in
 order across threads (nothing orders them).
+
+## perf/raw-constants: every constant buffer read as raw bytes, in place at any title alignment (NOT COMPILED, UNMEASURED; no switch)
+
+Measured before (log play-20261127-111731-14036): ~14 fps in every scene; the submitting thread works 71 ms of a
+71.7 ms frame (title waits 29.6 ms at presents). Port #1 opened (`1 regions ... in place (185 MB)`), but per frame
+only 371 constant views were read in place and 6,185 were "not in place: not 256-aligned", so "6149 fills read out
+of them" still ran on the CPU every frame with their refreshes, card copies and bookkeeping (lists' steps 29.8 ms,
+copies in card memory 10.9 ms). Cause: a D3D12 CBV must begin on 256 bytes; the title places constants on 16.
+
+Change (structural, no switch; constants in code):
+1. Translator (`victory-shader`, changes its hash: one cold retranslation and pipeline rebuild on the next run).
+   Every constant buffer load (`s_buffer_load_dword*` through a CBV, `buffer_load_dword*` through a CBV, the
+   heap-picked fallback) goes through `Lower::constant_view` / `constant_dword` (emit/lower.rs):
+   - root constant buffers: raw loads (`rawBufferLoad`, DXIL kind 11) through a new raw root SRV `t<slot>` in
+     `ROOT_CBV_SPACE` (`Shader::root_constants_handle`, replaces `root_cbv_handle`); byte 0 is the title's address;
+     the address is masked to a dword and reads at or past `ROOT_CONSTANT_BYTES` (64 KiB, what a CBV shows) give 0
+     without touching memory (a root view has no size);
+   - constant buffers in tables, and picked from the heap: raw loads through the raw twin of the slot
+     (`raw_twin`, props 11), which the host already kept for every slot (`raw_views`); the twin is sized like the CBV
+     (`constant_bytes`: size rounded to 256, at most 64 KiB, cut at the buffer's end), so reads past it give 0;
+   - without raw twins (`VICTORY_RAW_VIEWS=0` or a heap of 2x the twins refused): the CBV, as before.
+   Metadata: `HostShader::root_cbvs` are now raw SRVs (listed with the root SRVs, PSV kind 4).
+2. Root signature (`pipeline/host.rs`): `root_cbvs` are `D3D12_ROOT_PARAMETER_TYPE_SRV` root descriptors (never
+   one-view tables). `draw.rs` `bind` sets them with `Set*RootShaderResourceView`.
+3. Binding: `draw.rs` `root_view` asks `port::constants(address, 64 KiB, ROOT_ALIGN = 4)`; fallback binds the
+   host copy at any 4-byte address (the 64 KiB scratch fill is left only for an address off 4 bytes).
+   `draw.rs` `tables` asks `port::constants(address, size, HostHeap::constant_align())` (16 with twins, 256
+   without); `HostHeap::constant_at` makes the CBV only on 256 (else a null CBV) and the twin as a raw view through
+   `raw_view_range` (16-byte start, cut at the buffer's end). Fallback is unchanged (scratch + `defer_constants`).
+4. Title-slot mirror (`make_twinned`, `View::Constant`): the twin of a CBV slot is now a raw view of the same bytes
+   (was a second CBV), so heap-picked constant buffers read correctly as raw bytes; a host copy off 256 but on 16
+   now gets a null CBV + a raw twin instead of a null slot.
+
+Residual misalignment: none is passed. A raw root SRV binds at the exact title address (4-byte granularity covers
+every dword address), so a root view has no residual. A raw view in a slot needs a 16-byte start; the console's
+CBVs are on 16, so a table constant buffer off 16 (should be ~0) takes the old fill path and is counted as "not
+aligned". A per-slot offset table would cost every table constant load an extra dependent load for that case.
+
+Expected: the `renderer port 1` frame line shows thousands of "constant views read in place", "not aligned for
+their raw view" ~0, "fills read out of them" ~0; the frame line's "copies ms/MB", card-step fills, list steps and
+"preparing per frame ... refreshes" fall by the share the 6,149 fills had (lists' steps 29.8 ms, card copies
+10.9 ms). GPU side: constants are read over PCIe from title memory (L2-cached) through raw loads; NVIDIA serves
+uniform raw loads through its L1, not the constant cache: watch the card's busy % in the frame line.
+
+Risks: (a) a wrong DXIL/root-signature mismatch shows as "host pipeline refused" / "host root signature refused"
+on the first run (check the log after retranslation); (b) a table CBV read by a shader whose host heap has no twins
+for that index (index past `twins.len()`) reads zeros; (c) twins are made on every CBV slot already, so no new
+descriptor traffic, but the in-place path adds one `HostList::keep` (QueryInterface/AddRef) per bound constant
+buffer, ~6.5k a frame; (d) same coherence assumptions as the port (ring discipline; first shader write to a page
+read before it lands), now over ~17x more views.

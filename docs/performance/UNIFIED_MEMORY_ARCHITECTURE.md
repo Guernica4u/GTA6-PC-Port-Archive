@@ -36,7 +36,9 @@ so that for the common classes there is nothing to notice, move or wait for.
 3. **Skinning writes through one UAV of the whole heap** (`port.rs` header; `draw.rs:2216-2235` declares "all that is
    left of the title's buffer"). A UAV view needs one contiguous GPU range; with constraint 1 it must be VRAM.
 4. **CBVs need 256-byte aligned addresses** on the host (`draw.rs:1145-1165` root CBVs, `descriptor/host.rs:4889-4899`);
-   the title aligns constants to 16. Misaligned constants still need a copy into upload memory.
+   the title aligns constants to 16. *Resolved on `perf/raw-constants` (section 10):* translated shaders no longer
+   read constants through CBVs but as raw bytes (raw root SRVs need 4 bytes, raw views in slots 16), so no constant
+   needs a copy because of its alignment.
 5. **Title writes are visible to the GPU in place without any action**: the opened heap is a custom write-back L0 heap
    (`inplace.rs:27-30`); the GPU snoops. This is the one place the console's model holds for free.
 
@@ -63,8 +65,9 @@ The oracle that separates C1 from C2 is per 4 KiB page and has three inputs, all
   (`host.rs:7338 defer_read_back`).
 
 An access resolves to T only if **no page it can read is marked by any of them**, the address is in an opened port
-region, the CBV's rounded size fits in the region, and the host address is 256-aligned. Anything else takes the old
-path, unchanged.
+region, the CBV's rounded size fits in the region, and the host address is aligned for the view that reads it (since
+`perf/raw-constants`: 4 bytes for a root constant buffer, 16 for one in a table; 256 only on a host without raw
+twins). Anything else takes the old path, unchanged.
 
 ### The mixed 174 MB buffer
 
@@ -72,11 +75,12 @@ It is not split under one view (constraint 1). It has **two homes at once**: V (
 SRV/UAV/root-SRV/vertex/index/indirect access uses, as today) and T (the port region buffer, which CBV accesses to C1
 pages use). The same title address resolves differently by access kind:
 
-- `draw.rs` `root_view` (root CBV, `srv == false`): `port::constants(address, 64 KiB)` first; `Shadow::find`/`gpu`
-  and the 64 KiB refresh only on fallback.
-- `draw.rs` table CBV (`View::Constant` in `tables`): `port::constants(address, size)` first; the slot is made over
-  the region buffer (`descriptor/host.rs:3720 constant_at`, which holds the buffer); scratch + `defer_constants` only
-  on fallback.
+- `draw.rs` `root_view` (root constant buffer, `srv == false`, a raw root SRV since `perf/raw-constants`):
+  `port::constants(address, 64 KiB, ROOT_ALIGN)` first; `Shadow::find`/`gpu` and the 64 KiB refresh only on
+  fallback (any 4-byte address; scratch only off 4 bytes).
+- `draw.rs` table CBV (`View::Constant` in `tables`): `port::constants(address, size, HostHeap::constant_align())`
+  first; the slot's raw twin is made over the region buffer (`descriptor/host.rs` `constant_at`, which holds the
+  buffer; the CBV itself only on 256, else null); scratch + `defer_constants` only on fallback.
 - Everything else keeps `shadow::find` / `Shadow::gpu` (V).
 
 Why that is coherent: C1 pages are by definition pages no shader writes, so V's bytes for them can only be *older*
@@ -163,7 +167,7 @@ Kept, and why (honest scope):
 3. **Mirror CBVs to T**: `descriptor/host.rs:4889` resolves through `port::constants` too, re-made on class change.
 4. **C1 for small CPU-written vertex/index windows** (UI vertices outside buffers): same oracle, bound in T.
 
-## 8. Log lines to check
+## 8. Log lines to check (see also section 10)
 
 - `renderer port 1: a stretch of the title's graphics memory opened as a host heap through a view of ours` (once).
 - Frame-rate block: `renderer port 1: N regions ... (M MB); per frame: X constants read in place (Y KB), fell back: a misaligned, b written by shaders, c outside the regions; ...`.
@@ -183,3 +187,30 @@ Kept, and why (honest scope):
 5. `port`: the page oracle per 4 KiB page (`PAGE_MARKS`): read-backs for good, every title buffer copy for 8 frames
    from its recording (`defer_copy`, `note_placed`: copies done on the card by `card_steps` or at their place land
    after their flight), landings for 600 frames.
+
+## 10. `perf/raw-constants`: constants read as raw bytes (removes constraint 4)
+
+Measured on this branch's port (log play-20261127-111731-14036): the region opened (185 MB), yet per frame only 371
+constant views were read in place and 6,185 were "not 256-aligned"; 6,149 fills still ran on the CPU every frame
+(lists' steps 29.8 ms, card copies 10.9 ms, submitting thread 71 of 71.7 ms, ~14 fps). The 256-byte rule is
+D3D12's for CBVs; the console has none, and its constants lie on 16.
+
+Structure after the change (no switch; constants in code):
+
+| Access | Shader reads (victory-shader `emit/lower.rs` `constant_view`) | Host binds | Needs |
+|---|---|---|---|
+| root constant buffer | `rawBufferLoad` through root SRV `t<slot>` (`ROOT_CBV_SPACE`), zeros past 64 KiB by the code | `Set*RootShaderResourceView` at T (`port::constants(.., ROOT_ALIGN)`) or the host copy | 4 bytes |
+| constant buffer in a table | `rawBufferLoad` through the raw twin of its slot (`raw_twin`) | twin = raw view of the bytes (sized like the CBV: zeros past it) over T or the scratch copy | 16 bytes |
+| constant buffer picked from the heap | the same twin (title slots: `make_twinned` now makes the twin raw) | mirror over V | 16 bytes |
+| any, without raw twins | `cbufferLoadLegacy` through the CBV (old path) | as before | 256 bytes |
+
+Coherence is the port's (section 2, 5): only the view kind changed; which bytes are T is still decided per page by
+the oracle. Fallbacks (not in a region, pages shaders write, off alignment) keep the old copy paths, so correctness
+does not depend on the port opening. Pages shaders write keep V exactly as before.
+
+Not done: a residual offset for table constant buffers off 16 bytes (none expected; they take the fill path and are
+counted as "not aligned"); descriptor-mirror CBVs (title slots picked by index) still show V (section 7 item 3).
+
+Log lines: `renderer port 1: ... per frame: N constant views read in place` in the thousands, `not aligned for
+their raw view (4 root, 16 table)` ~0, `fills read out of them` ~0. Must not appear: `host root signature refused`,
+`host pipeline refused`, `a constant buffer's raw twin could not be made`.

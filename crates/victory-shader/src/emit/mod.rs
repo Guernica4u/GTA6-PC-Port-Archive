@@ -25,10 +25,17 @@
 //!   sampler description). Comparison sampling (added 2026-11-23): an
 //!   immediate sampler it uses has a comparison filter there (bit 0x80);
 //!   a heap sampler it uses must be a comparison sampler on the host.
-//! * **Root CBVs and root SRVs** (raw buffers) as root descriptors
-//!   `b<i>` / `t<i>` in [`ROOT_CBV_SPACE`], `i` the title's root parameter
-//!   index ([`HostShader::root_cbvs`], [`HostShader::root_srvs`]); the
-//!   address the title sets is the buffer's.
+//! * **Root CBVs and root SRVs** as root descriptors `t<i>` (raw buffers)
+//!   in [`ROOT_CBV_SPACE`], `i` the title's root parameter index
+//!   ([`HostShader::root_cbvs`], [`HostShader::root_srvs`]); the address the
+//!   title sets is the buffer's. Constant buffers are read as raw bytes
+//!   (changed 2026-11-27): a CBV's address must lie on 256 bytes on the host,
+//!   the console's on 16, and a raw view lets the host read the title's
+//!   constants where it wrote them. Root ones read zeros past
+//!   [`ROOT_CONSTANT_BYTES`]; ones in tables (and picked from the heap) are
+//!   read through the raw twin of their slot ([`raw_views`]), which the host
+//!   makes over the same bytes as the constant buffer view, so reads past
+//!   its size give zeros; without raw twins, through the CBV as before.
 //! * **Vertex fetch** (added 2026-11-23). The title's mesh and
 //!   vertex programs fetch vertices themselves with typed-format loads
 //!   (`tbuffer_load_format_*`): the format (8_8_8_8 unorm, 16_16 snorm,
@@ -123,7 +130,7 @@ pub use sampler::StaticSampler;
 pub use lower::{host_settings, set_host_max_wave, set_host_rdna};
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
+    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, ROOT_CONSTANT_BYTES, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
@@ -425,8 +432,11 @@ pub struct HostShader {
     /// The same samplers decoded, `s<n>` at position n: the static sampler
     /// descriptions the host's root signature declares.
     pub static_samplers: Vec<StaticSampler>,
-    /// Root CBVs the shader reads: root parameter indices, each bound as
-    /// `b<index>` in [`ROOT_CBV_SPACE`].
+    /// Root constant buffers the shader reads: root parameter indices, each
+    /// read as raw bytes through the root SRV `t<index>` in
+    /// [`ROOT_CBV_SPACE`] (a root descriptor at the title's address, which
+    /// needs 4 bytes where a CBV needs 256; zeros past
+    /// [`ROOT_CONSTANT_BYTES`]). The host binds an SRV there, not a CBV.
     pub root_cbvs: Vec<u8>,
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
