@@ -924,16 +924,16 @@ pub(crate) fn with_heap<T>(heap: usize, f: impl FnOnce(&Heap) -> T) -> Option<T>
     heaps.iter().any(|&(_, _, h)| h == heap).then(|| f(unsafe { &*(heap as *const Heap) }))
 }
 
-/// Gives back dynamic slots of the host heap behind the title heap at
-/// `heap`, if that host heap instance (`id`) still exists.
+/// Give back the slots of completed command lists before readbacks and merges.
 #[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, id: u64, first: u32, n: u32) {
-    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-    if heaps.iter().any(|&(_, _, h)| h == heap)
-        // SAFETY: registered heaps are live (removed when dropped).
-        && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
-    {
-        host.release(id, first, n);
+pub(crate) fn reclaim_dynamic(completed: u64) {
+    // Allocation can also reclaim completed ranges if a heap is being registered.
+    let Ok(heaps) = SHADER_HEAPS.try_read() else { return };
+    for &(_, _, heap) in heaps.iter() {
+        // SAFETY: registered heaps are live for the read guard.
+        if let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get() {
+            host.reclaim_dynamic(completed);
+        }
     }
 }
 

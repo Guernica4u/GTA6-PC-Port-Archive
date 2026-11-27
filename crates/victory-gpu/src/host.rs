@@ -951,6 +951,13 @@ pub(crate) fn existing() -> Option<&'static Host> {
     HOST.get()?.as_ref()
 }
 
+/// The direct queue fence used to retire descriptors from detached lists.
+pub(crate) fn completed_descriptor_fence() -> Option<u64> {
+    // SAFETY: a query on the live host fence. Device removal returns u64::MAX.
+    let completed = unsafe { existing()?.fence.GetCompletedValue() };
+    (completed != u64::MAX).then_some(completed)
+}
+
 /// The host GPU if it is made already.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn made_host() -> Option<&'static Host> {
@@ -3896,23 +3903,17 @@ pub(crate) fn settle_for_present() {
 #[derive(Clone, Copy)]
 pub(crate) enum FenceDrain {
     TitleFence,
-    DynamicRootUav,
-    DynamicRootSrv,
-    DynamicTable,
     BakeTextureFlip,
     BakePublish,
     ExternalUpscaler,
 }
 
 impl FenceDrain {
-    const ALL: [Self; 7] = [Self::TitleFence, Self::DynamicRootUav, Self::DynamicRootSrv, Self::DynamicTable, Self::BakeTextureFlip, Self::BakePublish, Self::ExternalUpscaler];
+    const ALL: [Self; 4] = [Self::TitleFence, Self::BakeTextureFlip, Self::BakePublish, Self::ExternalUpscaler];
 
     fn name(self) -> &'static str {
         match self {
             Self::TitleFence => "title_fence",
-            Self::DynamicRootUav => "dynamic_root_uav",
-            Self::DynamicRootSrv => "dynamic_root_srv",
-            Self::DynamicTable => "dynamic_table",
             Self::BakeTextureFlip => "bake_texture_flip",
             Self::BakePublish => "bake_publish",
             Self::ExternalUpscaler => "external_upscaler",
@@ -3924,16 +3925,6 @@ static FENCE_DRAINS: [[AtomicU64; 3]; FenceDrain::ALL.len()] = [const { [const {
 
 pub(crate) fn settle_for_fence(reason: FenceDrain) {
     settle_now_for(WHY_FENCE, Some(reason));
-}
-
-/// Settles in-flight submissions and recycles every landed list immediately
-/// so dynamic descriptor slots held by those lists are freed at once.
-pub(crate) fn settle_for_dynamic(reason: FenceDrain) {
-    settle_for_fence(reason);
-    let landed: Vec<_> = line().landed.drain(..).collect();
-    for (lists, order) in landed {
-        crate::list::recycle(lists, &order);
-    }
 }
 
 /// Whether the submitting thread is currently preparing a submission.
@@ -4376,6 +4367,7 @@ fn late_line(frames: f64) {
     prefetch::log(frames);
     water_timing::log(frames);
     gpu_time::log(frames);
+    crate::descriptor::host::dynamic_line(frames);
     for reason in FenceDrain::ALL {
         let [calls, lock_us, drain_us] = FENCE_DRAINS[reason as usize].each_ref().map(|c| c.swap(0, Ordering::Relaxed));
         if calls != 0 {
@@ -5894,6 +5886,9 @@ impl Host {
                         last_notes(&runs)
                     ));
                 }
+                if let Some(flight) = flights.last() {
+                    crate::descriptor::reclaim_dynamic(flight.fence);
+                }
                 let plans: Vec<(&CardPlan, u64)> = flights.iter().filter_map(|f| Some((f.card.as_ref()?, f.fence))).collect();
                 // (Each byte once: the ranges are joined.)
                 let mut back: Vec<Declared> = Vec::new();
@@ -6211,7 +6206,7 @@ impl Host {
         self.send_late(lists, order, parts);
     }
 
-    fn send_late(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>, parts: &[usize]) {
+    fn send_late(&self, mut lists: Vec<crate::list::Detached>, order: Vec<usize>, parts: &[usize]) {
         let sent = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
             self.submit(&runs, parts, true)
@@ -6222,6 +6217,9 @@ impl Host {
             return;
         };
         let after = std::time::Instant::now();
+        for list in &mut lists {
+            list.tables_submitted(*submitted);
+        }
         let told = !sent.writes.is_empty();
         let sizes = crate::memory::asked_sizes(order.iter().map(|&i| lists[i].host()));
         let most = {
@@ -6422,6 +6420,9 @@ impl Host {
                     ));
                 }
                 submitting(3, flights);
+                if let Some(completed) = completed_descriptor_fence() {
+                    crate::descriptor::reclaim_dynamic(completed);
+                }
                 let copying = std::time::Instant::now();
                 let mut seen = std::collections::HashSet::new();
                 let mut back: Vec<Declared> = Vec::new();

@@ -273,8 +273,12 @@ impl Detached {
         &self.host
     }
 
-    /// Releases this list's dynamic descriptor slots once its GPU submission
-    /// has completed, without waiting for the full `bury_lag` allocator delay.
+    pub(crate) fn tables_submitted(&mut self, fence: u64) {
+        self._state.tables_submitted(fence);
+    }
+
+    /// Clears the descriptor state of a finished list. The slots of a flight
+    /// were handed off to the heap when the list was submitted.
     pub(crate) fn release_tables(&mut self) {
         self._state.tables_done();
     }

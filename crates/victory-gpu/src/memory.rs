@@ -1059,7 +1059,7 @@ pub(crate) fn ready(
         Some(&run) => run,
         None => {
             // Held for the heap's life: not given back with a list's slots.
-            let base = heap.dynamic(COPIES + 1)?;
+            let base = heap.reserve_dynamic(COPIES + 1)?;
             // Every slot of the run: a number shows no view of another kind.
             for n in 0..=COPIES {
                 heap.null_raw_uav_at(base + n);
