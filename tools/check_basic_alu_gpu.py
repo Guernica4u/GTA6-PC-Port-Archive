@@ -208,11 +208,16 @@ SCALAR = {
     "s_sext_i32_i8": (1, lambda a: (((a & 0xff) - (0x100 if a & 0x80 else 0)) & M, None)),
     "s_sext_i32_i16": (1, lambda a: (((a & 0xffff) - (0x10000 if a & 0x8000 else 0)) & M, None)),
     "s_abs_i32": (1, lambda a: nonzero(abs(s32(a)) & M)),
+    "s_wqm_b32": (1, lambda a: nonzero(quads(a))),
     # SCC is 1 before each instruction, so these two carry or borrow one in.
     "s_addc_u32": (2, lambda a, b: ((a + b + 1) & M, int(a + b + 1 > M))),
     "s_subb_u32": (2, lambda a, b: ((a - b - 1) & M, int(b + 1 > a))),
 }
 M64 = (1 << 64) - 1
+
+
+def halves64(value):
+    return value & M, value >> 32 & M
 
 
 def s64(value):
@@ -273,6 +278,48 @@ GROUP_MEMORY = {
     "ds_read_u16_d16_hi": ([WRITE, "v_mov_b32_e32 {0}, v6", "ds_read_u16_d16_hi {0}, v20"],
                            lambda b, c: [(b & 0xffff) << 16 | (c & 0xffff)]),
     "ds_write_b16_d16_hi": ([WRITE, "ds_write_b16_d16_hi v20, v6", READ], lambda b, c: [(b & 0xffff0000) | c >> 16]),
+}
+def quads(a):
+    """`s_wqm`: every bit of a group of four is set where any of them is."""
+    return sum(0xf << shift for shift in range(0, 32, 4) if a >> shift & 0xf)
+
+
+def borrow(minuend, subtrahend, carry):
+    return [(minuend - subtrahend - carry) & M, int(subtrahend + carry > minuend)]
+
+
+# Vector forms that need more than one instruction to set up or to read.
+# name: (instructions with `{0}` and `{1}` the result registers, model of the three inputs)
+CARRY = "v_cmp_lt_u32_e32 vcc_lo, v4, v6"
+CARRY_OUT = "v_cndmask_b32_e64 {1}, 0, 1, vcc_lo"
+SEQUENCES = {
+    # The count is the first source; the value is the pair in the next two.
+    "v_lshlrev_b64": (["v_lshlrev_b64 v[{0n}:{1n}], v4, v[5:6]"],
+                      lambda a, b, c: list(halves64((b | c << 32) << (a & 63)))),
+    "v_lshrrev_b64": (["v_lshrrev_b64 v[{0n}:{1n}], v4, v[5:6]"],
+                      lambda a, b, c: list(halves64((b | c << 32) >> (a & 63)))),
+    "v_ashrrev_i64": (["v_ashrrev_i64 v[{0n}:{1n}], v4, v[5:6]"],
+                      lambda a, b, c: list(halves64(s64(b | c << 32) >> (a & 63)))),
+    # VCC holds a carry of 1 where the first input is below the third.
+    "v_add_co_ci_u32": ([CARRY, "v_add_co_ci_u32_e32 {0}, vcc_lo, v4, v5, vcc_lo", CARRY_OUT],
+                        lambda a, b, c: [(a + b + (a < c)) & M, int(a + b + (a < c) > M)]),
+    "v_sub_co_ci_u32": ([CARRY, "v_sub_co_ci_u32_e32 {0}, vcc_lo, v4, v5, vcc_lo", CARRY_OUT],
+                        lambda a, b, c: borrow(a, b, int(a < c))),
+    "v_subrev_co_ci_u32": ([CARRY, "v_subrev_co_ci_u32_e32 {0}, vcc_lo, v4, v5, vcc_lo", CARRY_OUT],
+                           lambda a, b, c: borrow(b, a, int(a < c))),
+    "v_swap_b32": (["v_mov_b32_e32 {0}, v4", "v_mov_b32_e32 {1}, v5", "v_swap_b32 {0}, {1}"], lambda a, b, c: [b, a]),
+    # The pairs are {second, third} and {first, third}, equal where the first two inputs are.
+    **{f"v_cmp_{name}_u64": (["v_mov_b32_e32 v21, v4", "v_mov_b32_e32 v22, v6", f"v_cmp_{name}_u64_e32 vcc_lo, v[5:6], v[21:22]",
+                              "v_cndmask_b32_e64 {0}, 0, 1, vcc_lo"],
+                             lambda a, b, c, name=name: [int(RELATIONS[name](b | c << 32, a | c << 32))])
+       for name in ("eq", "ne", "lt", "gt", "le", "ge")},
+    **{f"v_cmpx_{name}_u64": (["v_mov_b32_e32 v21, v4", "v_mov_b32_e32 v22, v6", "v_mov_b32_e32 {0}, 0", "s_mov_b32 s26, exec_lo",
+                               f"v_cmpx_{name}_u64_e32 v[5:6], v[21:22]", "v_mov_b32_e32 {0}, 1", "s_mov_b32 exec_lo, s26"],
+                              lambda a, b, c, name=name: [int(RELATIONS[name](b | c << 32, a | c << 32))])
+       for name in ("eq", "ne", "lt", "gt", "le", "ge")},
+    # M0 is added to the register number: v4 + 1 is v5, and v7 + 1 the second result.
+    "v_movrels_b32": (["s_mov_b32 m0, 1", "v_movrels_b32 {0}, v4"], lambda a, b, c: [b]),
+    "v_movreld_b32": (["s_mov_b32 m0, 1", "v_mov_b32_e32 {0}, v6", "v_movreld_b32 {0}, v4"], lambda a, b, c: [c, a]),
 }
 OUTPUTS = 8
 
@@ -851,6 +898,8 @@ def count(name):
     """Result words one instruction produces: scalar ones also report SCC."""
     if name in GROUP_MEMORY:
         return len(GROUP_MEMORY[name][1](1, 1))
+    if name in SEQUENCES:
+        return len(SEQUENCES[name][1](1, 1, 1))
     if name in PAIRS:
         result = PAIRS[name](1, 1, 1)
         return 1 if isinstance(result, int) else 2 if result[1] is None else 3
@@ -885,12 +934,14 @@ def lines_for(name, destination):
         if count(name) == 3:
             program += ["s_cselect_b32 s26, 1, 0", f"v_mov_b32_e32 v{destination + 2}, s26"]
         return program + [f"v_mov_b32_e32 v{destination}, s24", f"v_mov_b32_e32 v{destination + 1}, s25"]
-    if name in GROUP_MEMORY:
-        # A word-aligned address within the first 64 bytes.
-        return ["v_and_b32_e32 v20, 0x3c, v4"] + [
+    if name in GROUP_MEMORY or name in SEQUENCES:
+        # Group memory gets a word-aligned address within the first 64 bytes.
+        lines, start = (GROUP_MEMORY[name][0], ["v_and_b32_e32 v20, 0x3c, v4"]) if name in GROUP_MEMORY \
+            else (SEQUENCES[name][0], [])
+        return start + [
             line.format(f"v{destination}", f"v{destination + 1}") if "{0n}" not in line
             else line.replace("{0n}", str(destination)).replace("{1n}", str(destination + 1))
-            for line in GROUP_MEMORY[name][0]]
+            for line in lines]
     if name in MIX:
         instruction, selection = name.split("@")
         low = ",".join(str(int(pick == "h")) for pick in selection)
@@ -963,6 +1014,8 @@ def results(name, values):
         return [value & M, value >> 32] + ([] if flag is None else [flag])
     if name in GROUP_MEMORY:
         return GROUP_MEMORY[name][1](values[1], values[2])
+    if name in SEQUENCES:
+        return SEQUENCES[name][1](*values)
     if name in CONSTANT_COMPARES:
         return [CONSTANT_COMPARES[name][1](values[0])]
     if name in CONSTANT or name in IN_PLACE:
@@ -1037,7 +1090,7 @@ def main():
         ap.error("choose a fresh receipt")
     a.work.mkdir(parents=True, exist_ok=False)
     rng = random.Random(0x414c5531)
-    every = [*OPERATIONS, *SCALAR, *GROUP_MEMORY, *PAIRS, *IN_PLACE, *CONSTANT, *CONSTANT_COMPARES, *COMPARES, *SCALAR_COMPARES,
+    every = [*OPERATIONS, *SCALAR, *GROUP_MEMORY, *SEQUENCES, *PAIRS, *IN_PLACE, *CONSTANT, *CONSTANT_COMPARES, *COMPARES, *SCALAR_COMPARES,
              *EXEC_COMPARES, *HALF, *PACKED, *HALF_COMPARES, *HALF_EXEC_COMPARES, *FLOATS, *FLOAT_COMPARES,
              *FLOAT_EXEC_COMPARES]
     supported, refused = probe(every, a.emitter, a.llvm_mc)
