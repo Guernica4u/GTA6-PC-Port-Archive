@@ -314,6 +314,16 @@ fn reflected_root(
                 return Ok(TableLayout::Unsupported);
             }
             let ordinary = rest.is_empty() && signature.flags & 0xc00 == 0;
+            // A one-table root that leaves FSSM slots out: append those ranges
+            // rather than rebuild the table around the bindings reflection found.
+            // Otherwise the translated program names a resource the pipeline's
+            // signature never carries, and dxil-spirv refuses to remap it.
+            if ordinary
+                && let Some(extra) = missing_raster_ranges(vertex, pixel, &signature)
+                && !extra.is_empty()
+            {
+                return append_ranges_and_map(device, original, &extra, &signature, node, false, strides);
+            }
             let both_stages = |check_user_layout| {
                 let get = |shader: &[u8], stage| {
                     if check_user_layout {
@@ -625,6 +635,31 @@ fn append_corroborated_ranges(
     append_ranges_and_map(device, original, &extra, signature, node, append_map, append_strides)
 }
 
+/// The FSSM slots both raster stages name and the root leaves out, sorted and
+/// deduplicated. None when the two stages give one slot different bindings, or
+/// when either program has no user-data records to corroborate them.
+fn missing_raster_ranges(
+    vertex: &[u8],
+    pixel: &[u8],
+    signature: &tuxbox_dxbc::rootsig::RootSig,
+) -> Option<Vec<tuxbox_dxbc::compute_table::Binding>> {
+    let mut extra = tuxbox_dxbc::compute_table::missing_root_descriptors(vertex, signature, 1);
+    extra.extend(tuxbox_dxbc::compute_table::missing_root_descriptors(pixel, signature, 0));
+    // Both stages read their tables from the same SGPRs, so they can name one
+    // slot differently. That slot has no single binding, so keep the guest root.
+    extra.sort_by_key(|binding| (binding.table, binding.slot));
+    for pair in extra.windows(2) {
+        let (first, second) = (&pair[0], &pair[1]);
+        if (first.table, first.slot) == (second.table, second.slot)
+            && (first.kind, first.register, first.space) != (second.kind, second.register, second.space)
+        {
+            return None;
+        }
+    }
+    extra.dedup_by_key(|binding| (binding.table, binding.slot));
+    Some(extra)
+}
+
 /// Append the FSSM slots a raster root leaves out, for both stages.
 ///
 /// The arms above only rebuild a root with one leading table plus trailing root
@@ -645,20 +680,9 @@ fn append_missing_raster_ranges(
     if signature.version != 2 {
         return Ok(TableLayout::Unsupported);
     }
-    let mut extra = tuxbox_dxbc::compute_table::missing_root_descriptors(vertex, signature, 1);
-    extra.extend(tuxbox_dxbc::compute_table::missing_root_descriptors(pixel, signature, 0));
-    // Both stages read their tables from the same SGPRs, so they can name one
-    // slot differently. That slot has no single binding, so keep the guest root.
-    extra.sort_by_key(|binding| (binding.table, binding.slot));
-    for pair in extra.windows(2) {
-        let (first, second) = (&pair[0], &pair[1]);
-        if (first.table, first.slot) == (second.table, second.slot)
-            && (first.kind, first.register, first.space) != (second.kind, second.register, second.space)
-        {
-            return Ok(TableLayout::Unsupported);
-        }
-    }
-    extra.dedup_by_key(|binding| (binding.table, binding.slot));
+    let Some(extra) = missing_raster_ranges(vertex, pixel, signature) else {
+        return Ok(TableLayout::Unsupported);
+    };
     if extra.is_empty() {
         return Ok(TableLayout::Unsupported);
     }
