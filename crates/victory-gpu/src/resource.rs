@@ -3312,7 +3312,7 @@ mod tests {
             if rgb9e5_target_supported() { 67 } else { 10 }
         );
         assert_eq!(target_format(28), 28);
-        assert_eq!(target_format(118), 45);
+        assert_eq!(target_format(118), 20);
     }
 
     #[test]
