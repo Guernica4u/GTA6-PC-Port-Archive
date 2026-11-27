@@ -1,0 +1,103 @@
+//! Texture sizes taken from a descriptor. Encodings are from llvm-mc `-mcpu=gfx1030`.
+use super::*;
+use crate::meta::{RootParam, RootParamKind, RootRange, RootSig};
+
+const END: u32 = 0xbf810000;
+const LOAD: [u32; 2] = [0xf40c0202, 0xfa000020]; // s_load_dwordx8 s[8:15], s[4:5], 0x20
+const WIDTH_HIGH: u32 = 0x8f03820a; // s_lshl_b32 s3, s10, 2
+const WIDTH_LOW: u32 = 0x90029e09; // s_lshr_b32 s2, s9, 30
+const JOIN: u32 = 0x88030302; // s_or_b32 s3, s2, s3
+const LEVEL: [u32; 2] = [0x9382ff0b, 0x0004000c]; // s_bfe_u32 s2, s11, 0x4000c
+const MASK: [u32; 2] = [0x8703ff03, 0x0000ffff]; // s_and_b32 s3, s3, 0xffff
+const HEIGHT: [u32; 2] = [0x9386ff0a, 0x0010000e]; // s_bfe_u32 s6, s10, 0x10000e
+const PLUS_ONE: [u32; 2] = [0x81038103, 0x81068106]; // s_add_i32 s3, s3, 1; s_add_i32 s6, s6, 1
+const SCALE: [u32; 2] = [0x90030203, 0x90060206]; // s_lshr_b32 s3, s3, s2; s_lshr_b32 s6, s6, s2
+const USE: [u32; 2] = [0x7e080203, 0x7e0a0206]; // v_mov_b32 v4, s3; v_mov_b32 v5, s6
+const IMAGE: [u32; 2] = [0xf0000f08, 0x00020004]; // image_load v[0:3], v[4:5], s[8:15], 2D
+
+/// A rooted compute program with no parameters yet.
+fn extract(words: &[u32]) -> ShaderExtract {
+    let isa: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    ShaderExtract { flat_inputs: Vec::new(), flat_outputs: Vec::new(),
+        stage: Stage::Compute, shader_model: (6, 0), required_features: None,
+        bitcode_stripped: true, fspx_config: None, ps09_pixel_inputs: None,
+        fssm: Vec::new(), entry: Some("main".into()), isa_data: isa.clone(),
+        isa, isa_offset_in_fssm: 0, psv_threads: None, isa_preamble: [0, 32, 1, 1],
+        has_input_sig: false, has_output_sig: false, has_psv0: false, has_root_sig: true,
+        input_sig: Vec::new(), output_sig: Vec::new(), resources: Vec::new(),
+        gs_info: None, mesh_info: None, primitive_sig: Vec::new(),
+        root_sig: Some(RootSig { version: 1, flags: 0, num_static_samplers: 0, static_samplers: Vec::new(), params: Vec::new() }),
+    }
+}
+
+/// A compute program under one table of four SRVs, t0 to t3.
+fn tabled(words: &[&[u32]]) -> ShaderExtract {
+    let mut ex = extract(&[&words.concat()[..], &[END]].concat());
+    let range = RootRange { range_type: 0, num: 4, base_register: 0, space: 0, offset_in_table: 0 };
+    ex.root_sig.as_mut().unwrap().params.push(RootParam { visibility: 0, kind: RootParamKind::Table(vec![range]) });
+    ex
+}
+
+fn sequence(after_level: &[u32]) -> ShaderExtract {
+    tabled(&[&LOAD, &[WIDTH_HIGH, WIDTH_LOW, JOIN], &LEVEL, after_level, &MASK, &HEIGHT, &PLUS_ONE, &SCALE, &USE, &IMAGE])
+}
+
+#[test]
+fn the_load_fills_the_size_fields_from_the_texture() {
+    let hlsl = translate(&sequence(&[])).unwrap().hlsl;
+    let fill = hlsl.find("tex1.GetDimensions(0u, w0, h0, n0);").expect(&hlsl);
+    for line in ["s9 = ((w0 - 1u) & 3u) << 30;", "s10 = ((w0 - 1u) >> 2) | ((h0 - 1u) << 14);", "s11 = 0u;"] {
+        let at = hlsl[fill..].find(line).unwrap_or_else(|| panic!("{line}: {hlsl}"));
+        // Before the program's first read of the words.
+        assert!(fill + at < hlsl.find("s_lshl_b32").unwrap(), "{hlsl}");
+    }
+}
+
+#[test]
+fn a_descriptor_used_only_as_a_descriptor_is_not_filled() {
+    let hlsl = translate(&tabled(&[&LOAD, &IMAGE])).unwrap().hlsl;
+    assert!(!hlsl.contains("GetDimensions"), "{hlsl}");
+}
+
+#[test]
+fn a_size_value_used_outside_the_computation_is_refused() {
+    let refusal = |ex: ShaderExtract| translate(&ex).err().expect("refused");
+    // v_mov_b32 v6, s2 reads the base level, which is not the console's.
+    assert!(refusal(sequence(&[0x7e0c0202])).contains("used outside its size computation at 0x1c"));
+    // The width without its level: v_mov_b32 v4, s3 straight after the add.
+    let unscaled = tabled(&[&LOAD, &[WIDTH_HIGH, WIDTH_LOW, JOIN], &MASK, &[PLUS_ONE[0], USE[0]], &IMAGE]);
+    assert!(refusal(unscaled).contains("used outside its size computation"));
+    // A width scaled by another texture's level is not this view's size either.
+    let other = [0x9382ff13, 0x0004000c]; // s_bfe_u32 s2, s19, 0x4000c
+    let second = [0xf40c0402, 0xfa000040]; // s_load_dwordx8 s[16:23], s[4:5], 0x40
+    let mixed = tabled(&[&LOAD, &second, &[WIDTH_HIGH, WIDTH_LOW, JOIN], &other, &MASK, &[PLUS_ONE[0], SCALE[0], USE[0]], &IMAGE]);
+    assert!(refusal(mixed).contains("used outside its size computation"));
+}
+
+#[test]
+fn a_size_value_lost_at_a_join_is_refused_only_when_read() {
+    // s_cbranch_scc0 over the level extract: s2 holds the level on one path only.
+    let skip = 0xbf840002;
+    let joined = |read: &[u32]| tabled(&[&LOAD, &[skip], &LEVEL, read, &IMAGE]);
+    assert!(translate(&joined(&[])).is_ok());
+    // v_mov_b32 v6, s2 after the join.
+    let reason = translate(&joined(&[0x7e0c0202])).err().expect("refused");
+    assert!(reason.contains("used outside its size computation"), "{reason}");
+}
+
+#[test]
+fn the_mask_may_be_held_in_a_register() {
+    // s_mov_b32 s7, 0xffff; s_and_b32 s3, s3, s7
+    let held = tabled(&[&LOAD, &[0xbe8703ff, 0x0000ffff, WIDTH_HIGH, WIDTH_LOW, JOIN], &LEVEL, &[0x87030703], &HEIGHT, &PLUS_ONE, &SCALE, &USE, &IMAGE]);
+    assert!(translate(&held).unwrap().hlsl.contains("tex1.GetDimensions(0u, w0, h0, n0);"));
+    // Another mask leaves the height in the value.
+    let wide = tabled(&[&LOAD, &[WIDTH_HIGH, WIDTH_LOW, JOIN], &LEVEL, &[0x8703ff03, 0x000fffff], &PLUS_ONE, &SCALE, &USE, &IMAGE]);
+    assert!(translate(&wide).is_err());
+}
+
+/// The program `tools/check_descriptor_size.py` runs on the GPU.
+#[test]
+fn texture_size_from_descriptor_fields_for_the_gpu_check() {
+    let translated = translate(&sequence(&[])).unwrap();
+    println!("BEGIN_HLSL\n{}\nEND_HLSL", translated.hlsl);
+}
