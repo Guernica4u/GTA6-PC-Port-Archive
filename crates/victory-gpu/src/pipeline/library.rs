@@ -929,6 +929,15 @@ fn ordered(used: HashSet<String>) -> Vec<String> {
     out
 }
 
+/// The title pipelines earlier runs requested, in the order they first did
+/// (those with no recorded place last, by key): what the prewarm makes at the
+/// start, before the title creates them (`known::prewarm`). Empty on a first
+/// run, which only records.
+pub(super) fn plan() -> Vec<String> {
+    let set: HashSet<String> = used().iter().flatten().cloned().collect();
+    ordered(set)
+}
+
 /// The text of [`ORDER_FILE`] for a save: this run's pipelines in the order
 /// they were first used, then the earlier runs' others in theirs.
 fn order_text() -> String {

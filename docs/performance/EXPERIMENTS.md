@@ -145,3 +145,27 @@ is told" for that frame. An exact fallback needs a card-side whole-range compare
 card steps, not touched here) or a shader-side bounds flag. Attribution is a superset (any noted declaration of the
 copy overlapping a landing), so errors widen, never narrow. Measure: log of `footprint of 64 KiB blocks`, and
 shadow/flight lines with the switch on vs off. Code was not compiled or tested (instruction); unit tests in tight.rs.
+
+## perf/prewarm-pipelines: earlier runs' pipelines made from process start, not at the title's creation (NOT COMPILED, UNMEASURED)
+
+Status: written by reading only; **not compiled, not run**. Targets root cause 2 of `ROOT_CAUSES.md` (about 1,360 pipelines compiled after world entry) and the idle loading screen (~30 s of static images in which nothing was prepared). Based on `perf/radical-refactor`; builds on the pipeline-order entry above. victory-shader untouched (translator hash unchanged, no cold start).
+
+What changed
+- `known::prewarm()` (called from `apps/victory/src/run.rs` right after `use_shader_cache`, only with `--execute`, so not by `victory warm`/`translate`): a thread reads `pipeline-order.txt` + `early-pipelines.txt` (`library::plan()`, first-use order), looks each key up in `known-pipelines.bin`/`known-shaders.bin`, rebuilds the `Pending` (same key, checked) and queues it as EARLY on the existing workers (translation, library load or compile, `note_time`). It runs before the title image is even loaded, so the menu and the loading screen are the time used. First run (no order/early file or no book): logs "nothing recorded" and does nothing.
+- `make::adopt` (one line in `pipeline.rs::hand_out`): the title's CreatePipelineState gets the prewarmed `Arc<Pending>` for its key (made, or in the queue; a draw promotes it to REQUESTED as before). This matters for the static-sampler pipelines (54%, never in the library): they were recompiled every run, and a made `HostPipeline` is now kept and handed out instead of thrown away. If the title creates one first, its own is used and the prewarm skips the key.
+- `LOADING` phase from the prewarm's start: workers other than worker 0 at NORMAL priority (usual: LOWEST), known-slow cap raised from workers/4 to workers-1, and the early and slow heaps are drained together in first-use order (slow ones were behind all others). The loader counts as one waiting pipeline so "all made" does not fire between its entries.
+- Loading over (priority back to usual, one log line): a world's frame (300 or more draws and dispatches, twice in a row; menu and loading screens draw 1 to 11) or everything queued made, or nothing to make. Constants only, no env switches added (existing ones still apply: `VICTORY_PIPELINE_ORDER=0`, `VICTORY_PIPELINE_SLOW=0`, `VICTORY_PIPELINE_WORKERS`).
+- `victory warm --used` now makes the pipelines in first-use order too (reads `pipeline-order.txt`).
+
+What to look for in the log (release)
+- `pipeline prewarm: pipelines of earlier runs queued, first used first` : planned / queued / not_in_the_books / unreadable / key_changed (must be 0: the rebuilt key differs from the recorded one) / created_by_the_title_first / ms.
+- `pipeline prewarm: loading over ...` : why ("the title draws a world", "everything queued is made", "nothing to make ahead"), seconds, made, found_by_the_title (hand-outs that found a prewarmed one), asked_before_made (draws that asked before it was made: the remaining stall), waiting.
+- At world entry: `waiting`/`mk` near 0, the existing `host pipelines made` lines (count made after entry vs the 1,360 baseline), frames over 200 ms after entry, `a pass over the screen was waited for`.
+- How to test: run twice (the first only records; needs `VICTORY_PIPELINE_BOOK=1`, set by `play.rs`); compare the second against run 095317 (250-340 ms frames for ~2.5 min). A/B a changed translator (cold driver cache) to see how much of the compile fits in the loading screen.
+
+Risks
+- Normal-priority workers compete with the title's loading threads (unmeasured); a worker keeps its priority until its current pipeline ends (up to 58 s for the worst).
+- The host D3D12 device is created on the prewarm thread at process start (after Streamline init, before the title's device creation); the title's `D3D12XboxCreateDevice` finds it. If something in the title's device setup must precede `host()`, this is where it shows (not found by reading).
+- Two title pipelines with one key now share one `Pending` (and `host` Arc); builder pipelines may be listed twice in `BUILDER.pipelines`. Prewarmed pipelines the title never creates stay alive (bounded by the recorded set, about 5,500).
+- Compiler crash/hang now costs the process, not a child; but these are the same pipelines the title queued at creation before, so no new class of crash.
+- The world threshold (300 draws) is a guess from report 05's numbers; if a menu draws more, loading ends early and the prewarm continues at the usual low priority.
