@@ -24,6 +24,32 @@ const STOCK_SDR_MODE: [u8; 16] = [0, 15, 0, 0, 112, 8, 0, 0, 60, 0, 0, 0, 1, 0, 
 const SCANOUT_RESERVATION: u32 = 0x0247_ad4a;
 const TEMPORAL_SCALE: u32 = 0x028f_1e7e;
 const UI_VIEWPORT_LOAD: u32 = 0x0580_48d4;
+/// The interface's screen object answers its size with two getters,
+/// `mov eax, [global]; ret`: 0x4f21f10 the width (0x92d7924), 0x4f21f00 the
+/// height (0x92d7928), the output's 2560x1440. Every movie slot takes its
+/// rectangle from them (0x4f21b90, through 0x4f21e60) and lays out in it,
+/// with sizes made for 3840x2160: the HUD came out 1.5 times too big. They
+/// read the legacy UI size (3840x2160 at 0xa9438ec) instead. Each: the
+/// getter, its stock target, the legacy one.
+/// Scaleform then gets 3840x2160 movie viewports in a 2560x1440 buffer
+/// and leaves out what lies past it: 0x13cba40 builds the buffer size from
+/// `vmovsd xmm0, [rsi+0xa0]`, which reads the [3840.0, 2160.0] at 0x615a3ec
+/// instead. The GPU side puts those viewports and scissors onto the output
+/// (`draw.rs`, `ui_canvas_scale`).
+const UI_BUFFER_SIZE_LOAD: u32 = 0x013c_ba73;
+const UI_CANVAS_SIZE: u32 = 0x0615_a3ec;
+/// The menus (Settings > Controls' panels, its tabs) lay out from the size
+/// of the target they are drawn for, read at 0x53915bc by
+/// `vmovq xmm10, [rax+0x38]`: the output's 2560x1440 cut them to 2/3 of
+/// their 3840x2160 layout. That read jumps to a cave in the int3 padding
+/// after 0x55e8247 (a call that does not return; the next function starts
+/// at 0x55e8280), which gives the legacy UI size for the output's.
+const UI_TARGET_SIZE_LOAD: u32 = 0x0539_15bc;
+const UI_TARGET_SIZE_CAVE: u32 = 0x055e_8250;
+const UI_SCREEN_GETTERS: [(u32, u32, u32); 2] = [
+    (0x04f2_1f10, 0x092d_7924, 0x0a94_38ec),
+    (0x04f2_1f00, 0x092d_7928, 0x0a94_38f0),
+];
 
 /// Patches `image` for a 2560x1440 output; the scene is drawn at 2560x1440,
 /// or at 1920x1080 with `render_1080p`. Returns the scene's size.
@@ -62,6 +88,9 @@ pub(super) fn prepare(image: &mut PreparedImage, render_1080p: bool) -> Result<(
     let (render_width, render_height) = if render_1080p { (1920, 1080) } else { (WIDTH, HEIGHT) };
     *scale = (render_width as f32 / WIDTH as f32).to_le_bytes();
 
+    // `VICTORY_UI_SCREEN=0` leaves the interface on the output's size.
+    let ui_screen = std::env::var("VICTORY_UI_SCREEN").as_deref() != Ok("0");
+
     // Settings lays out its preview panels with a viewport setter of its
     // own that loads the legacy UI size (3840x2160) even when a 1440p UI
     // surface was made: it reads the selected SDR mode instead.
@@ -72,6 +101,52 @@ pub(super) fn prepare(image: &mut PreparedImage, render_1080p: bool) -> Result<(
     );
     let displacement = (SDR_MODE as i32) - (UI_VIEWPORT_LOAD as i32 + 8);
     viewport[4..].copy_from_slice(&displacement.to_le_bytes());
+
+    if ui_screen {
+        for (at, stock, legacy) in UI_SCREEN_GETTERS {
+            let getter = field::<7>(image, at)?;
+            let disp = i32::from_le_bytes(getter[2..6].try_into()?);
+            ensure!(
+                getter[..2] == [0x8b, 0x05] && getter[6] == 0xc3 && (at + 6).wrapping_add_signed(disp) == stock,
+                "unexpected interface screen size getter"
+            );
+            getter[2..6].copy_from_slice(&(legacy.wrapping_sub(at + 6) as i32).to_le_bytes());
+        }
+        ensure!(
+            *field::<8>(image, UI_CANVAS_SIZE)? == [0, 0, 0x70, 0x45, 0, 0, 0x07, 0x45],
+            "unexpected [3840.0, 2160.0] constant"
+        );
+        let load = field::<8>(image, UI_BUFFER_SIZE_LOAD)?;
+        ensure!(*load == [0xc5, 0xfb, 0x10, 0x86, 0xa0, 0, 0, 0], "unexpected viewport buffer size load");
+        load[3] = 0x05; // modrm: xmm0, [rip+disp32]
+        load[4..].copy_from_slice(&(UI_CANVAS_SIZE.wrapping_sub(UI_BUFFER_SIZE_LOAD + 8) as i32).to_le_bytes());
+
+        // The size read becomes a jump into the cave, which reads it, and
+        // takes the legacy one instead when it is the output's.
+        let back = UI_TARGET_SIZE_LOAD + 5;
+        let rel = |from: u32, to: u32| (to.wrapping_sub(from) as i32).to_le_bytes();
+        let mut cave = Vec::with_capacity(44);
+        cave.extend_from_slice(&[0xc5, 0x7a, 0x7e, 0x50, 0x38]); // vmovq xmm10, [rax+0x38]
+        cave.extend_from_slice(&[0x81, 0x78, 0x38]); // cmp dword [rax+0x38], WIDTH
+        cave.extend_from_slice(&WIDTH.to_le_bytes());
+        cave.extend_from_slice(&[0x0f, 0x85]); // jne back
+        cave.extend_from_slice(&rel(UI_TARGET_SIZE_CAVE + 18, back));
+        cave.extend_from_slice(&[0x81, 0x78, 0x3c]); // cmp dword [rax+0x3c], HEIGHT
+        cave.extend_from_slice(&HEIGHT.to_le_bytes());
+        cave.extend_from_slice(&[0x0f, 0x85]); // jne back
+        cave.extend_from_slice(&rel(UI_TARGET_SIZE_CAVE + 31, back));
+        cave.extend_from_slice(&[0xc5, 0x7a, 0x7e, 0x15]); // vmovq xmm10, [rip+legacy size]
+        cave.extend_from_slice(&rel(UI_TARGET_SIZE_CAVE + 39, UI_SCREEN_GETTERS[0].2));
+        cave.push(0xe9); // jmp back
+        cave.extend_from_slice(&rel(UI_TARGET_SIZE_CAVE + 44, back));
+        let free = field::<44>(image, UI_TARGET_SIZE_CAVE)?;
+        ensure!(free.iter().all(|&b| b == 0xcc), "unexpected padding for the interface size cave");
+        free.copy_from_slice(&cave);
+        let load = field::<5>(image, UI_TARGET_SIZE_LOAD)?;
+        ensure!(*load == [0xc5, 0x7a, 0x7e, 0x50, 0x38], "unexpected interface target size load");
+        load[0] = 0xe9;
+        load[1..].copy_from_slice(&rel(back, UI_TARGET_SIZE_CAVE));
+    }
     Ok((render_width, render_height))
 }
 
@@ -172,6 +247,7 @@ mod tests {
             let load = *field::<8>(&mut image, UI_VIEWPORT_LOAD).unwrap();
             let disp = i32::from_le_bytes(load[4..].try_into().unwrap());
             assert_eq!(UI_VIEWPORT_LOAD.wrapping_add(8).wrapping_add_signed(disp), SDR_MODE);
+            assert_eq!(field::<1>(&mut image, UI_TARGET_SIZE_LOAD).unwrap()[0], 0xe9);
             // Patched once, the image is no longer the stock one: refused.
             assert!(prepare(&mut image, render_1080p).is_err());
         }

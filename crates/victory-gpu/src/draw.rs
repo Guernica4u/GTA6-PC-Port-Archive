@@ -140,6 +140,19 @@ pub(crate) struct IndexView {
     format: u32,
 }
 
+/// With the 1440p image patch's interface screen (`VICTORY_UI_SCREEN`, on
+/// unless `0`, at a 2560x1440 output): the factor that puts the interface's
+/// 3840x2160 viewports and scissors onto the output.
+fn ui_canvas_scale() -> Option<f32> {
+    static K: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        let on = std::env::var("VICTORY_NATIVE_1440P").as_deref() == Ok("1")
+            && std::env::var("VICTORY_UI_SCREEN").as_deref() != Ok("0")
+            && std::env::var_os("VICTORY_DISPLAY_WIDE").is_none();
+        on.then_some(2560.0 / 3840.0)
+    })
+}
+
 /// Host states of a depth target, and of a texture shaders read.
 const DEPTH_WRITE: u32 = 0x10;
 const DEPTH_READ: u32 = 0x20;
@@ -517,6 +530,11 @@ pub(crate) struct State {
     host_targets: Option<(Vec<TargetKey>, Option<TargetKey>)>,
     viewports: Vec<D3D12_VIEWPORT>,
     scissors: Vec<RECT>,
+    /// The bound viewports are the interface's 3840x2160 canvas on a 1440p
+    /// output ([`ui_canvas_scale`]): what the host list gets of them and of
+    /// the scissors is scaled onto the output; the fields above keep the
+    /// title's own.
+    ui_canvas: bool,
     blend: Option<[f32; 4]>,
     stencil: Option<u32>,
     depth_bounds: Option<[f32; 2]>,
@@ -1444,6 +1462,42 @@ impl State {
     /// (25,662 times in a frame of another fork). `VICTORY_BIND_CACHE=0`
     /// sets them every time.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
+        self.bind_targets(list, handles, depth);
+        self.refresh_canvas(list);
+    }
+
+    /// Whether the bound viewports are the interface's 3840x2160 canvas on a
+    /// target smaller than them (the 1440p output; a 3840x2160 target, such
+    /// as the one the intro video is drawn into, keeps its viewport).
+    fn on_canvas(&self) -> bool {
+        // only the interface's own 3840x2160 canvas: other passes (a 2048x2048
+        // depth-only one, say) keep their viewports
+        if ui_canvas_scale().is_none() || !self.viewports.iter().any(|v| v.Width == 3840.0 && v.Height == 2160.0) {
+            return false;
+        }
+        let first = self.targets.first().copied().or((self.depth != 0).then_some(self.depth));
+        first.and_then(|t| crate::resource::host_resource(t as This)).is_some_and(|texture| {
+            // SAFETY: a live host resource, kept by the title's target.
+            let d = unsafe { texture.GetDesc() };
+            d.Width <= 2560 && d.Height <= 1440
+        })
+    }
+
+    /// Re-sends the viewports and scissors when [`State::on_canvas`] changed.
+    fn refresh_canvas(&mut self, list: &HostList) {
+        let now = self.on_canvas();
+        if now != self.ui_canvas {
+            self.ui_canvas = now;
+            if !self.viewports.is_empty() {
+                self.send_viewports(list);
+            }
+            if !self.scissors.is_empty() {
+                self.send_scissors(list);
+            }
+        }
+    }
+
+    fn bind_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
         let Some(host) = crate::host::host() else {
             return;
         };
@@ -1527,7 +1581,51 @@ impl State {
         }
         self.viewports.clear();
         self.viewports.extend_from_slice(viewports);
-        crate::draw::viewports(list, viewports);
+        let was = self.ui_canvas;
+        self.ui_canvas = self.on_canvas();
+        self.send_viewports(list);
+        if was != self.ui_canvas && !self.scissors.is_empty() {
+            self.send_scissors(list);
+        }
+    }
+
+    /// The bound viewports onto the host list (scaled for the interface's canvas).
+    fn send_viewports(&self, list: &HostList) {
+        match ui_canvas_scale().filter(|_| self.ui_canvas) {
+            Some(k) => {
+                let scaled: Vec<_> = self
+                    .viewports
+                    .iter()
+                    .map(|v| D3D12_VIEWPORT { TopLeftX: v.TopLeftX * k, TopLeftY: v.TopLeftY * k, Width: v.Width * k, Height: v.Height * k, ..*v })
+                    .collect();
+                crate::draw::viewports(list, &scaled);
+            }
+            None => crate::draw::viewports(list, &self.viewports),
+        }
+    }
+
+    /// The bound scissors onto the host list (scaled for the interface's
+    /// canvas, outwards so that nothing inside is cut).
+    fn send_scissors(&self, list: &HostList) {
+        match ui_canvas_scale().filter(|_| self.ui_canvas) {
+            Some(k) => {
+                let scaled: Vec<_> = self
+                    .scissors
+                    .iter()
+                    .map(|r| if (r.left, r.top, r.right, r.bottom) == (0, 0, 2560, 1440) {
+                        // already the whole output, not a canvas rectangle
+                        *r
+                    } else { RECT {
+                        left: (r.left as f32 * k).floor() as i32,
+                        top: (r.top as f32 * k).floor() as i32,
+                        right: (r.right as f32 * k).ceil() as i32,
+                        bottom: (r.bottom as f32 * k).ceil() as i32,
+                    } })
+                    .collect();
+                crate::draw::scissors(list, &scaled);
+            }
+            None => crate::draw::scissors(list, &self.scissors),
+        }
     }
 
     pub(crate) fn set_scissors(&mut self, list: &HostList, rects: &[RECT]) {
@@ -1546,7 +1644,7 @@ impl State {
             crate::draw::scissors(list, &vec![full; rects.len()]);
             return;
         }
-        crate::draw::scissors(list, rects);
+        self.send_scissors(list);
     }
 
     pub(crate) fn set_blend_factor(&mut self, list: &HostList, factor: Option<&[f32; 4]>) {
@@ -1590,7 +1688,7 @@ impl State {
             self.set_targets(list, &handles, self.depth_handle);
         }
         if !self.viewports.is_empty() {
-            crate::draw::viewports(list, &self.viewports);
+            self.send_viewports(list);
         }
         if !self.scissors.is_empty() {
             let rects = std::mem::take(&mut self.scissors);
