@@ -2979,7 +2979,12 @@ impl<'a> Lower<'a> {
         // slot. A preliminary write of a degenerate triangle makes WARP
         // 1.0.22 keep that first write instead of the exported indices.
         if threads == mesh.max_primitives && matches!(self.x.st.exits.as_slice(), [LaneExit::End]) {
-            let mut exports = self.x.io.exports.iter().filter(|e| e.target == Target::Primitive);
+            let mut exports = self
+                .x
+                .io
+                .exports
+                .iter()
+                .filter(|e| e.target == Target::Primitive);
             if let Some(export) = exports.next()
                 && exports.next().is_none()
                 && self.x.st.guards[export.site.0][export.site.1].is_none()
