@@ -1110,6 +1110,44 @@ pub(crate) mod tests {
         forget(third);
     }
 
+    /// A thread that looked a view up finds it again while another thread
+    /// holds the view registry's lock (as a title thread writing a view
+    /// does): it does not wait for that lock.
+    #[test]
+    fn a_view_looked_up_before_does_not_wait_for_the_view_registry() {
+        let null = std::ptr::null();
+        let slots = [0u64; 4];
+        let a = slots.as_ptr() as u64;
+        let resource = 0x777b_0000usize;
+        create_srv(null, resource as This, std::ptr::null(), a);
+        let (ask, asked) = std::sync::mpsc::channel::<u64>();
+        let (answer, answers) = std::sync::mpsc::channel::<Option<View>>();
+        let in_time = std::thread::scope(|s| {
+            s.spawn(move || {
+                for at in asked {
+                    answer.send(view(at)).unwrap();
+                }
+            });
+            ask.send(a).unwrap();
+            assert_eq!(answers.recv().unwrap(), Some(View::Shader(resource, None)));
+            // The entry stays live (only `forget` of its resource frees it),
+            // so nothing changes what the thread found while the lock is held.
+            let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+            ask.send(a).unwrap();
+            let in_time = answers.recv_timeout(std::time::Duration::from_secs(1));
+            drop(views);
+            let late = in_time.is_err().then(|| answers.recv().unwrap());
+            drop(ask);
+            (in_time, late)
+        });
+        assert_eq!(
+            in_time,
+            (Ok(Some(View::Shader(resource, None))), None),
+            "the lookup waited for the view registry's lock"
+        );
+        forget(resource);
+    }
+
     /// A record the title copies into its shader-visible heap as bytes (no
     /// call) is made on the host at the next sync, and only then.
     #[cfg(windows)]
