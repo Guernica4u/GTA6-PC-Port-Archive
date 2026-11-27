@@ -138,6 +138,8 @@ Kept, and why (honest scope):
 | Region cannot be opened (lazy/soft views not committed, not one stretch, host refusal) | Falls back to the old path; retried every 600 frames for uncommitted/not-a-stretch; a host refusal disables T for the run. The log line counts each reason. |
 | 185 MB of PC memory locked while the region stands | Bounded by `MOST` (512 MiB); the title keeps the heap for the process lifetime. |
 | GPU reads constants over PCIe instead of VRAM (aligned root CBVs used V before) | Constants are tiny and L2-cached; table CBVs were already in upload (PC) memory (`host.rs:7369 scratch_held`). Watch "the card's clock" busy % in the frame line. |
+| Pages mapped lazily (`VICTORY_SOFT_VIEWS=copies` in the launcher maps pool views when first touched, `xmem.rs` `map_pages(.., lazy)`): the stretch may be uncommitted or unknown to `inplace` when first asked | `NOT_COMMITTED`/`NOT_STRETCH` are retried every 600 frames; the log line counts them. If they never clear, the region is never opened and nothing changes (old path). |
+| The region is opened on whichever thread records the first CBV in it (a THIN worker): a one-off map + open + place, pages locked (tens of ms once) | Under `REGIONS`' write lock, which no other lock is held around (`watch.rs:3015-3017` calls `views_gone` then `title_memory_freeing` sequentially). |
 | `xmem::arrange` now always runs for the 32-bit reservation | It only exchanges never-mapped, never-written slices (`xmem.rs:1160-1172`); it ran in all port #1 runs. Log: "pages given their section's slices in address order". |
 
 ## 7. Next steps (designed, not in this branch)
@@ -161,3 +163,13 @@ Kept, and why (honest scope):
 - `renderer port 1: the title's 32-bit graphics pages given their section's slices in address order` (xmem).
 - Must fall: frame line "copies ms/MB", card-step fills, "title memory read" settles, "preparing per frame ... refreshes".
 - Must not rise: `settled for: title memory changed under shader writes`; no constants flicker in cutscenes; boats float.
+
+## 9. Commits on this branch
+
+1. this document;
+2. `port`: title-memory home (one region buffer over the 32-bit heap's stretch, `port::constants`, the per-page
+   oracle, `gpu_bound`), always on; whole-buffer port path and `VICTORY_PORT_CONSTANTS` removed (gpu, xmem, menu);
+3. `draw`: root and table CBVs resolve to the title-memory home first; `note_placed` and `defer_read_back` mark
+   their pages; `VICTORY_FILL_TITLE` removed (its default kept);
+4. `shadow`: write-combined copies >= 1 MiB keep shader writes on the card by default (`VICTORY_WC_NO_BACK`,
+   `_MIN_KB` removed from code, launcher, `play.rs` and menu).

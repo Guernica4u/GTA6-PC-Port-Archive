@@ -397,10 +397,11 @@ pub(crate) fn copied(dst: usize, src: usize, len: usize) {
 /// what was not and why.
 pub(crate) fn log(frames: f64) {
     let s: Vec<u64> = STATS[..READ].iter().map(|s| s.load(Ordering::Relaxed)).collect();
-    let per: Vec<f64> = STATS[READ..].iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    let taken: Vec<f64> = STATS[READ..].iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     if s[OPENED] == 0 && s[NOT_STRETCH..=NO_BUFFER].iter().all(|&n| n == 0) {
         return;
     }
+    let per = |at: usize| taken[at - READ];
     tracing::info!(
         "renderer port 1: {} regions of the title's graphics memory in place ({} MB); per frame: {:.0} constant views read in place ({:.1} KB: \
          nothing refreshed, filled or waited for), not in place: {:.0} not 256-aligned, {:.0} on pages shaders write, {:.0} outside the regions; \
@@ -408,15 +409,15 @@ pub(crate) fn log(frames: f64) {
          {} not one stretch of a section, {} not committed, {} no view, {} by the host, {} no buffer; {} regions forgotten (other pages mapped there)",
         s[OPENED],
         s[OPENED_BYTES] >> 20,
-        per[READ - READ],
-        per[READ_BYTES - READ] / 1024.0,
-        per[MISALIGNED - READ],
-        per[SHADERS - READ],
-        per[OUTSIDE - READ],
-        per[FILLS - READ],
-        per[FILL_BYTES - READ] / 1024.0,
-        per[COPIES - READ],
-        per[COPY_BYTES - READ] / 1024.0,
+        per(READ),
+        per(READ_BYTES) / 1024.0,
+        per(MISALIGNED),
+        per(SHADERS),
+        per(OUTSIDE),
+        per(FILLS),
+        per(FILL_BYTES) / 1024.0,
+        per(COPIES),
+        per(COPY_BYTES) / 1024.0,
         s[NOT_STRETCH],
         s[NOT_COMMITTED],
         s[NO_VIEW],
