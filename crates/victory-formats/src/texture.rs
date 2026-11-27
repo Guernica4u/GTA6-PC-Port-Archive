@@ -682,9 +682,9 @@ impl Layout {
         // Dense linear rows have no padding to preserve. Copy a whole plane,
         // or the whole volume when both layouts also have adjacent planes.
         // A mip chain separates depth slices by slice_size, not slice_bytes.
-        if self.desc.swizzle == Swizzle::LINEAR
-            && row_pitch == bytes
+        if row_pitch == bytes
             && m.pitch as usize * n == bytes
+            && self.desc.swizzle == Swizzle::LINEAR
         {
             let base = (u64::from(first) * self.slice_size + m.offset) as usize;
             if depth > 1 && self.slice_size == slice_bytes as u64 && depth_pitch == slice_bytes {
