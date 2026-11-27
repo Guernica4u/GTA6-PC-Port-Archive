@@ -207,6 +207,7 @@ impl<'a> Emitter<'a> {
         self.dsel_loads.clear();
         // Facts held while the analysis was still converging are not proof.
         self.size_reads.clear();
+        self.count_reads.clear();
         self.dsel_runtime.clear();
         self.dsel_moves.clear();
         self.raw_byte_index.clear();

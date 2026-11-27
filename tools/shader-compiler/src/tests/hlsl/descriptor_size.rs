@@ -101,3 +101,37 @@ fn texture_size_from_descriptor_fields_for_the_gpu_check() {
     let translated = translate(&sequence(&[])).unwrap();
     println!("BEGIN_HLSL\n{}\nEND_HLSL", translated.hlsl);
 }
+
+const BUFFER: [u32; 2] = [0xf4080202, 0xfa000020]; // s_load_dwordx4 s[8:11], s[4:5], 0x20
+const READ: [u32; 2] = [0xe0300000, 0x80020000]; // buffer_load_dword v0, off, s[8:11], 0
+const LAST: u32 = 0x8103c10a; // s_add_i32 s3, s10, -1
+
+/// The same table with PSV naming t1 a raw buffer.
+fn buffered(words: &[&[u32]]) -> ShaderExtract {
+    let mut ex = tabled(words);
+    ex.resources = vec![crate::psv::PsvResource { res_type: 4, space: 0, lower: 1, upper: 1 }];
+    ex
+}
+
+#[test]
+fn the_load_fills_a_buffer_record_count() {
+    let hlsl = translate(&buffered(&[&BUFFER, &[LAST], &READ])).unwrap().hlsl;
+    let fill = hlsl.find("uint n0; raw_sbuf1.GetDimensions(n0);").expect(&hlsl);
+    let word = fill + hlsl[fill..].find("s10 = n0;").expect(&hlsl);
+    assert!(word < hlsl.find("s_add_i32").unwrap(), "{hlsl}");
+    // Words 1 and 3 are not filled.
+    assert!(!hlsl.contains("s9 = ") && !hlsl.contains("s11 = "), "{hlsl}");
+}
+
+#[test]
+fn a_buffer_used_only_as_a_buffer_is_not_asked_for_its_count() {
+    let hlsl = translate(&buffered(&[&BUFFER, &READ])).unwrap().hlsl;
+    assert!(!hlsl.contains("GetDimensions"), "{hlsl}");
+}
+
+#[test]
+fn a_count_with_no_host_buffer_to_ask_is_refused() {
+    // Nothing reads through the descriptor, so the translation declares no buffer.
+    let reason = translate(&buffered(&[&BUFFER, &[LAST]])).err().expect("refused");
+    assert!(reason.contains("buffer record count read from a descriptor with no one host buffer"), "{reason}");
+}

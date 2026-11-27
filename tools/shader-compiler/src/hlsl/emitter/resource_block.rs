@@ -45,6 +45,7 @@ impl<'a> Emitter<'a> {
                 _ => None,
             };
             self.step_texture_size(insns, idx, sym)?;
+            self.note_buffer_count(insns, idx, sym);
             if self.mesh_bindings.is_some() && ins.mnemonic != "v_nop" {
                 for (i, source) in ins.src.iter().enumerate() {
                     let Some(Sym::MeshRawAddress { word, .. }) = sg(source).and_then(|s| sym.get(&s)) else {

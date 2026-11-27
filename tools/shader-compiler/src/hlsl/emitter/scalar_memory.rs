@@ -83,6 +83,7 @@ impl<'a> Emitter<'a> {
             }
             self.line("// (descriptor fetch from root table — resolved statically)");
             self.emit_texture_size(idx)?;
+            self.emit_buffer_count(idx)?;
             return Ok(());
         }
         let n = 1u32 << (ins.op - 8);

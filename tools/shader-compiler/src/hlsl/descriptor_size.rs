@@ -15,8 +15,13 @@
 //! shift leaves at least one texel. That is exact only for this computation,
 //! so the fields are followed from the descriptor to the shift, and a program
 //! that does anything else with them is refused.
+//!
+//! A buffer descriptor keeps its record count in word 2 (`SQ_BUF_RSRC_WORD2`),
+//! which is what `GetDimensions` returned to the program's source: bytes for
+//! a raw buffer, elements otherwise. The count is the whole word, so the load
+//! fills it and every later use is right.
 use super::*;
-use super::operand_fields::{constant_before, unused_field};
+use super::operand_fields::{constant_before, memory, run_start, unused_field};
 use crate::rdna2::clobbers_scalar;
 
 /// A value on the way from a descriptor to its texture's size. `u32` is the
@@ -190,6 +195,79 @@ impl<'a> Emitter<'a> {
         self.ws(&Opnd::Sgpr(first + 1), &format!("((w{t} - 1u) & 3u) << 30"))?;
         self.ws(&Opnd::Sgpr(first + 2), &format!("((w{t} - 1u) >> 2) | ((h{t} - 1u) << 14)"))?;
         self.ws(&Opnd::Sgpr(first + 3), "0u")
+    }
+}
+
+impl<'a> Emitter<'a> {
+    /// Record a read of word 2 of a four-word descriptor as a number.
+    pub(super) fn note_buffer_count(&mut self, insns: &[Insn], at: usize, sym: &HashMap<u16, Sym>) {
+        let ins = &insns[at];
+        // These take a descriptor as a descriptor, and a move carries the fact along.
+        if memory(ins) || matches!(ins.mnemonic.as_str(), "v_nop" | "s_mov_b32" | "s_mov_b64" | "s_getpc_b64") {
+            return;
+        }
+        for (index, source) in ins.src.iter().enumerate() {
+            let Opnd::Sgpr(register) = *source else { continue };
+            if unused_field(ins, index, register) {
+                continue;
+            }
+            let Some(Sym::Desc { table, off, k: 2 }) = sym.get(&u16::from(register)).copied() else { continue };
+            let id = (u32::from(table) << 24) | off;
+            let loads: Vec<usize> = self.dsel_loads.iter().filter(|&(_, &(_, loaded))| loaded == id).map(|(&load, _)| load).collect();
+            if loads.is_empty() || loads.iter().any(|&load| insns[load].op != 2) {
+                continue;
+            }
+            // Certain when the load is in the same straight run and nothing
+            // wrote the register since: the descriptor facts are optimistic
+            // where paths join.
+            let certain = loads.iter().any(|&load| load < at && load >= run_start(insns, at)
+                && self.dsel_loads[&load].0 + 2 == u16::from(register)
+                && !(load + 1..at).any(|between| clobbers_scalar(&insns[between], register)));
+            *self.count_reads.entry(id).or_insert(false) |= certain;
+        }
+    }
+
+    /// Fill the record count of a buffer descriptor load.
+    pub(super) fn emit_buffer_count(&mut self, idx: usize) -> Result<(), String> {
+        let Some(&(first, id)) = self.dsel_loads.get(&idx) else { return Ok(()) };
+        let Some(&certain) = self.count_reads.get(&id) else { return Ok(()) };
+        let (table, offset) = ((id >> 24) as u8, id & 0x00ff_ffff);
+        let query = self.table_binding(table, offset, 32).ok().and_then(|(kind, slot)| {
+            let is_uav = match kind? { 0 => false, 1 => true, _ => return None };
+            // The view type PSV names decides what the console counted.
+            let space = self.binding_spaces.get(&(u32::from(is_uav), slot)).copied().unwrap_or(0);
+            let (native, space) = self.native_binding(is_uav, slot, space);
+            let base = if is_uav { 6 } else { 3 };
+            let mut types = self.ex.resources.iter()
+                .filter(|p| p.space == space && p.lower <= native && native <= p.upper && (base..base + 3).contains(&p.res_type))
+                .map(|p| p.res_type - base);
+            let ty = types.next()?;
+            if types.next().is_some() {
+                return None;
+            }
+            let key = (is_uav, slot);
+            let declared = [self.tbuf.contains(&key), self.raw.contains(&key), self.sbuf.contains_key(&key)];
+            let name = |srv: &str, uav: &str| format!("{}{slot}", if is_uav { uav } else { srv });
+            match (ty, declared) {
+                (0, [true, false, false]) => Some((name("stb", "utb"), false)),
+                (1, [false, true, false]) => Some((name("raw_sbuf", "raw_ubuf"), false)),
+                (2, [false, false, true]) => Some((name("sbuf", "ubuf"), true)),
+                _ => None,
+            }
+        });
+        let Some((buffer, stride)) = query else {
+            // A read the dataflow is sure of has no number to use.
+            return if certain { Err("buffer record count read from a descriptor with no one host buffer".into()) } else { Ok(()) };
+        };
+        let first = u8::try_from(first).ok().filter(|&n| n < 102).ok_or("descriptor words outside the scalar registers")?;
+        let t = self.tmp;
+        self.tmp += 1;
+        if stride {
+            self.line(&format!("uint n{t}, st{t}; {buffer}.GetDimensions(n{t}, st{t});"));
+        } else {
+            self.line(&format!("uint n{t}; {buffer}.GetDimensions(n{t});"));
+        }
+        self.ws(&Opnd::Sgpr(first + 2), &format!("n{t}"))
     }
 }
 

@@ -343,6 +343,9 @@ struct Emitter<'a> {
     dsel_loads: HashMap<usize, (u16, u32)>,
     /// Descriptors whose size fields the program reads (`descriptor_size`).
     size_reads: BTreeSet<u32>,
+    /// Buffer descriptors whose record count the program reads, and whether some
+    /// read is certain (`descriptor_size`).
+    count_reads: BTreeMap<u32, bool>,
     dsel_runtime: HashMap<usize, (u16, u8, u8, u32)>,
     dsel_moves: HashMap<usize, (u16, u16)>,
     /// Registers read before written (entry ABI), from `live_in`.
