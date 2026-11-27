@@ -11,7 +11,7 @@ the translation works. Game files stay outside the repository.
 
 | Part | What works for us |
 |------|-------------------|
-| Wine | 11.22, in a dedicated prefix (`target/wine-prefix`) |
+| Wine | 11.22 with one server change (below), in a dedicated prefix (`target/wine-prefix`) |
 | D3D12 | vkd3d-proton 3.1-83 (`v3.1-83-gcae8353ed`) from GE-Proton11-14 |
 | DXGI | DXVK's `dxgi.dll` from GE-Proton11-14; Wine's own DXGI crashes in `wined3d` on the first present |
 | Host GPU | NVIDIA RTX 5090; a Vulkan ICD and a driver that supports shader model 6.6 and mesh shaders |
@@ -19,6 +19,15 @@ the translation works. Game files stay outside the repository.
 
 Older vkd3d-proton builds (Proton 11.0's, for example) crash while creating the first
 world pipelines; use the GE-Proton11-14 DLLs.
+
+**wineserver.** The stock server walks every mapped view of the process on each map
+and unmap request, and the title keeps tens of thousands of views mapped. Our server
+keeps the views in a tree by base address instead (a one-commit change to
+`server/mapping.c` on top of 11.22). @Anzymanz measured the stock server at about eight
+times the world frame time on their machine (see AMD specifics);
+[CachyOS/wine-cachyos#50](https://github.com/CachyOS/wine-cachyos/pull/50) is the same
+idea, and per their note GE-Proton's tree carries an equivalent since `d3b6ae7`, so a
+GE-Proton release after 11-14 that includes it needs no local build.
 
 ## Building on Linux
 
@@ -133,6 +142,36 @@ The observed cache size grew to about 700 MB on this setup.
   about 1,460 → 2,690 draws per frame).
 * Do not run a GPU test while the title is running. They share the GPU, and an Xid
   from a test can take down the game run as well.
+
+## AMD specifics (RADV)
+
+Contributed by @Anzymanz from their own measurements; we have not run AMD hardware.
+One machine: RX 9070 XT (16 GB), Ryzen 9 5950X (two CCDs of eight cores), CachyOS,
+Mesa 26.3.1 RADV, GE-Proton11-14, vkd3d-proton master; Series X profile at 4K, ray tracing on.
+The runs used forks of VIctory, not this repository's `main`; these points do not depend on the tree.
+Full notes: https://github.com/Anzymanz/VIctory-ox/blob/main/docs/linux-findings.md
+
+* **wineserver.** A median world frame of 8,442 ms with the stock server, against
+  1,041-1,061 ms with the views kept in a tree (see the note under What we test with).
+  [LooperSalty/AnyXboxX#261](https://github.com/LooperSalty/AnyXboxX/pull/261) builds that
+  server for GE-Proton11-14.
+* **Leave `power_dpm_force_performance_level` on `auto`.** Forced to `high`, the RX 9070 XT
+  stayed at 2.4 GHz against 3.4 GHz on `auto`, and GPU time per frame tripled.
+* **Check the GPU clock.** Under VIctory's bursty submissions the driver can read the load
+  as light and run the card at half clock (1.6 against 3.3 GHz here, about six times the GPU
+  time per frame). `pp_dpm_sclk` under `/sys/class/drm/card*/device/` shows it.
+* **Both CCDs.** The title gives its threads console affinity masks, and under Wine these land
+  on both CCDs of a two-CCD Ryzen whatever `taskset` the launch used (of 184 threads, 110 were
+  unrestricted and 39 held to one CCD). A `WINE_CPU_TOPOLOGY` map that shows the game one CCD
+  keeps it there but gained nothing measurable (244 and 192 ms a frame against 219 and
+  216), nor did a map that pairs each core with its SMT sibling (mean 146 ms over four runs
+  against 154 over six, inside the spread). Holding every game thread to one CCD cost time: in
+  an on/off test inside one run (20 phases of 8 s) it was 8.6 ms a frame slower (124.7 against
+  116.0 ms, slower in 9 of 10 pairs). Leave the game on both CCDs.
+* **Run-to-run spread.** Identical whole runs differed by up to 50 ms a frame while other
+  programs were busy; alternate off and on runs before trusting a difference. Most of the
+  frame times above come from runs that also saved a picture every 8th frame, in both arms of
+  each comparison: the differences stand, but the absolute times include that cost.
 
 ## Unmerged PRs needed on NVIDIA/Wine (2026-11-26)
 
