@@ -124,6 +124,7 @@ mod sampler_heap;
 mod lane_reads;
 mod heap_offsets;
 mod heap_origins;
+mod operand_fields;
 use sampler_heap::DirectSampler;
 mod reflection_probe;
 mod wave_scan;
