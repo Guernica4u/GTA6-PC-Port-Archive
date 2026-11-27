@@ -380,6 +380,12 @@ fn track_as(start: usize, len: usize, views: bool, copy: bool) -> Option<Tracked
 /// runtime's; another allocator committing it before the first take would
 /// have it guarded.
 fn runtime_pages(start: usize, end: usize, views: bool) -> Vec<usize> {
+    static FAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let fast = *FAST.get_or_init(|| std::env::var_os("VICTORY_WATCH_REGION_PROBE").is_some_and(|v| v == "1"));
+    runtime_pages_with_probe(start, end, views, fast)
+}
+
+fn runtime_pages_with_probe(start: usize, end: usize, views: bool, fast: bool) -> Vec<usize> {
     use windows_sys::Win32::System::Memory::{
         GetWriteWatch, MEM_COMMIT, MEM_IMAGE, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
@@ -389,6 +395,25 @@ fn runtime_pages(start: usize, end: usize, views: bool) -> Vec<usize> {
         unsafe { GetWriteWatch(0, at as *const _, len, (&raw mut found).cast(), &mut count, &mut granularity) == 0 }
     };
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    // Experimental: a fresh query must cover the entire requested range in
+    // one committed private region before a positive short write-watch probe
+    // can classify it. No address classifications survive this call. A failed
+    // query or probe always falls back to the original classification.
+    let aligned = start & !(4096 - 1);
+    if fast && end.saturating_sub(aligned) >= 4 * 1024 * 1024 {
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: the query only writes the supplied information structure.
+        let queried = unsafe { VirtualQuery(aligned as *const _, &mut info, size_of_val(&info)) };
+        if queried != 0
+            && info.State == MEM_COMMIT
+            && info.Type == MEM_PRIVATE
+            && info.BaseAddress as usize <= aligned
+            && (info.BaseAddress as usize).checked_add(info.RegionSize).is_some_and(|limit| end <= limit)
+            && watched(aligned, 4096)
+        {
+            return (first..last).collect();
+        }
+    }
     // One pool holds it all (the common case; asking `VirtualQuery` costs
     // milliseconds in the runtime's big pools).
     if watched(start & !(4096 - 1), end - (start & !(4096 - 1))) {
@@ -978,6 +1003,69 @@ pub(crate) mod tests {
     pub(crate) fn free(p: usize) {
         // SAFETY: an allocation of ours.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn region_probe_matches_baseline_after_address_reuse() {
+        const N: usize = 64;
+        let p = pool(N);
+        let check = |p: usize| {
+            for views in [false, true] {
+                assert_eq!(
+                    runtime_pages_with_probe(p, p + N * PAGE, views, true),
+                    runtime_pages_with_probe(p, p + N * PAGE, views, false)
+                );
+            }
+        };
+        check(p);
+        free(p);
+        // SAFETY: reserve a fresh plain allocation at the old address when
+        // possible. Other parallel tests may have taken that address.
+        let q = unsafe {
+            VirtualAlloc(p as *const _, N * PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        } as usize;
+        let q = if q == 0 {
+            // SAFETY: a new allocation owned by this test.
+            (unsafe {
+                VirtualAlloc(std::ptr::null(), N * PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+            }) as usize
+        } else {
+            q
+        };
+        assert_ne!(q, 0);
+        check(q);
+        assert!(runtime_pages_with_probe(q, q + N * PAGE, false, true).is_empty());
+        free(q);
+    }
+
+    #[test]
+    fn region_probe_matches_baseline_across_protections() {
+        use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+        let p = pool(128);
+        let mut old = 0;
+        // SAFETY: the middle page belongs to this allocation.
+        assert_ne!(unsafe { VirtualProtect((p + 64 * PAGE) as *const _, PAGE, PAGE_READONLY, &mut old) }, 0);
+        for views in [false, true] {
+            assert_eq!(
+                runtime_pages_with_probe(p, p + 128 * PAGE, views, true),
+                runtime_pages_with_probe(p, p + 128 * PAGE, views, false)
+            );
+        }
+        free(p);
+    }
+
+    #[test]
+    #[ignore = "manual synthetic timing; no fixed speedup assertion"]
+    fn region_probe_benchmark() {
+        let p = pool(4096);
+        for fast in [false, true, true, false] {
+            let start = std::time::Instant::now();
+            for _ in 0..100 {
+                std::hint::black_box(runtime_pages_with_probe(p, p + 4096 * PAGE, false, fast));
+            }
+            eprintln!("region probe fast={fast}: {:?}", start.elapsed());
+        }
+        free(p);
     }
 
     /// Everything is changed at first; after taking, only what is written
