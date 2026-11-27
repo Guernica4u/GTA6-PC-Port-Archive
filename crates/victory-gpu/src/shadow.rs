@@ -998,6 +998,17 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
             shadow: None,
         },
     );
+    // A large buffer the title declares, whether or not a view of it is ever
+    // made: with the "large buffer copied to the host" line of [`find`], a
+    // buffer registered and never read through views is told from memory
+    // with no resource (XMEM), which only `loose` copies.
+    if len >= 16 << 20 {
+        tracing::info!(
+            start = format_args!("{start:#x}"),
+            len,
+            "title buffer declared"
+        );
+    }
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
