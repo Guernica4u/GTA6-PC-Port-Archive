@@ -149,7 +149,7 @@ unsafe extern "system" fn tuxbox_bvh_rehydrate2(
     list: Object,
     count: u32,
     builds: *const Build,
-    _addresses: *const u64,
+    addresses: *const u64,
 ) -> HRESULT {
     if count == 0 {
         return HRESULT(0);
@@ -158,7 +158,52 @@ unsafe extern "system" fn tuxbox_bvh_rehydrate2(
         return E_INVALIDARG;
     }
     // Cooked Xbox node records cannot be submitted as native serialized DXR.
+    // Nothing is built at the destinations, so scenes that reference them
+    // point at console node data; say which ones.
+    let builds = unsafe { core::slice::from_raw_parts(builds, count as usize) };
+    unsafe { report_rehydrate(builds, addresses) };
     E_NOTIMPL
+}
+
+/// Bounded log of refused rehydrations: calls, structures and the first
+/// destinations, with the inputs that describe the cooked records.
+unsafe fn report_rehydrate(builds: &[Build], addresses: *const u64) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    static STRUCTURES: AtomicUsize = AtomicUsize::new(0);
+    let call = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    let total = STRUCTURES.fetch_add(builds.len(), Ordering::Relaxed) + builds.len();
+    if call > 8 && !call.is_power_of_two() {
+        return;
+    }
+    log(&format!(
+        "TuxBox XboxBvhBuilder: refused rehydration #{call} of {} structures ({total} so far, addresses {}): cooked console nodes are not built",
+        builds.len(),
+        if addresses.is_null() { "none" } else { "given" },
+    ));
+    for (i, build) in builds.iter().take(4).enumerate() {
+        let inputs = &build.Inputs;
+        let extra = if addresses.is_null() { 0 } else { unsafe { addresses.add(i).read_unaligned() } };
+        log(&format!(
+            "TuxBox XboxBvhBuilder: rehydration #{call}[{i}] dest {:#x} source {:#x} scratch {:#x} address {extra:#x} type {} flags {:#x} count {} layout {}",
+            build.DestAccelerationStructureData,
+            build.SourceAccelerationStructureData,
+            build.ScratchAccelerationStructureData,
+            inputs.Type.0,
+            inputs.Flags.0,
+            inputs.NumDescs,
+            inputs.DescsLayout.0,
+        ));
+    }
+}
+
+fn log(message: &str) {
+    let mut bytes = Vec::with_capacity(message.len() + 2);
+    bytes.extend_from_slice(message.as_bytes());
+    bytes.extend_from_slice(b"\n\0");
+    unsafe {
+        windows::Win32::System::Diagnostics::Debug::OutputDebugStringA(windows::core::PCSTR(bytes.as_ptr()))
+    };
 }
 
 #[unsafe(no_mangle)]
