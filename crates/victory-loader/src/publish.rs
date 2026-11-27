@@ -13,12 +13,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::os::windows::ffi::OsStrExt;
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, ERROR_LOCK_VIOLATION, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
 };
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK,
-    LockFileEx, OPEN_ALWAYS,
+    LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, OPEN_ALWAYS,
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::IO::OVERLAPPED;
@@ -125,20 +125,52 @@ fn write_sidecar(path: &Path, digest: &blake3::Hash) {
     }
 }
 
-/// An exclusive lock on the lock file beside the published path, held for
-/// the guard's life: closing the handle releases it, so a crashed publisher
-/// does not leave the cache locked.
+/// How long a publisher waits for the lock before it stops waiting for it.
+/// Long enough for a holder that is running to finish the read-back, sidecar
+/// removal and rename it holds the lock for (a few file operations: the
+/// milliseconds they take), short enough that a holder that never runs again
+/// — a publisher killed or suspended mid-publish — costs the boot a bounded
+/// wait instead of all of it.
 #[cfg(windows)]
-struct PublishLock(HANDLE);
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How long a publisher sleeps between attempts at the lock.
+#[cfg(windows)]
+const LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// What asking for the lock got.
+#[cfg(windows)]
+enum PublishLock {
+    /// Held for the guard's life: closing the handle releases it, so a
+    /// crashed publisher does not leave the cache locked.
+    Held(HANDLE),
+    /// A holder kept the lock past `LOCK_WAIT`. The caller must not wait for
+    /// it any longer — a holder that is suspended or gone keeps the lock until
+    /// its process ends — and publishes only what it can check without
+    /// writing; see `publish_without_lock`.
+    TimedOut,
+}
+
 #[cfg(windows)]
 impl Drop for PublishLock {
     fn drop(&mut self) {
-        // SAFETY: our handle.
-        unsafe { CloseHandle(self.0) };
+        if let PublishLock::Held(handle) = *self {
+            // SAFETY: our handle.
+            unsafe { CloseHandle(handle) };
+        }
     }
 }
 
-/// Locks the publishers of `path` against each other.
+/// Locks the publishers of `path` against each other, for at most
+/// `LOCK_WAIT`.
+///
+/// The lock is asked for with `LOCKFILE_FAIL_IMMEDIATELY` and retried in a
+/// bounded loop. A publisher that lost the race to one that is about to finish
+/// still serialises behind it, which is what orders the sidecar around the
+/// image's rename. A publisher that lost the race to one that is not going to
+/// finish cannot tell the two apart by waiting, so it stops at `LOCK_WAIT`: an
+/// unbounded `LockFileEx` would hang the boot silently and forever, with
+/// nothing to show for it.
 #[cfg(windows)]
 fn publish_lock(path: &Path) -> std::io::Result<PublishLock> {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("image");
@@ -165,24 +197,96 @@ fn publish_lock(path: &Path) -> std::io::Result<PublishLock> {
     }
     // SAFETY: a zeroed OVERLAPPED is valid; unused on a synchronous handle.
     let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
-    // SAFETY: a valid handle.
-    if unsafe {
-        LockFileEx(
-            handle,
-            LOCKFILE_EXCLUSIVE_LOCK,
-            0,
-            u32::MAX,
-            u32::MAX,
-            &mut overlapped,
-        )
-    } == 0
-    {
+    let started = std::time::Instant::now();
+    let mut said = false;
+    loop {
+        // SAFETY: a valid handle, and an OVERLAPPED of the right type.
+        let locked = unsafe {
+            LockFileEx(
+                handle,
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0,
+                u32::MAX,
+                u32::MAX,
+                &mut overlapped,
+            )
+        } != 0;
+        if locked {
+            return Ok(PublishLock::Held(handle));
+        }
         let error = std::io::Error::last_os_error();
-        // SAFETY: our handle.
-        unsafe { CloseHandle(handle) };
-        return Err(error);
+        // Only a holder of the range is waited for. Anything else (a lock file
+        // that cannot be locked at all) is this publisher's problem, and is
+        // reported rather than retried until the wait runs out.
+        if error.raw_os_error() != Some(ERROR_LOCK_VIOLATION as i32) {
+            // SAFETY: our handle.
+            unsafe { CloseHandle(handle) };
+            return Err(error);
+        }
+        let waited = started.elapsed();
+        if waited >= LOCK_WAIT {
+            // SAFETY: our handle.
+            unsafe { CloseHandle(handle) };
+            tracing::warn!(
+                path = %lock_path.display(),
+                waited_ms = waited.as_millis(),
+                "gave up waiting for the publisher holding the cache lock",
+            );
+            return Ok(PublishLock::TimedOut);
+        }
+        // Said once, before the first retry: a holder that is merely slow (a
+        // large image, a scanner reading it) is then visible in the log, rather
+        // than a boot that looks stuck, and the line is there ahead of the give
+        // up line for a holder that is gone.
+        if !said {
+            said = true;
+            tracing::warn!(
+                path = %lock_path.display(),
+                waited_ms = waited.as_millis(),
+                wait_ms = LOCK_WAIT.as_millis(),
+                "another publisher holds the cache lock; waiting for it",
+            );
+        }
+        std::thread::sleep(LOCK_RETRY);
     }
-    Ok(PublishLock(handle))
+}
+
+/// Publishes without the publishers' lock, which is safe only where nothing is
+/// written: the image is checked by reading it back, and an image that already
+/// holds `bytes` is left alone.
+///
+/// A cache hit publishes no sidecar either. The sidecar records the image's
+/// length and last-write time taken from whatever is at the path when it is
+/// written, so one written beside a holder's rename could describe the
+/// holder's image with this digest — and the boot after that would trust it.
+/// Left unwritten, the next boot reads the image back instead, which is what
+/// this path has just done, and the sidecar is backfilled by a publisher that
+/// holds the lock.
+///
+/// An image that has to be replaced needs the lock: the sidecar's removal, the
+/// rename and the sidecar's write are ordered by it, and interleaving them with
+/// a holder that may wake up mid-sequence is how a sidecar ends up describing
+/// an image that is not on disk. So that publish is reported — an error naming
+/// the file, which the load path carries into the boot's failure — instead of
+/// raced.
+#[cfg(windows)]
+fn publish_without_lock(path: &Path, staging: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let _ = std::fs::remove_file(staging);
+    if std::fs::read(path).is_ok_and(|existing| existing == bytes) {
+        tracing::info!(
+            path = %path.display(),
+            "the image is already published; the sidecar is left to the lock holder",
+        );
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        format!(
+            "another publisher held the lock on {} for more than {} ms",
+            path.display(),
+            LOCK_WAIT.as_millis()
+        ),
+    ))
 }
 
 /// Writes `bytes` to `path` unless it is already there, using a staging file
@@ -219,7 +323,14 @@ pub fn write_if_changed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     // critical section: written outside it, its sidecar could describe an
     // image another publisher replaced meanwhile.
     #[cfg(windows)]
-    let _lock = publish_lock(path)?;
+    let lock = publish_lock(path)?;
+    // A holder that kept the lock past `LOCK_WAIT` is not waited for any
+    // longer: the image is verified by reading it back, and nothing is
+    // written beside it (see `publish_without_lock`).
+    #[cfg(windows)]
+    if matches!(lock, PublishLock::TimedOut) {
+        return publish_without_lock(path, &staging, bytes);
+    }
     if std::fs::read(path).is_ok_and(|existing| existing == bytes) {
         // Already there: keep it, and publish the sidecar for the next boot
         // (a failure there only costs the fallback read next time).
@@ -451,7 +562,8 @@ mod tests {
 
     /// A cache from before sidecars: its sidecar is backfilled under the
     /// publishers' lock, so it cannot land over an image another publisher
-    /// replaced meanwhile. Held here, a publisher waits for the lock.
+    /// replaced meanwhile. Held here for part of the wait, a publisher
+    /// retries and then has the lock.
     #[cfg(windows)]
     #[test]
     fn a_legacy_sidecar_backfill_waits_for_the_publishers_lock() {
@@ -461,9 +573,16 @@ mod tests {
         // A legacy cache: the image is there, the sidecar is not.
         std::fs::write(&path, &bytes).unwrap();
         let held = publish_lock(&path).unwrap();
+        assert!(
+            matches!(held, PublishLock::Held(_)),
+            "the lock was free for the test to take"
+        );
         let (p, b) = (path.clone(), bytes.clone());
         let published = std::thread::spawn(move || write_if_changed(&p, &b));
-        std::thread::sleep(std::time::Duration::from_millis(250));
+        // Held for part of the publisher's wait, so it is still retrying here
+        // and the backfill below happens under the lock rather than after a
+        // give-up.
+        std::thread::sleep(LOCK_WAIT / 2);
         assert!(
             !sidecar(&path).exists(),
             "the sidecar was published outside the publishers' lock"
@@ -473,6 +592,106 @@ mod tests {
         let side = read_sidecar(&path).expect("the backfill wrote a sidecar");
         assert_eq!(side.digest, *blake3::hash(&bytes).as_bytes());
         assert_eq!(side.written_nanos, image_stamp(&path).unwrap().1);
+    }
+
+    /// Runs `attempt` on its own thread and hands back what it produced,
+    /// failing the test if it has not returned within a generous ceiling. An
+    /// attempt that regressed to waiting for a lock it cannot have must fail
+    /// this suite, not hang it; the thread that is stuck is left to the test
+    /// process, which ends the suite.
+    #[cfg(windows)]
+    fn within_ceiling<T: Send + 'static>(
+        what: &str,
+        attempt: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        const CEILING: std::time::Duration = std::time::Duration::from_secs(5);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(attempt());
+        });
+        receiver.recv_timeout(CEILING).unwrap_or_else(|_| {
+            panic!("{what} did not return within {CEILING:?}: it blocked instead of giving up")
+        })
+    }
+
+    /// A lock this process already holds is retried and given up on, not
+    /// waited for forever: a holder that is suspended or hung (a debugger, a
+    /// stopped process) would otherwise stall the boot silently, with nothing
+    /// in the log to say which file it was. Measured, and run behind
+    /// `within_ceiling`, so a regression to a blocking `LockFileEx` fails here
+    /// instead of hanging the suite.
+    #[cfg(windows)]
+    #[test]
+    fn a_lock_held_past_the_wait_gives_up_instead_of_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.bin");
+        let held = publish_lock(&path).unwrap();
+        assert!(matches!(held, PublishLock::Held(_)), "the lock was free");
+        let waiting = path.clone();
+        let (elapsed, gave_up) = within_ceiling("a second attempt at the lock", move || {
+            let started = std::time::Instant::now();
+            let outcome = publish_lock(&waiting).expect("a lock held elsewhere is not an error");
+            let gave_up = matches!(outcome, PublishLock::TimedOut);
+            (started.elapsed(), gave_up)
+        });
+        // Released even though the attempt gave up, so the file is free for the
+        // next test that wants it.
+        drop(held);
+        assert!(gave_up, "the attempt reported that it did not get the lock");
+        assert!(
+            elapsed >= LOCK_WAIT,
+            "it retried for its whole bound before giving up: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "and gave up within a few hundred milliseconds: {elapsed:?}"
+        );
+    }
+
+    /// A publish that cannot have the lock within the wait does not block
+    /// either: it verifies the image by reading it back. So a cache hit still
+    /// succeeds, and writes nothing beside the image (a sidecar stamped here
+    /// could describe the holder's image), while an image that would have to be
+    /// replaced — which needs the lock for the sidecar ordering — is reported.
+    #[cfg(windows)]
+    #[test]
+    fn a_publish_that_waits_out_the_lock_verifies_the_image_instead() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.bin");
+        let there = vec![0x66u8; 1 << 16];
+        std::fs::write(&path, &there).unwrap();
+        let held = publish_lock(&path).unwrap();
+        assert!(matches!(held, PublishLock::Held(_)), "the lock was free");
+        // The bytes asked for are already the image: read back and left alone.
+        let (p, b) = (path.clone(), there.clone());
+        let hit = within_ceiling("a publish of the image already there", move || {
+            write_if_changed(&p, &b)
+        });
+        assert!(hit.is_ok(), "the image is already there: {hit:?}");
+        assert!(
+            !sidecar(&path).exists(),
+            "no sidecar is published without the publishers' lock"
+        );
+        // Different bytes: this publish would have to replace the image, which
+        // needs the lock, so it is reported instead of raced.
+        let (p, b) = (path.clone(), vec![0x77u8; 1 << 16]);
+        let stopped = within_ceiling("a publish that has to replace the image", move || {
+            write_if_changed(&p, &b)
+        });
+        drop(held);
+        let error = stopped.expect_err("a publish that cannot replace the image is reported");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock, "{error}");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            there,
+            "the image was not replaced beside a holder this publish cannot see"
+        );
+        let staging: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(staging.is_empty(), "no staging file survives: {staging:?}");
     }
 
     /// A sidecar another process holds without delete sharing cannot be
