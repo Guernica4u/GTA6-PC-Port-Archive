@@ -173,7 +173,7 @@ pub extern "system" fn XMemVirtualAlloc(
             );
         }
     }
-    if !at.is_null() && kind & MEM_COMMIT != 0 && kind & MEM_WRITE_WATCH != 0 {
+    if !at.is_null() && kind & MEM_RESERVE != 0 && kind & MEM_WRITE_WATCH != 0 {
         touch_diag::track(at as usize, size);
     }
     if base.is_null() {
@@ -1670,6 +1670,7 @@ pub mod low_guards {
 mod touch_diag {
     use std::collections::BTreeMap;
     use std::ffi::c_void;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{LazyLock, Mutex, Once};
     use std::time::Duration;
 
@@ -1684,7 +1685,8 @@ mod touch_diag {
     const REPORT_INTERVAL: Duration = Duration::from_secs(30);
     const PAGE_BYTES: usize = 4096;
 
-    static TRACKED: LazyLock<Mutex<BTreeMap<usize, usize>>> =
+    static NEXT_GEN: AtomicU64 = AtomicU64::new(1);
+    static TRACKED: LazyLock<Mutex<BTreeMap<usize, (usize, u64)>>> =
         LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
     fn enabled_for(val: Option<&str>) -> bool {
@@ -1705,10 +1707,11 @@ mod touch_diag {
         if !enabled() || base == 0 || len == 0 {
             return;
         }
+        let epoch = NEXT_GEN.fetch_add(1, Ordering::Relaxed);
         TRACKED
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(base, len);
+            .insert(base, (len, epoch));
         static SPAWN: Once = Once::new();
         SPAWN.call_once(|| {
             let _ = std::thread::Builder::new()
@@ -1725,74 +1728,93 @@ mod touch_diag {
         untouched_bytes: usize,
     }
 
-    /// Inspects one write-watched committed region without resetting watch bits.
-    /// Returns `None` if the region has been freed or decommitted.
+    /// Inspects one write-watched allocation across all consecutive subregions
+    /// (handling `VirtualProtect` splits and partial `MEM_DECOMMIT`) without
+    /// resetting watch bits. Returns `None` once the reservation is released or
+    /// replaced by a non-write-watched mapping.
     fn inspect_region(base: usize, len: usize) -> Option<(usize, usize)> {
-        let mut mbi = MEMORY_BASIC_INFORMATION::default();
-        // SAFETY: querying current process VA metadata only.
-        let queried = unsafe {
-            VirtualQueryEx(
-                GetCurrentProcess(),
-                base as *const c_void,
-                &mut mbi,
-                size_of::<MEMORY_BASIC_INFORMATION>(),
-            )
-        };
-        if queried == 0 || mbi.State != MEM_COMMIT || mbi.AllocationBase as usize != base {
-            return None;
+        let end = base.saturating_add(len);
+        let mut cursor = base;
+        let mut live = false;
+        let mut total_committed = 0usize;
+        let mut total_touched = 0usize;
+        let mut addrs: Vec<*mut c_void> = Vec::new();
+
+        while cursor < end {
+            let mut mbi = MEMORY_BASIC_INFORMATION::default();
+            // SAFETY: querying current process VA metadata only.
+            let queried = unsafe {
+                VirtualQueryEx(
+                    GetCurrentProcess(),
+                    cursor as *const c_void,
+                    &mut mbi,
+                    size_of::<MEMORY_BASIC_INFORMATION>(),
+                )
+            };
+            if queried == 0 || mbi.RegionSize == 0 || mbi.AllocationBase as usize != base {
+                break;
+            }
+            live = true;
+            let seg_end = cursor.saturating_add(mbi.RegionSize).min(end);
+            let seg_len = seg_end.saturating_sub(cursor);
+            if mbi.State == MEM_COMMIT && seg_len > 0 {
+                let max_pages = seg_len.div_ceil(PAGE_BYTES).max(1);
+                if addrs.len() < max_pages {
+                    addrs.resize(max_pages, std::ptr::null_mut());
+                }
+                let mut count = max_pages;
+                let mut granularity = 0u32;
+                // Flag 0 = non-destructive query (does not reset write-watch bits).
+                // SAFETY: `cursor..seg_end` is a live committed write-watched subregion.
+                let rc = unsafe {
+                    GetWriteWatch(
+                        0,
+                        cursor as *const c_void,
+                        seg_len,
+                        addrs.as_mut_ptr(),
+                        &mut count,
+                        &mut granularity,
+                    )
+                };
+                if rc != 0 {
+                    return None;
+                }
+                let page = (granularity as usize).max(PAGE_BYTES);
+                total_committed = total_committed.saturating_add(seg_len);
+                total_touched = total_touched.saturating_add(count.saturating_mul(page).min(seg_len));
+            }
+            cursor = seg_end;
         }
-        let committed = mbi.RegionSize.min(len);
-        if committed == 0 {
-            return None;
-        }
-        let max_pages = committed.div_ceil(PAGE_BYTES).max(1);
-        let mut addrs = vec![std::ptr::null_mut::<c_void>(); max_pages];
-        let mut count = max_pages;
-        let mut granularity = 0u32;
-        // Flag 0 = non-destructive query (does not reset write-watch bits).
-        // SAFETY: `base..base+committed` is a live committed write-watched region.
-        let rc = unsafe {
-            GetWriteWatch(
-                0,
-                base as *const c_void,
-                committed,
-                addrs.as_mut_ptr(),
-                &mut count,
-                &mut granularity,
-            )
-        };
-        if rc != 0 {
-            return None;
-        }
-        let page = (granularity as usize).max(PAGE_BYTES);
-        let touched = count.saturating_mul(page).min(committed);
-        Some((committed, touched))
+
+        live.then_some((total_committed, total_touched))
     }
 
-    fn snapshot_map(tracked: &Mutex<BTreeMap<usize, usize>>) -> TouchSummary {
-        let entries: Vec<(usize, usize)> = tracked
+    fn snapshot_map(tracked: &Mutex<BTreeMap<usize, (usize, u64)>>) -> TouchSummary {
+        let entries: Vec<(usize, usize, u64)> = tracked
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .map(|(&b, &l)| (b, l))
+            .map(|(&b, &(l, epoch))| (b, l, epoch))
             .collect();
         let mut summary = TouchSummary::default();
         let mut stale = Vec::new();
-        for (base, len) in entries {
+        for (base, len, epoch) in entries {
             match inspect_region(base, len) {
                 Some((committed, touched)) => {
                     summary.regions += 1;
                     summary.committed_bytes = summary.committed_bytes.saturating_add(committed);
                     summary.touched_bytes = summary.touched_bytes.saturating_add(touched);
                 }
-                None => stale.push(base),
+                None => stale.push((base, epoch)),
             }
         }
         summary.untouched_bytes = summary.committed_bytes.saturating_sub(summary.touched_bytes);
         if !stale.is_empty() {
             let mut g = tracked.lock().unwrap_or_else(|e| e.into_inner());
-            for base in stale {
-                g.remove(&base);
+            for (base, epoch) in stale {
+                if g.get(&base).is_some_and(|&(_, cur_epoch)| cur_epoch == epoch) {
+                    g.remove(&base);
+                }
             }
         }
         summary
@@ -1842,7 +1864,8 @@ mod touch_diag {
     mod tests {
         use super::*;
         use windows_sys::Win32::System::Memory::{
-            MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+            MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect,
         };
 
         #[test]
@@ -1868,7 +1891,7 @@ mod touch_diag {
             } as usize;
             assert_ne!(base, 0);
 
-            let map = Mutex::new(BTreeMap::from([(base, LEN)]));
+            let map = Mutex::new(BTreeMap::from([(base, (LEN, 1))]));
             let before = snapshot_map(&map);
             assert_eq!(before.regions, 1);
             assert_eq!(before.committed_bytes, LEN);
@@ -1891,6 +1914,111 @@ mod touch_diag {
             assert_eq!(after2, after1);
 
             // Freeing the block prunes it cleanly on the next snapshot.
+            // SAFETY: ours.
+            assert_ne!(unsafe { VirtualFree(base as *mut c_void, 0, MEM_RELEASE) }, 0);
+            let freed = snapshot_map(&map);
+            assert_eq!(freed.regions, 0);
+            assert!(map.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn snapshot_walks_virtual_protect_splits_and_leading_decommit() {
+            const LEN: usize = 16 * PAGE_BYTES;
+            // SAFETY: fresh write-watched allocation for test.
+            let base = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    LEN,
+                    MEM_RESERVE | MEM_COMMIT | super::super::MEM_WRITE_WATCH,
+                    PAGE_READWRITE,
+                )
+            } as usize;
+            assert_ne!(base, 0);
+
+            // Touch page 0 and page 10.
+            // SAFETY: inside our committed LEN-byte allocation.
+            unsafe {
+                std::ptr::write_volatile(base as *mut u8, 1);
+                std::ptr::write_volatile((base + 10 * PAGE_BYTES) as *mut u8, 2);
+            }
+
+            // Split the allocation into 3 subregions via VirtualProtect on pages 4..8.
+            let mut old = 0u32;
+            assert_ne!(
+                // SAFETY: valid subregion inside our allocation.
+                unsafe {
+                    VirtualProtect(
+                        (base + 4 * PAGE_BYTES) as *const c_void,
+                        4 * PAGE_BYTES,
+                        PAGE_READONLY,
+                        &mut old,
+                    )
+                },
+                0
+            );
+
+            let map = Mutex::new(BTreeMap::from([(base, (LEN, 1))]));
+            let split = snapshot_map(&map);
+            assert_eq!(split.regions, 1);
+            assert_eq!(split.committed_bytes, LEN);
+            assert_eq!(split.touched_bytes, 2 * PAGE_BYTES);
+
+            // Decommit the leading 4 pages; the remaining 12 pages stay live and counted.
+            assert_ne!(
+                // SAFETY: valid subregion inside our allocation.
+                unsafe { VirtualFree(base as *mut c_void, 4 * PAGE_BYTES, MEM_DECOMMIT) },
+                0
+            );
+            let partial = snapshot_map(&map);
+            assert_eq!(partial.regions, 1);
+            assert_eq!(partial.committed_bytes, 12 * PAGE_BYTES);
+            assert_eq!(partial.touched_bytes, PAGE_BYTES);
+            assert!(!map.lock().unwrap().is_empty());
+
+            // SAFETY: ours.
+            assert_ne!(unsafe { VirtualFree(base as *mut c_void, 0, MEM_RELEASE) }, 0);
+        }
+
+        #[test]
+        fn snapshot_keeps_reserved_write_watch_arena_until_committed() {
+            const LEN: usize = 8 * PAGE_BYTES;
+            // SAFETY: fresh reserved-only write-watched arena for test.
+            let base = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    LEN,
+                    MEM_RESERVE | super::super::MEM_WRITE_WATCH,
+                    PAGE_READWRITE,
+                )
+            } as usize;
+            assert_ne!(base, 0);
+
+            let map = Mutex::new(BTreeMap::from([(base, (LEN, 1))]));
+            let reserved = snapshot_map(&map);
+            assert_eq!(reserved.regions, 1);
+            assert_eq!(reserved.committed_bytes, 0);
+            assert_eq!(reserved.touched_bytes, 0);
+            assert!(!map.lock().unwrap().is_empty());
+
+            // Commit the upper half and touch 1 page.
+            // SAFETY: inside our reserved arena.
+            let committed = unsafe {
+                VirtualAlloc(
+                    (base + 4 * PAGE_BYTES) as *const c_void,
+                    4 * PAGE_BYTES,
+                    MEM_COMMIT,
+                    PAGE_READWRITE,
+                )
+            };
+            assert!(!committed.is_null());
+            // SAFETY: inside the newly committed half.
+            unsafe { std::ptr::write_volatile((base + 5 * PAGE_BYTES) as *mut u8, 7) };
+
+            let after = snapshot_map(&map);
+            assert_eq!(after.regions, 1);
+            assert_eq!(after.committed_bytes, 4 * PAGE_BYTES);
+            assert_eq!(after.touched_bytes, PAGE_BYTES);
+
             // SAFETY: ours.
             assert_ne!(unsafe { VirtualFree(base as *mut c_void, 0, MEM_RELEASE) }, 0);
             let freed = snapshot_map(&map);
