@@ -4,7 +4,7 @@ use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::{ID3D12Device, ID3D12Resource};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Kind {
     TextureHeap,
     SampledTexture,
@@ -13,10 +13,18 @@ pub(crate) enum Kind {
     SharedBuffer,
     MappedLocalBuffer,
     LocalUavBuffer,
+    UavPlacedConstants,
+    UavCopyAlias,
+    UavCopyIntermediate,
+    UavIndirectBudget,
+    UavIndirectScratch,
+    UavShadow,
+    UavSend,
+    UavTextureSupport,
 }
 
 impl Kind {
-    const ALL: [(Self, &'static str); 7] = [
+    const ALL: [(Self, &'static str); 15] = [
         (Self::TextureHeap, "texture_heap"),
         (Self::SampledTexture, "sampled_texture"),
         (Self::WritableTexture, "writable_texture"),
@@ -24,6 +32,14 @@ impl Kind {
         (Self::SharedBuffer, "shared_buffer"),
         (Self::MappedLocalBuffer, "mapped_local_buffer"),
         (Self::LocalUavBuffer, "local_uav_buffer"),
+        (Self::UavPlacedConstants, "local_uav_placed_constants"),
+        (Self::UavCopyAlias, "local_uav_copy_alias"),
+        (Self::UavCopyIntermediate, "local_uav_copy_intermediate"),
+        (Self::UavIndirectBudget, "local_uav_indirect_budget"),
+        (Self::UavIndirectScratch, "local_uav_indirect_scratch"),
+        (Self::UavShadow, "local_uav_shadow"),
+        (Self::UavSend, "local_uav_send"),
+        (Self::UavTextureSupport, "local_uav_texture_support"),
     ];
 }
 
@@ -50,6 +66,8 @@ impl Allocation {
 pub(super) enum Step {
     MakeResident,
     WaitForMapping,
+    Enqueue,
+    WaitForFence,
 }
 
 #[derive(Clone, Copy)]
@@ -65,8 +83,8 @@ impl Counts {
     const EMPTY: Self = Self { calls: 0, errors: 0, bytes: 0, elapsed_us: 0, max_us: 0 };
 }
 
-const EMPTY: [[Counts; 2]; Kind::ALL.len()] = [[Counts::EMPTY; 2]; Kind::ALL.len()];
-static COUNTS: Mutex<[[Counts; 2]; Kind::ALL.len()]> = Mutex::new(EMPTY);
+const EMPTY: [[Counts; 4]; Kind::ALL.len()] = [[Counts::EMPTY; 4]; Kind::ALL.len()];
+static COUNTS: Mutex<[[Counts; 4]; Kind::ALL.len()]> = Mutex::new(EMPTY);
 
 fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -104,8 +122,8 @@ pub(super) fn report(memory: Option<[u64; 4]>) {
         );
     }
     for (kind, domain) in Kind::ALL {
-        let [resident, mapped] = counts[kind as usize];
-        if resident.calls + mapped.calls == 0 {
+        let [resident, mapped, enqueued, waited] = counts[kind as usize];
+        if resident.calls + mapped.calls + enqueued.calls + waited.calls == 0 {
             continue;
         }
         tracing::info!(
@@ -122,6 +140,16 @@ pub(super) fn report(memory: Option<[u64; 4]>) {
             mapped_bytes = mapped.bytes,
             mapped_us = mapped.elapsed_us,
             mapped_max_us = mapped.max_us,
+            enqueue_calls = enqueued.calls,
+            enqueue_errors = enqueued.errors,
+            enqueue_bytes = enqueued.bytes,
+            enqueue_us = enqueued.elapsed_us,
+            enqueue_max_us = enqueued.max_us,
+            paging_wait_calls = waited.calls,
+            paging_wait_errors = waited.errors,
+            paging_wait_bytes = waited.bytes,
+            paging_wait_us = waited.elapsed_us,
+            paging_wait_max_us = waited.max_us,
             "GPU residency sample"
         );
     }

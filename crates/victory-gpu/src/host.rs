@@ -59,6 +59,7 @@ pub(crate) struct Host {
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
     adapter: Option<IDXGIAdapter3>,
+    uav_residency: OnceLock<Option<uav_residency::Queue>>,
     /// 1-descriptor shader-visible fallback heaps bound when a command list
     /// omits a view or sampler heap while using directly-indexed root signatures.
     fallback_view: OnceLock<Option<ID3D12DescriptorHeap>>,
@@ -1147,6 +1148,7 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
             adapter,
+            uav_residency: OnceLock::new(),
             fallback_view: OnceLock::new(),
             fallback_sampler: OnceLock::new(),
         })
@@ -4431,6 +4433,7 @@ pub(crate) mod awake;
 mod card_steps;
 pub(crate) mod indirects;
 pub(crate) mod memory_samples;
+mod uav_residency;
 mod font;
 mod menu;
 mod panel;
@@ -5063,7 +5066,7 @@ impl Host {
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
         for shadow in declared.iter().map(|d| &d.0).chain(looked.iter().map(|l| &l.0)) {
             if shadow.card_make_before(|size| {
-                let before = self.uav_buffer(crate::shadow::card_hash_bytes(size))?;
+                let before = self.uav_buffer_for(crate::shadow::card_hash_bytes(size), Kind::UavShadow)?;
                 name(&before, || "title buffer on the card, hashes of its pieces".into());
                 Some(before)
             }) {
@@ -8509,7 +8512,7 @@ impl HostList {
             return None;
         }
         self.list.cast::<ID3D12GraphicsCommandList2>().ok()?;
-        let buffer = host()?.uav_buffer(256)?;
+        let buffer = host()?.uav_buffer_for(256, Kind::UavIndirectBudget)?;
         name(&buffer, || "indirect budget".to_owned());
         Some(buffer)
     }
@@ -8590,7 +8593,7 @@ impl HostList {
             .saturating_mul(2)
             .max(needed)
             .next_multiple_of(64 << 10);
-        let buffer = host()?.uav_buffer(alloc)?;
+        let buffer = host()?.uav_buffer_for(alloc, Kind::UavIndirectScratch)?;
         name(&buffer, || format!("indirect arguments {alloc:#x}"));
         let old = slot.replace((buffer.clone(), alloc));
         drop(slot);
@@ -8612,7 +8615,7 @@ impl HostList {
         let (buffer, i) = ((args.1 / BATCHES) as usize, args.1 % BATCHES);
         if buffer == args.0.len() {
             let size = u64::from(BATCHES * JOBS * SLOT);
-            let made = host()?.uav_buffer(size)?;
+            let made = host()?.uav_buffer_for(size, Kind::UavIndirectScratch)?;
             name(&made, || format!("indirect batches {size:#x}"));
             args.0.push(made);
         }
@@ -11756,6 +11759,10 @@ impl Host {
     /// A device-local buffer shaders may write (unordered access) and indirect
     /// execution may read, starting in the common state.
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        self.uav_buffer_for(size, Kind::LocalUavBuffer)
+    }
+
+    pub(crate) fn uav_buffer_for(&self, size: u64, kind: Kind) -> Option<ID3D12Resource> {
         MADE[4].fetch_add(1, Ordering::Relaxed);
         MADE[5].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -11792,9 +11799,18 @@ impl Host {
         if let Some(b) = &buffer {
             crate::book::made(b, || "an unordered access buffer".into());
         }
-        let allocation = Allocation(Kind::LocalUavBuffer, desc.Width);
+        let allocation = Allocation(kind, desc.Width);
         let made = made.and_then(|()| match buffer.as_ref() {
-            Some(buffer) => resident_and_mapped(&self.device, buffer, allocation),
+            Some(buffer) => {
+                if wait_resident()
+                    && kind != Kind::UavTextureSupport
+                    && uav_residency::enabled()
+                    && let Some(queue) = uav_residency::Queue::get(&self.uav_residency, &self.device)?
+                {
+                    return queue.make_resident(buffer, allocation);
+                }
+                resident_and_mapped(&self.device, buffer, allocation)
+            }
             None => mapped(&self.device, allocation),
         });
         match made {

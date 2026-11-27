@@ -283,7 +283,7 @@ fn vram_buffer(host: &Host, size: u64) -> Option<VramBuffer> {
         }
     }
     let size = size.max(8 << 20).next_power_of_two();
-    let buffer = host.uav_buffer(size)?;
+    let buffer = host.uav_buffer_for(size, Kind::UavSend)?;
     name(&buffer, || "bytes a submission scatters on the card".into());
     Some(VramBuffer { buffer, size })
 }

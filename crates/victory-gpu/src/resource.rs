@@ -537,7 +537,7 @@ fn twin_texture(
                 Some(&mut bytes),
             );
         }
-        let Some(buffer) = host.uav_buffer(bytes) else {
+        let Some(buffer) = host.uav_buffer_for(bytes, Kind::UavTextureSupport) else {
             TWINS[1].fetch_add(1, Relaxed);
             return None;
         };

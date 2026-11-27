@@ -286,7 +286,7 @@ impl HostList {
                 from.refresh(self, src as u64, len as u64);
                 let offset = from.offset(src as u64);
                 if from.buffer.as_raw() == to.buffer.as_raw() {
-                    let Some(between) = self.between(host, len as u64) else {
+                    let Some(between) = self.between(host, len as u64, Kind::UavCopyAlias) else {
                         return false;
                     };
                     unsafe {
@@ -332,7 +332,7 @@ impl HostList {
         }
         let host = host()?;
         let from = shaders_own(src, len)?;
-        let between = self.between(host, len as u64)?;
+        let between = self.between(host, len as u64, Kind::UavTextureSupport)?;
         from.refresh(self, src as u64, len as u64);
         STATS[3].fetch_add(1, Ordering::Relaxed);
         // SAFETY: an open list; live buffers, ranges inside them.
@@ -379,7 +379,7 @@ impl HostList {
         let held = self.deferred().constants.clone();
         let (buffer, at, fresh) = match held {
             Some((buffer, used)) if used + size <= CONSTANTS_ROOM => (buffer, used, false),
-            _ => (self.between(host, CONSTANTS_ROOM)?, 0, true),
+            _ => (self.between(host, CONSTANTS_ROOM, Kind::UavPlacedConstants)?, 0, true),
         };
         from.refresh(self, src as u64, len as u64);
         // SAFETY: an open list; live buffers (the list keeps both), ranges
@@ -419,8 +419,8 @@ impl HostList {
     }
 
     /// A buffer on the card for this recording alone.
-    fn between(&self, host: &Host, len: u64) -> Option<ID3D12Resource> {
-        let buffer = host.uav_buffer(len.next_multiple_of(1 << 16))?;
+    fn between(&self, host: &Host, len: u64, kind: Kind) -> Option<ID3D12Resource> {
+        let buffer = host.uav_buffer_for(len.next_multiple_of(1 << 16), kind)?;
         name(&buffer, || "bytes between copies".into());
         self.keep(&buffer);
         Some(buffer)

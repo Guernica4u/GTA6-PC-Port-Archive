@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
+use crate::host::memory_samples::Kind;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
@@ -524,7 +525,7 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
         return None;
     }
-    let buffer = host.uav_buffer(size);
+    let buffer = host.uav_buffer_for(size, Kind::UavShadow);
     if buffer.is_none() {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
     }
@@ -669,7 +670,7 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
         return None;
     }
-    let buffer = host.uav_buffer(size);
+    let buffer = host.uav_buffer_for(size, Kind::UavShadow);
     if buffer.is_none() {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
     }
@@ -6417,7 +6418,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
     let (staging, data) = host.shared_buffer_cpu(len)?;
     let on_card = if room && USED.fetch_add(len, Ordering::Relaxed) + len <= most {
-        host.uav_buffer(len)
+        host.uav_buffer_for(len, Kind::UavShadow)
     } else {
         None
     };

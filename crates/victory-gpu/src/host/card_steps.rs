@@ -957,7 +957,7 @@ impl Host {
             own.list.reset();
             return Some(own);
         }
-        let between = self.uav_buffer(BETWEEN)?;
+        let between = self.uav_buffer_for(BETWEEN, Kind::UavCopyIntermediate)?;
         name(&between, || "copies of title memory on the card".into());
         let list = self.new_list().ok()?;
         Some(Own { list, between })

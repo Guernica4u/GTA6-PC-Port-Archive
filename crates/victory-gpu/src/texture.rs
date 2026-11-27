@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
+use crate::host::memory_samples::Kind;
 use crate::host::{HostList, host};
 use crate::object::This;
 
@@ -247,7 +248,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                 if bytes[0] == 0 || bytes[0] != bytes[1] || !alike {
                     return false;
                 }
-                let Some(buffer) = host.uav_buffer(bytes[0]) else {
+                let Some(buffer) = host.uav_buffer_for(bytes[0], Kind::UavTextureSupport) else {
                     return false;
                 };
                 crate::host::name(&buffer, || {
