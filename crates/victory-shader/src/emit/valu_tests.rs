@@ -73,6 +73,10 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
 }
 
 fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
+    try_build_valu_cs_in_wave(body, false)
+}
+
+fn try_build_valu_cs_in_wave(body: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderError> {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -89,7 +93,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: false,
+        wave64,
         vgprs: 16,
         layout: vec![
             RootParam {
@@ -239,9 +243,49 @@ fn read_fp_round_mode_field_after_each_setting() {
                 panic!("S_GETREG_B32 MODE {offset}:{width} with rounding {mode}: {error}");
             });
             run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
-                assert_eq!(got, expected, "{backend} MODE {offset}:{width} with rounding {mode}");
+                assert_eq!(
+                    got, expected,
+                    "{backend} MODE {offset}:{width} with rounding {mode}"
+                );
             });
         }
+    }
+}
+
+#[test]
+fn read_fp_round_mode_written_inside_a_whole_wave_section() {
+    let shader = build_valu_cs(&[
+        0xBE8D_3DC1,            // s_or_saveexec_b32 s13, -1
+        0xBFA4_000C,            // s_round_mode: binary16 and binary64 toward zero
+        s_mov_b32(ir::EXEC, 13), // restore exec_lo
+        0xB90C_0881,            // s_getreg_b32 s12, hwreg(MODE, 2, 2)
+        vop1(0x001, 0, sgpr(12)),
+    ]);
+    run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+        assert_eq!(got, 3, "{backend}");
+    });
+}
+
+#[test]
+fn read_fp_round_mode_cannot_write_architectural_masks() {
+    for (dst, wave64) in [
+        (ir::EXEC, false),
+        (ir::EXEC + 1, true),
+        (ir::VCC, false),
+        (ir::VCC + 1, true),
+    ] {
+        let error = try_build_valu_cs_in_wave(&[0xB900_0881 | u32::from(dst) << 16], wave64)
+            .expect_err("a MODE read into EXEC or VCC must be refused");
+        assert!(
+            matches!(
+                error,
+                crate::ShaderError::Unsupported {
+                    what: "a hardware register read into EXEC or VCC",
+                    ..
+                }
+            ),
+            "{dst}: {error:?}"
+        );
     }
 }
 

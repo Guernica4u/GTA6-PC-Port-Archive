@@ -15,7 +15,7 @@ use super::shader::{Shader, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_ST
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
-use crate::ir::{Block, EXEC, Exit, Inst, Phi, Program, Reg, Value};
+use crate::ir::{Block, EXEC, Exit, Inst, Phi, Program, Reg, VCC, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER_DATA};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
@@ -90,6 +90,19 @@ enum Stop {
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    // A numeric MODE read cannot supply the per-lane masks used by EXEC
+    // and VCC branches, including inside whole-wave sections.
+    if let Some(inst) = parts.p.blocks.iter().flat_map(|b| &b.insts).find(|inst| {
+        inst.name() == "s_getreg_b32"
+            && inst.writes.iter().any(|&(r, _)| {
+                matches!(r, Reg::S(c) if matches!(c, EXEC | VCC) || c == EXEC + 1 || c == VCC + 1)
+            })
+    }) {
+        return Err(ShaderError::Unsupported {
+            offset: inst.machine.offset,
+            what: "a hardware register read into EXEC or VCC",
+        });
+    }
     let mut bad = HashMap::new();
     loop {
         match Lower::new(parts, &bad).run() {
@@ -1346,6 +1359,7 @@ impl<'a> Lower<'a> {
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
                         self.section_inst(b, j, i);
+                        self.mode16 = round16_after(&p.blocks[b].insts[j], self.mode16);
                     }
                     i = end;
                     continue;
@@ -3375,8 +3389,12 @@ impl<'a> Lower<'a> {
             return Err(LANE_MASK);
         }
         if name == "s_getreg_b32" {
+            if lo.is_some_and(|v| self.x.st.highs.contains_key(&v)) {
+                return Err(LANE_MASK);
+            }
             let selector = imm.ok_or("a missing hardware register selector")?;
-            let (register, offset, width) = (selector & 63, selector >> 6 & 31, (selector >> 11) + 1);
+            let (register, offset, width) =
+                (selector & 63, selector >> 6 & 31, (selector >> 11) + 1);
             // MODE[3:2] holds the FP16/FP64 rounding state tracked during lowering.
             if register != 1 || offset < 2 || offset + width > 4 {
                 return Err("an unmodeled hardware register field");
