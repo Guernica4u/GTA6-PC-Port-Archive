@@ -9642,6 +9642,7 @@ impl Meter {
                     per_frame(6) / 1e3
                 );
             }
+            crate::copystat_footprint::log();
             let [raw_srv, raw_uav] = crate::descriptor::host::raw_view_counts();
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \

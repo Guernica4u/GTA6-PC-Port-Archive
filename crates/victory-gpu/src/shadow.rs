@@ -3828,6 +3828,12 @@ impl Shadow {
                 let (lo, hi) = ((stale[i] * PAGE).max(a), ((stale[i] + 1) * PAGE).min(e));
                 MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
                 MERGED[2].fetch_add(runs.iter().map(|r| r.1 as u64).sum(), Ordering::Relaxed);
+                crate::copystat_footprint::pending_wrote(
+                    self.id,
+                    self.start,
+                    self.len,
+                    runs.iter().map(|&(r, m)| (lo - start + r, lo - start + r + m)),
+                );
                 self.card_changed_runs(runs.into_iter().map(|(r, m)| (lo - start + r, lo - start + r + m)));
                 // Taken, if the range holds all of the page that is in the
                 // copy; else the rest of it is the refresh's, which notes
@@ -4244,6 +4250,7 @@ impl Shadow {
                         ECHO[0].fetch_add((next - at) as u64, Ordering::Relaxed);
                     } else {
                         ECHO[1].fetch_add((next - at) as u64, Ordering::Relaxed);
+                        crate::copystat_footprint::cpu_wrote(self.id, self.start, self.len, at - start, next - start);
                         held.copy_from_slice(title);
                         self.changed(at - start, next - start);
                         self.card_changed(at - start, next - start);
@@ -4288,6 +4295,7 @@ impl Shadow {
                 for &(a, len) in &runs {
                     held[a..a + len].copy_from_slice(&title[a..a + len]);
                     self.changed(at - start + a, at - start + a + len);
+                    crate::copystat_footprint::cpu_wrote(self.id, self.start, self.len, at - start + a, at - start + a + len);
                 }
                 self.card_changed_runs(runs.iter().map(|&(a, len)| (at - start + a, at - start + a + len)));
                 if let Some(was) = was {
@@ -4324,6 +4332,7 @@ impl Shadow {
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
+        crate::copystat_footprint::cpu_wrote(self.id, self.start, self.len, from - start, to - start);
         to - from
     }
 
@@ -4747,6 +4756,7 @@ impl Shadow {
             self.walls_merged(hi - lo, merged as usize);
             if merged > 0 {
                 self.note_landing(lo, hi);
+                crate::copystat_footprint::gpu_wrote(self.id, self.start, self.len, lo, hi);
             }
             put += merged;
         }
@@ -4776,7 +4786,11 @@ impl Shadow {
         // keeps out what else writes them. Title memory that is not there
         // is looked at again when the next flight that declared the range
         // lands.
-        unsafe { crate::land::piece(self.start as usize + at, self.data.add(at), held.add(at), &[(0, n)], false, notes, self) }
+        let put = unsafe { crate::land::piece(self.start as usize + at, self.data.add(at), held.add(at), &[(0, n)], false, notes, self) };
+        if put > 0 {
+            crate::copystat_footprint::gpu_wrote(self.id, self.start, self.len, at, at + n);
+        }
+        put
     }
 
     /// What shaders wrote in 64 KiB block `block` (of title memory) of this
