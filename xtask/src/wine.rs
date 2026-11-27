@@ -160,13 +160,13 @@ pub fn run(root: &Path, o: Options) -> Result<()> {
         // The loader's two end-to-end tests (victory-loader's
         // tests/load_probe.rs) build their fixture by starting cargo from
         // inside the test process, which Wine cannot do. The prebuilt-fixture
-        // hook (VICTORY_HLE_PROBE) is in pr/hle-probe, not in this branch, so
+        // hook (VICTORY_HLE_PROBE) is in PR #3270, not in this branch, so
         // skip them until it is available. The skips are the test binaries'
         // options, so they go after `--`; cargo itself has no `--skip`.
         if std::env::var_os("VICTORY_HLE_PROBE").is_none() {
             eprintln!(
                 "skipping victory-loader's hle-probe tests: they need the \
-                 VICTORY_HLE_PROBE hook from pr/hle-probe (a fixture built on \
+                 VICTORY_HLE_PROBE hook from PR #3270 (a fixture built on \
                  the host); pass -- <cargo-test-args> to override"
             );
             test.args([
