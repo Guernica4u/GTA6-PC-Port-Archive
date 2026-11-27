@@ -434,6 +434,11 @@ pub(crate) fn sync_heaps() {
     let (mut pages, mut looked, mut mirrored, mut tabled, mut later) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let (mut views, mut bytes) = (0u64, 0u64);
     let mut spent = [0u64; 3];
+    // Calls to the kernel's write watch (`Tracked::take`), ns of those that found nothing,
+    // ns of those that found pages, calls that found nothing.
+    let mut ask = [0u64; 4];
+    // Ring pages, their bytes, changed records on them.
+    let mut ring = [0u64; 3];
     let since = |at: std::time::Instant| at.elapsed().as_nanos() as u64;
     let mut kinds = [0u64; 5];
     let mut short = 0u64;
@@ -474,7 +479,12 @@ pub(crate) fn sync_heaps() {
         let mut make: Vec<u32> = Vec::new();
         let began = std::time::Instant::now();
         let taken = written.take(start as usize, end as usize);
-        spent[0] += since(began);
+        let asking = since(began);
+        spent[0] += asking;
+        // (E4) the asking, split by whether it found anything.
+        ask[0] += 1;
+        ask[if taken.is_empty() { 1 } else { 2 }] += asking;
+        ask[3] += u64::from(taken.is_empty());
         let mut parts: Vec<(usize, usize)> = Vec::new();
         for (range_from, range_end) in taken {
             let mut page = range_from & !(crate::watch::PAGE - 1);
@@ -545,6 +555,8 @@ pub(crate) fn sync_heaps() {
                     unsafe { copied.changes(first as u32, &records[..(count * step) as usize], &mut changed) };
                     records
                 };
+                let tabled_before = out.tabled;
+                let changed_here = changed.len() as u64;
                 for &index in &changed {
                     let at = (u64::from(index) - first) as usize * step as usize;
                     let word = |n: usize| {
@@ -587,6 +599,14 @@ pub(crate) fn sync_heaps() {
                         2
                     }] += 1;
                 }
+                // (E5) a ring page: nearly all of the records that changed on it
+                // are of draws' tables (the title's table ring).
+                let tabled_here = out.tabled - tabled_before;
+                if changed_here > 0 && tabled_here * 10 > changed_here * 9 {
+                    out.ring[0] += 1;
+                    out.ring[1] += (to - from) as u64;
+                    out.ring[2] += changed_here;
+                }
             }
             *found[n].lock().unwrap_or_else(|e| e.into_inner()) = out;
         });
@@ -606,6 +626,9 @@ pub(crate) fn sync_heaps() {
             make.append(&mut part.make);
             for (kind, n) in kinds.iter_mut().zip(part.kinds) {
                 *kind += n;
+            }
+            for (sum, n) in ring.iter_mut().zip(part.ring) {
+                *sum += n;
             }
         }
         spent[1] += since(began);
@@ -633,7 +656,32 @@ pub(crate) fn sync_heaps() {
         count.fetch_add(n, Relaxed);
     }
     SYNC_SHORT.fetch_add(short, Relaxed);
+    for (count, n) in SYNC_ASK.iter().zip(ask) {
+        count.fetch_add(n, Relaxed);
+    }
+    for (count, n) in SYNC_RING.iter().zip(ring) {
+        count.fetch_add(n, Relaxed);
+    }
+    SYNC_ROUNDS_DONE[0].fetch_add(1, Relaxed);
+    SYNC_ROUNDS_DONE[1].fetch_add(u64::from(pages == 0), Relaxed);
 }
+
+/// Since the last frame line, of [`sync_heaps`]: rounds run, rounds in which no
+/// heap page had changed.
+#[cfg(windows)]
+static SYNC_ROUNDS_DONE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Since the last frame line: asks of the kernel's write watch (one per heap per
+/// round), nanoseconds of those that found nothing, of those that found pages,
+/// and how many found nothing.
+#[cfg(windows)]
+static SYNC_ASK: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Since the last frame line: ring pages (changed pages on which more than 90%
+/// of the changed records were of draws' tables), their bytes, the records that
+/// changed on them.
+#[cfg(windows)]
+static SYNC_RING: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Pages [`sync_heaps`] read in place of which a part could not be read
 /// ([`sync_in_place`]), since the last frame line.
@@ -682,6 +730,8 @@ struct SyncPart {
     kinds: [u64; 5],
     /// Pages read in place not all there ([`SYNC_SHORT`]).
     short: u64,
+    /// Ring pages, their bytes, the records that changed on them.
+    ring: [u64; 3],
 }
 
 /// Pages [`sync_heaps`] gives a thread at a time.
@@ -761,6 +811,34 @@ pub(crate) fn sync_line(frames: f64) {
             quick[0],
             quick[1],
             sync_jobs().0
+        );
+    }
+    let rounds = [0, 1].map(|i| SYNC_ROUNDS_DONE[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let ask = [0, 1, 2, 3].map(|i| SYNC_ASK[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64);
+    let ring = [0, 1, 2].map(|i| SYNC_RING[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64);
+    let [made, made_ns, twin_made, twin_ns] =
+        [0, 1, 2, 3].map(|i| host::VIEW_MAKE[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64);
+    if made > 0.0 {
+        tracing::info!(
+            "view creation per frame (VICTORY_DESCRIPTOR_TIMING=0: counted, not timed): {:.0} buffer views in {:.2} ms,              {:.0} raw twins in {:.2} ms (thread time, all threads)",
+            made / frames,
+            made_ns / 1e6 / frames,
+            twin_made / frames,
+            twin_ns / 1e6 / frames
+        );
+    }
+    if rounds[0] > 0 {
+        tracing::info!(
+            "the heaps' records, rounds per frame: {:.1} run, {:.1} of them with no changed page; {:.1} asks of the write              watch, {:.2} ms in those that found nothing ({:.1}), {:.2} ms in those that found pages; {:.1} ring pages              (over 90% of their changed records of draws' tables), {:.2} MB of them read, {:.0} records changed on them",
+            rounds[0] as f64 / frames,
+            rounds[1] as f64 / frames,
+            ask[0] / frames,
+            ask[1] / 1e6 / frames,
+            ask[3] / frames,
+            ask[2] / 1e6 / frames,
+            ring[0] / frames,
+            ring[1] / (1 << 20) as f64 / frames,
+            ring[2] / frames
         );
     }
     if pages == 0 {

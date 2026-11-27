@@ -4415,6 +4415,20 @@ fn buffer_view_ok(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw:
 /// these that could not be moved there (null).
 pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
+/// Since the last frame line, of [`buffer_srv`] (the views a draw's table or the
+/// buffer pass makes): typed/structured views created, their nanoseconds in
+/// `CreateShaderResourceView`, raw twins created, theirs. Nanoseconds are
+/// counted only with [`view_timing`]. Measures what a persistent descriptor
+/// cache would save (`docs/performance/AGENT_REPORTS/03-descriptors.md`, B, E2).
+pub(crate) static VIEW_MAKE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Whether [`VIEW_MAKE`] times the calls (`VICTORY_DESCRIPTOR_TIMING=0`: it only
+/// counts them; a clock read is about 25 ns, twice per view).
+fn view_timing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DESCRIPTOR_TIMING").is_none_or(|v| v != "0"))
+}
+
 /// Moves the raw view at `at`, a slot of our heaps the card does not see,
 /// which shows `bytes` from `start` on (GPU address), `by` bytes on: for a
 /// twin whose view begins between two multiples of 16, where the host makes
@@ -4545,10 +4559,15 @@ fn buffer_srv(
     }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
+    let timed = view_timing().then(std::time::Instant::now);
     unsafe {
         host.device
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
+    if let Some(began) = timed {
+        VIEW_MAKE[1].fetch_add(began.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    VIEW_MAKE[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let Some(twin) = twin {
         let window = twin_window(desc.Format, first, count, stride, raw, width);
         if let Some((first, count, by)) = window {
@@ -4560,11 +4579,16 @@ fn buffer_srv(
                 Flags: D3D12_BUFFER_SRV_FLAG_RAW,
             };
             // SAFETY: a live buffer and a slot of our heap.
+            let timed = view_timing().then(std::time::Instant::now);
             let start = unsafe {
                 host.device
                     .CreateShaderResourceView(&shadow.buffer, Some(&desc), twin);
                 shadow.buffer.GetGPUVirtualAddress() + first * 4
             };
+            if let Some(began) = timed {
+                VIEW_MAKE[3].fetch_add(began.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+            VIEW_MAKE[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
                 TWINS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 null_buffer_view(twin);
