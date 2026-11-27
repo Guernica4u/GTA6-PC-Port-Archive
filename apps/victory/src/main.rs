@@ -151,7 +151,14 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let cli = Cli::parse();
-    sdkpath::check()?;
+    if matches!(
+        &cli.command,
+        Command::Translate {
+            pipelines: true, ..
+        } | Command::Run { execute: true, .. }
+    ) {
+        sdkpath::check()?;
+    }
     match cli.command {
         Command::Inspect {
             file,

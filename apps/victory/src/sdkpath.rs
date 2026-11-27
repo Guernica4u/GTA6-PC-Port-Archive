@@ -9,7 +9,7 @@
 //!
 //! The runtime does not fall back to the in-box one when the folder is
 //! missing: device creation fails (0x887E0003, `D3D12_ERROR_INVALID_REDIST`).
-//! So a build with the feature checks for the folder at start ([`check`]).
+//! Commands that use Direct3D 12 check for the folder first ([`check`]).
 
 /// Agility SDK version the runtime must match (1.620.x).
 #[cfg(all(windows, feature = "agility-sdk"))]

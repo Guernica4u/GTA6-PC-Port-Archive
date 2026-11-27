@@ -81,8 +81,8 @@ folder beside it. From the
 [Microsoft.Direct3D.D3D12](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12)
 1.620.x package (a `.nupkg` is a zip), copy `build\native\bin\x64\D3D12Core.dll`
 (and `d3d12SDKLayers.dll` for the debug layer) to `target\release\D3D12\`.
-With the feature the folder is required (Direct3D 12 does not fall back to
-the in-box runtime without it), and `victory` says so at start.
+With the feature enabled, commands that use Direct3D 12 require the folder.
+Those commands report what to install if the folder is missing.
 
 A run in the world takes about 33 GB of Windows commit (RAM plus paging
 file) and about 10 GB of video memory. The tested machine has 32 GB of RAM
