@@ -462,6 +462,14 @@ fn sweep() {
     crate::resource::let_go_idle();
 }
 
+/// Whether the periodic sweep behind flights drains them first, as it did
+/// (`VICTORY_SWEEP_SETTLE=1`). Off by default: what the sweep drops is
+/// retired by submission number.
+fn sweep_settles() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SWEEP_SETTLE"))
+}
+
 /// The number of the newest submission begun, and of the newest of which all
 /// before it have finished too.
 pub(crate) fn submissions() -> (u64, u64) {
@@ -5746,8 +5754,16 @@ impl Host {
             SWEPT.store(now_ms(), Ordering::Relaxed);
         } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
             // With the present sent ahead nothing else brings a moment
-            // with nothing in the air: one is made for the sweep.
-            self.settle(&mut submitted, WHY_SYNC);
+            // with nothing in the air. What the sweep lets go of goes
+            // through [`retire`], which holds it until every submission
+            // started so far has finished (the submission numbers are the
+            // fence values), and what only a list names has a count above
+            // one while the list is in a flight; so no drain is needed
+            // (`VICTORY_SWEEP_SETTLE=1`, or the up-check, which needs a
+            // card at rest: as before, 10 to 30 ms every 1.5 s).
+            if sweep_settles() || upcheck::on() {
+                self.settle(&mut submitted, WHY_SYNC);
+            }
             if upcheck::on() {
                 upcheck::at_rest(self);
             }
