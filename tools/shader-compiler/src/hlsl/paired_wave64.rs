@@ -451,6 +451,11 @@ pub(super) fn emit(em: &mut Emitter<'_>, idx: usize, ins: &Insn, is_ps: bool, br
         }
         return Ok(());
     }
+    if em.bsel.contains_key(&idx) {
+        // One guarded copy per descriptor the instruction may name, chosen by a scalar
+        // every lane shares. Each copy comes back here and is expanded for its lanes.
+        return em.emit_insn_body(idx, ins, is_ps, br);
+    }
     em.line(&format!("// {:#06x} {m}", ins.offset));
     em.cur_idx = idx;
     if !matches!(m, "v_readfirstlane_b32" | "v_readlane_b32") {
