@@ -354,7 +354,7 @@ struct LaneState {
     mask_phis: HashMap<Value, V>,
     pending_masks: Vec<(V, usize, usize)>,
     data_phis: Vec<(V, usize, usize)>,
-    handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
+    handles: HashMap<HandleKey, V>,
     strides: HashMap<(usize, Site, u8), V>,
     clane: Option<V>,
 }

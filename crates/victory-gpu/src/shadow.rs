@@ -690,11 +690,11 @@ pub(crate) static PATCHED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 /// dword touched.
 pub(crate) fn patch_words(at: usize, title: &[u8], runs: &[(usize, usize)], out: &mut Vec<PatchWord>) {
     for &(r, m) in runs {
-        for k in r..r + m {
+        for (k, &byte) in (r..).zip(&title[r..r + m]) {
             let offset = at + k;
             let word = (offset & !3) as u32;
             let lane = ((offset & 3) * 8) as u32;
-            let (mask, value) = (0xffu32 << lane, u32::from(title[k]) << lane);
+            let (mask, value) = (0xffu32 << lane, u32::from(byte) << lane);
             match out.last_mut() {
                 Some(w) if w[0] == word => {
                     w[1] |= mask;
@@ -731,11 +731,15 @@ pub(crate) fn patched_word(old: u32, w: PatchWord) -> u32 {
     (old & !w[1]) | (w[2] & w[1])
 }
 
+/// A copy's masked patch as [`card_patches`] takes it: the copy, its words
+/// and the byte runs they set.
+pub(crate) type CardPatch = (Arc<Shadow>, Vec<PatchWord>, Vec<(usize, usize)>);
+
 /// The masked patches of the copies in the card's memory, taken for the
 /// send numbered `sent_as` ([`card_dirty`]'s): per copy its words, folded
 /// ([`folded`]), and the byte runs they set, joined. With [`relay`] the runs
 /// are noted as sent, as the changed ranges are.
-pub(crate) fn card_patches(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<PatchWord>, Vec<(usize, usize)>)> {
+pub(crate) fn card_patches(sent_as: u64) -> Vec<CardPatch> {
     let mut out = Vec::new();
     if masked_patch_mode() == 0 {
         return out;

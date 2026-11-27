@@ -26,19 +26,23 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::object::This;
 
+/// A kind of texture copied back: width, height and format
+/// (`VICTORY_TEXTURE_BACK`'s `256x256f41`).
+type Kind = (u64, u32, u32);
+
 #[cfg(test)]
 thread_local! {
-    pub(crate) static TEST_KINDS: std::cell::Cell<Option<&'static [(u64, u32, u32)]>> =
+    pub(crate) static TEST_KINDS: std::cell::Cell<Option<&'static [Kind]>> =
         const { std::cell::Cell::new(None) };
 }
 
 /// The kinds copied back: (width, height, format).
-fn kinds() -> &'static [(u64, u32, u32)] {
+fn kinds() -> &'static [Kind] {
     #[cfg(test)]
     if let Some(kinds) = TEST_KINDS.get() {
         return kinds;
     }
-    static KINDS: OnceLock<Vec<(u64, u32, u32)>> = OnceLock::new();
+    static KINDS: OnceLock<Vec<Kind>> = OnceLock::new();
     KINDS.get_or_init(|| {
         const DEFAULT: &str = "256x256f41,256x256f16,64x64f16,128x128f36";
         let list = match std::env::var("VICTORY_TEXTURE_BACK").as_deref() {
