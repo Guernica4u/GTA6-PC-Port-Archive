@@ -19,7 +19,7 @@
 | Your card | Frame generation | Limits |
 | --- | --- | --- |
 | GeForce RTX 40 and RTX 50 | **DLSS frame generation** | 2x on RTX 40; more than 2x (up to 6x) needs an RTX 50 |
-| GeForce RTX 20 and RTX 30 | **AMD FSR 3 frame generation** (DLSS frame generation needs an RTX 40 or later) | **2x at most**. DLSS upscaling still works on these cards, so the Series X profile is fine |
+| GeForce RTX 20 and RTX 30 | **Built-in DLSS-G bypass (RTX 30)** or **AMD FSR 3 frame generation** | Built-in Ampere DLSS-G/MFG bypass (`opendlssgenabler`, auto on RTX 30; disable with `VICTORY_DLSSG_BYPASS=0`), or FSR 3 (`2x` at most; DLSS upscaling still works on these cards, so the Series X profile is fine) |
 | Other cards (no DLSS) | **AMD FSR 3 frame generation** | **2x at most, Series S profile only** (F1 menu, CONSOLE): without DLSS the game's own upscaler, which FSR 3 needs, only takes the Series S sizes. Not tested here |
 
 - **At every start the game tells you** which one your card runs, and why
@@ -32,6 +32,11 @@
   `amd_fidelityfx_framegeneration_dx12.dll`, from AMD's FidelityFX SDK). They
   are AMD's and not part of this program: put them in a `fidelityfx` folder
   next to `victory.exe`, or name their folder with `VICTORY_FIDELITYFX_DIR`.
+- **Optional DLSS-G unlocker DLLs** (`MFGUnlocker.dll`, `RTX40MFGCore.dll`, or
+  `opendlssgenabler.dll`) are not part of this repository, and are picked up
+  automatically if placed beside `victory.exe`, in `%LOCALAPPDATA%\victory`, or
+  in the repository folder (or named via `VICTORY_DLSSG_UNLOCKER`; set
+  `VICTORY_DLSSG_UNLOCKER=0` to disable).
 
 ## Quick start: how to run it
 

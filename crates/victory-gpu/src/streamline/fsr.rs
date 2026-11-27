@@ -884,6 +884,7 @@ mod tests {
             files_missing: false,
             dlss_fg_asked: true,
             dlss_fg_supported,
+            unlocker_loaded: false,
             fsr_asked: true,
             fsr_loaded,
             fsr_needs_series_s: !series_s && !dlss,

@@ -88,6 +88,8 @@ const KEPT: &[&str] = &[
     "VICTORY_CACHE_DIR",
     "VICTORY_DATA_DIR",
     "VICTORY_STREAMLINE_DIR",
+    "VICTORY_DLSSG_UNLOCKER",
+    "VICTORY_DLSSG_BYPASS",
     "VICTORY_FIDELITYFX_DIR",
     "VICTORY_LOG",
 ];
@@ -96,6 +98,7 @@ const FG_TYPES: [&str; 3] = ["auto", "dlss", "fsr"];
 
 const RESOLUTIONS: [&str; 3] = ["1440", "1080to1440", "4k"];
 const DLSS_MODES: [&str; 5] = ["off", "dlaa", "quality", "balanced", "performance"];
+const UNLOCKER_NAMES: &[&str] = &["MFGUnlocker.dll", "RTX40MFGCore.dll", "opendlssgenabler.dll"];
 
 #[derive(clap::Args, Clone, Debug)]
 pub(crate) struct Play {
@@ -193,6 +196,25 @@ fn streamline_dir(here: &Path) -> Option<PathBuf> {
     let ours = nvidia_home().ok().map(|d| d.join("Streamline").join("bin").join("x64"));
     let beside = [here.join("nvidia-sdk").join("Streamline").join("bin").join("x64"), here.to_path_buf()];
     named.into_iter().chain(ours).chain(beside).find(|d| has_streamline(d))
+}
+
+fn find_unlocker_in(dirs: &[PathBuf]) -> Option<PathBuf> {
+    dirs.iter()
+        .flat_map(|dir| UNLOCKER_NAMES.iter().map(move |name| dir.join(name)))
+        .find(|candidate| candidate.is_file())
+}
+
+fn dlssg_unlocker(here: &Path, home: &Path) -> Option<PathBuf> {
+    if let Ok(val) = std::env::var("VICTORY_DLSSG_UNLOCKER") {
+        let trimmed = val.trim();
+        if trimmed == "0" {
+            return None;
+        }
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+    find_unlocker_in(&[home.to_path_buf(), home.join("dlssg-unlocker"), here.to_path_buf()])
 }
 
 /// The lines `NAME=value` of the menu's file.
@@ -431,6 +453,12 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
     }
     let streamline = streamline_dir(&here);
     let (mut s, series_s) = settings(o, &menu, streamline.as_deref());
+    if s.contains_key("VICTORY_FRAMEGEN")
+        && !s.contains_key("VICTORY_DLSSG_UNLOCKER")
+        && let Some(unlocker) = dlssg_unlocker(&here, &home)
+    {
+        s.insert("VICTORY_DLSSG_UNLOCKER".to_owned(), unlocker.to_string_lossy().into_owned());
+    }
     // Where the menu saves, and how it starts the title again (`--set` is not carried over).
     let quoted = |p: &Path| format!("'{}'", p.to_string_lossy().replace('\'', "''"));
     s.insert("VICTORY_MENU_FILE".to_owned(), menu_file.to_string_lossy().into_owned());
@@ -580,5 +608,33 @@ mod tests {
         assert_eq!(stamp(0), "19700101-000000");
         assert_eq!(stamp(1_795_753_200), "20261127-042000");
         assert_eq!(stamp(951_782_400), "20000229-000000");
+    }
+
+    #[test]
+    fn find_unlocker_in_checks_priority_and_dirs() {
+        let root = std::env::temp_dir().join(format!("victory-play-unlocker-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir_a = root.join("a");
+        let dir_b = root.join("b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+
+        assert_eq!(find_unlocker_in(&[dir_a.clone(), dir_b.clone()]), None);
+
+        let open_b = dir_b.join("opendlssgenabler.dll");
+        std::fs::write(&open_b, b"").unwrap();
+        assert_eq!(find_unlocker_in(&[dir_a.clone(), dir_b.clone()]), Some(open_b.clone()));
+
+        // Earlier directory wins over later directory.
+        let rtx_a = dir_a.join("RTX40MFGCore.dll");
+        std::fs::write(&rtx_a, b"").unwrap();
+        assert_eq!(find_unlocker_in(&[dir_a.clone(), dir_b.clone()]), Some(rtx_a));
+
+        // Within the same directory, MFGUnlocker.dll wins over RTX40MFGCore.dll.
+        let mfg_a = dir_a.join("MFGUnlocker.dll");
+        std::fs::write(&mfg_a, b"").unwrap();
+        assert_eq!(find_unlocker_in(&[dir_a.clone(), dir_b.clone()]), Some(mfg_a));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -79,6 +79,15 @@ pub struct Asked {
     /// our swap chain is Streamline's proxy of it, so that Streamline sees
     /// the presents (its bookkeeping per frame).
     pub present_hook: bool,
+    /// `VICTORY_DLSSG_UNLOCKER=<path>`: optional third-party DLSS-G unlocker
+    /// DLL (or folder containing `MFGUnlocker.dll`, `RTX40MFGCore.dll`, or
+    /// `opendlssgenabler.dll`) loaded before Streamline initializes.
+    pub dlssg_unlocker: Option<PathBuf>,
+    /// `VICTORY_DLSSG_BYPASS`: built-in RTX 30 (Ampere) DLSS-G / MFG bypass
+    /// (`opendlssgenabler`). `None`: auto (enabled on RTX 30 cards when no
+    /// external `VICTORY_DLSSG_UNLOCKER` is set); `Some(true)`: forced;
+    /// `Some(false)`: disabled (`0`).
+    pub builtin_bypass: Option<bool>,
     /// `VICTORY_FSR_FRAMEGEN=1`: AMD FSR 3 frame generation where DLSS Frame
     /// Generation does not run ([`fsr`]), from `fidelityfx_dir`
     /// (`VICTORY_FIDELITYFX_DIR`).
@@ -123,6 +132,15 @@ impl Asked {
             log_dir: var("VICTORY_STREAMLINE_LOG").filter(|v| !v.trim().is_empty() && v.trim() != "0").map(PathBuf::from),
             hudless: var("VICTORY_FRAMEGEN_HUDLESS").is_none_or(|v| v.trim() != "0"),
             present_hook: on("VICTORY_STREAMLINE_PRESENT"),
+            dlssg_unlocker: var("VICTORY_DLSSG_UNLOCKER")
+                .map(|v| v.trim().to_owned())
+                .filter(|v| !v.is_empty() && v != "0")
+                .map(PathBuf::from),
+            builtin_bypass: match var("VICTORY_DLSSG_BYPASS").as_deref().map(str::trim) {
+                Some("1") => Some(true),
+                Some("0") => Some(false),
+                _ => None,
+            },
             fsr_framegen,
             fidelityfx_dir: fsr::dir_from_env(),
             series_s: var("VICTORY_MENU_CONSOLE").is_some_and(|c| c.trim() == "series-s"),
@@ -227,6 +245,13 @@ struct Sl {
 }
 
 static SL: OnceLock<Sl> = OnceLock::new();
+const UNLOCKER_NAMES: &[&str] = &["MFGUnlocker.dll", "RTX40MFGCore.dll", "opendlssgenabler.dll"];
+static UNLOCKER: OnceLock<(PathBuf, Library)> = OnceLock::new();
+static BUILTIN_BYPASS: AtomicBool = AtomicBool::new(false);
+
+fn is_ampere_rtx30(adapter: &str) -> bool {
+    adapter.to_ascii_lowercase().contains("rtx 30")
+}
 
 /// What is on once the library is in: the switches and the features found.
 struct Plan {
@@ -362,6 +387,7 @@ pub fn init(asked: &Asked) -> Available {
         files_missing,
         dlss_fg_asked: asked.framegen,
         dlss_fg_supported: available.framegen,
+        unlocker_loaded: UNLOCKER.get().is_some() || BUILTIN_BYPASS.load(Acquire),
         fsr_asked: asked.fsr_framegen,
         fsr_loaded: fsr_framegen,
         fsr_needs_series_s,
@@ -379,6 +405,7 @@ struct Facts {
     files_missing: bool,
     dlss_fg_asked: bool,
     dlss_fg_supported: bool,
+    unlocker_loaded: bool,
     fsr_asked: bool,
     fsr_loaded: bool,
     fsr_needs_series_s: bool,
@@ -435,8 +462,12 @@ fn notice_of(f: &Facts, dlss_live: bool, fsr_live: bool) -> Vec<String> {
         }.into());
     }
     if dlss_live {
-        lines.push("FRAME GEN: DLSS, SUPPORTED HERE (F1 MENU: 2X-6X)".into());
-        lines.push("MORE THAN 2X NEEDS AN RTX 50 CARD".into());
+        if f.unlocker_loaded {
+            lines.push("FRAME GEN: DLSS (UNLOCKER, F1 MENU: 2X-6X)".into());
+        } else {
+            lines.push("FRAME GEN: DLSS, SUPPORTED HERE (F1 MENU: 2X-6X)".into());
+            lines.push("MORE THAN 2X NEEDS AN RTX 50 CARD".into());
+        }
     } else if fsr_live {
         lines.push(if no_dlss_fg {
             "USING AMD FSR 3 FRAME GEN INSTEAD: 2X AT MOST".into()
@@ -473,17 +504,52 @@ fn notice_of(f: &Facts, dlss_live: bool, fsr_live: bool) -> Vec<String> {
     lines
 }
 
+fn resolve_unlocker_path(path: &Path) -> Result<PathBuf, String> {
+    let abs = std::path::absolute(path).map_err(|e| e.to_string())?;
+    if abs.is_file() {
+        return Ok(abs);
+    }
+    if abs.is_dir() {
+        return UNLOCKER_NAMES
+            .iter()
+            .map(|name| abs.join(name))
+            .find(|candidate| candidate.is_file())
+            .ok_or_else(|| format!("no {} in {}", UNLOCKER_NAMES.join(", "), abs.display()));
+    }
+    Err(format!("{} not found", abs.display()))
+}
+
+fn load_unlocker(path: &Path) -> Result<PathBuf, String> {
+    use windows_sys::Win32::System::LibraryLoader::{
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+    };
+    if let Some((loaded, _)) = UNLOCKER.get() {
+        return Ok(loaded.clone());
+    }
+    let resolved = resolve_unlocker_path(path)?;
+    let file = wide(&resolved);
+    // Third-party open-source unlockers are unsigned, so skip verify_signature.
+    // SAFETY: a NUL-terminated full path.
+    let module = unsafe {
+        LoadLibraryExW(
+            file.as_ptr(),
+            std::ptr::null_mut(),
+            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
+        )
+    };
+    if module.is_null() {
+        return Err(format!("{} did not load ({})", resolved.display(), std::io::Error::last_os_error()));
+    }
+    let (loaded, _) = UNLOCKER.get_or_init(|| (resolved, Library(module)));
+    Ok(loaded.clone())
+}
+
 fn load_and_init(asked: &Asked, require_line: bool) -> Result<Available, String> {
     let path = std::path::absolute(asked.dir.join(INTERPOSER)).map_err(|e| e.to_string())?;
     if !path.is_file() {
         return Err(format!("no {INTERPOSER} in that folder (VICTORY_STREAMLINE_DIR)"));
     }
     verify_signature(&path)?;
-    let sl = load(&path)?;
-    let sl = SL.get_or_init(|| sl);
-    let dir_wide: Vec<u16> = wide(&asked.dir);
-    let paths = [dir_wide.as_ptr()];
-    let log_wide = asked.log_dir.as_deref().map(wide);
     // Frame generation presents from the line's thread, in order with the
     // submissions: without the line it is not loaded at all.
     let framegen_asked = asked.framegen && (!require_line || line_asked());
@@ -492,6 +558,37 @@ fn load_and_init(asked: &Asked, require_line: bool) -> Result<Available, String>
             "DLSS Frame Generation needs the line of submissions (VICTORY_THIN=1 or VICTORY_ASYNC_SUBMIT=1): frame generation stays off"
         );
     }
+    if framegen_asked {
+        if let Some(unlocker) = &asked.dlssg_unlocker {
+            match load_unlocker(unlocker) {
+                Ok(loaded) => tracing::info!(
+                    library = %loaded.display(),
+                    "DLSS-G unlocker loaded before Streamline (VICTORY_DLSSG_UNLOCKER)"
+                ),
+                Err(why) => tracing::warn!(
+                    path = %unlocker.display(),
+                    "DLSS-G unlocker did not load: {why}; continuing without it"
+                ),
+            }
+        } else if asked.builtin_bypass == Some(true)
+            || (asked.builtin_bypass.is_none()
+                && default_adapter().is_some_and(|(name, _)| is_ampere_rtx30(&name)))
+        {
+            if victory_dlssg_bypass::init(true, asked.log_dir.as_deref()) {
+                BUILTIN_BYPASS.store(true, Release);
+                tracing::info!(
+                    "Built-in DLSS-G Ampere bypass initialized before Streamline (VICTORY_DLSSG_BYPASS)"
+                );
+            } else {
+                tracing::warn!("Built-in DLSS-G Ampere bypass failed to initialize");
+            }
+        }
+    }
+    let sl = load(&path)?;
+    let sl = SL.get_or_init(|| sl);
+    let dir_wide: Vec<u16> = wide(&asked.dir);
+    let paths = [dir_wide.as_ptr()];
+    let log_wide = asked.log_dir.as_deref().map(wide);
     let mut features = Vec::new();
     if asked.dlss {
         features.push(abi::FEATURE_DLSS);
@@ -1932,6 +2029,11 @@ fn check_run(output: [u32; 2], device: bool, present: bool) -> Vec<String> {
         Ok(available) => available,
         Err(why) => return vec![format!("Streamline did not load from {}: {why}", asked.dir.display())],
     };
+    if let Some((loaded, _)) = UNLOCKER.get() {
+        lines.push(format!("DLSS-G unlocker loaded before Streamline: {}", loaded.display()));
+    } else if BUILTIN_BYPASS.load(Acquire) {
+        lines.push("Built-in DLSS-G Ampere bypass active (opendlssgenabler)".into());
+    }
     lines.push(format!(
         "Streamline loaded from {}: DLSS {}, frame generation {} on this GPU",
         asked.dir.display(),
@@ -2178,5 +2280,53 @@ pub(crate) fn line(frames: f64) {
                 "DLSS Frame Generation, colour without the interface, last ten lines: {copies} copies in front of the title's interface composite, {tagged} presents tagged with one, {missing} presents with frame generation on had none; {composites} interface composite draws into a presented texture ({again} after a copy in their list), {others} draws of other pipelines into one"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_unlocker_path_handles_files_dirs_priority_and_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::path::absolute(dir.path()).unwrap();
+
+        // Empty directory returns an error.
+        let err = resolve_unlocker_path(&root).unwrap_err();
+        assert!(err.contains("MFGUnlocker.dll"));
+
+        // Missing path returns an error.
+        let missing = root.join("missing.dll");
+        assert!(resolve_unlocker_path(&missing).is_err());
+
+        // Direct file path resolves directly regardless of filename.
+        let custom = root.join("custom.dll");
+        std::fs::write(&custom, b"").unwrap();
+        assert_eq!(resolve_unlocker_path(&custom).unwrap(), custom);
+
+        // Directory with opendlssgenabler.dll.
+        let opendlss = root.join("opendlssgenabler.dll");
+        std::fs::write(&opendlss, b"").unwrap();
+        assert_eq!(resolve_unlocker_path(&root).unwrap(), opendlss);
+
+        // Adding RTX40MFGCore.dll prefers it over opendlssgenabler.dll.
+        let rtx40 = root.join("RTX40MFGCore.dll");
+        std::fs::write(&rtx40, b"").unwrap();
+        assert_eq!(resolve_unlocker_path(&root).unwrap(), rtx40);
+
+        // Adding MFGUnlocker.dll prefers it over both.
+        let mfg = root.join("MFGUnlocker.dll");
+        std::fs::write(&mfg, b"").unwrap();
+        assert_eq!(resolve_unlocker_path(&root).unwrap(), mfg);
+    }
+
+    #[test]
+    fn rtx30_detection_matches_ampere_cards_only() {
+        assert!(is_ampere_rtx30("NVIDIA GeForce RTX 3070 Ti"));
+        assert!(is_ampere_rtx30("NVIDIA GeForce RTX 3080 Laptop GPU"));
+        assert!(!is_ampere_rtx30("NVIDIA GeForce RTX 4070 SUPER"));
+        assert!(!is_ampere_rtx30("NVIDIA GeForce RTX 5070"));
+        assert!(!is_ampere_rtx30("NVIDIA GeForce RTX 2080 Ti"));
     }
 }
