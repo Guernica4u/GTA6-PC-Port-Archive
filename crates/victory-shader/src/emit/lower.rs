@@ -115,7 +115,9 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
             Ok(l) => return Ok(l),
             // In halves, refused for want of a meeting: the regions where
             // one was wanted run wave-wide next time, where values missing
-            // for want of one may not be.
+            // for want of one may not be. What earlier attempts asked counts
+            // too: a join that read such a value is missing in later ones,
+            // and reading it there asks for nothing.
             Err(Stop::Fail(ShaderError::Unsupported { what, .. })) if wide.widen(parts, what) => {
                 bad.retain(|_, &mut why| !halves::for_want_of_a_meeting(why));
             }
@@ -127,7 +129,6 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
                 bad.retain(|_, &mut why| why != SECTION_UNFOLLOWED && why != halves::SUM16_ACROSS);
             }
             Err(Stop::Retry(v, why)) => {
-                wide.forget();
                 if bad.insert(v, why).is_some() {
                     return Err(ShaderError::Unsupported {
                         offset: 0,
@@ -10344,10 +10345,13 @@ impl<'a> Lower<'a> {
                 let abort = self.abort_block();
                 Term::CondBr(ok, self.block[t].expect("reachable"), abort)
             }
-            LaneExit::Jump(t) => {
-                self.enter_loop(b, t, self.cur);
-                Term::Br(self.block[t].expect("reachable"))
-            }
+            LaneExit::Jump(t) => match self.wide_entry(b, t) {
+                Some(e) => Term::Br(e),
+                None => {
+                    self.enter_loop(b, t, self.cur);
+                    Term::Br(self.block[t].expect("reachable"))
+                }
+            },
             LaneExit::Branch {
                 when,
                 taken,
@@ -10458,6 +10462,9 @@ impl<'a> Lower<'a> {
 
     /// The DXIL block a branch from IR block `from` to `to` goes to.
     fn edge(&mut self, from: usize, to: usize) -> usize {
+        if let Some(e) = self.wide_entry(from, to) {
+            return e;
+        }
         let target = self.block[to].expect("reachable");
         let preds = self.x.p.blocks[to]
             .preds

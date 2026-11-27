@@ -63,7 +63,7 @@ use super::*;
 pub(super) struct Plan {
     /// The regions run wave-wide, by their heads.
     heads: BTreeSet<usize>,
-    /// The blocks the last attempt wanted a meeting at.
+    /// The blocks the attempts since the plan last grew wanted a meeting at.
     asked: RefCell<BTreeSet<usize>>,
 }
 
@@ -74,8 +74,10 @@ impl Plan {
     }
 
     /// After an attempt refused for `what`: the regions around the blocks
-    /// it asked for join the plan; whether another attempt is worth making
-    /// (some region joined).
+    /// the attempts since the last call asked for join the plan (a join
+    /// that read a value refused for want of a meeting is missing in the
+    /// attempts after, and reading it there asks for nothing); whether
+    /// another attempt is worth making (some region joined).
     pub(super) fn widen(&mut self, x: &Parts, what: Why) -> bool {
         let asked = std::mem::take(self.asked.get_mut());
         if asked.is_empty() || !super::halves::for_want_of_a_meeting(what) {
@@ -90,17 +92,15 @@ impl Plan {
         }
         grew
     }
-
-    /// Forgets what the last attempt asked for.
-    pub(super) fn forget(&mut self) {
-        self.asked.get_mut().clear();
-    }
 }
 
 /// A region that can run wave-wide.
 struct Region {
-    /// The block every lane enters it from.
+    /// The block whose lane branch enters it.
     head: usize,
+    /// The other edges into it: from blocks whose way on the whole group
+    /// takes together ([`regions`]), to a block of the region.
+    entries: Vec<(usize, usize)>,
     /// Per IR block: in the region.
     blocks: Vec<bool>,
     /// The block every way out of the region leads to; `None` where each
@@ -133,6 +133,14 @@ struct Loop {
 /// has no scalar instruction with effects beyond its values, and its loops
 /// are entered at their headers only; else the regions of its branches
 /// where every thread meets, where those are.
+///
+/// Blocks every thread meets at whose way on the whole group takes together
+/// (a branch on scalar values in a group of one console wave, the early end
+/// of a program that skips its work) may also lead into the region, or
+/// around it to its join. Around it, no lane of the group is in the region,
+/// and the join takes that edge's values as they are. Into it, the group
+/// runs the region from its first block, with every lane in the block that
+/// edge leads to and none in the blocks before ([`Lower::wide_entries`]).
 fn regions(x: &Parts) -> Vec<Region> {
     let (p, st) = (x.p, x.st);
     let n = st.exits.len();
@@ -182,19 +190,31 @@ fn regions(x: &Parts) -> Vec<Region> {
     for b in (0..n).filter(|&b| apart(b)) {
         sets.entry(find(&mut root, b)).or_default().push(b);
     }
+    let branches = super::halves::lane_regions(x).unwrap_or_default();
+    // Blocks whose way on the whole group takes together: every thread
+    // meets there, and no lane branch leaves them (in a group of several
+    // console waves every branch is one: each wave may take its own way).
+    let together = |q: usize| meet[q] && !branches.iter().any(|(h, _)| *h == q);
+    let joins = descriptor_joins(x);
     let region = |members: &[usize]| -> Option<Region> {
         let mut blocks = vec![false; n];
         for &b in members {
             blocks[b] = true;
         }
         let (mut head, mut join, mut ends) = (None, None, false);
+        let mut entries = Vec::new();
         for &b in members {
             ends |= st.exits[b] == LaneExit::End;
             if p.blocks[b].insts.iter().any(|i| scalar_effect(i.name())) {
                 return None;
             }
             for &q in &p.blocks[b].preds {
-                if rpo[q] != usize::MAX && !blocks[q] && *head.get_or_insert(q) != q {
+                if rpo[q] == usize::MAX || blocks[q] {
+                    continue;
+                }
+                if together(q) {
+                    entries.push((q, b));
+                } else if *head.get_or_insert(q) != q {
                     return None;
                 }
             }
@@ -204,27 +224,58 @@ fn regions(x: &Parts) -> Vec<Region> {
                 }
             }
         }
+        // Entered from one block only, that is the head, whatever its way on.
+        if head.is_none() && entries.iter().all(|&(q, _)| q == entries[0].0) {
+            head = entries.first().map(|&(q, _)| q);
+            entries.clear();
+        }
         // A lane that ends never gets to a join: a region with ends has none.
         let head = head?;
         if ends == join.is_some() {
             return None;
         }
-        let between = |b: usize| rpo[head] < rpo[b] && join.is_none_or(|j| rpo[b] < rpo[j]);
+        // shortcut: a descriptor chosen by control flow in a region entered
+        // other than from its head is made from each way in's own block
+        // (`Lower::uniform_heap_index`), which does not lead to the region's
+        // blocks there; such a region is not run wave-wide.
+        if !entries.is_empty() && members.iter().any(|b| joins.contains(b)) {
+            return None;
+        }
+        // After the first block it is entered from (an edge in past the head
+        // may come first in reverse postorder), before its join.
+        let first = entries
+            .iter()
+            .map(|&(q, _)| rpo[q])
+            .fold(rpo[head], usize::min);
+        let between = |b: usize| first < rpo[b] && join.is_none_or(|j| rpo[b] < rpo[j]);
         if succ[head].iter().any(|&t| !blocks[t] && Some(t) != join)
             || join.is_some_and(|j| {
                 p.blocks[j]
                     .preds
                     .iter()
-                    .any(|&q| rpo[q] != usize::MAX && !blocks[q] && q != head)
+                    .any(|&q| rpo[q] != usize::MAX && !blocks[q] && q != head && !together(q))
             })
             || !members.iter().all(|&b| between(b))
         {
             return None;
         }
         let mut loops = loops(p, members, &blocks, &succ, &rpo)?;
+        // An entry other than the head is not into a loop of the region,
+        // nor is the region's first block a loop's header: the entries go
+        // there ([`Lower::wide_entries`]).
+        if entries
+            .iter()
+            .any(|&(_, t)| loops.iter().any(|l| l.body[t]))
+        {
+            return None;
+        }
         let order = chain(&blocks, None, &mut loops, &succ, &rpo)?;
+        if !entries.is_empty() && loops.iter().any(|l| l.header == order[0]) {
+            return None;
+        }
         Some(Region {
             head,
+            entries,
             blocks,
             join,
             order,
@@ -236,7 +287,6 @@ fn regions(x: &Parts) -> Vec<Region> {
     // meets may.
     // A branch's region may span two sets (its sides in each), or reach
     // round a loop into another branch's: the first taken keeps its blocks.
-    let branches = super::halves::lane_regions(x).unwrap_or_default();
     let mut regions = Vec::new();
     let mut taken = vec![false; n];
     for members in sets.into_values() {
@@ -447,8 +497,25 @@ pub(super) struct Wide {
     last: HashSet<usize>,
     /// Per IR block: in a region run wave-wide.
     pub(super) inside: Vec<bool>,
-    /// The regions' blocks in the order they are lowered.
-    orders: Vec<Vec<usize>>,
+    /// The regions' blocks in the order they are lowered, and the block
+    /// outside they are lowered after where that is not the one before
+    /// their first: the last of the blocks they are entered from.
+    orders: Vec<(Vec<usize>, Option<usize>)>,
+    /// Per region entered other than from its head, by its first block:
+    /// how ([`Lower::wide_entries`]).
+    entered: HashMap<usize, Entered>,
+    /// Per edge into a region other than from its head: the region's first
+    /// block; once its source is lowered, the DXIL block the edge goes to.
+    entry_into: HashMap<(usize, usize), usize>,
+    entry_block: HashMap<(usize, usize), usize>,
+    /// Per IR block of such a region, its join and its last block: the
+    /// region's first block.
+    entered_by: HashMap<usize, usize>,
+    /// Per such region, by its first block, while it is lowered: the values
+    /// [`Lower::wide_entries`] replaced, as they were (and so as the blocks
+    /// outside the region read them), and the DXIL values that replaced
+    /// them, by the ones replaced (for its phis, which are set last).
+    swaps: HashMap<usize, (Vec<Swapped>, HashMap<V, V>)>,
     /// The regions' loops, by header.
     loops: HashMap<usize, Loop>,
     /// Per IR block that is the last of loops: their headers, the inmost
@@ -479,10 +546,29 @@ impl Wide {
         if plan.heads.is_empty() {
             return wide;
         }
+        let mut doms: Option<Doms> = None;
         for r in regions(x)
             .into_iter()
             .filter(|r| plan.heads.contains(&r.head))
         {
+            let first = r.order[0];
+            let mut after = None;
+            if !r.entries.is_empty() {
+                let doms = doms.get_or_insert_with(|| Doms::new(x.p));
+                let e = Entered::new(x, &r, doms);
+                // Lowered once every block it is entered from is.
+                after = e
+                    .sources()
+                    .max_by_key(|&q| doms.rpo[q])
+                    .filter(|&q| doms.rpo[q] > doms.rpo[first]);
+                for &edge in &r.entries {
+                    wide.entry_into.insert(edge, first);
+                }
+                for &b in r.order.iter().chain(&r.join) {
+                    wide.entered_by.insert(b, first);
+                }
+                wide.entered.insert(first, e);
+            }
             let mut last = r.head;
             for &b in &r.order {
                 wide.inside[b] = true;
@@ -507,34 +593,314 @@ impl Wide {
                 }
             }
             wide.loops.extend(loops.into_iter().map(|l| (l.header, l)));
-            wide.orders.push(r.order);
+            wide.orders.push((r.order, after));
         }
         wide
     }
 
     /// `order` (the program's blocks in reverse postorder) with each
     /// region's blocks together in the region's own order, where its first
-    /// was.
+    /// was, or after the last block it is entered from.
     pub(super) fn lowered_in(&self, order: &[usize]) -> Vec<usize> {
         let mut out = Vec::with_capacity(order.len());
         for &b in order {
             if !self.inside[b] {
                 out.push(b);
-            } else if let Some(o) = self.orders.iter().find(|o| o[0] == b) {
-                out.extend(o);
+            }
+            for (o, after) in &self.orders {
+                if *after == Some(b) || after.is_none() && o[0] == b {
+                    out.extend(o);
+                }
             }
         }
         out
     }
 }
 
+/// The blocks where a descriptor of the program is chosen by control flow
+/// ([`Source::Phi`], [`Source::LanePhi`]).
+fn descriptor_joins(x: &Parts) -> HashSet<usize> {
+    fn walk(s: &Source, out: &mut HashSet<usize>) {
+        match s {
+            Source::Phi { block, args } => {
+                out.insert(*block);
+                args.iter().for_each(|a| walk(a, out));
+            }
+            Source::LanePhi { block, args } => {
+                out.insert(*block);
+                args.iter().flatten().for_each(|a| walk(a, out));
+            }
+            Source::Select { args, .. } | Source::Lanes { args, .. } => {
+                args.iter().for_each(|a| walk(a, out));
+            }
+            _ => {}
+        }
+    }
+    let mut out = HashSet::new();
+    for d in &x.res.descriptors {
+        walk(&d.source, &mut out);
+    }
+    out
+}
+
+/// A value [`Lower::wide_entries`] replaced, as the lowering held it.
+struct Swapped {
+    value: Value,
+    val: Option<Val>,
+    lane_bit: Option<V>,
+    mask_phi: Option<V>,
+}
+
+/// A program's blocks' immediate dominators, and their places in reverse
+/// postorder.
+struct Doms {
+    idom: Vec<usize>,
+    rpo: Vec<usize>,
+}
+
+impl Doms {
+    fn new(p: &Program) -> Self {
+        let order = crate::ir::reverse_postorder(&p.blocks);
+        let mut rpo = vec![usize::MAX; p.blocks.len()];
+        for (k, &b) in order.iter().enumerate() {
+            rpo[b] = k;
+        }
+        Doms {
+            idom: crate::ir::idoms(&p.blocks, &order, &rpo),
+            rpo,
+        }
+    }
+
+    /// Whether IR block `d` dominates IR block `b`.
+    fn dominates(&self, d: usize, mut b: usize) -> bool {
+        loop {
+            if b == d {
+                return true;
+            }
+            let up = self.idom[b];
+            if up == usize::MAX || up == b {
+                return false;
+            }
+            b = up;
+        }
+    }
+}
+
+/// How a region is entered other than from its head ([`Region::entries`]).
+#[derive(Clone)]
+struct Entered {
+    head: usize,
+    /// The other edges in.
+    edges: Vec<(usize, usize)>,
+    /// The values defined on some ways in and not on others, which the
+    /// region may read (by its instructions, or through the lane conditions
+    /// and masks the lowering keeps of them): each with, per way in (the
+    /// head, then each edge), whether it comes by its definition.
+    values: Vec<(Value, Vec<bool>)>,
+}
+
+impl Entered {
+    fn new(x: &Parts, r: &Region, doms: &Doms) -> Self {
+        let p = x.p;
+        let mut e = Entered {
+            head: r.head,
+            edges: r.entries.clone(),
+            values: Vec::new(),
+        };
+        let sources: Vec<usize> = e.sources().collect();
+        for (d, block) in p.blocks.iter().enumerate() {
+            if r.blocks[d] || doms.rpo[d] == usize::MAX {
+                continue;
+            }
+            let by: Vec<bool> = sources.iter().map(|&s| doms.dominates(d, s)).collect();
+            if by.iter().all(|&b| b) || !by.iter().any(|&b| b) {
+                continue;
+            }
+            let defined = block
+                .phis
+                .iter()
+                .map(|phi| phi.value)
+                .chain(block.insts.iter().flat_map(|i| &i.writes).map(|w| w.1));
+            e.values.extend(defined.map(|v| (v, by.clone())));
+        }
+        e
+    }
+
+    /// The blocks it is entered from: the head, then each edge's source.
+    fn sources(&self) -> impl Iterator<Item = usize> + '_ {
+        std::iter::once(self.head).chain(self.edges.iter().map(|&(q, _)| q))
+    }
+}
+
 impl Lower<'_> {
+    /// The DXIL block an edge from IR block `from` into a region at `to`,
+    /// other than from its head, goes to: a block of its own on to the
+    /// region's first block ([`Lower::wide_entries`]).
+    pub(super) fn wide_entry(&mut self, from: usize, to: usize) -> Option<usize> {
+        let first = *self.wide.entry_into.get(&(from, to))?;
+        let e = self.s.m.new_block();
+        self.s
+            .m
+            .terminate(e, Term::Br(self.block[first].expect("reachable")));
+        self.wide.entry_block.insert((from, to), e);
+        Some(e)
+    }
+
+    /// At the start of IR block `b`, the first of a region entered other
+    /// than from its head ([`regions`]), which every way in leads to: which
+    /// way the group came. Along the head's edges, their lanes, and none
+    /// where it came by another; along each other edge, every lane where
+    /// it came by that one, and none elsewhere. The blocks before the one
+    /// an edge leads to run with no lanes. A value defined outside that
+    /// some way in does not come by is zero along it (no lane there reads
+    /// it).
+    fn wide_entries(&mut self, b: usize, e: &Entered) {
+        let c = self.cur;
+        let head_tail = self.wide.from[&b];
+        let blocks: Vec<usize> = e
+            .edges
+            .iter()
+            .map(|edge| self.wide.entry_block[edge])
+            .collect();
+        let ways: Vec<usize> = std::iter::once(head_tail)
+            .chain(blocks.iter().copied())
+            .collect();
+        let i1 = self.s.t.i1;
+        let (f, t) = (self.s.m.bool(false), self.s.m.bool(true));
+        let mut head_edges: Vec<((usize, usize), V)> = self
+            .wide
+            .edges
+            .iter()
+            .filter(|((q, _), _)| *q == e.head)
+            .map(|(&k, &v)| (k, v))
+            .collect();
+        head_edges.sort_by_key(|&(k, _)| k);
+        for (edge, lanes) in head_edges {
+            let phi = self.s.m.phi(c, i1);
+            let incoming = std::iter::once(lanes)
+                .chain(blocks.iter().map(|_| f))
+                .zip(ways.iter().copied())
+                .collect();
+            self.s.m.set_phi(phi, incoming);
+            self.wide.edges.insert(edge, phi);
+        }
+        for (i, &edge) in e.edges.iter().enumerate() {
+            let phi = self.s.m.phi(c, i1);
+            let incoming = std::iter::once(f)
+                .chain((0..blocks.len()).map(|k| if k == i { t } else { f }))
+                .zip(ways.iter().copied())
+                .collect();
+            self.s.m.set_phi(phi, incoming);
+            self.wide.edges.insert(edge, phi);
+        }
+        let (mut saved, mut swaps) = (Vec::new(), HashMap::new());
+        for (v, by) in &e.values {
+            let was = Swapped {
+                value: *v,
+                val: self.vals.get(v).copied(),
+                lane_bit: self.lane_bits.get(v).copied(),
+                mask_phi: self.mask_phis.get(v).copied(),
+            };
+            // A constant is the same along every way in.
+            let made = match was.val {
+                Some(Val::I32(x)) if !matches!(x, V::Const(_)) => Some((x, false)),
+                Some(Val::Bit(x)) if !matches!(x, V::Const(_)) => Some((x, true)),
+                _ => None,
+            };
+            if let Some((x, bit)) = made {
+                let y = self.zero_along(c, x, bit, by, &ways);
+                swaps.insert(x, y);
+                self.vals
+                    .insert(*v, if bit { Val::Bit(y) } else { Val::I32(y) });
+            }
+            if let Some(x) = was.lane_bit.filter(|x| !matches!(x, V::Const(_))) {
+                let y = self.zero_along(c, x, true, by, &ways);
+                swaps.insert(x, y);
+                self.lane_bits.insert(*v, y);
+            }
+            if let Some(x) = was.mask_phi.filter(|x| !matches!(x, V::Const(_))) {
+                let y = self.zero_along(c, x, true, by, &ways);
+                swaps.insert(x, y);
+                self.mask_phis.insert(*v, y);
+            }
+            // Made again from the value, here.
+            self.floats.remove(v);
+            self.low16.remove(v);
+            self.ballots.remove(v);
+            saved.push(was);
+        }
+        self.wide.swaps.insert(b, (saved, swaps));
+        // Lane booleans worked out before now read the values as they were.
+        self.bools.clear();
+    }
+
+    /// After the last block of a region [`Lower::wide_entries`] lowered:
+    /// the values it replaced are again as they were, for the blocks after
+    /// the region (its join reads them through its phis, which map them,
+    /// [`Lower::wide_phi`]).
+    fn wide_restore(&mut self, last: usize) {
+        let Some(&first) = self.wide.entered_by.get(&last) else {
+            return;
+        };
+        if self
+            .wide
+            .next
+            .get(&last)
+            .is_some_and(|n| self.wide.entered_by.get(n) == Some(&first) && self.wide.inside[*n])
+        {
+            return;
+        }
+        let Some((saved, _)) = self.wide.swaps.get_mut(&first) else {
+            return;
+        };
+        for was in std::mem::take(saved) {
+            let v = was.value;
+            match was.val {
+                Some(val) => self.vals.insert(v, val),
+                None => self.vals.remove(&v),
+            };
+            match was.lane_bit {
+                Some(x) => self.lane_bits.insert(v, x),
+                None => self.lane_bits.remove(&v),
+            };
+            match was.mask_phi {
+                Some(x) => self.mask_phis.insert(v, x),
+                None => self.mask_phis.remove(&v),
+            };
+            self.floats.remove(&v);
+            self.low16.remove(&v);
+            self.ballots.remove(&v);
+        }
+        self.bools.clear();
+    }
+
+    /// A phi in DXIL block `at` of `x` along the `ways` in that `by` marks,
+    /// zero (false where `bit`) along the others.
+    fn zero_along(&mut self, at: usize, x: V, bit: bool, by: &[bool], ways: &[usize]) -> V {
+        let (ty, zero) = if bit {
+            (self.s.t.i1, self.s.m.bool(false))
+        } else {
+            (self.s.t.i32, self.s.m.i32(0))
+        };
+        let phi = self.s.m.phi(at, ty);
+        let incoming = by
+            .iter()
+            .zip(ways)
+            .map(|(&b, &w)| (if b { x } else { zero }, w))
+            .collect();
+        self.s.m.set_phi(phi, incoming);
+        phi
+    }
+
     /// At the start of IR block `b`, after its phis: where `b` runs
     /// wave-wide, its lanes, those of its edges in. A loop's header takes
     /// the lanes entering the loop, then those going round.
     pub(super) fn wide_enter(&mut self, b: usize) {
         if !self.wide.inside.get(b).copied().unwrap_or(false) {
             return;
+        }
+        if let Some(e) = self.wide.entered.get(&b).cloned() {
+            self.wide_entries(b, &e);
         }
         let c = self.cur;
         let body = self.wide.loops.get(&b).map(|l| l.body.clone());
@@ -751,6 +1117,7 @@ impl Lower<'_> {
         for h in self.wide.ends.get(&b).cloned().unwrap_or_default() {
             self.wide_round(h)?;
         }
+        self.wide_restore(b);
         let Some(next) = next else {
             return Ok(Some(Term::Ret));
         };
@@ -839,22 +1206,40 @@ impl Lower<'_> {
     /// the edges from IR blocks `from`. Where `b` is in a region run
     /// wave-wide or joins one, its DXIL predecessor brings the value along
     /// the edge each lane came by; a loop's header has two, the block the
-    /// loop is entered from and the one its rounds go back from.
+    /// loop is entered from and the one its rounds go back from. An edge
+    /// into a join around the region (the whole group took it, see
+    /// [`regions`]) keeps its own DXIL predecessor. In a region entered
+    /// other than from its head, a value replaced along the ways in
+    /// ([`Lower::wide_entries`]) is what replaced it.
     pub(super) fn wide_phi(&mut self, v: V, b: usize, incoming: Vec<(V, usize)>, from: &[usize]) {
         let Some(&at) = self.wide.from.get(&b) else {
             self.s.m.set_phi(v, incoming);
             return;
         };
-        let edges: Vec<(V, usize)> = incoming
-            .iter()
+        let around = |q: usize| {
+            !self.wide.inside[q]
+                && !self.wide.next.contains_key(&q)
+                && !self.wide.entry_into.contains_key(&(q, b))
+        };
+        let (around, edges): (Vec<_>, Vec<_>) = incoming
+            .into_iter()
             .zip(from)
-            .map(|(&(x, _), &q)| (x, q))
+            .partition(|&(_, &q)| around(q));
+        let swaps = self
+            .wide
+            .entered_by
+            .get(&b)
+            .and_then(|first| self.wide.swaps.get(first))
+            .map(|(_, s)| s);
+        let edges: Vec<(V, usize)> = edges
+            .into_iter()
+            .map(|((x, _), &q)| (swaps.and_then(|s| s.get(&x)).copied().unwrap_or(x), q))
             .collect();
         let Some((end, back)) = self.wide.rounds.get(&b).and_then(|r| r.end) else {
             let picked = self.wide_pick(b, &edges, at);
-            self.s
-                .m
-                .set_phi(v, picked.map(|x| (x, at)).into_iter().collect());
+            let mut incoming: Vec<(V, usize)> = around.into_iter().map(|(x, _)| x).collect();
+            incoming.extend(picked.map(|x| (x, at)));
+            self.s.m.set_phi(v, incoming);
             return;
         };
         let body = &self.wide.loops[&b].body;

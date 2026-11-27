@@ -346,7 +346,8 @@ impl Lower<'_> {
         }
         // Where one half's lanes alone run, its host wave's first lane in
         // EXEC is the console's, unless a guard may leave EXEC empty (the
-        // console then reads lane 0, which may not be running here).
+        // console then reads lane 0, which may not be running here): then
+        // the region runs wave-wide instead, where the halves meet.
         let alone = match (self.meets(), self.alone(self.cur_ir)) {
             (true, _) => None,
             (false, Some(h)) => Some(h),
@@ -359,7 +360,7 @@ impl Lower<'_> {
             .position(|j| std::ptr::eq(j, inst))
             .ok_or(FIRST_ACROSS)?;
         let on = match self.guard(b, i)? {
-            Some(_) if alone.is_some() => return Err(FIRST_ACROSS),
+            Some(_) if alone.is_some() => return Err(self.apart(b, FIRST_ACROSS)),
             Some(g) => g,
             None => self.s.m.bool(true),
         };

@@ -116,13 +116,20 @@ regions. Two cases are lowered, tried in this order after Level 2:
   16` in an LDS tree step), the other half's host wave runs the block
   alone, in the console's order: its ballot is the console's with the
   other dword 0, its first lane in EXEC and its reductions are the
-  console's (a first lane under a guard that may leave EXEC empty is still
-  refused), and LDS the region both writes and reads needs no barrier
-  inside.
+  console's (a first lane under a guard that may leave EXEC empty runs
+  wave-wide instead), and LDS the region both writes and reads needs no
+  barrier inside.
 - **Wave-wide** (`lower::wide`). Otherwise the region runs wave-wide: the
   blocks not every thread meets at, joined by their edges, entered from
   one block and left to one, or holding the program's ends (or, where such
-  a set is neither, the region of one branch in it). Every thread runs
+  a set is neither, the region of one branch in it). Blocks where every
+  thread meets and whose way on the whole group takes together (a branch on
+  scalar values in a group of one console wave) may also lead around the
+  region to its join, or into it past its head: going around, no lane is
+  in the region; going in, the group runs it from its first block, with
+  every lane in the block it went to and none in those before, and what
+  only one way in defines is zero along the others (a region with a
+  descriptor chosen by control flow is not entered that way). Every thread runs
   every block of it in order, each
   block after those its forward edges come from and a loop's blocks
   together, and each block acts only in its own lanes, those along its
@@ -184,7 +191,7 @@ end, and it reorders memory effects between them.
 executable, `XboxBvhBuilder.dll` and the FidelityFX upscaler DLL: wave64
 compute programs that need console lanes run in halves. Compute programs
 emitted, as each step was added (of 2,763; none lost on the way, every
-program gained validates but for 6 in an existing validator failure class
+program gained validates but for 12 in an existing validator failure class
 that 735 compute programs share):
 
 | Step | Compute programs emitted |
@@ -199,11 +206,12 @@ that 735 compute programs share):
 | wave-wide loops | 2,650 |
 | regions to the program's end, loops of larger groups | 2,697 |
 | sections step by step, lane permutes per instruction | 2,704 |
+| regions a whole-group branch goes around or into | 2,721 |
 
-Still refused in halves: 9 first lanes, 6 one-wave LDS regions, 4 masks
-and 2 reductions, in a region not entered from one block and left to one
-(nor one of its branches' regions); 2 programs whose LDS leaves no room for
-the trades' 16 bytes per console wave; 6 tiled group shapes; 2 16-bit sums
+Still refused in halves: 2 first lanes in a region entered by a
+whole-group branch that holds a descriptor chosen by control flow, 1 mask
+in a region of neither shape; 2 programs whose LDS leaves no room for the
+trades' 16 bytes per console wave; 6 tiled group shapes; 2 16-bit sums
 where not every thread of a group of several console waves meets.
 
 Before Levels 2 and 3, a local build that recorded every cross-half site
@@ -240,11 +248,12 @@ points, in one-half regions and wave-wide, LDS of one-wave groups
 group-shared slots' cost in barriers; loops each lane leaves in its own
 round (the halves going round different numbers of times) with first
 lanes, masks and LDS inside, and a first lane read after such a loop;
-a section run step by step whose uneven lanes are kept, a 16-bit sum, and
-the lane permutes.
+regions a whole-group branch goes around or into, a section run step by
+step whose uneven lanes are kept, a 16-bit sum, and the lane permutes.
 `emit::halves_random_tests` runs random wave64 programs (cross-lane steps
 at the top level, in branches one inside another and in loops each lane
-leaves in its own round, LDS, scalar branches, lanes that end partway) in
+leaves in its own round, LDS, scalar branches, lanes that end partway,
+whole-group branches around or into a lane branch) in
 halves and as one wave64 on an adapter that runs 64-lane waves, lane by
 lane.
 

@@ -194,7 +194,7 @@ impl Gen {
 
     fn step(&mut self) {
         let ended = self.ended.is_some();
-        match self.r.below(19) {
+        match self.r.below(21) {
             0 | 1 => self.alu(),
             2 | 3 => self.dpp(),
             4 | 5 if ended => self.alu(),
@@ -210,9 +210,75 @@ impl Gen {
             14 | 15 => self.alu(),
             16 => self.lane_loop(),
             17 => self.early_end(),
+            18 => self.around(),
+            19 => self.into(),
             _ if ended => self.alu(),
             _ => self.section(),
         }
+    }
+
+    /// A branch on a scalar compare (`s5` is 0: with `s_cmp_eq_u32 s5, 0`
+    /// the whole group takes it, with 1 none) to the join of a lane branch
+    /// ([`Gen::branch`]) right after it, around the region its lanes run.
+    /// Where every lane takes the branches around it.
+    fn around(&mut self) {
+        if self.lanes != [0, 64] || self.in_loop {
+            return self.alu();
+        }
+        let none = self.r.below(2);
+        self.w.extend([
+            0xBE94_047E,             // s_mov_b64 s[20:21], exec (the join restores it)
+            0xBF06_8005 | none << 8, // s_cmp_eq_u32 s5, none
+        ]);
+        let at = self.w.len();
+        self.w.push(0);
+        self.branch(0);
+        // To the branch's join, its `s_mov_b64 exec, s[20:21]`.
+        self.w[at] = 0xBF85_0000 | (self.w.len() - at - 2) as u32; // s_cbranch_scc1
+    }
+
+    /// A lane branch (console lanes below a random one, or from one) of a
+    /// step, then steps that read across lanes, which a branch on a scalar
+    /// compare before it (taken by the whole group or by none, as
+    /// [`Gen::around`]) may take the whole group straight into, with every
+    /// lane. Where every lane takes the branches around it.
+    fn into(&mut self) {
+        if self.lanes != [0, 64] || self.in_loop {
+            return self.alu();
+        }
+        let none = self.r.below(2);
+        let (from, lanes) = (self.r.below(2) == 0, 1 + self.r.below(63));
+        // v_cmp_le_u32 (from) or v_cmp_gt_u32 (below) vcc, lanes, v10
+        let op: u32 = if from { 0xC3 } else { 0xC4 };
+        self.w.extend([
+            0xBE94_047E,             // s_mov_b64 s[20:21], exec (the join restores it)
+            0xBF06_8005 | none << 8, // s_cmp_eq_u32 s5, none
+        ]);
+        let jump = self.w.len();
+        self.w.push(0);
+        self.w.extend([
+            vop2(10, 0x1B, k(63), 0), // v_and_b32 v10, 63, v0
+            0x7C00_0000 | op << 17 | 10 << 9 | k(lanes) as u32,
+            0xBE94_246A, // s_and_saveexec_b64 s[20:21], vcc
+        ]);
+        let past = self.w.len();
+        self.w.push(0);
+        // Lane reads name the branch's lanes, which run either way.
+        self.lanes = if from { [lanes, 64] } else { [0, lanes] };
+        self.alu();
+        let mid = self.w.len();
+        for _ in 0..1 + self.r.below(2) {
+            match self.r.below(4) {
+                0 => self.first_lane(),
+                1 => self.ballot(),
+                2 => self.dpp(),
+                _ => self.read_lane(),
+            }
+        }
+        self.lanes = [0, 64];
+        self.w[jump] = 0xBF85_0000 | (mid - jump - 1) as u32; // s_cbranch_scc1 into it
+        self.w[past] = 0xBF88_0000 | (self.w.len() - past - 1) as u32; // s_cbranch_execz past it
+        self.w.push(0xBEFE_0414); // s_mov_b64 exec, s[20:21]
     }
 
     /// A lane's own arithmetic.

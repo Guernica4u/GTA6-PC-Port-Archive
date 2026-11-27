@@ -175,7 +175,7 @@ fn refusal(words: &[u32], threads: u32, lds_bytes: u32) -> String {
 /// The hand-encoded words are the instructions their comments name.
 #[test]
 fn the_test_programs_are_what_their_comments_say() {
-    let programs: [(Vec<u32>, &[&str]); 32] = [
+    let programs: [(Vec<u32>, &[&str]); 34] = [
         (
             sum16(),
             &[
@@ -189,6 +189,27 @@ fn the_test_programs_are_what_their_comments_say() {
                 "v_readlane_b32 s4, v4, 31",
                 "v_readlane_b32 s5, v4, 63",
                 "v_add_f16 v6, s4, v7",
+            ],
+        ),
+        (
+            whole_group_around(true),
+            &[
+                "s_cmp_eq_u32 s5, 0",
+                "s_cbranch_scc1",
+                "v_cmp_gt_u32 vcc, 10, v1",
+                "s_andn2_b64 exec, exec, vcc",
+                "s_cbranch_execz",
+                "v_readfirstlane_b32 s13, v1",
+            ],
+        ),
+        (
+            whole_group_into(false),
+            &[
+                "s_cmp_eq_u32 s5, 1",
+                "s_cbranch_scc1",
+                "v_mov_b32 v2, lit(0x0000dead)",
+                "s_bcnt1_i32_b64 s12, vcc",
+                "v_readfirstlane_b32 s13, v1",
             ],
         ),
         (
@@ -2262,6 +2283,152 @@ fn wave64_programs_in_halves_match_the_console_on_every_gpu() {
 "
         )
     );
+}
+
+/// Lanes below 10 leave the program and the others read a mask and a first
+/// lane over the lanes left, as [`lanes_that_end`], after every lane stores
+/// its console lane at dword 2; but where `skip`, a branch on a scalar
+/// compare before (`s5` is 0) takes the whole group around all of it, to
+/// the program's end, which the lanes that leave also go to.
+fn whole_group_around(skip: bool) -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0xD766_0001,
+        0x0002_02C1, // v_mbcnt_hi_u32_b32 v1, -1, v1
+    ]);
+    w.extend(store(1, 8));
+    let mut rest = vec![
+        0x7C00_0000 | 0xC4 << 17 | 1 << 9 | 168, // v_cmp_gt_u32 vcc, 40, v1
+        sop1(12, 0x10, 106),                     // s_bcnt1_i32_b64 s12, vcc
+        vop1(2, 0x01, 12),                       // v_mov_b32 v2, s12
+        vop1(13, 0x02, 256 + 1),                 // v_readfirstlane_b32 s13, v1
+        vop1(3, 0x01, 13),                       // v_mov_b32 v3, s13
+    ];
+    rest.extend(store(2, 0));
+    rest.extend(store(3, 4));
+    let leave = [
+        0x7C00_0000 | 0xC4 << 17 | 1 << 9 | 138, // v_cmp_gt_u32 vcc, 10, v1
+        0x8AFE_6A7E,                             // s_andn2_b64 exec, exec, vcc
+        0xBF88_0000 | rest.len() as u32,         // s_cbranch_execz to the end
+    ];
+    w.extend([
+        0xBF06_8005 | u32::from(!skip) << 8, // s_cmp_eq_u32 s5, 0 (1 without `skip`)
+        0xBF85_0000 | (leave.len() + rest.len()) as u32, // s_cbranch_scc1 to the end
+    ]);
+    w.extend(leave);
+    w.extend(rest);
+    w.push(S_ENDPGM);
+    w
+}
+
+/// Lanes below 10 leave the program; the others take how many of them are
+/// below 40 (`v2`, 0xdead before), then read the first lane left (`v3`) and
+/// store both. Where `skip`, a branch on a scalar compare before (`s5` is 0)
+/// takes the whole group straight to the first-lane read, with every lane:
+/// into the middle of the region the lanes that stay run.
+fn whole_group_into(skip: bool) -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0xD766_0001,
+        0x0002_02C1, // v_mbcnt_hi_u32_b32 v1, -1, v1
+        vop1(2, 0x01, 255),
+        0xDEAD, // v_mov_b32 v2, 0xdead
+    ]);
+    let mut read = vec![
+        vop1(13, 0x02, 256 + 1), // v_readfirstlane_b32 s13, v1
+        vop1(3, 0x01, 13),       // v_mov_b32 v3, s13
+    ];
+    read.extend(store(2, 0));
+    read.extend(store(3, 4));
+    let count = [
+        0x7C00_0000 | 0xC4 << 17 | 1 << 9 | 168, // v_cmp_gt_u32 vcc, 40, v1
+        sop1(12, 0x10, 106),                     // s_bcnt1_i32_b64 s12, vcc
+        vop1(2, 0x01, 12),                       // v_mov_b32 v2, s12
+    ];
+    let leave = [
+        0x7C00_0000 | 0xC4 << 17 | 1 << 9 | 138, // v_cmp_gt_u32 vcc, 10, v1
+        0x8AFE_6A7E,                             // s_andn2_b64 exec, exec, vcc
+        0xBF88_0000 | (count.len() + read.len()) as u32, // s_cbranch_execz to the end
+    ];
+    w.extend([
+        0xBF06_8005 | u32::from(!skip) << 8, // s_cmp_eq_u32 s5, 0 (1 without `skip`)
+        0xBF85_0000 | (leave.len() + count.len()) as u32, // s_cbranch_scc1 to the read
+    ]);
+    w.extend(leave);
+    w.extend(count);
+    w.extend(read);
+    w.push(S_ENDPGM);
+    w
+}
+
+/// Regions run wave-wide that the whole group may also go around, to their
+/// join ([`whole_group_around`]), or into, at a block past their head
+/// ([`whole_group_into`]), on a branch it takes together, translate in
+/// halves in groups of one and of several console waves, to valid DXIL.
+#[test]
+fn regions_the_whole_group_goes_around_or_into_translate_in_halves() {
+    let mut validator =
+        validator::Validator::load(validator::Validator::default_path().as_deref()).ok();
+    for threads in [48, 64, 128] {
+        for skip in [false, true] {
+            for (name, words) in [
+                ("around", whole_group_around(skip)),
+                ("into", whole_group_into(skip)),
+            ] {
+                let l = lowered(&native(&words, true, threads, 0), true)
+                    .unwrap_or_else(|e| panic!("{name} {threads} {skip}: {e}"));
+                if let Some(v) = validator.as_mut() {
+                    v.validate(&mut l.dxil.clone())
+                        .unwrap_or_else(|e| panic!("{name} {threads} {skip}: {e}"));
+                }
+            }
+        }
+    }
+}
+
+/// [`whole_group_around`] and [`whole_group_into`] on every hardware
+/// adapter, in halves and as one wave64 where the adapter runs those, in
+/// groups of 48, 64 and 128, with the whole group going its own way or not.
+#[test]
+fn regions_the_whole_group_goes_around_or_into_match_the_console_on_every_gpu() {
+    let mut failed = Vec::new();
+    for threads in [48, 64, 128] {
+        let wave = |l: u32| (l & !63, (threads - (l & !63)).min(64));
+        for skip in [false, true] {
+            let around: Vec<u32> = (0..threads)
+                .flat_map(|l| {
+                    let (base, n) = wave(l);
+                    let lane = l - base;
+                    if skip || lane < 10 {
+                        [0, 0, lane]
+                    } else {
+                        [n.min(40) - 10, 10, lane]
+                    }
+                })
+                .collect();
+            failed.extend(differences(&whole_group_around(skip), threads, 3, &around));
+            let into: Vec<u32> = (0..threads)
+                .flat_map(|l| {
+                    let (base, n) = wave(l);
+                    if skip {
+                        [0xDEAD, 0]
+                    } else if l - base < 10 {
+                        [0, 0]
+                    } else {
+                        [n.min(40) - 10, 10]
+                    }
+                })
+                .collect();
+            failed.extend(differences(&whole_group_into(skip), threads, 2, &into));
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
 /// A wave64 sum written the way the console compiler expands one (the
