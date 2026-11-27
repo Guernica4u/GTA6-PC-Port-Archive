@@ -857,7 +857,9 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         );
         return false;
     }
-    if !commit(base, len) {
+    if lazy_commit::physical_enabled() && !on_wine() {
+        lazy_commit::mark_range(base, len);
+    } else if !commit(base, len) {
         // SAFETY: the view just mapped, back to a placeholder.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
@@ -1001,6 +1003,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 }
             }
         }
+        lazy_commit::unmark_range(at, size);
         victory_gpu::title_memory_remapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
@@ -1694,10 +1697,11 @@ pub(crate) fn ensure_committed(address: usize, len: usize) {
 }
 
 /// Opt-in demand-commit (`VICTORY_XMEM_LAZY_COMMIT=1`, off by default) for large
-/// (`>= 4 MiB`) writable `XMemVirtualAlloc` allocations: reserves with
-/// `MEM_RESERVE | MEM_WRITE_WATCH` and commits 64 KiB pages on first CPU touch
-/// via a vectored exception handler, or ahead of kernel syscalls via
-/// [`ensure_committed`].
+/// (`>= 4 MiB`) writable `XMemVirtualAlloc` allocations, plus opt-in demand-commit
+/// (`VICTORY_XMEM_LAZY_PHYSICAL=1`, off by default) for mapped `SEC_RESERVE`
+/// physical-page views: reserves without committing upfront and commits 64 KiB
+/// pages on first CPU touch via a vectored exception handler, or ahead of kernel
+/// syscalls via [`ensure_committed`].
 mod lazy_commit {
     use std::collections::BTreeSet;
     use std::ffi::c_void;
@@ -1734,6 +1738,14 @@ mod lazy_commit {
     fn enabled() -> bool {
         static ON: LazyLock<bool> = LazyLock::new(|| {
             !cfg!(test) && enabled_for(std::env::var("VICTORY_XMEM_LAZY_COMMIT").ok().as_deref())
+        });
+        *ON
+    }
+
+    pub(super) fn physical_enabled() -> bool {
+        static ON: LazyLock<bool> = LazyLock::new(|| {
+            !cfg!(test)
+                && enabled_for(std::env::var("VICTORY_XMEM_LAZY_PHYSICAL").ok().as_deref())
         });
         *ON
     }
@@ -1998,6 +2010,61 @@ mod lazy_commit {
             unmark_allocation(base);
             // SAFETY: ours.
             assert_ne!(unsafe { VirtualFree(base as *mut c_void, 0, MEM_RELEASE) }, 0);
+        }
+
+        #[test]
+        fn lazy_physical_sec_reserve_view_commits_on_touch_and_ensure() {
+            use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+            use windows_sys::Win32::System::Memory::{
+                CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, SEC_RESERVE, UnmapViewOfFile,
+            };
+
+            const LEN: usize = 4 * PAGE;
+            // SAFETY: creating a temporary pagefile-backed SEC_RESERVE section for test.
+            let section = unsafe {
+                CreateFileMappingW(
+                    INVALID_HANDLE_VALUE,
+                    std::ptr::null(),
+                    PAGE_READWRITE | SEC_RESERVE,
+                    0,
+                    LEN as u32,
+                    std::ptr::null(),
+                )
+            };
+            assert!(!section.is_null());
+
+            // SAFETY: mapping our section as a writable view.
+            let view = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, LEN) };
+            let base = view.Value as usize;
+            assert_ne!(base, 0);
+
+            let is_lazy = |p: usize| LAZY.read().unwrap().contains(&p);
+            mark_range(base, LEN);
+            assert!(is_reserved_span(base, LEN));
+            assert!(is_lazy(base));
+
+            // First CPU write commits page 0 via VEH; page 1 stays reserved.
+            // SAFETY: page 0 is marked lazy inside our mapped section view.
+            unsafe { std::ptr::write_volatile(base as *mut u32, 0xCAFE_BABE) };
+            // SAFETY: page 0 is now committed.
+            assert_eq!(unsafe { std::ptr::read_volatile(base as *const u32) }, 0xCAFE_BABE);
+            assert!(!is_lazy(base));
+            assert!(is_lazy(base + PAGE));
+
+            // `ensure` commits page 2 ahead of a kernel write without faulting.
+            ensure(base + 2 * PAGE, PAGE);
+            assert!(!is_lazy(base + 2 * PAGE));
+            assert!(is_lazy(base + 3 * PAGE));
+
+            unmark_range(base, LEN);
+            assert!(!is_lazy(base + PAGE));
+            assert!(!is_lazy(base + 3 * PAGE));
+
+            // SAFETY: unmapping and closing our test section.
+            unsafe {
+                UnmapViewOfFile(view);
+                CloseHandle(section);
+            }
         }
     }
 }
