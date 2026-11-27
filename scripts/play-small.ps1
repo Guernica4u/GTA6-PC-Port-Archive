@@ -30,7 +30,7 @@ param(
     [int]$BarMB = 1024,
     # VICTORY_CARD_ROOM_FOR_TARGETS_MB: VRAM the texture queue keeps for render targets (repo default 3072).
     [int]$TargetsMB = 1536,
-    # Leave the game windowed (default: borderless full screen through scripts\fullscreen.ps1).
+    # Leave the game windowed (default: borderless full screen made by the layer, VICTORY_FULLSCREEN=1).
     [switch]$Windowed,
     # Raise the game process to High priority once it is up.
     [switch]$High,
@@ -64,6 +64,9 @@ $set = @{
 if ($BarMB -gt 0) { $set.VICTORY_WINDOWS_BAR_MB = [string]$BarMB }
 if (-not $Pool) { $set.VICTORY_TEXTURE_POOL = '0' }
 if ($SkipLevels -gt 0) { $set.VICTORY_TEXTURE_SKIP_LEVELS = [string]$SkipLevels; $set.VICTORY_TEXTURE_SKIP_MIN = [string]$SkipMin }
+# Borderless full screen made by the layer when it creates the title's window (lifecycle.rs `fullscreen`): unlike
+# scripts\fullscreen.ps1, which waits at most 3 minutes for the window, it also holds after a long -Preload.
+if (-not $Windowed) { $set.VICTORY_FULLSCREEN = '1' }
 foreach ($k in $More.Keys) { $set[$k] = $More[$k] }
 
 $fg = if ($NoFrameGen) { @{ NoFrameGenReady = $true } } else { @{ FrameGen = $true; FrameGenX = 2 } }
@@ -71,16 +74,13 @@ $fg = if ($NoFrameGen) { @{ NoFrameGenReady = $true } } else { @{ FrameGen = $tr
 if ($High) {
     $null = Start-Job -ArgumentList $repo -ScriptBlock {
         param($r)
-        $end = (Get-Date).AddMinutes(15)
+        $end = (Get-Date).AddMinutes(120)   # a -Preload comes first: the game may start much later
         while ((Get-Date) -lt $end) {
             $p = Get-Process victory -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$r*" }
             if ($p) { $p | ForEach-Object { $_.PriorityClass = 'High' }; break }
             Start-Sleep -Seconds 2
         }
     }
-}
-if (-not $Windowed) {
-    Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $PSScriptRoot 'fullscreen.ps1')
 }
 Write-Host ("Small PC: Series S, DLSS {0}, frame generation {1}, textures {2} % (skip {3} level(s) >= {4}), pool {5}, BAR {6} MB, targets {7} MB" -f `
         $Dlss, $(if ($NoFrameGen) { 'off' } else { '2x' }), $RoomPct, $SkipLevels, $SkipMin, $(if ($Pool) { 'on' } else { 'off' }), $BarMB, $TargetsMB)

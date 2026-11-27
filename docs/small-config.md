@@ -179,7 +179,8 @@ changed by any setting.
 
 Everything else is `play-foxhound.ps1`'s set, plus `VICTORY_PLACED_ORDER=1` as the `PLAY_FRAMEGEN.cmd` launcher
 sets it.
-Borderless full screen (`scripts\fullscreen.ps1`) is started by the launcher.
+Borderless full screen is the layer's own (`VICTORY_FULLSCREEN=1`, made when the window is created), not
+`scripts\fullscreen.ps1`, which gives up after 3 minutes and so missed the game after a `-Preload`.
 
 ## Every run, in order
 
@@ -219,7 +220,7 @@ comes from `game_dir` in `victory.toml` (or `VICTORY_GAME_DIR`, or `-Exe`).
 | `-Pool` | pool off | `VICTORY_TEXTURE_POOL` | turn the texture pool back on (step 5) |
 | `-BarMB <MB>` | 1024 | `VICTORY_WINDOWS_BAR_MB` | title windows in BAR memory (step 3); 0: off |
 | `-TargetsMB <MB>` | 1536 | `VICTORY_CARD_ROOM_FOR_TARGETS_MB` | render target reserve (step 4) |
-| `-Windowed` | full screen | | leave the window as it is |
+| `-Windowed` | full screen | `VICTORY_FULLSCREEN` | leave the window as the title makes it |
 | `-High` | normal | | High process priority once the game is up |
 | `-Preload` | off | | `victory preload` with these switches first (every shader translated, the known pipelines made, the loading ones stored in the pipeline library), then the game; once per new build or driver |
 | `-More @{...}` | | any | any other switch, as `play-foxhound.ps1 -More` |
