@@ -1138,9 +1138,21 @@ fn record_upload(
                 },
             },
         };
+        upload_noted(list, footprint);
         // SAFETY: an open list; both locations name live resources.
         unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
+}
+
+/// An upload of one subresource into `list`: work there, counted with its
+/// bytes (`host::gpu_time`'s steps line).
+fn upload_noted(list: &HostList, footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT) {
+    list.gpu_work();
+    let f = &footprint.Footprint;
+    crate::host::count_gpu_step(
+        crate::host::GpuStep::Uploads,
+        u64::from(f.RowPitch) * u64::from(f.Height) * u64::from(f.Depth),
+    );
 }
 
 fn fill_plane(
@@ -1229,6 +1241,7 @@ pub(crate) fn zeros(list: &HostList, host: &crate::host::Host, texture: &ID3D12R
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *footprint },
         };
+        upload_noted(list, footprint);
         // SAFETY: an open list; both locations name live resources.
         unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
@@ -1297,6 +1310,7 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
                 Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
             };
+            upload_noted(list, &footprint);
             // SAFETY: an open list; both locations name live resources.
             unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
         }

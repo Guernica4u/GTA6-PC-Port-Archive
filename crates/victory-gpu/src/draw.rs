@@ -1546,6 +1546,7 @@ impl State {
         self.host_targets = Some(now);
         let rtvs: Vec<_> = views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
         let dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
+        list.gpu_pass_break();
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
@@ -1887,13 +1888,64 @@ impl State {
             // SAFETY: an open list; the view names a live host buffer.
             unsafe { l.IASetIndexBuffer(Some(&view)) };
         }
-        const RENDER_TARGET: u32 = 0x4;
-        for &t in &self.targets {
-            crate::list::ensure_state(list, t as This, RENDER_TARGET);
-        }
         if self.depth != 0 {
             // A depth texture shaders also write: what they wrote, first.
             list.twin_use(self.depth as This, false, true);
+        }
+        const RENDER_TARGET: u32 = 0x4;
+        // Batch all target and depth state transitions into a single ResourceBarrier call.
+        let mut barriers = [const { std::mem::MaybeUninit::<D3D12_RESOURCE_BARRIER>::uninit() }; 9];
+        let mut barrier_count = 0usize;
+        let flush_barriers = |barriers: &mut [std::mem::MaybeUninit<D3D12_RESOURCE_BARRIER>; 9], count: &mut usize| {
+            if *count > 0 {
+                // SAFETY: `barriers[..*count]` were initialized below.
+                let slice = unsafe { std::slice::from_raw_parts(barriers.as_ptr().cast::<D3D12_RESOURCE_BARRIER>(), *count) };
+                // SAFETY: an open list and live textures.
+                unsafe { l.ResourceBarrier(slice) };
+                *count = 0;
+            }
+        };
+        let mut push_state = |resource: This, wanted: u32| {
+            use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
+            use windows::core::Interface;
+            if let Some((texture, before)) = list.transition(resource, wanted) {
+                let state = crate::host::legal_state(texture, wanted);
+                let raw = texture.as_raw();
+                // SAFETY: `barriers[..barrier_count]` are initialized Transition barriers.
+                let existing = (0..barrier_count).find(|&i| unsafe {
+                    barriers[i]
+                        .assume_init_ref()
+                        .Anonymous
+                        .Transition
+                        .pResource
+                        .as_ref()
+                        .map(Interface::as_raw)
+                        == Some(raw)
+                });
+                if let Some(i) = existing {
+                    // Combine consecutive transitions of the same resource in this draw.
+                    // SAFETY: initialized Transition barrier at `i`.
+                    unsafe {
+                        (*barriers[i].assume_init_mut().Anonymous.Transition).StateAfter = State(state as i32);
+                    }
+                    return;
+                }
+                if barrier_count == barriers.len() {
+                    flush_barriers(&mut barriers, &mut barrier_count);
+                }
+                barriers[barrier_count].write(crate::host::transition(
+                    texture,
+                    State(before as i32),
+                    State(state as i32),
+                ));
+                barrier_count += 1;
+                crate::host::count_gpu_step(crate::host::GpuStep::OurStates, 0);
+            }
+        };
+        for &t in &self.targets {
+            push_state(t as This, RENDER_TARGET);
+        }
+        if self.depth != 0 {
             // A view that writes neither plane keeps the texture readable:
             // the depth read state, together with the shader read states
             // if this draw's shaders read the same texture (the write state
@@ -1909,8 +1961,9 @@ impl State {
             } else {
                 DEPTH_WRITE
             };
-            crate::list::ensure_state(list, self.depth as This, state);
+            push_state(self.depth as This, state);
         }
+        flush_barriers(&mut barriers, &mut barrier_count);
         true
     }
 
@@ -2300,7 +2353,7 @@ impl State {
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
                 let Some(index) = host.dynamic(1).or_else(|| {
-                    crate::host::settle_for_dynamic();
+                    crate::host::settle_for_dynamic(crate::host::FenceDrain::DynamicRootUav);
                     host.dynamic(1)
                 }) else {
                     return false;
@@ -2374,7 +2427,7 @@ impl State {
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
                 let Some(index) = host.dynamic(1).or_else(|| {
-                    crate::host::settle_for_dynamic();
+                    crate::host::settle_for_dynamic(crate::host::FenceDrain::DynamicRootSrv);
                     host.dynamic(1)
                 }) else {
                     return false;
@@ -2537,7 +2590,7 @@ impl State {
             let need_settle = host.needs_gpu_settle_for_bake();
             if need_settle {
                 settled = true;
-                crate::host::settle_for_fence();
+                crate::host::settle_for_fence(crate::host::FenceDrain::BakeTextureFlip);
             }
             flipped += host.texture_views_remade();
             flipped += host.texture_slots_flip();
@@ -2958,7 +3011,7 @@ impl State {
                     gpu.execute_sync_internal(bake_list);
                     bake_list.reset();
                 } else if !sync.publish.is_empty() {
-                    crate::host::settle_for_fence();
+                    crate::host::settle_for_fence(crate::host::FenceDrain::BakePublish);
                 }
                 for (index, handle, key) in sync.publish {
                     let _ = host.publish_uploaded_slot(index, handle, key);
@@ -3845,8 +3898,10 @@ impl State {
                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
             }
         }
+        list.gpu_pass(true, self.pipeline, crate::host::render_trace::Command("dispatch", [x.into(), y.into(), z.into(), flags.into(), 0]), || p.name.clone());
+        list.gpu_uav_work();
         // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        list.water_dispatch(Some(p), || unsafe { list.list.Dispatch(x, y, z) });
         self.buffers_written();
         DISPATCHED.add(1);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
@@ -4389,9 +4444,10 @@ impl State {
                     if x > 65_535 {
                         once!(x, "a mesh dispatch of more groups than the host takes: cut");
                     }
+                    list.gpu_pass(false, self.pipeline, crate::host::render_trace::Command("dispatch_mesh", [x.min(65_535).into(), 1, 1, 0, 0]), || gpu_pass_name(self.pipeline));
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
-                    self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
+                    self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
                     self.mesh_scissor(list, false);
                     DRAWN.add(1);
                     true
@@ -4651,7 +4707,7 @@ impl State {
                 continue;
             }
             let Some(first) = host.dynamic(n).or_else(|| {
-                crate::host::settle_for_dynamic();
+                crate::host::settle_for_dynamic(crate::host::FenceDrain::DynamicTable);
                 host.dynamic(n)
             }) else {
                 // No room: the draw must not run with the title's own
@@ -4687,49 +4743,48 @@ impl State {
                 // and nothing more if nothing changed in the list since.
                 if list_views
                     && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
-                    && let Some(mut listed) = host.make_listed(recording, words, index)
+                    && host
+                        .use_listed(recording, words, index, |listed, target| {
+                            let kind = group
+                                .entry(k)
+                                .map(|u| u.kind)
+                                .or_else(|| selected.binary_search(&k).ok().and(listed.kind));
+                            if let Some(kind) = kind {
+                                let tested = TESTED_DEPTH.get();
+                                if kind == ResourceType::Srv && listed.ready.0 == list.epoch() && listed.ready.1 == tested.0 {
+                                    if listed.ready.2 {
+                                        TESTED_DEPTH.set((tested.0, true));
+                                    }
+                                } else {
+                                    let _ = crate::residency::take_staging_deferred();
+                                    TESTED_DEPTH.set((tested.0, false));
+                                    readable_listed(list, kind, target);
+                                    let depth = TESTED_DEPTH.get().1;
+                                    TESTED_DEPTH.set((tested.0, tested.1 || depth));
+                                    if kind == ResourceType::Srv && !crate::residency::take_staging_deferred() {
+                                        listed.ready = (list.epoch(), tested.0, depth);
+                                    }
+                                }
+                            }
+                            // (Told once per record and recording; with
+                            // `VICTORY_TABLED_REREAD=1` also of a slot the queue
+                            // holds again since: written after its first read.)
+                            if let Some(title) = title_first
+                                && listed.texture
+                                && (listed.tabled != Some((title + k, kind.is_some()))
+                                    || (crate::descriptor::host::tabled_reread()
+                                        && kind.is_some()
+                                        && host.texture_slot_queued(title + k)))
+                            {
+                                listed.tabled = Some((title + k, kind.is_some()));
+                                host.texture_slot_tabled(title + k, kind.is_some());
+                                if kind.is_some() {
+                                    host.mirror_after(list, title + k, table + u64::from(k) * 32);
+                                }
+                            }
+                        })
+                        .is_some()
                 {
-                    let kind = group
-                        .entry(k)
-                        .map(|u| u.kind)
-                        .or_else(|| selected.binary_search(&k).ok().and(listed.kind));
-                    let was = (listed.ready, listed.tabled);
-                    if let Some(kind) = kind {
-                        let tested = TESTED_DEPTH.get();
-                        if kind == ResourceType::Srv && listed.ready.0 == list.epoch() && listed.ready.1 == tested.0 {
-                            if listed.ready.2 {
-                                TESTED_DEPTH.set((tested.0, true));
-                            }
-                        } else if let Some(view) = crate::descriptor::host::listed_view(recording, words) {
-                            let _ = crate::residency::take_staging_deferred();
-                            TESTED_DEPTH.set((tested.0, false));
-                            readable(list, kind, &view);
-                            let depth = TESTED_DEPTH.get().1;
-                            TESTED_DEPTH.set((tested.0, tested.1 || depth));
-                            if kind == ResourceType::Srv && !crate::residency::take_staging_deferred() {
-                                listed.ready = (list.epoch(), tested.0, depth);
-                            }
-                        }
-                    }
-                    // (Told once per record and recording; with
-                    // `VICTORY_TABLED_REREAD=1` also of a slot the queue
-                    // holds again since: written after its first read.)
-                    if let Some(title) = title_first
-                        && listed.texture
-                        && (listed.tabled != Some((title + k, kind.is_some()))
-                            || (crate::descriptor::host::tabled_reread()
-                                && kind.is_some()
-                                && host.texture_slot_queued(title + k)))
-                    {
-                        listed.tabled = Some((title + k, kind.is_some()));
-                        host.texture_slot_tabled(title + k, kind.is_some());
-                        if kind.is_some() {
-                            host.mirror_after(list, title + k, table + u64::from(k) * 32);
-                        }
-                    }
-                    if was != (listed.ready, listed.tabled) {
-                        crate::descriptor::host::note_listed(recording, words, listed);
-                    }
                     continue;
                 }
                 let used = group.entry(k);
@@ -4893,6 +4948,7 @@ impl State {
             if let Some(viewport) = frontend {
                 viewports(list, &[viewport]);
             }
+            list.gpu_pass(false, self.pipeline, crate::host::render_trace::Command("draw", [count.into(), instances.into(), from.into(), first_instance.into(), 0]), || gpu_pass_name(self.pipeline));
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -4901,7 +4957,7 @@ impl State {
             if frontend.is_some() {
                 viewports(list, &self.viewports);
             }
-            self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
+            self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
             DRAWN.add(1);
         }
         if !ran {
@@ -5079,12 +5135,13 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            list.gpu_pass(false, self.pipeline, crate::host::render_trace::Command("draw_indexed", [indices.into(), instances.into(), first.into(), base.into(), first_instance.into()]), || gpu_pass_name(self.pipeline));
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
-            self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
+            self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
             DRAWN.add(1);
         }
         if !ran {
@@ -5107,8 +5164,14 @@ impl State {
 
     /// A draw with the pipeline `p` was recorded (as [`State::buffers_written`]
     /// if its shaders can store to buffers).
-    fn drew(&mut self, p: Option<&HostPipeline>) {
-        if p.is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores)) {
+    fn drew(&mut self, list: &HostList, p: Option<&HostPipeline>) {
+        if p.is_none_or(|p| {
+            p.stages.iter().any(|stage| {
+                let t = stage.translated();
+                t.stores || t.stores_by_address
+            })
+        }) {
+            list.gpu_uav_work();
             self.batch = None;
         }
     }
@@ -5426,9 +5489,10 @@ impl State {
                 if kind == MESH {
                     self.mesh_scissor(list, true);
                 }
+                list.gpu_pass(kind == DISPATCH, self.pipeline, crate::host::render_trace::Command("execute_indirect", [kind.into(), max.into(), at as i64, i64::from(counter.is_some()), 0]), || p.name.clone());
                 // SAFETY: an open list with everything set; the scratch buffer and
                 // host copies are kept alive by the list, and the signature is cached.
-                unsafe {
+                list.water_dispatch((kind == DISPATCH).then_some(p), || unsafe {
                     list.list.ExecuteIndirect(
                         &signature,
                         max,
@@ -5437,7 +5501,7 @@ impl State {
                         counter.as_ref().map(|(s, _)| &s.buffer),
                         counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
                     )
-                };
+                });
                 if kind == MESH {
                     self.mesh_scissor(list, false);
                 }
@@ -5451,9 +5515,10 @@ impl State {
         #[cfg(feature = "diagnostics")]
         list.ran_indirect(p.pso.as_raw() as usize, &p.name, kind, max, &self.user);
         if kind == DISPATCH {
+            list.gpu_uav_work();
             self.buffers_written();
         } else {
-            self.drew(Some(p));
+            self.drew(list, Some(p));
         }
         // The stand-in for reflections after the program that gives rays
         // that found nothing the sky (`crate::ambient`, `Role::Miss`): the
@@ -5685,86 +5750,124 @@ impl RecordHash {
     }
 }
 
-fn readable(list: &HostList, kind: ResourceType, view: &View) {
+fn refresh_buffer_view(
+    list: &HostList,
+    kind: ResourceType,
+    shadow: &std::sync::Arc<crate::shadow::Shadow>,
+    address: u64,
+    len: u64,
+) {
+    shadow.refresh(list, address, len);
+    if kind == ResourceType::Uav {
+        // A shader that cannot store to buffers leaves the range as
+        // the title has it: nothing to find afterwards.
+        if STORES.get() || !write_skip() {
+            #[cfg(feature = "diagnostics")]
+            crate::host::wide_write(address, len, 0);
+            shadow.gpu_writes(list, address, len);
+        } else {
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::GpuWritesLeftOut, 1);
+                crate::copystat::add(crate::copystat::C::GpuWritesLeftOutBytes, len);
+            }
+        }
+    }
+}
+
+fn readable_shader_texture(list: &HostList, resource: usize, first: u32, uploadable: Option<bool>) {
+    // A view the title placed, in another format, in the memory of
+    // a texture the host writes: that texture's texels, copied on
+    // the host (title memory does not have them).
+    let aliased = crate::resource::alias_of(resource as This)
+        .is_some_and(|source| crate::texture::alias(list, resource as This, source));
+    let can_upload = uploadable.unwrap_or_else(|| {
+        crate::resource::host_copy(resource as This).is_some_and(|t| t.flags() & 0x7 == 0)
+    });
+    if !aliased && can_upload {
+        // (A texture the title writes: no target, depth or unordered
+        // access, `crate::texture::title_written`.)
+        crate::texture::upload_from(list, resource as This, first);
+    }
+    // A depth texture shaders also write: what they wrote, first.
+    list.twin_use(resource as This, false, false);
+    // The depth target the draw only tests is read in both ways at
+    // once: both read states, which its preparation asks for too.
+    let (tested, _) = TESTED_DEPTH.get();
+    let state = if tested != 0 && tested == resource {
+        TESTED_DEPTH.set((tested, true));
+        DEPTH_READ | SHADER_RESOURCE
+    } else {
+        SHADER_RESOURCE
+    };
+    crate::list::ensure_state(list, resource as This, state);
+    #[cfg(feature = "diagnostics")]
+    if tracing::enabled!(tracing::Level::DEBUG)
+        && let Some(t) = crate::resource::host_resource(resource as This)
+    {
+        // SAFETY: a live resource.
+        let d = unsafe { t.GetDesc() };
+        if d.Flags.0 & 7 == 0 {
+            tracing::debug!(
+                resource = format_args!("{resource:#x}"),
+                ?d,
+                "a shader reads a texture the title fills"
+            );
+        }
+    }
+}
+
+fn readable_unordered_texture(list: &HostList, resource: usize) {
     const UNORDERED_ACCESS: u32 = 0x8;
+    #[cfg(feature = "diagnostics")]
+    crate::capture::note_target(resource as This);
+    // Some compute-written textures are also read by the title CPU.
+    list.texture_written(resource as This);
+    // Unordered access to a depth texture is its colour twin's.
+    if !list.twin_use(resource as This, true, true) {
+        crate::list::ensure_state(list, resource as This, UNORDERED_ACCESS);
+    }
+}
+
+fn readable_listed(list: &HostList, kind: ResourceType, target: &crate::descriptor::host::ListedTarget) {
+    use crate::descriptor::host::ListedTarget;
+    match target {
+        ListedTarget::Buffer { shadow, address, len } => {
+            refresh_buffer_view(list, kind, shadow, *address, *len);
+        }
+        ListedTarget::ShaderTexture { resource, placed, first_mip, uploadable } => {
+            if kind == ResourceType::Srv {
+                let first = if *placed { *first_mip } else { 0 };
+                readable_shader_texture(list, *resource, first, Some(*uploadable));
+            }
+        }
+        ListedTarget::UnorderedTexture { resource } => {
+            if kind == ResourceType::Uav {
+                readable_unordered_texture(list, *resource);
+            }
+        }
+        ListedTarget::None => {}
+    }
+}
+
+fn readable(list: &HostList, kind: ResourceType, view: &View) {
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
     if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
-        shadow.refresh(list, address, len);
-        if kind == ResourceType::Uav {
-            // A shader that cannot store to buffers leaves the range as
-            // the title has it: nothing to find afterwards.
-            if STORES.get() || !write_skip() {
-                #[cfg(feature = "diagnostics")]
-                crate::host::wide_write(address, len, 0);
-                shadow.gpu_writes(list, address, len);
-            } else {
-                #[cfg(feature = "diagnostics")]
-                {
-                    crate::copystat::add(crate::copystat::C::GpuWritesLeftOut, 1);
-                    crate::copystat::add(crate::copystat::C::GpuWritesLeftOutBytes, len);
-                }
-            }
-        }
+        refresh_buffer_view(list, kind, &shadow, address, len);
     }
     match (view, kind) {
         (View::Shader(resource, _), ResourceType::Srv) => {
-            // A view the title placed, in another format, in the memory of
-            // a texture the host writes: that texture's texels, copied on
-            // the host (title memory does not have them).
-            let aliased = crate::resource::alias_of(*resource as This)
-                .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
-            if !aliased
-                && let Some(t) = crate::resource::host_copy(*resource as This)
-                && t.flags() & 0x7 == 0
-            {
-                // (A texture the title writes: no target, depth or unordered
-                // access, `crate::texture::title_written`.)
-                // Of a texture the title placed, the levels the view shows.
-                let first = match (&placed, view) {
-                    (Some(_), View::Shader(_, Some(desc))) => crate::resource::first_mip(desc),
-                    _ => 0,
-                };
-                crate::texture::upload_from(list, *resource as This, first);
-            }
-            // A depth texture shaders also write: what they wrote, first.
-            list.twin_use(*resource as This, false, false);
-            // The depth target the draw only tests is read in both ways at
-            // once: both read states, which its preparation asks for too.
-            let (tested, _) = TESTED_DEPTH.get();
-            let state = if tested != 0 && tested == *resource {
-                TESTED_DEPTH.set((tested, true));
-                DEPTH_READ | SHADER_RESOURCE
-            } else {
-                SHADER_RESOURCE
+            let first = match (&placed, view) {
+                (Some(_), View::Shader(_, Some(desc))) => crate::resource::first_mip(desc),
+                _ => 0,
             };
-            crate::list::ensure_state(list, *resource as This, state);
-            #[cfg(feature = "diagnostics")]
-            if tracing::enabled!(tracing::Level::DEBUG)
-                && let Some(t) = crate::resource::host_resource(*resource as This)
-            {
-                // SAFETY: a live resource.
-                let d = unsafe { t.GetDesc() };
-                if d.Flags.0 & 7 == 0 {
-                    tracing::debug!(
-                        resource = format_args!("{resource:#x}"),
-                        ?d,
-                        "a shader reads a texture the title fills"
-                    );
-                }
-            }
+            readable_shader_texture(list, *resource, first, None);
         }
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
-            #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(*resource as This);
-            // Some compute-written textures are also read by the title CPU.
-            list.texture_written(*resource as This);
-            // Unordered access to a depth texture is its colour twin's.
-            if !list.twin_use(*resource as This, true, true) {
-                crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
-            }
+            readable_unordered_texture(list, *resource);
         }
         _ => {}
     }
@@ -6070,4 +6173,10 @@ mod record_hash_tests {
         let zeros: Vec<u64> = (2..100).map(|n| of(&vec![[0; 3]; n])).collect();
         assert!(zeros.iter().all(|h| seen.insert(*h)));
     }
+}
+
+/// The name a GPU pass beginning with this pipeline is logged by (the
+/// runtime's name of its shaders; `crate::host` `gpu_time`).
+fn gpu_pass_name(pipeline: usize) -> String {
+    crate::pipeline::host_pipeline(pipeline as This).map_or_else(|| format!("pipeline {pipeline:#x}"), |p| p.name.clone())
 }

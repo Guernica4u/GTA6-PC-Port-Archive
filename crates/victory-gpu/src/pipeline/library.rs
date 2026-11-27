@@ -255,14 +255,15 @@ static CALLS: Mutex<Vec<(u32, &'static str, String, u64)>> = Mutex::new(Vec::new
 thread_local! {
     /// The pipeline this thread is making (its shaders), for [`CALLS`].
     static LABEL: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
-    /// Whether the pipeline this thread makes has static samplers
-    /// ([`with_static_samplers`]).
-    static STATIC_SAMPLERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// How the pipeline this thread makes may use the library for its
+    /// static samplers ([`with_static_samplers`]).
+    static STATIC_SAMPLERS: std::cell::Cell<super::samplers::Use> =
+        const { std::cell::Cell::new(super::samplers::Use::Plain) };
 }
 
 /// The pipelines this thread makes while the guard lives have static
-/// samplers (`samplers`): they are made, never loaded from or stored in the
-/// library, unless `VICTORY_LIBRARY_STATIC_SAMPLERS=1`.
+/// samplers, and `use_` says whether they may come from and go into the
+/// library ([`super::samplers::admit`]).
 ///
 /// Why: the card's driver (NVIDIA, 4070 SUPER) keeps static samplers in a
 /// table of its own and puts their places in that table into the compiled
@@ -278,32 +279,23 @@ thread_local! {
 /// 0.44 stops with green and magenta fringes (2026-11-26 runs; made in the
 /// run, the image was smooth). Every loaded pipeline with static samplers
 /// may read through another one's: other filters, address modes, levels
-/// and comparisons.
-/// shortcut: they are compiled every run (the driver's own cache on disk
-/// makes that quick); a fixed order of static samplers made before any
-/// pipeline would let the library keep them again.
-pub(crate) fn with_static_samplers(samplers: bool) -> StaticSamplers {
-    StaticSamplers(STATIC_SAMPLERS.replace(samplers && !static_samplers_kept()))
+/// and comparisons. [`super::samplers`] makes the states of earlier runs
+/// first, in their order, so they keep their places: pipelines with only
+/// those come from the library under a name that holds their places
+/// ([`super::samplers::Use::Placed`]); the others are made.
+pub(crate) fn with_static_samplers(use_: super::samplers::Use) -> StaticSamplers {
+    StaticSamplers(STATIC_SAMPLERS.replace(use_))
 }
 
-/// While it lives, the pipelines this thread makes skip the library if they
-/// have static samplers ([`with_static_samplers`]); the setting before it
-/// comes back when it is dropped.
-pub(crate) struct StaticSamplers(bool);
+/// While it lives, the pipelines this thread makes use the library as
+/// [`with_static_samplers`] was told; the setting before it comes back when
+/// it is dropped.
+pub(crate) struct StaticSamplers(super::samplers::Use);
 
 impl Drop for StaticSamplers {
     fn drop(&mut self) {
         STATIC_SAMPLERS.set(self.0);
     }
-}
-
-/// `VICTORY_LIBRARY_STATIC_SAMPLERS=1`: pipelines with static samplers are
-/// loaded from and stored in the library too, as before.
-fn static_samplers_kept() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var_os("VICTORY_LIBRARY_STATIC_SAMPLERS").is_some_and(|v| v == "1")
-    })
 }
 
 /// Names the pipeline this thread makes next.
@@ -568,12 +560,25 @@ pub(crate) fn pipeline(
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
+    use super::samplers::Use;
+    let samplers = STATIC_SAMPLERS.get();
+    // A pipeline with static samplers is named by their places in the
+    // driver's table as well: one stored where they had other places is
+    // never looked up.
+    let salted;
+    let name = match samplers {
+        Use::Placed(tag) => {
+            salted = format!("{name}-s{tag:016x}");
+            salted.as_str()
+        }
+        Use::Plain | Use::Unplaced => name,
+    };
     let wide = HSTRING::from(name);
-    let Some(library) = library().filter(|_| !STATIC_SAMPLERS.get()) else {
+    let Some(library) = library().filter(|_| samplers != Use::Unplaced) else {
         MADE.fetch_add(1, Ordering::Relaxed);
         let made_at = std::time::Instant::now();
         let pso = create();
-        record(if STATIC_SAMPLERS.get() { Kind::StaticSamplers } else { Kind::Made }, made_at);
+        record(if samplers == Use::Unplaced { Kind::StaticSamplers } else { Kind::Made }, made_at);
         return pso;
     };
     let began = std::time::Instant::now();
@@ -966,12 +971,16 @@ enum Kind {
     Loaded,
     /// Compiled by the host driver (its own cache on disk may make that quick).
     Made,
-    /// Compiled by the driver and kept out of the library for its static
-    /// samplers ([`with_static_samplers`]).
+    /// Compiled by the driver and kept out of the library: static samplers
+    /// not yet made first ([`super::samplers`]).
     StaticSamplers,
 }
 
-const KINDS: [&str; 3] = ["loaded from the library", "made", "made, static samplers (never in the library)"];
+const KINDS: [&str; 3] = [
+    "loaded from the library",
+    "made",
+    "made, static samplers new to the table (in the library from the next run)",
+];
 
 static TIMES: Mutex<[Vec<u32>; 3]> = Mutex::new([Vec::new(), Vec::new(), Vec::new()]);
 
@@ -1047,13 +1056,15 @@ mod tests {
         assert_ne!(a, name("graphics", b"root", &[b"vsp", b"s"], "state"));
     }
 
-    /// A pipeline with static samplers is made, not looked up in the library
-    /// (with or without a host); the guard gives the setting back.
+    /// A pipeline with static samplers not made first is made, not looked up
+    /// in the library (with or without a host); the guard gives the setting
+    /// back.
     #[test]
-    fn pipelines_with_static_samplers_skip_the_library() {
+    fn pipelines_with_unplaced_static_samplers_skip_the_library() {
+        use super::super::samplers::Use;
         let looked = std::cell::Cell::new(false);
         {
-            let _guard = with_static_samplers(true);
+            let _guard = with_static_samplers(Use::Unplaced);
             let made = pipeline(
                 "with static samplers",
                 |_, _| {
@@ -1065,12 +1076,12 @@ mod tests {
             assert!(made.is_err());
             assert!(!looked.get(), "the library was asked");
             {
-                let _inner = with_static_samplers(false);
-                assert!(!STATIC_SAMPLERS.get());
+                let _inner = with_static_samplers(Use::Placed(7));
+                assert_eq!(STATIC_SAMPLERS.get(), Use::Placed(7));
             }
-            assert!(STATIC_SAMPLERS.get());
+            assert_eq!(STATIC_SAMPLERS.get(), Use::Unplaced);
         }
-        assert!(!STATIC_SAMPLERS.get());
+        assert_eq!(STATIC_SAMPLERS.get(), Use::Plain);
     }
 
     #[test]

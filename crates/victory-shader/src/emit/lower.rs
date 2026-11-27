@@ -131,9 +131,17 @@ fn counted_in_threads(parts: &Parts) -> bool {
 /// at once (`shader.rs` `USER_DISPATCH_THREADS_X`; after DexNom/VIctory
 /// bc3cd4b0, which does so for two of the programs by their digests).
 pub(super) fn lower_counted(parts: &Parts, counted: bool) -> Result<Lowered, ShaderError> {
+    lower_with_options(parts, counted, &[])
+}
+
+pub(super) fn lower_with_lds_seed(parts: &Parts, seed: &[u32]) -> Result<Lowered, ShaderError> {
+    lower_with_options(parts, false, seed)
+}
+
+fn lower_with_options(parts: &Parts, counted: bool, lds_seed: &[u32]) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run(counted) {
+        match Lower::new(parts, &bad).run(counted, lds_seed) {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -2595,12 +2603,36 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.bin(c, Bin::Or, first, total))
     }
 
-    fn run(mut self, counted: bool) -> Result<Lowered, Stop> {
+    fn run(mut self, counted: bool, lds_seed: &[u32]) -> Result<Lowered, Stop> {
         let p = self.x.p;
         // A host group has 32 KiB of LDS (D3D12): the program's LDS with the meetings' and
         // exchanges' dwords past it must fit (`CS_CollectTriangles_Meshlets` uses all 32 KiB).
         if self.pairs.is_some() && self.s.lds_dwords > HOST_LDS_DWORDS {
             return Err(unsupported(0, "LDS for the console waves' meetings past the host's 32 KiB"));
+        }
+        if !lds_seed.is_empty() {
+            let StageIo::Cs(cs) = self.x.native.io else {
+                return Err(unsupported(0, "LDS initialization outside compute"));
+            };
+            if lds_seed.len() > (cs.lds_bytes() / 4) as usize {
+                return Err(unsupported(0, "LDS initialization past the guest allocation"));
+            }
+            let entry = self.s.entry;
+            self.cur = entry;
+            let thread = self.s.op(entry, "flattenedThreadIdInGroup.i32", Attr::ReadNone, self.s.t.i32, 96, &[]);
+            let zero = self.s.m.i32(0);
+            let first = self.s.m.cmp(entry, pred::EQ, thread, zero);
+            let branch = self.begin_guarded(Some(first));
+            let lds = self.s.lds();
+            for (index, &word) in lds_seed.iter().enumerate() {
+                let index = self.s.m.i32(index as u32);
+                let ptr = self.s.m.element(self.cur, lds, index);
+                let value = self.s.m.i32(word);
+                self.s.m.store(self.cur, ptr, value);
+            }
+            self.end_guarded(branch, &[]);
+            self.group_sync(self.cur);
+            self.s.entry = self.cur;
         }
         if counted {
             // Before anything else, so that wave counts, reads of the first
@@ -5806,6 +5838,19 @@ impl<'a> Lower<'a> {
                 && !(name.starts_with("ds_read")
                     || name.starts_with("ds_swizzle")
                     || name.contains("permute"));
+        if std::env::var_os("VICTORY_LDS_WHY").is_some()
+            && matches!(inst.fields, Fields::Ds { .. })
+            && !(name.starts_with("ds_swizzle") || name.contains("permute"))
+        {
+            eprintln!(
+                "LDS-WHY {:#x} {name} block={b} split={} all={:?} meet_at={:?} unordered={}",
+                offset,
+                self.split_lds,
+                self.lds_meet.as_ref().map(|(all, _)| all[b]),
+                self.lds_meet.as_ref().map(|(_, m)| m[b]),
+                self.lds_unordered.contains(&(b, i)),
+            );
+        }
         if self.split_lds
             && matches!(inst.fields, Fields::Ds { .. })
             && !(name.starts_with("ds_swizzle") || name.contains("permute"))

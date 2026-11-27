@@ -3461,7 +3461,22 @@ impl HostHeap {
     /// [`HostHeap::make_at`] does, and keeps that ([`ListViews`]). What is
     /// known of the record in this recording; `None` (the slot is not made):
     /// not a view kept so.
+    #[cfg(test)]
     pub(crate) fn make_listed(&self, recording: u64, words: [u32; 3], index: u32) -> Option<Listed> {
+        self.use_listed(recording, words, index, |listed, _| *listed)
+    }
+
+    /// As [`HostHeap::make_listed`], running `f` with the cached [`Listed`]
+    /// state and resolved [`ListedTarget`] inside the same [`LIST_VIEWS`]
+    /// borrow so callers avoid extra TLS lookups and redundant resource/shadow
+    /// resolution.
+    pub(crate) fn use_listed<R>(
+        &self,
+        recording: u64,
+        words: [u32; 3],
+        index: u32,
+        f: impl FnOnce(&mut Listed, &ListedTarget) -> R,
+    ) -> Option<R> {
         if self.sampler {
             return None;
         }
@@ -3477,33 +3492,40 @@ impl HostHeap {
                 views.evict_stale(frame);
             }
             let twins = self.twins.get(index as usize).is_some();
+            let (start, step) = (views.start, views.step);
+            let slot_at = |s: u32| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start + s as usize * step };
             if let Some(entry) = views.made.get_mut(&words) {
                 let same_recording = entry.recording == recording;
-                let still_valid = same_recording
-                    || (super::view_at(words[1], words[2]).is_some()
-                        && list_view_valid(&entry.view, &entry.kept, entry.first_shown, entry.base));
-                if still_valid {
+                let refreshed = if same_recording {
+                    Some(None)
+                } else if super::view_at(words[1], words[2]).is_some() {
+                    list_view_valid_target(&entry.view, &entry.kept, entry.first_shown, entry.base)
+                } else {
+                    None
+                };
+                if let Some(new_target) = refreshed {
                     entry.frame = frame;
                     if !same_recording {
                         entry.recording = recording;
                         entry.listed.ready = (0, 0, false);
                         entry.listed.tabled = None;
+                        if let Some(target) = new_target {
+                            entry.target = target;
+                        }
                     }
                     let at = entry.at;
                     let twin = entry.twin;
                     let stride_word = entry.stride_word;
-                    let kept = entry.kept.clone();
-                    let listed = entry.listed;
-                    self.copy_from(index, views.slot(at));
+                    self.copy_from(index, slot_at(at));
                     if twin && twins {
-                        self.copy_from(self.raw + index, views.slot(at + 1));
+                        self.copy_from(self.raw + index, slot_at(at + 1));
                         self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
                     } else {
                         self.clear_twin(index);
                     }
                     self.write_stride(index, stride_word);
-                    self.keep(index, kept);
-                    return Some(listed);
+                    self.keep_ref(index, entry.kept.as_ref());
+                    return Some(f(&mut entry.listed, &entry.target));
                 }
                 if let Some(stale) = views.made.remove(&words) {
                     views.free_slots.push(stale.at);
@@ -3515,24 +3537,21 @@ impl HostHeap {
                 return None;
             }
             let at = views.alloc_pair()?;
-            let twin = twinned(&view);
-            let Some(kept) = make_twinned(&view, views.slot(at), Some(views.slot(at + 1))) else {
+            let placed = placed_texture(&view);
+            let resolved = placed.as_ref().unwrap_or(&view);
+            let twin = twinned(resolved);
+            let Some(kept) = make_twinned(resolved, views.slot(at), Some(views.slot(at + 1))) else {
                 views.free_slots.push(at);
                 return None;
             };
             let stride_word = view_stride_word(&view);
-            let (first_shown, base) = list_view_tex_state(&view);
+            let (first_shown, base, target) = resolve_listed_state(resolved, placed.is_some());
             let listed = Listed {
                 kind: crate::draw::view_kind(&view),
                 texture: is_texture_view(&view),
                 ready: (0, 0, false),
                 tabled: None,
             };
-            views.order.push_back(words);
-            views.made.insert(
-                words,
-                ListView { recording, frame, view, at, twin, stride_word, kept: kept.clone(), first_shown, base, listed },
-            );
             self.copy_from(index, views.slot(at));
             if twin && twins {
                 self.copy_from(self.raw + index, views.slot(at + 1));
@@ -3541,8 +3560,22 @@ impl HostHeap {
                 self.clear_twin(index);
             }
             self.write_stride(index, stride_word);
-            self.keep(index, kept);
-            Some(listed)
+            self.keep_ref(index, kept.as_ref());
+            views.order.push_back(words);
+            let entry = views.made.entry(words).or_insert(ListView {
+                recording,
+                frame,
+                view,
+                at,
+                twin,
+                stride_word,
+                kept,
+                first_shown,
+                base,
+                listed,
+                target,
+            });
+            Some(f(&mut entry.listed, &entry.target))
         })
     }
 
@@ -3619,6 +3652,28 @@ impl HostHeap {
         }
     }
 
+    /// As [`HostHeap::keep`], borrowing `resource` so an unchanged slot does
+    /// not clone (`AddRef`) or drop (`Release`) it.
+    fn keep_ref(&self, index: u32, resource: Option<&ID3D12Resource>) {
+        let Some(slot) = self.kept.get(index as usize) else {
+            return;
+        };
+        let old = {
+            use windows::core::Interface;
+            let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+            // The same again: nothing to retire, and zero COM AddRef/Release.
+            if slot.as_ref().map(Interface::as_raw) == resource.map(Interface::as_raw) {
+                return;
+            }
+            std::mem::replace(&mut *slot, resource.cloned())
+        };
+        // A running submission may still read the old resource through
+        // this slot.
+        if let Some(old) = old {
+            crate::host::retire_resource(old);
+        }
+    }
+
     /// What slot `index` views.
     fn kept_in(&self, index: u32) -> Option<ID3D12Resource> {
         self.kept.get(index as usize)?.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -3656,7 +3711,7 @@ impl HostHeap {
         // (Bound by its handle, not read by index.)
         self.clear_twin(index);
         self.write_stride(index, 1);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer));
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view that reads
@@ -3704,7 +3759,7 @@ impl HostHeap {
         self.put(index);
         self.clear_twin(index);
         self.write_stride(index, 1);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer));
     }
 
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
@@ -3773,7 +3828,7 @@ impl HostHeap {
         self.write_stride(index, 0);
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
-        self.keep(index, holds.then(|| buffer.clone()));
+        self.keep_ref(index, holds.then_some(buffer));
     }
 
     /// Makes slot `index` (a dynamic one) a constant buffer that reads zeros
@@ -7013,6 +7068,27 @@ pub(crate) struct Listed {
     pub(crate) tabled: Option<(u32, bool)>,
 }
 
+/// Resolved backing target cached in [`ListView`] so `draw.rs` can bring a
+/// tabled view up to date without re-resolving `placed_texture` or
+/// `buffer_copy` (`shadow::find`).
+pub(crate) enum ListedTarget {
+    Buffer {
+        shadow: std::sync::Arc<crate::shadow::Shadow>,
+        address: u64,
+        len: u64,
+    },
+    ShaderTexture {
+        resource: usize,
+        placed: bool,
+        first_mip: u32,
+        uploadable: bool,
+    },
+    UnorderedTexture {
+        resource: usize,
+    },
+    None,
+}
+
 struct ListView {
     recording: u64,
     frame: u64,
@@ -7025,21 +7101,64 @@ struct ListView {
     first_shown: Option<u32>,
     base: u32,
     listed: Listed,
+    target: ListedTarget,
 }
 
-fn list_view_tex_state(view: &View) -> (Option<u32>, u32) {
-    let placed = placed_texture(view);
-    let view = placed.as_ref().unwrap_or(view);
-    if let View::Shader(resource, _) = view {
-        let resource = *resource as crate::object::This;
-        if let Some(copy) = crate::resource::host_copy(resource) {
-            return (crate::resource::first_shown(resource), copy.base);
+fn resolve_listed_state(resolved: &View, placed: bool) -> (Option<u32>, u32, ListedTarget) {
+    match resolved {
+        View::Shader(resource, desc) => {
+            let r = *resource as crate::object::This;
+            if let Some(copy) = crate::resource::host_copy(r) {
+                let first_mip = if placed {
+                    desc.as_ref().map_or(0, |d| crate::resource::first_mip(d))
+                } else {
+                    0
+                };
+                return (
+                    crate::resource::first_shown(r),
+                    copy.base,
+                    ListedTarget::ShaderTexture {
+                        resource: *resource,
+                        placed,
+                        first_mip,
+                        uploadable: copy.flags() & 0x7 == 0,
+                    },
+                );
+            }
+            if let Some((shadow, address, len)) = buffer_copy(resolved) {
+                return (None, 0, ListedTarget::Buffer { shadow, address, len });
+            }
+            (None, 0, ListedTarget::None)
         }
+        View::Unordered(resource, _, _) => {
+            let r = *resource as crate::object::This;
+            if crate::resource::host_resource(r).is_some() {
+                return (None, 0, ListedTarget::UnorderedTexture { resource: *resource });
+            }
+            if let Some((shadow, address, len)) = buffer_copy(resolved) {
+                return (None, 0, ListedTarget::Buffer { shadow, address, len });
+            }
+            (None, 0, ListedTarget::None)
+        }
+        View::Placed(..) => {
+            if let Some((shadow, address, len)) = buffer_copy(resolved) {
+                return (None, 0, ListedTarget::Buffer { shadow, address, len });
+            }
+            (None, 0, ListedTarget::None)
+        }
+        _ => (None, 0, ListedTarget::None),
     }
-    (None, 0)
 }
 
-fn list_view_valid(view: &View, kept: &Kept, first_shown: Option<u32>, base: u32) -> bool {
+/// Validates a cached [`ListView`] across recordings. Returns `Some(None)` if
+/// still valid with an unchanged target, `Some(Some(target))` if valid with a
+/// refreshed buffer target, or `None` if stale.
+fn list_view_valid_target(
+    view: &View,
+    kept: &Kept,
+    first_shown: Option<u32>,
+    base: u32,
+) -> Option<Option<ListedTarget>> {
     use windows::core::Interface;
     let placed = placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
@@ -7048,14 +7167,16 @@ fn list_view_valid(view: &View, kept: &Kept, first_shown: Option<u32>, base: u32
         View::Shader(resource, _) => {
             let resource = *resource as crate::object::This;
             if let Some(copy) = crate::resource::host_copy(resource) {
-                return kept_raw == Some(copy.texture.as_raw())
+                return (kept_raw == Some(copy.texture.as_raw())
                     && first_shown == crate::resource::first_shown(resource)
-                    && base == copy.base;
+                    && base == copy.base)
+                    .then_some(None);
             }
-            if let Some((shadow, ..)) = buffer_copy(view) {
-                return kept_raw == Some(shadow.buffer.as_raw());
+            if let Some((shadow, address, len)) = buffer_copy(view) {
+                return (kept_raw == Some(shadow.buffer.as_raw()))
+                    .then(|| Some(ListedTarget::Buffer { shadow, address, len }));
             }
-            false
+            None
         }
         View::Unordered(resource, _, _) => {
             let resource = *resource as crate::object::This;
@@ -7063,20 +7184,22 @@ fn list_view_valid(view: &View, kept: &Kept, first_shown: Option<u32>, base: u32
                 let effective = crate::resource::twin_resource(resource)
                     .or_else(|| crate::resource::twin_plane_resource(resource))
                     .unwrap_or(texture);
-                return kept_raw == Some(effective.as_raw());
+                return (kept_raw == Some(effective.as_raw())).then_some(None);
             }
-            if let Some((shadow, ..)) = buffer_copy(view) {
-                return kept_raw == Some(shadow.buffer.as_raw());
+            if let Some((shadow, address, len)) = buffer_copy(view) {
+                return (kept_raw == Some(shadow.buffer.as_raw()))
+                    .then(|| Some(ListedTarget::Buffer { shadow, address, len }));
             }
-            false
+            None
         }
         View::Placed(..) => {
-            if let Some((shadow, ..)) = buffer_copy(view) {
-                return kept_raw == Some(shadow.buffer.as_raw());
+            if let Some((shadow, address, len)) = buffer_copy(view) {
+                return (kept_raw == Some(shadow.buffer.as_raw()))
+                    .then(|| Some(ListedTarget::Buffer { shadow, address, len }));
             }
-            kept_raw.is_none()
+            kept_raw.is_none().then_some(None)
         }
-        _ => false,
+        _ => None,
     }
 }
 
@@ -7170,27 +7293,6 @@ impl ListViews {
 
 thread_local! {
     static LIST_VIEWS: std::cell::RefCell<Option<ListViews>> = const { std::cell::RefCell::new(None) };
-}
-
-/// The view the record `words` names, as this thread made it for `recording`.
-pub(crate) fn listed_view(recording: u64, words: [u32; 3]) -> Option<View> {
-    LIST_VIEWS.with(|views| {
-        let views = views.borrow();
-        let views = views.as_ref()?;
-        views.made.get(&words).filter(|m| m.recording == recording).map(|m| m.view.clone())
-    })
-}
-
-/// Notes what is known of the record `words` in `recording`.
-pub(crate) fn note_listed(recording: u64, words: [u32; 3], listed: Listed) {
-    LIST_VIEWS.with(|views| {
-        if let Some(views) = views.borrow_mut().as_mut()
-            && let Some(made) = views.made.get_mut(&words)
-            && made.recording == recording
-        {
-            made.listed = listed;
-        }
-    });
 }
 
 /// Whether a list makes a view its tables hold once (`VICTORY_LIST_VIEWS=0`:

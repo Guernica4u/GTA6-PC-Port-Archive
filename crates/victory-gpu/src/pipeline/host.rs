@@ -608,9 +608,9 @@ impl HostPipeline {
                 return None;
             }
         };
-        // Not from the library if it has static samplers (their places in the
-        // driver's table differ between runs: `library::with_static_samplers`).
-        let _samplers = super::library::with_static_samplers(!samplers.is_empty());
+        // From the library with static samplers only where their places in
+        // the driver's table are those of earlier runs (`pipeline::samplers`).
+        let _samplers = super::library::with_static_samplers(super::samplers::admit(&samplers));
         let code = |i: usize| {
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),

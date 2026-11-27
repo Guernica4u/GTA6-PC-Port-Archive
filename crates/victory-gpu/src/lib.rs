@@ -17,6 +17,8 @@
 
 #[cfg(windows)]
 mod ambient;
+pub mod bench;
+mod bench_gpu;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
@@ -90,6 +92,8 @@ mod memory;
 #[cfg(windows)]
 mod shadow;
 mod sharded;
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod stages;
 #[cfg(windows)]
 mod tiles;
 pub mod signature;

@@ -774,6 +774,16 @@ pub mod known;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(windows)]
+mod samplers;
+
+/// Makes the static sampler states of earlier runs on the host device, in
+/// their order, before anything else makes one (`samplers::replay`): called
+/// right after the device is made.
+#[cfg(windows)]
+pub(crate) fn replay_static_samplers(device: &windows::Win32::Graphics::Direct3D12::ID3D12Device) {
+    samplers::replay(device);
+}
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.

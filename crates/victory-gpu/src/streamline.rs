@@ -1876,7 +1876,7 @@ fn check_run(output: [u32; 2], device: bool, present: bool) -> Vec<String> {
             host.present_planes(&base, 0, None, frame);
             std::thread::sleep(std::time::Duration::from_millis(16));
         }
-        crate::host::settle_for_fence();
+        crate::host::settle_for_fence(crate::host::FenceDrain::ExternalUpscaler);
         lines.push(format!(
             "frame generation: 180 presents, {} with it on, {} frames shown by it, {} presents tagged with a colour without the interface, status {:#x} (0 is fine){}",
             FG_ON_ALL.load(Relaxed) - on,
