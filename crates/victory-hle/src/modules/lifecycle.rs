@@ -992,22 +992,23 @@ mod tests {
             assert!(orphan_a.is_null());
             assert_eq!(GetLastError(), ERROR_TLW_WITH_WSCHILD);
 
-            let parent = CreateWindowExW(
+            // A message-only parent made directly, not through our hook: no
+            // stand-in and nothing on the desktop that other tests share.
+            let parent = wm::CreateWindowExW(
                 0,
                 w!("STATIC"),
                 w!("parent"),
-                wm::WS_OVERLAPPEDWINDOW,
+                0,
                 0,
                 0,
                 20,
                 20,
-                null,
+                wm::HWND_MESSAGE,
                 null,
                 null,
                 std::ptr::null(),
             );
             assert!(!parent.is_null());
-            assert!(!stand_in_of(parent).is_null());
 
             let child_w = CreateWindowExW(
                 0,
@@ -1053,10 +1054,46 @@ mod tests {
         }
     }
 
+    /// Set only in the child test process that
+    /// [`relaunch_closes_its_duplicated_process_handle`] starts.
+    const HANDLE_COUNT_CHILD: &str = "VICTORY_TEST_RELAUNCH_HANDLE_COUNT_CHILD";
+
+    /// Counts handles in a child copy of this test executable that runs only
+    /// [`relaunch_handle_count_in_isolated_process`] on one thread, so other
+    /// tests cannot open or close handles while it counts.
     #[test]
     fn relaunch_closes_its_duplicated_process_handle() {
+        let module = module_path!();
+        let helper = format!(
+            "{}::relaunch_handle_count_in_isolated_process",
+            module.split_once("::").map_or(module, |(_, path)| path)
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([helper.as_str(), "--exact", "--ignored", "--test-threads=1"])
+            .env(HANDLE_COUNT_CHILD, "1")
+            .output()
+            .expect("start the isolated handle-count test process");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "isolated handle-count test failed ({}):\n{stdout}\n{stderr}",
+            output.status
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "isolated handle-count test did not run:\n{stdout}\n{stderr}"
+        );
+    }
+
+    #[test]
+    #[ignore = "run by relaunch_closes_its_duplicated_process_handle in a child process"]
+    fn relaunch_handle_count_in_isolated_process() {
         use windows_sys::Win32::System::Threading::GetProcessHandleCount;
 
+        if std::env::var_os(HANDLE_COUNT_CHILD).is_none() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing-relaunch-target.exe");
         assert!(relaunch_exe(&missing, &[]).is_err());
