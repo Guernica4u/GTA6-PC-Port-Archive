@@ -916,6 +916,31 @@ fn ldexp_f64_uses_the_denormal_mode_for_both_operands_and_results() {
 }
 
 #[test]
+fn ldexp_f64_keeps_the_other_denormal_bit_after_a_partial_write() {
+    const SIGN: u64 = 1 << 63;
+    const NORMAL: u64 = 1 << 52;
+    let flush_outputs = [0xBA80_01C1, 0]; // hwreg(MODE, 7, 1)
+    let flush_inputs = [
+        0xBE8D_3DC1, // s_or_saveexec_b32 s13, -1
+        0xBA80_0181, // s_setreg_imm32_b32 hwreg(MODE, 6, 1), 0
+        0,
+        s_mov_b32(ir::EXEC, 13), // restore exec_lo
+    ];
+    for (setup, input, output) in [
+        (&flush_outputs[..], NORMAL, 0),
+        (&flush_inputs[..], 0, NORMAL / 2),
+    ] {
+        let cases = [
+            (1, 52, input),
+            (SIGN | 1, 52, SIGN | input),
+            (NORMAL, -1, output),
+            (SIGN | NORMAL, -1, SIGN | output),
+        ];
+        ldexp_f64_cases(setup, vgpr(1), vgpr(3), &cases);
+    }
+}
+
+#[test]
 fn v_med3_f16_matches_rdna2_with_nan() {
     // v_med3_f16 v0, v1, v2, v3 (VOP3 opcode 0x357)
     let shader = build_valu_cs(&vop3(0x357, 0, vgpr(1), vgpr(2), vgpr(3)));

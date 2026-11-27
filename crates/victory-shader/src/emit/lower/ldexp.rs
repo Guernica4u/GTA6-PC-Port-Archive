@@ -12,7 +12,11 @@ impl Lower<'_> {
         if v.clamp || v.omod != 0 || v.sdwa.is_some() || v.dpp.is_some() || (v.abs | v.neg) & !1 != 0 {
             return Err("binary64 scaling modifiers");
         }
-        let (Some(round), Some(denorm)) = (self.mode16.round, self.mode16.denorm) else {
+        let (Some(round), Some(preserve_input), Some(preserve_output)) = (
+            self.mode16.round,
+            self.mode16.denorm_input,
+            self.mode16.denorm_output,
+        ) else {
             return Err("binary64 scaling with unknown floating-point modes");
         };
         let Some(Operand::Vector { reg, .. }) = v.dst else {
@@ -94,7 +98,7 @@ impl Lower<'_> {
             (round != 0).then_some(away),
         );
         let m = &mut self.s.m;
-        if denorm & 2 == 0 {
+        if !preserve_output {
             // A carry can round the largest subnormal up to the minimum
             // normal. Flush only a result that is still subnormal.
             let rounds_to_normal = m.cmp(c, pred::IUGE, sub_high, implicit);
@@ -116,7 +120,7 @@ impl Lower<'_> {
         let result_low = m.select(c, overflow, overflow_low, result_low);
         let result_high = m.select(c, overflow, overflow_high, result_high);
 
-        let zero_operand = if denorm & 1 == 0 {
+        let zero_operand = if !preserve_input {
             exponent_zero
         } else {
             let no_fraction = m.cmp(c, pred::EQ, input_fraction, zero);
