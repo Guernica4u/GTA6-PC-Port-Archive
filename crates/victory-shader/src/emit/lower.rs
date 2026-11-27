@@ -397,19 +397,26 @@ enum MaskData {
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
 
-/// Instructions that read a lane mask (not EXEC implicitly, not a lane's
-/// Whether a GFX10 DPP modifier operates within 32 lanes (and is therefore
-/// invariant between Wave32 and Wave64).
-fn wave_invariant_dpp(dpp: crate::gfx10::Dpp) -> bool {
-    !matches!(
+/// DPP can omit the wave size when the source is quad-local and the
+/// destination ignores wave-wide row and bank numbering.
+fn wave_invariant_dpp(dpp: Dpp) -> bool {
+    matches!(
         dpp,
-        crate::gfx10::Dpp::Row {
-            ctrl: 0x130 | 0x134 | 0x138 | 0x13c | 0x143,
+        Dpp::Row {
+            ctrl: 0..=0xFF,
+            row_mask: 0xF,
+            bank_mask: 0xF,
             ..
         }
     )
 }
 
+fn quad_swizzle(offset: u32) -> bool {
+    offset & 0x8000 != 0
+        || offset & 0x1C == 0x1C && offset & 0x380 == 0 && offset >> 10 & 0x1F < 4
+}
+
+/// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
 fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
@@ -583,7 +590,12 @@ impl<'a> Lower<'a> {
             // within one wave, where the console compiler leaves out barriers.
             console_lanes = insts().any(|i| {
                 let n = i.name();
-                n.contains("permute")
+                matches!(
+                    &i.fields,
+                    Fields::Ds { offset0, offset1, .. }
+                        if n == "ds_swizzle_b32"
+                            && !quad_swizzle(u32::from(*offset0) | u32::from(*offset1) << 8)
+                ) || n.contains("permute")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some_and(|d| !wave_invariant_dpp(d)))
@@ -3209,13 +3221,12 @@ impl<'a> Lower<'a> {
         if name == "ds_swizzle_b32" {
             // Bit 15 set: each lane of a quad picks a lane of it; else lanes
             // of each group of 32 combine their index with and/or/xor masks.
-            let quad = offset & 0x8000 != 0
-                || offset & 0x1C == 0x1C && offset & 0x380 == 0 && offset >> 10 & 0x1F < 4;
+            let quad = quad_swizzle(offset);
             // Mesh: host quads are threads 4n..4n+3 of a 1D group, as the
             // console's, so quad-local swizzles read through quad operations.
             let mesh_quad = self.s.mesh.is_some() && quad;
             if !mesh_quad {
-                self.cross_lane_inner(quad, true)?;
+                self.cross_lane_inner(quad, quad)?;
             }
             // The source sits in the address field.
             let x = self.vgprs(inst, addr.as_ref().ok_or("a swizzle source")?, 1)?[0];
@@ -12275,15 +12286,29 @@ mod tests {
     }
 
     #[test]
-    fn wave64_dpp_row_shl_omits_wave_size() {
-        let words = [
-            0x7E04_02FA, // v_mov_b32_dpp v2, v0 row_shl:1
-            0xFF01_0100,
+    fn wave64_ds_swizzle_across_quad_keeps_wave_size() {
+        let lowered = lower_cs_wave64(&[
+            0xD8D4_401F, // ds_swizzle_b32 v2, v0 xor 16
+            0x0200_0000,
             S_ENDPGM,
-        ];
-        let lowered = lower_cs_wave64(&words);
-        assert_eq!(lowered.wave_size, None);
+        ]);
+        assert_eq!(lowered.wave_size, Some(64));
         assert!(lowered.wave_ops);
+    }
+
+    #[test]
+    fn wave64_dpp_omits_wave_size_only_for_unmasked_quad_ops() {
+        for (control, wave_size) in [
+            (0xFF00_B100, None),     // quad_perm, all rows and banks
+            (0xCF00_B100, Some(64)), // quad_perm, upper rows only
+            (0xF500_B100, Some(64)), // quad_perm, selected banks
+            (0xFF01_0100, Some(64)), // row_shl:1
+            (0x5F01_4000, Some(64)), // row_mirror, repeating row mask
+        ] {
+            let lowered = lower_cs_wave64(&[0x7E04_02FA, control, S_ENDPGM]);
+            assert_eq!(lowered.wave_size, wave_size, "DPP control {control:#x}");
+            assert!(lowered.wave_ops);
+        }
     }
 
     #[test]
