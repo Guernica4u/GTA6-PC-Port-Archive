@@ -167,14 +167,6 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     }
 }
 
-/// Something placed elsewhere (`crate::port`) in the same form: counted as
-/// [`place_for`] counts, so that [`gone`] takes it off again.
-pub(crate) fn counted(window: bool, bytes: u64) {
-    let at = if window { 0 } else { 2 };
-    STATS[at].fetch_add(1, Ordering::Relaxed);
-    STATS[at + 1].fetch_add(bytes, Ordering::Relaxed);
-}
-
 /// What [`place_for`] gave is gone.
 pub(crate) fn gone(window: bool, bytes: u64) {
     let at = if window { 0 } else { 2 };
