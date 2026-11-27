@@ -2444,20 +2444,67 @@ const COALESCE: usize = crate::watch::PAGE;
 /// copied take no gap, so coverage never claims a byte no flush copied
 /// (a request inside a gap would be wrongly skipped).
 fn push_range(ranges: &mut Vec<(usize, usize)>, gap: usize, address: usize, end: usize) {
+    push_joined(ranges, address, end, |a, e, from, to| {
+        a <= to.saturating_add(gap) && from <= e.saturating_add(gap)
+    });
+}
+
+/// Adds `[address, end)` to `ranges`, kept sorted and disjoint: the
+/// ranges `joins` takes in merge into it, and the ranges it now bridges
+/// with merge together.
+///
+/// One pass in address order over a list kept sorted, so a push costs
+/// `O(ranges)` moves of 16-byte pairs: not a `remove` per range taken in
+/// (each shifts the tail, making a push quadratic in the ranges) and not
+/// a re-sort. A copy asked for in `n` pieces costs `O(n²)` moves over the
+/// submission, against the `O(n³)` of removing per range, and `n` is the
+/// page-separated groups one *written* copy is asked for: the requests of
+/// a submission are ~9,000 across its copies, and most are copies with
+/// nothing written, which `add` returns on before this — a few ranges per
+/// copy in the world submission's case, a few hundred at the dossier's
+/// density (80 copies × 40 requests, 200 × 64 KiB), where the whole
+/// submission's passes are a few million moves against the hundreds of
+/// megabytes of span the ranges no longer copy.
+fn push_joined(
+    ranges: &mut Vec<(usize, usize)>,
+    address: usize,
+    end: usize,
+    joins: impl Fn(usize, usize, usize, usize) -> bool,
+) {
+    // Sorted and disjoint: the new range belongs before the first range
+    // that starts at or after it.
+    let at = ranges.partition_point(|&(a, _)| a < address);
+    ranges.insert(at, (address, end));
     let (mut from, mut to) = (address, end);
-    let mut i = 0;
-    while i < ranges.len() {
-        let (a, e) = ranges[i];
-        if a <= to.saturating_add(gap) && from <= e.saturating_add(gap) {
-            ranges.remove(i);
+    let mut write = 0;
+    // Where the merged range sits: the place of the first range it takes
+    // in, or its own place when it takes none in.
+    let mut merged = None;
+    for read in 0..ranges.len() {
+        if read == at {
+            if merged.is_none() {
+                merged = Some(write);
+                write += 1;
+            }
+            continue;
+        }
+        let (a, e) = ranges[read];
+        if joins(a, e, from, to) {
             from = from.min(a);
             to = to.max(e);
+            if merged.is_none() {
+                merged = Some(write);
+                write += 1;
+            }
         } else {
-            i += 1;
+            ranges[write] = (a, e);
+            write += 1;
         }
     }
-    ranges.push((from, to));
-    ranges.sort_unstable();
+    ranges.truncate(write);
+    if let Some(at) = merged {
+        ranges[at] = (from, to);
+    }
 }
 
 /// Whether `[address, end)` lies inside one of `ranges`.
@@ -2473,22 +2520,10 @@ fn covered(ranges: &[(usize, usize)], address: usize, end: usize) -> bool {
 /// skipped — the split page of #2473. Joined with the rule of #2474:
 /// the ranges join when their intersection contains a whole page.
 fn push_copied(ranges: &mut Vec<(usize, usize)>, from: usize, to: usize) {
-    let (mut f, mut t) = (from, to);
-    let mut i = 0;
-    while i < ranges.len() {
-        let (a, e) = ranges[i];
+    push_joined(ranges, from, to, |a, e, f, t| {
         let (lo, hi) = (a.max(f), e.min(t));
-        let joins = lo.div_ceil(crate::watch::PAGE) <= hi / crate::watch::PAGE;
-        if joins {
-            ranges.remove(i);
-            f = f.min(a);
-            t = t.max(e);
-        } else {
-            i += 1;
-        }
-    }
-    ranges.push((f, t));
-    ranges.sort_unstable();
+        lo.div_ceil(crate::watch::PAGE) <= hi / crate::watch::PAGE
+    });
 }
 
 /// Copies title memory at submission. The ranges were checked against their
@@ -3612,6 +3647,237 @@ mod batch {   // `mod tests` is already taken at the top of this file
         push_copied(&mut spans, 0x2_4000, 0x4_0000);
         assert_eq!(spans, [(0x1_0000, 0x4_0000)]);
         assert!(covered(&spans, 0x2_4000, 0x3_0000));
+    }
+
+    /// The closure of what a submission asked for, brute force: sorted,
+    /// and what lies within a page of the last range joins it.
+    fn closure(asked: &[(usize, usize)]) -> Vec<(usize, usize)> {
+        let mut asked = asked.to_vec();
+        asked.sort_unstable();
+        let mut out: Vec<(usize, usize)> = vec![];
+        for (a, e) in asked {
+            match out.last_mut() {
+                Some(last) if a <= last.1.saturating_add(COALESCE) => last.1 = last.1.max(e),
+                _ => out.push((a, e)),
+            }
+        }
+        out
+    }
+
+    /// Adds `[from, to)` to `ranges`, the reference of the bytes a
+    /// submission's flushes have copied: merged, sorted.
+    fn copied_push(ranges: &mut Vec<(usize, usize)>, from: usize, to: usize) {
+        ranges.push((from, to));
+        ranges.sort_unstable();
+        let mut out: Vec<(usize, usize)> = vec![];
+        for &(a, e) in ranges.iter() {
+            match out.last_mut() {
+                Some(last) if a <= last.1 => last.1 = last.1.max(e),
+                _ => out.push((a, e)),
+            }
+        }
+        *ranges = out;
+    }
+
+    /// `ranges` by address, the order the slow coalescer leaves them in.
+    fn sorted(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+        let mut out = ranges.to_vec();
+        out.sort_unstable();
+        out
+    }
+
+    /// Whether every byte of `[address, end)` is inside one of `ranges`,
+    /// sorted and merged.
+    fn within(ranges: &[(usize, usize)], address: usize, end: usize) -> bool {
+        let mut at = address;
+        for &(a, e) in ranges {
+            if a > at {
+                return false;
+            }
+            at = at.max(e);
+            if at >= end {
+                return true;
+            }
+        }
+        at >= end
+    }
+
+    /// Whether every page of `[address, end)` is marked in `guarded`.
+    fn pages_within(guarded: &[bool], address: usize, end: usize) -> bool {
+        (address.div_ceil(crate::watch::PAGE)..end / crate::watch::PAGE).all(|p| guarded[p])
+    }
+
+    /// What joining means for the ranges to copy: a page's gap coalesces.
+    fn gap_of_a_page(a: usize, e: usize, from: usize, to: usize) -> bool {
+        a <= to.saturating_add(COALESCE) && from <= e.saturating_add(COALESCE)
+    }
+
+    /// What joining means for the ranges copied: a whole page in common
+    /// (#2474).
+    fn shares_a_page(a: usize, e: usize, from: usize, to: usize) -> bool {
+        let (lo, hi) = (a.max(from), e.min(to));
+        lo.div_ceil(crate::watch::PAGE) <= hi / crate::watch::PAGE
+    }
+
+    /// The coalescers written the slow way — a range at a time, removed
+    /// from the middle and sorted after — the reference `push_joined`'s
+    /// single pass must match, whatever the ranges asked for.
+    fn slow_push(
+        ranges: &mut Vec<(usize, usize)>,
+        address: usize,
+        end: usize,
+        joins: fn(usize, usize, usize, usize) -> bool,
+    ) {
+        let (mut from, mut to) = (address, end);
+        let mut i = 0;
+        while i < ranges.len() {
+            let (a, e) = ranges[i];
+            if joins(a, e, from, to) {
+                ranges.remove(i);
+                from = from.min(a);
+                to = to.max(e);
+            } else {
+                i += 1;
+            }
+        }
+        ranges.push((from, to));
+        ranges.sort_unstable();
+    }
+
+    /// The coalescers against a brute-force reference, over thousands of
+    /// random submissions' worth of requests, flushes and title writes:
+    ///
+    /// - after every request the pending ranges are exactly the closure of
+    ///   everything asked for since the last title write: sorted and
+    ///   disjoint, nothing dropped, and nothing merged across more than a
+    ///   page — two distant requests are not copied as the span between
+    ///   them;
+    /// - every push leaves what the slow coalescer (a range at a time,
+    ///   removed from the middle, sorted after) leaves;
+    /// - the ranges of one flush are disjoint, so no byte is copied twice
+    ///   in a flush;
+    /// - a request a flush covered whole was brought up to date: asked
+    ///   again, it is still claimed, so it is not copied twice;
+    /// - what `current` claims by covering a request was copied: every
+    ///   byte of it at least once, and every page inside it by a flush
+    ///   whose range covered the page whole — a claim over a page none
+    ///   guarded would skip a refresh (the split page of #2473).
+    ///
+    /// The pure coalescers only, no host GPU: the tests below that need a
+    /// copy return on a runner without one.
+    #[test]
+    fn the_coalescers_match_a_brute_force_coalescer_over_random_submissions() {
+        use crate::watch::PAGE;
+        const WINDOW: usize = 32 * PAGE;
+        // xorshift64*, deterministic: a failure names the sequence that
+        // reproduces it.
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rand = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 24) as usize % n
+        };
+        let (mut requests, mut skipped) = (0, 0);
+        for sequence in 0..4_096 {
+            let mut pending: Vec<(usize, usize)> = vec![];
+            let mut current: Vec<(usize, usize)> = vec![];
+            let mut slow_pending: Vec<(usize, usize)> = vec![];
+            let mut slow_current: Vec<(usize, usize)> = vec![];
+            // What was asked for since the last title write, the ranges
+            // flushed since then, the bytes they copied and the pages they
+            // copied whole.
+            let mut asked: Vec<(usize, usize)> = vec![];
+            let mut flushed: Vec<(usize, usize)> = vec![];
+            let mut copied: Vec<(usize, usize)> = vec![];
+            let mut guarded = [false; WINDOW / PAGE];
+            for _ in 0..64 {
+                match rand(4) {
+                    // A request, as `Batch::add` records one.
+                    0 | 1 => {
+                        let address = rand(WINDOW);
+                        let end = (address + 1 + rand(2 * PAGE)).min(WINDOW);
+                        requests += 1;
+                        assert!(
+                            !flushed.iter().any(|&(f, t)| f <= address && end <= t)
+                                || covered(&current, address, end),
+                            "sequence {sequence}: {address:#x}..{end:#x} was copied whole already, and is asked for again"
+                        );
+                        if covered(&current, address, end) {
+                            skipped += 1;
+                            assert!(
+                                within(&copied, address, end),
+                                "sequence {sequence}: {address:#x}..{end:#x} skipped, not copied"
+                            );
+                            assert!(
+                                pages_within(&guarded, address, end),
+                                "sequence {sequence}: {address:#x}..{end:#x} skipped over a page no flush guarded"
+                            );
+                            continue;
+                        }
+                        asked.push((address, end));
+                        push_range(&mut pending, COALESCE, address, end);
+                        slow_push(&mut slow_pending, address, end, gap_of_a_page);
+                        assert_eq!(
+                            pending,
+                            closure(&asked),
+                            "sequence {sequence}: pending is not the closure of what was asked"
+                        );
+                        assert_eq!(
+                            sorted(&pending),
+                            slow_pending,
+                            "sequence {sequence}: {address:#x}..{end:#x} is not what the slow coalescer makes"
+                        );
+                    }
+                    // A flush: the pending ranges are copied, one by one.
+                    2 => {
+                        for i in 0..pending.len() {
+                            for &(a, _) in &pending[i + 1..] {
+                                assert!(
+                                    pending[i].1 <= a,
+                                    "sequence {sequence}: pending ranges overlap: {pending:?}"
+                                );
+                            }
+                            let (from, to) = pending[i];
+                            flushed.push((from, to));
+                            copied_push(&mut copied, from, to);
+                            let (first, last) = (from.div_ceil(PAGE), to / PAGE);
+                            if first < last {
+                                guarded[first..last].fill(true);
+                            }
+                            push_copied(&mut current, from, to);
+                            slow_push(&mut slow_current, from, to, shares_a_page);
+                            assert_eq!(
+                                sorted(&current),
+                                slow_current,
+                                "sequence {sequence}: a flush of {from:#x}..{to:#x} is not what the slow coalescer makes"
+                            );
+                        }
+                        pending.clear();
+                        slow_pending.clear();
+                        asked.clear();
+                    }
+                    // A step that writes title memory: what was copied is
+                    // for later submissions.
+                    _ => {
+                        pending.clear();
+                        slow_pending.clear();
+                        asked.clear();
+                        current.clear();
+                        slow_current.clear();
+                        flushed.clear();
+                        copied.clear();
+                        guarded = [false; WINDOW / PAGE];
+                    }
+                }
+                assert!(
+                    current.windows(2).all(|w| w[0].0 < w[1].0),
+                    "sequence {sequence}: current is not sorted: {current:?}"
+                );
+            }
+        }
+        assert!(requests > 120_000, "only {requests} requests");
+        assert!(skipped > 500, "only {skipped} were brought up to date");
     }
 
     /// A submission asking for distant parts of one copy refreshes them
