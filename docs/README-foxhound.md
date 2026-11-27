@@ -114,10 +114,18 @@ Logs go to `%LOCALAPPDATA%\victory\logs`, saves to `%LOCALAPPDATA%\victory\data`
 ### Warming up (once per build or driver)
 
 The first run of a build compiles pipelines while playing and stutters. Runs write down every pipeline the title
-makes (`VICTORY_PIPELINE_BOOK=1`, set by the launcher); afterwards make them all ahead:
+makes (`VICTORY_PIPELINE_BOOK=1`, set by the launcher), and the launcher makes those earlier runs drew with ahead of
+every start (`victory warm --used`): minutes the first time and after a change of the translator, of its switches
+or of the driver, a few seconds otherwise. `-NoWarm` leaves that out; `-WarmOnly` does it and does not start the
+title.
+
+By hand, set first what the start sets. A translation depends on some switches, and so does the pipeline the
+driver keeps; `VICTORY_EARLY_DEPTH=1`, which the launcher sets, is one of them. A bare `victory warm` translates
+and compiles every pipeline in a form no start of the launcher draws with:
 
 ```powershell
 $env:VICTORY_HOST_WAVE = '32'
+$env:VICTORY_EARLY_DEPTH = '1'
 target\release\victory.exe warm
 ```
 

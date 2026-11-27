@@ -7,6 +7,8 @@
 #   .\scripts\play-foxhound.ps1 -Exe ... -SeriesS             Series S profile (1280x720 inside, faster, softer)
 #   .\scripts\play-foxhound.ps1 -Exe ... -Build diag          diagnostics build (slower; captures, timelines)
 #   .\scripts\play-foxhound.ps1 -Exe ... -More @{VICTORY_AMBIENT_SPECULAR='0'}   add or override switches
+#   .\scripts\play-foxhound.ps1 -Exe ... -NoWarm              no pipelines made ahead of the start
+#   .\scripts\play-foxhound.ps1 -Exe ... -WarmOnly            only that: the title is not started
 #
 # In the game, F1 opens a settings menu (arrow keys pick and change, Enter does it). What it saves goes to
 # victory-settings.txt in the repository's folder and is applied here at every start, over the options above;
@@ -34,6 +36,12 @@ param(
     # Frames begin every 1/Fps s whatever the title asks (it asks 1/30). 1000, the default: no cap, a frame
     # begins as soon as the last is done. 30: the title's own rate.
     [ValidateRange(1, 1000)][int]$Fps = 1000,
+    # Before every start the pipelines earlier runs drew with are made ahead (`victory warm --used`, with the
+    # switches of this start: the translations and so the driver's cached pipelines depend on some of them, on
+    # VICTORY_EARLY_DEPTH for one). Minutes once, and after a change of the translator, of those switches or of
+    # the driver; seconds otherwise. -NoWarm: not. -WarmOnly: that, and the title is not started.
+    [switch]$NoWarm,
+    [switch]$WarmOnly,
     [hashtable]$More = @{}
 )
 $repo = Split-Path $PSScriptRoot -Parent
@@ -139,6 +147,26 @@ if (-not (Test-Path -LiteralPath $Exe)) { Write-Host "No $Exe."; return }
 $paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_STREAMLINE_DIR'
 Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
+
+# The pipelines made ahead (-NoWarm, -WarmOnly above). Run here, with this start's switches set: made with the
+# README's bare `victory warm`, the 3,492 pipelines of 2026-11-27 were translated and compiled a second time in
+# the form without VICTORY_EARLY_DEPTH, which no start of this launcher draws with (284 s, 3,397 new files in
+# the shader cache). Without Streamline: nothing is presented, and its files would load in every process.
+if (-not $NoWarm) {
+    Write-Host 'Making ahead the pipelines earlier runs drew with (victory warm --used) ...'
+    $held = @{}
+    foreach ($k in 'VICTORY_DLSS', 'VICTORY_FRAMEGEN', 'VICTORY_FRAMEGEN_X') {
+        if (Test-Path "Env:$k") { $held[$k] = (Get-Item "Env:$k").Value; Remove-Item "Env:$k" }
+    }
+    Push-Location $repo   # victory.toml is read from here
+    try {
+        & $victory warm --used 2>&1 | ForEach-Object { "$_" } | Where-Object { $_ -match 'pipelines known|^\d+ of \d+|made in \d|^pipeline \d+' }
+    } finally {
+        Pop-Location
+        foreach ($k in $held.Keys) { Set-Item "Env:$k" $held[$k] }
+    }
+}
+if ($WarmOnly) { return }
 
 $logs = Join-Path $env:LOCALAPPDATA 'victory\logs'; New-Item -ItemType Directory -Force $logs | Out-Null
 $log = Join-Path $logs ('foxhound-{0:yyyyMMdd-HHmmss}.log' -f (Get-Date))
