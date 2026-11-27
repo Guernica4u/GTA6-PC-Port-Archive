@@ -395,21 +395,38 @@ fn runtime_pages_with_probe(start: usize, end: usize, views: bool, fast: bool) -
         unsafe { GetWriteWatch(0, at as *const _, len, (&raw mut found).cast(), &mut count, &mut granularity) == 0 }
     };
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    // Experimental: a fresh query must cover the entire requested range in
-    // one committed private region before a positive short write-watch probe
-    // can classify it. No address classifications survive this call. A failed
-    // query or probe always falls back to the original classification.
+    // Query allocation metadata rather than walking the page protections.
+    // Only a fully committed private allocation covering the entire range
+    // is eligible. MEM_WRITE_WATCH is a property of the reservation; the
+    // short probe must succeed. Nothing is cached across calls.
     let aligned = start & !(4096 - 1);
-    if fast && end.saturating_sub(aligned) >= 4 * 1024 * 1024 {
-        // SAFETY: this plain Windows information structure accepts zero initialization.
-        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: the query only writes the supplied information structure.
-        let queried = unsafe { VirtualQuery(aligned as *const _, &mut info, size_of_val(&info)) };
+    if fast && end.saturating_sub(aligned) >= 16 * 1024 * 1024 {
+        use windows_sys::Win32::System::Memory::{
+            MemoryRegionInfo, QueryVirtualMemoryInformation, WIN32_MEMORY_REGION_INFORMATION,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut info = WIN32_MEMORY_REGION_INFORMATION::default();
+        // SAFETY: current-process pseudo-handle, valid output structure and
+        // size; querying an invalid address fails without dereferencing it.
+        let queried = unsafe {
+            QueryVirtualMemoryInformation(
+                GetCurrentProcess(),
+                aligned as *const _,
+                MemoryRegionInfo,
+                (&raw mut info).cast(),
+                size_of_val(&info),
+                std::ptr::null_mut(),
+            )
+        };
+        // SAFETY: Flags is the integer representation of the documented
+        // union, whose low bit identifies private allocations.
+        let private = unsafe { info.Anonymous.Flags & 1 != 0 };
+        let base = info.AllocationBase as usize;
         if queried != 0
-            && info.State == MEM_COMMIT
-            && info.Type == MEM_PRIVATE
-            && info.BaseAddress as usize <= aligned
-            && (info.BaseAddress as usize).checked_add(info.RegionSize).is_some_and(|limit| end <= limit)
+            && private
+            && info.CommitSize == info.RegionSize
+            && base <= aligned
+            && base.checked_add(info.RegionSize).is_some_and(|limit| end <= limit)
             && watched(aligned, 4096)
         {
             return (first..last).collect();
@@ -1008,7 +1025,7 @@ pub(crate) mod tests {
 
     #[test]
     fn region_probe_matches_baseline_after_address_reuse() {
-        const N: usize = 64;
+        const N: usize = 256;
         let p = pool(N);
         let check = |p: usize| {
             for views in [false, true] {
@@ -1042,14 +1059,14 @@ pub(crate) mod tests {
     #[test]
     fn region_probe_matches_baseline_across_protections() {
         use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
-        let p = pool(128);
+        let p = pool(512);
         let mut old = 0;
         // SAFETY: the middle page belongs to this allocation.
         assert_ne!(unsafe { VirtualProtect((p + 64 * PAGE) as *const _, PAGE, PAGE_READONLY, &mut old) }, 0);
         for views in [false, true] {
             assert_eq!(
-                runtime_pages_with_probe(p, p + 128 * PAGE, views, true),
-                runtime_pages_with_probe(p, p + 128 * PAGE, views, false)
+                runtime_pages_with_probe(p, p + 512 * PAGE, views, true),
+                runtime_pages_with_probe(p, p + 512 * PAGE, views, false)
             );
         }
         free(p);
@@ -1169,8 +1186,8 @@ pub(crate) mod tests {
     #[test]
     fn a_range_over_foreign_memory_guards_only_the_runtimes() {
         use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualQuery};
-        const WINDOW: usize = 4 << 20;
-        // In a free 4 MiB-aligned window: plain committed memory (as the
+        const WINDOW: usize = 16 << 20;
+        // In a free 16 MiB-aligned window: plain committed memory (as the
         // process heap's) 1 MiB in, a pool 2 MiB in. Other tests allocate
         // meanwhile, so a window taken under our feet is tried again.
         let (base, foreign, pool) = (0..8)
