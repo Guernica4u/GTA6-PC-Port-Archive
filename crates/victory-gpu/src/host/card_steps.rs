@@ -106,7 +106,8 @@ fn placed_order() -> bool {
     *ON.get_or_init(|| crate::switch::on("VICTORY_PLACED_ORDER"))
 }
 
-/// Enable read-through with `VICTORY_PLACED_FILL_REDIRECT=1`.
+/// Enabled by default whenever `VICTORY_PLACED_ORDER=1` is active
+/// (`VICTORY_PLACED_FILL_REDIRECT=0` disables read-through).
 /// Diagnostic A/B runs can switch this without changing list recording.
 fn redirect_fills() -> bool {
     #[cfg(feature = "diagnostics")]
@@ -114,7 +115,7 @@ fn redirect_fills() -> bool {
         return on;
     }
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILL_REDIRECT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILL_REDIRECT").is_none_or(|v| v != "0"))
 }
 
 /// Why [`plan`] refuses for [`place`].
