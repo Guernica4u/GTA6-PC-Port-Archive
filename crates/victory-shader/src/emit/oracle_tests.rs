@@ -1850,3 +1850,135 @@ fn oracle_fuzz() {
     }
     assert_eq!(exact_failures, 0, "exact translations that differ from the oracle (see above)");
 }
+
+/// A lane-divergent branch: the lanes whose v5 (the thread id) is above s0 (signed) take
+/// `then`. [`by_hash`] turns it into one on v3 (a hash of the thread id, unsigned), as the
+/// fuzzer's branches are.
+fn lane_split(then: Vec<Item>, els: Option<Vec<Item>>) -> Item {
+    Item::If { cmp: Cmp::Lt, signed: true, a: Src::S(0), b: 5, then, els }
+}
+
+/// `items` with every branch of [`lane_split`] on v3, unsigned.
+fn by_hash(items: &[Item]) -> Vec<Item> {
+    items
+        .iter()
+        .map(|i| match i {
+            Item::If { cmp: Cmp::Lt, signed: true, a: Src::S(0), b: 5, then, els } => Item::If {
+                cmp: Cmp::Lt,
+                signed: false,
+                a: Src::S(0),
+                b: 3,
+                then: by_hash(then),
+                els: els.as_ref().map(|e| by_hash(e)),
+            },
+            Item::Loop { n, body } => Item::Loop { n: *n, body: by_hash(body) },
+            other => other.clone(),
+        })
+        .collect()
+}
+
+/// VCC read: through `v_cndmask` into `v{lane_bit}`, and with `data` as numbers too, `s_mov` to
+/// s20 (and s21 from vcc_hi in wave64), copied to `v{copy}` (and the next VGPR) where `copy` is
+/// given (inside a lane branch, where only the lanes in it keep that copy).
+fn read_vcc(lane_bit: u8, data: bool, wave64: bool, copy: Option<u8>) -> Vec<Item> {
+    use Src::*;
+    let mut out = vec![Item::I(Inst::Cnd { dst: lane_bit, a: Int(7), b: 1 })];
+    if data {
+        out.push(Item::I(Inst::S1 { op: S1::Mov, dst: 20, a: S(VCC_LO) }));
+        if wave64 {
+            out.push(Item::I(Inst::S1 { op: S1::Mov, dst: 21, a: S(VCC_HI) }));
+        }
+        if let Some(v) = copy {
+            out.push(Item::I(Inst::V1 { op: V1::Mov, dst: v, a: S(20) }));
+            if wave64 {
+                out.push(Item::I(Inst::V1 { op: V1::Mov, dst: v + 1, a: S(21) }));
+            }
+        }
+    }
+    out
+}
+
+/// Class 5 of the oracle's findings: a compare (`v_cmp_*` writing VCC) that runs while a
+/// lane-divergent branch narrows EXEC writes 0 for the lanes left out (RDNA2 ISA, VOPC), and
+/// after the join every lane has that mask whenever some lane ran the compare. VCC is read
+/// after the compare inside the branch and after it, through `v_cndmask` and, with masks as
+/// data, as numbers (`s_mov`). A compare in then, in else, in a nested branch, in a uniform loop
+/// inside the branch and in a branch inside a uniform loop; for all, some and no lanes, waves of
+/// 32 and of 64 (two host waves of 32 with `VICTORY_WAVE_WIDE=1`).
+#[test]
+fn oracle_compares_in_lane_branches_zero_the_lanes_left_out() {
+    use Src::*;
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    let gpu = Gpu { host };
+    // v4 < v6 (two hashes): about half of the lanes that run it.
+    let cmp = || Item::I(Inst::Cmp { cmp: Cmp::Lt, signed: false, a: V(4), b: 6 });
+    let shapes: Vec<(&str, fn(Item, Vec<Item>, Vec<Item>) -> Vec<Item>)> = vec![
+        ("in then", |cmp, inside, after| [vec![lane_split([vec![cmp], inside].concat(), None)], after].concat()),
+        ("in else", |cmp, inside, after| [vec![lane_split(vec![], Some([vec![cmp], inside].concat()))], after].concat()),
+        ("nested", |cmp, inside, after| {
+            // (the inner branch on v1 > v6: about half of the outer branch's lanes; VCC read
+            // after the inner join too)
+            let then = [vec![cmp], inside.clone()].concat();
+            let inner = Item::If { cmp: Cmp::Gt, signed: false, a: V(1), b: 6, then, els: None };
+            [vec![lane_split([vec![inner], inside].concat(), None)], after].concat()
+        }),
+        ("in a uniform loop in the branch", |cmp, inside, after| {
+            let step = Item::I(Inst::V2 { op: V2::AddNc, dst: 4, a: Int(9), b: 4 });
+            let body = [vec![cmp], inside, vec![step]].concat();
+            [vec![lane_split(vec![Item::Loop { n: 2, body }], None)], after].concat()
+        }),
+        ("in a branch in a uniform loop", |cmp, inside, after| {
+            let body = [vec![lane_split([vec![cmp], inside].concat(), None)], after.clone()].concat();
+            [vec![Item::Loop { n: 2, body }], after].concat()
+        }),
+    ];
+    let (mut failures, mut refused) = (Vec::new(), 0);
+    for wave64 in [false, true] {
+        // (on this thread only: other tests translate meanwhile)
+        lower::THREAD_WAVE_WIDE.set(true);
+        for (name, shape) in &shapes {
+            // On the thread id, s0: -1 every lane, 9 some lanes, 40 some (wave64) or none
+            // (wave32), 70 none. On the hash, s0: 0 nearly all, 2^31 about half, 2^32-1 none.
+            let cases = [(false, u32::MAX), (false, 9), (false, 40), (false, 70), (true, 0), (true, 0x8000_0000), (true, u32::MAX)];
+            // (VCC read as numbers too, in the program and stored, or only as each lane's bit)
+            for ((hash, s0), raw_masks) in cases.into_iter().flat_map(|c| [(c, false), (c, true)]) {
+                let (inside, after) = (read_vcc(9, raw_masks, wave64, Some(11)), read_vcc(10, raw_masks, wave64, None));
+                let body = shape(cmp(), inside, after);
+                let body = if hash { by_hash(&body) } else { body };
+                // (SCC from a scalar compare at the end, which the program stores: without masks as
+                // data, SCC of the branch's `s_and_saveexec` read as data is refused, another matter)
+                let body = [body, vec![Item::I(Inst::SCmp { cmp: Cmp::Eq, signed: false, a: S(16), b: S(16) })]].concat();
+                let name = format!("{name}{}{}", if hash { " (on a hash)" } else { "" }, if raw_masks { " (masks as data)" } else { "" });
+                let p = Prog { wave64, seeds: [s0, 3, 0x1234, 0x5678], body, raw_masks };
+                match check(&gpu, &p) {
+                    Outcome::Same => {}
+                    // (In a wave32 the nested shape with masks as data is refused, before the
+                    // change and after it: VCC joined in the inner branch and read as data in the
+                    // outer one is a lane mask holding lanes elsewhere where not every lane runs.
+                    // This fork has no retry that lowers such a mask as the number it is. A
+                    // refusal gives no wrong value; in wave64 the shape translates and passes.)
+                    Outcome::Refused(why)
+                        if !wave64 && raw_masks && name.starts_with("nested") && why.starts_with(lower::MASK_ELSEWHERE) =>
+                    {
+                        refused += 1;
+                    }
+                    other => failures.push(format!(
+                        "wave{} {name}, s0 = {s0:#x}: {}",
+                        if wave64 { 64 } else { 32 },
+                        match other {
+                            Outcome::Differs(d) => describe(&d),
+                            o => format!("{o:?}"),
+                        }
+                    )),
+                }
+            }
+        }
+        lower::THREAD_WAVE_WIDE.set(false);
+    }
+    eprintln!("{refused} of 140 cases refused as before (wave32, nested, masks as data)");
+    assert!(failures.is_empty(), "{} of 140 cases differ:\n{}", failures.len(), failures.join("\n"));
+}
