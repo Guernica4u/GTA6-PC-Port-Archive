@@ -137,6 +137,19 @@ pub(crate) fn pending_wrote(id: u64, start: u64, len: u64, runs: impl Iterator<I
 /// Every ~10 s, from the frame line: the totals and the eight copies shaders
 /// wrote most blocks of.
 pub(crate) fn log() {
+    // What the refreshes took, on or off (its own few seconds).
+    {
+        static SAID: Mutex<Option<Instant>> = Mutex::new(None);
+        let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+        match *said {
+            Some(t) if t.elapsed() < EVERY => {}
+            Some(t) => {
+                crate::shadow::refreshed_line(t.elapsed().as_secs_f64());
+                *said = Some(Instant::now());
+            }
+            None => *said = Some(Instant::now()),
+        }
+    }
     if !on() {
         return;
     }

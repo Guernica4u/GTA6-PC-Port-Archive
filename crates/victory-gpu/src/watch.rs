@@ -38,7 +38,12 @@ pub(crate) const PAGE: usize = 64 << 10;
 const KERNEL_PAGE: usize = 4096;
 
 /// The parts of a page.
-const PARTS: usize = PAGE / KERNEL_PAGE;
+pub(crate) const PARTS: usize = PAGE / KERNEL_PAGE;
+
+/// Of a host copy, per 64 KiB page it holds in part (by the page's index from
+/// the copy's first page): the asking after which each 4 KiB part was last
+/// taken whole. A part's note is the later of this and its page's own.
+pub(crate) type PartsTaken = BTreeMap<usize, [u64; PARTS]>;
 /// All of them.
 const WHOLE: u16 = u16::MAX;
 
@@ -97,6 +102,42 @@ fn next_asking() -> u64 {
     ASKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
+/// Page ranges (first, last) in order of their first page, those that
+/// overlap or touch made one. Every page of the result is a page of one of
+/// `ranges`: asked under the same number, a range across two of them is as
+/// asked as one inside either.
+fn joined_pages(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    ranges.retain(|r| r.0 < r.1);
+    ranges.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (a, b) in ranges {
+        match out.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => out.push((a, b)),
+        }
+    }
+    out
+}
+
+/// Whether pages `[first, last)` lie in `ahead` (as [`joined_pages`] makes
+/// it): in one of its ranges, which are apart.
+fn covers(ahead: &[(usize, usize)], first: usize, last: usize) -> bool {
+    let i = ahead.partition_point(|r| r.0 <= first);
+    i > 0 && ahead[i - 1].1 >= last
+}
+
+/// Since the last line: questions answered from what a submission asked
+/// ahead, and the ranges it had asked, summed over them (`ahead`'s length).
+pub(crate) static COVER_ASKS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// [`covers`], counted.
+fn covered(j: &Journal, first: usize, last: usize) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    COVER_ASKS[0].fetch_add(1, Relaxed);
+    COVER_ASKS[1].fetch_add(j.ahead.len() as u64, Relaxed);
+    covers(&j.ahead, first, last)
+}
+
 /// A title-memory range whose changed pages another subsystem needs to read.
 pub(crate) struct Tracked {
     start: usize,
@@ -127,7 +168,12 @@ struct Journal {
     parts: std::collections::HashMap<usize, [u64; PARTS], std::hash::BuildHasherDefault<PageHash>>,
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
     /// and the asking that did: `writes` answers for a range inside one
-    /// from the journal, without another kernel call.
+    /// from the journal, without another kernel call. In order and apart
+    /// ([`joined_pages`]): a range is looked for by halves ([`covers`]).
+    /// It was a list in the order asked, looked through whole by every
+    /// question, and a submission asks about thousands of ranges and then
+    /// asks the journal of each again (a frame of the chase in run 104020:
+    /// 12,800 refreshes, 10,977 of them known to copy nothing, 42.9 ms).
     ahead: Vec<(usize, usize)>,
     ahead_asked: u64,
     /// The ahead asking stands for a whole submission ([`ask_once`]): no
@@ -362,7 +408,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     note_hot(&written);
     let mut j = journal_mut();
     j.ahead_asked = next_asking();
-    j.ahead = asked;
+    j.ahead = joined_pages(asked);
     let now = j.ahead_asked;
     for (page, parts) in written {
         j.note(page, parts, now);
@@ -570,18 +616,28 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     // same, and all of them are noted under the one number below.
     let mut ordered: Vec<(usize, usize)> = ranges.to_vec();
     ordered.sort_unstable_by_key(|&(start, end)| (start, std::cmp::Reverse(end)));
+    // (What `ask_ahead` asked is in order and apart; what is asked here
+    // comes in order of its start, so only the last of it can hold the next.)
+    let before = joined_pages(std::mem::take(&mut ahead));
+    let mut run: Option<(usize, usize)> = None;
     for (start, end) in ordered {
         if start >= end || published(start, end) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !ahead.iter().any(|&(a, b)| a <= first && last <= b)
-            && let Some(pages) = kernel_written(first, last)
-        {
+        if covers(&before, first, last) || run.is_some_and(|(a, b)| a <= first && last <= b) {
+            continue;
+        }
+        if let Some(pages) = kernel_written(first, last) {
             written.extend(pages);
             ahead.push((first, last));
+            run = match run {
+                Some((a, b)) if first <= b => Some((a, b.max(last))),
+                _ => Some((first, last)),
+            };
         }
     }
+    ahead.extend(before);
     note_hot(&written);
     let mut j = journal_mut();
     // A number of its own, and the one this asking stands under: between
@@ -594,7 +650,7 @@ fn ask_rest(ranges: &[(usize, usize)]) {
         j.note(page, parts, now);
     }
     j.kept = !ahead.is_empty();
-    j.ahead = ahead;
+    j.ahead = joined_pages(ahead);
 }
 
 /// The submission's one asking stands no longer: its refreshes are done,
@@ -667,10 +723,7 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = journal();
-    j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
-        .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+    covered(&j, first, last).then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -688,7 +741,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() };
     // Asked ahead with the submission's other ranges: the journal has it.
-    let ahead = |j: &Journal| j.ahead.iter().any(|&(a, b)| a <= first && last <= b).then(|| (j.ahead_asked, of(j)));
+    let ahead = |j: &Journal| covered(j, first, last).then(|| (j.ahead_asked, of(j)));
     if let Some(known) = ahead(&journal()) {
         return Some(known);
     }
@@ -758,12 +811,13 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 }
 
 /// Whether nothing of `[start, end)` was written that a copy with the notes
-/// `copied` (the asking after which each page from page `base` on was taken)
-/// and `ranged` (the asking after which a range that holds this one was
-/// taken whole, or 0) does not hold, as [`writes`] would answer with nothing
+/// `copied` (the asking after which each page from page `base` on was taken),
+/// `parts` (the same for the 4 KiB parts of pages it took in part) and
+/// `ranged` (the asking after which a range that holds this one was taken
+/// whole, or 0) does not hold, as [`writes`] would answer with nothing
 /// asked: the submission's asking covers the range, or its blocks are known
 /// by their bits. `false` if something would have to be asked.
-pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
+pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64], parts: &PartsTaken, ranged: u64) -> bool {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     // The bits first, then the journal, as in `writes`.
     let known = published(start, end);
@@ -772,14 +826,55 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
         crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
     }
     let j = journal();
-    if !known && !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    if !known && !covered(&j, first, last) {
         return false;
     }
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
         return false;
     };
-    (ranged != 0 || taken.iter().all(|&at| at != 0))
-        && j.written.range(first..last).all(|(&page, &write)| write <= taken[page - first].max(ranged))
+    // The parts of `page` that hold bytes of the range.
+    let within = |page: usize| {
+        let (a, b) = ((page * PAGE).max(start), ((page + 1) * PAGE).min(end));
+        (a - page * PAGE) / KERNEL_PAGE..(b - page * PAGE).div_ceil(KERNEL_PAGE)
+    };
+    // Every byte was taken once: its page whole, or its part.
+    if ranged == 0 {
+        for (n, _) in taken.iter().enumerate().filter(|(_, at)| **at == 0) {
+            let page = first + n;
+            let Some(stamps) = parts.get(&(page - base)) else {
+                return false;
+            };
+            if within(page).any(|k| stamps[k] == 0) {
+                return false;
+            }
+        }
+    }
+    j.written.range(first..last).all(|(&page, &write)| {
+        let at = taken[page - first].max(ranged);
+        if at != 0 && write <= at {
+            return true;
+        }
+        // Taken in part since: each part as it was taken and written.
+        let Some(stamps) = parts.get(&(page - base)) else {
+            return false;
+        };
+        let each = j.parts.get(&page);
+        within(page).all(|k| {
+            let at = at.max(stamps[k]);
+            at != 0 && each.map_or(write, |w| w[k]) <= at
+        })
+    })
+}
+
+/// Per page of `pages`: the asking that last found each of its 4 KiB parts
+/// written, where the journal tells them apart; `None` where it holds the
+/// page as written whole (each part at the page's last write).
+pub(crate) fn part_writes(pages: &[usize]) -> Vec<Option<[u64; PARTS]>> {
+    if pages.is_empty() {
+        return Vec::new();
+    }
+    let j = journal();
+    pages.iter().map(|page| j.parts.get(page).copied()).collect()
 }
 
 impl Tracked {
@@ -3275,6 +3370,25 @@ mod parts_tests {
         // A page never written before: what was not named was never written.
         assert_eq!(j.note(9, 0b100, 9), 0);
         assert_eq!(j.parts_since(9, 5), 0b100);
+    }
+
+    /// The ranges asked ahead, joined, answer as the list did, and for a
+    /// range across two that touch.
+    #[test]
+    fn ranges_asked_ahead_are_found_by_halves() {
+        let asked = vec![(40, 50), (10, 20), (15, 30), (30, 32), (60, 61), (5, 5)];
+        let ahead = joined_pages(asked.clone());
+        assert_eq!(ahead, [(10, 32), (40, 50), (60, 61)]);
+        for first in 0..70 {
+            for last in first + 1..71 {
+                let one = asked.iter().any(|&(a, b)| a <= first && last <= b);
+                let joined = (10..=31).contains(&first) && last <= 32
+                    || (40..=49).contains(&first) && last <= 50
+                    || first == 60 && last == 61;
+                assert!(!one || covers(&ahead, first, last), "{first}..{last}");
+                assert_eq!(covers(&ahead, first, last), joined, "{first}..{last}");
+            }
+        }
     }
 }
 
