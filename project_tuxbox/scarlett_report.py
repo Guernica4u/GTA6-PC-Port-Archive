@@ -54,6 +54,17 @@ def refusal_bucket(error):
             return label
     return "other_refusal"
 
+
+# A mesh program without an embedded RTS0 cannot be translated at preparation
+# time — the pipeline creates it against the guest root later (with the root
+# embedded at that point). The emitter's refusal is real, but it is expected
+# here, so the receipt lists it separately from the actionable refusals.
+EXPECTED_AT_PREPARATION = frozenset({"mesh_root_layout"})
+
+
+def expected_at_preparation(bucket):
+    return bucket in EXPECTED_AT_PREPARATION
+
 def failure_bucket(error):
     if isinstance(error, subprocess.TimeoutExpired):
         # TimeoutExpired.cmd may contain private paths; use only fixed labels.
