@@ -1041,6 +1041,11 @@ struct Deferred {
     vram_probes: Vec<VramProbe>,
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_IN_EXECUTE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl Host {
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
@@ -1165,7 +1170,19 @@ impl Host {
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
+        #[cfg(test)]
+        let _bitmap_lock = crate::shadow::lock_test_bitmaps();
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(test)]
+        struct InExecute(bool);
+        #[cfg(test)]
+        impl Drop for InExecute {
+            fn drop(&mut self) {
+                TEST_IN_EXECUTE.with(|f| f.set(self.0));
+            }
+        }
+        #[cfg(test)]
+        let _in_execute = InExecute(TEST_IN_EXECUTE.with(|f| f.replace(true)));
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
@@ -2853,8 +2870,8 @@ impl Host {
         }
         const RING_BYTES: u64 = 64 << 20;
         static RING: Mutex<Option<(ID3D12Resource, usize)>> = Mutex::new(None);
+        let mut guard = RING.lock().unwrap_or_else(|e| e.into_inner());
         let (ring_buf, ring_ptr) = {
-            let mut guard = RING.lock().unwrap_or_else(|e| e.into_inner());
             let (buf, ptr) = guard.get_or_insert_with(|| {
                 let (b, p) = self.upload_buffer(RING_BYTES).expect("vram upload ring");
                 (b, p as usize)
@@ -2927,8 +2944,8 @@ impl Host {
         }
         const RING_BYTES: u64 = 32 << 20;
         static RING: Mutex<Option<(ID3D12Resource, usize)>> = Mutex::new(None);
+        let mut guard = RING.lock().unwrap_or_else(|e| e.into_inner());
         let (ring_buf, ring_ptr) = {
-            let mut guard = RING.lock().unwrap_or_else(|e| e.into_inner());
             let (buf, ptr) = guard.get_or_insert_with(|| {
                 let (b, p) = self.mapped_buffer(RING_BYTES, true).expect("vram readback ring");
                 (b, p as usize)
@@ -3005,12 +3022,15 @@ impl Host {
 
     #[cfg(test)]
     pub(crate) fn flush_test_vram_uploads(&self) {
-        static FLUSH: Mutex<()> = Mutex::new(());
-        let _guard = FLUSH.lock().unwrap_or_else(|e| e.into_inner());
+        if TEST_IN_EXECUTE.with(|f| f.get()) {
+            // Already inside `Host::execute` on this thread holding `self.submitted`;
+            // it will drain and upload `VRAM_UPLOADS` before executing the lists.
+            return;
+        }
+        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let uploads = crate::shadow::take_vram_uploads();
         if !uploads.is_empty() {
-            let mut dummy = 0u64;
-            self.upload_vram_copies(&uploads, &[], &mut dummy);
+            self.upload_vram_copies(&uploads, &[], &mut submitted);
         }
     }
 

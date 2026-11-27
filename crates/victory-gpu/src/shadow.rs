@@ -24,16 +24,50 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
-fn merge_writeback(title: &mut [u8], host: &mut [u8], old: &[u8]) -> bool {
-    let mut changed = 0;
+#[cfg(test)]
+pub(crate) static TEST_BITMAP_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+thread_local! {
+    static TEST_BITMAP_HELD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) struct TestBitmapGuard {
+    _guard: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+#[cfg(test)]
+impl Drop for TestBitmapGuard {
+    fn drop(&mut self) {
+        TEST_BITMAP_HELD.with(|c| c.set(c.get() - 1));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn lock_test_bitmaps() -> TestBitmapGuard {
+    let depth = TEST_BITMAP_HELD.with(|c| {
+        let d = c.get();
+        c.set(d + 1);
+        d
+    });
+    let _guard = (depth == 0).then(|| TEST_BITMAP_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
+    TestBitmapGuard { _guard }
+}
+
+fn merge_writeback(title: &mut [u8], host: &mut [u8], old: &[u8]) -> (bool, bool) {
+    let mut title_changed = 0;
+    let mut host_changed = 0;
     for ((title_byte, host_byte), old_byte) in title.iter_mut().zip(host).zip(old) {
         let mask = 0u8.wrapping_sub(u8::from(*host_byte != *old_byte));
         let delta = (*title_byte ^ *host_byte) & mask;
         *title_byte ^= delta;
+        let prev_host = *host_byte;
         *host_byte = *title_byte;
-        changed |= delta;
+        title_changed |= delta;
+        host_changed |= prev_host ^ *title_byte;
     }
-    changed != 0
+    (title_changed != 0, host_changed != 0)
 }
 
 #[test]
@@ -56,7 +90,7 @@ fn writeback_merge_matches_bytewise_oracle() {
                 .map(|((&gpu, &previous), &cpu)| if gpu == previous { cpu } else { gpu })
                 .collect();
             let changed = expected != title;
-            assert_eq!(merge_writeback(&mut title, &mut host, &old), changed);
+            assert_eq!(merge_writeback(&mut title, &mut host, &old).0, changed);
             assert_eq!(title, expected);
             assert_eq!(host, expected);
         }
@@ -582,11 +616,14 @@ impl Shadow {
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
-                    if merge_writeback(title, host, old) {
+                    let (title_changed, host_changed) = merge_writeback(title, host, old);
+                    if title_changed {
                         let _writing = crate::watch::writing(start + at, n);
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        self.queue_vram_upload(at as u64, n as u64);
                         written += n;
+                    }
+                    if host_changed {
+                        self.queue_vram_upload(at as u64, n as u64);
                     }
                     synced.push((start + at) / PAGE);
                 }
@@ -652,21 +689,22 @@ impl Shadow {
         if !crate::host::read_into(from as *const u8, &mut title) {
             return 0;
         }
-        let written = match &saved {
+        let (written, host_changed) = match &saved {
             // The title's bytes are the copy's from before: what differs is
             // the shaders'.
-            None => (*host != title[..]).then_some(host.as_ptr()),
+            None => ((*host != title[..]).then_some(host.as_ptr()), false),
             Some(before) => {
                 let before = &before[from - page..to - page];
-                merge_writeback(&mut title, host, before).then_some(title.as_ptr())
+                let (title_changed, host_changed) = merge_writeback(&mut title, host, before);
+                (title_changed.then_some(title.as_ptr()), host_changed)
             }
         };
         if let Some(bytes) = written {
             let _writing = crate::watch::writing(from, n);
             crate::host::write_mapped(from as *mut u8, bytes, n);
-            if saved.is_some() {
-                self.queue_vram_upload((from - start) as u64, n as u64);
-            }
+        }
+        if host_changed {
+            self.queue_vram_upload((from - start) as u64, n as u64);
         }
         // Equal to title memory now: taken, unless it holds the page in part.
         if from == page && to == page + PAGE {
@@ -1771,11 +1809,9 @@ pub(crate) mod tests {
     /// before) and a page nobody marked: the shader's byte and the title's
     /// both stay in the first; the second keeps the title's, and the copy's
     /// byte there (no mark) is not put back. The bits are cleared.
-    static TEST_BITMAP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn marked_pages_go_back_by_the_bytes_the_gpu_changed() {
-        let _bitmap_lock = TEST_BITMAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _bitmap_lock = lock_test_bitmaps();
         let p = crate::watch::tests::pool(3);
         let len = 3 * PAGE;
         register(p, p as u64, len as u64);
@@ -1823,7 +1859,7 @@ pub(crate) mod tests {
     /// marks of the same submission go back.
     #[test]
     fn marks_of_shaders_using_title_memory_are_held_back() {
-        let _bitmap_lock = TEST_BITMAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _bitmap_lock = lock_test_bitmaps();
         let p = crate::watch::tests::pool(2);
         let len = 2 * PAGE;
         register(p, p as u64, len as u64);
@@ -1899,6 +1935,7 @@ pub(crate) mod tests {
     /// back to the pre-fault value.
     #[test]
     fn partial_refresh_under_marked_range_updates_saved_bytes() {
+        let _bitmap_lock = lock_test_bitmaps();
         let p = crate::watch::tests::pool(2);
         let len = 2 * PAGE;
         register(p, p as u64, len as u64);
@@ -1955,7 +1992,7 @@ pub(crate) mod tests {
     /// without a `Step::GpuWrite` still reaches title memory on `Host::execute`.
     #[test]
     fn vram_marked_view_writes_go_back_to_title() {
-        let _bitmap_lock = TEST_BITMAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _bitmap_lock = lock_test_bitmaps();
         let Some(host) = host() else {
             return; // no host GPU here
         };
