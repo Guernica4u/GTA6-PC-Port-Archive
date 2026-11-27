@@ -73,13 +73,16 @@ fn is_translation(dir: &Path) -> bool {
     ours && dir.is_dir() && library_in(dir)
 }
 
-/// Whether `dir` holds a library: [`LIBRARY_FILE`], or its first shard where
-/// the library is split (`#1653` puts one file per shard, `host-pipelines.NN.bin`,
-/// in the same directory). Both are checked so that the two changes read the
-/// same directories whichever of them lands first - the names are written out
-/// because `shard_file` does not exist without the split.
+/// Whether `dir` holds a library: [`LIBRARY_FILE`], or any of its shards
+/// where the library is split (`#1653` puts one file per shard,
+/// `host-pipelines.00.bin` to `host-pipelines.15.bin`, in the same
+/// directory, and writes only the shards that changed, so a small cache can
+/// hold shard 15 and no shard 00). Both are checked so that the two changes
+/// read the same directories whichever of them lands first - the names are
+/// written out because `shard_file` does not exist without the split.
 fn library_in(dir: &Path) -> bool {
-    dir.join(LIBRARY_FILE).is_file() || dir.join("host-pipelines.00.bin").is_file()
+    dir.join(LIBRARY_FILE).is_file()
+        || (0..16).any(|shard| dir.join(format!("host-pipelines.{shard:02}.bin")).is_file())
 }
 
 /// How many translations keep a library: the one in use and the previous
@@ -936,6 +939,32 @@ mod keyed_tests {
 
         assert_eq!(keyed(&dir), current);
         assert!(dir.join("backup").join("sentinel").is_file(), "a foreign directory was deleted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A translation's directory is a library with the one-file library or
+    /// with any single shard of a split one, not only shard 00 (review on
+    /// #2706: the split writes only the shards that changed). A shard number
+    /// past the split's sixteen, or no library file at all, is not one.
+    #[test]
+    fn any_shard_makes_a_library_directory() {
+        let dir = std::env::temp_dir().join(format!("victory-shards-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (name, file, library) in [
+            ("legacy", Some("host-pipelines.bin"), true),
+            ("first", Some("host-pipelines.00.bin"), true),
+            ("last", Some("host-pipelines.15.bin"), true),
+            ("past", Some("host-pipelines.16.bin"), false),
+            ("other", Some("sentinel"), false),
+            ("empty", None, false),
+        ] {
+            let at = dir.join(name);
+            std::fs::create_dir_all(&at).unwrap();
+            if let Some(file) = file {
+                std::fs::write(at.join(file), b"library").unwrap();
+            }
+            assert_eq!(library_in(&at), library, "{name}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
