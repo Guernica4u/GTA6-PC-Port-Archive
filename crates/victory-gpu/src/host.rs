@@ -2901,7 +2901,9 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
 
 /// Whether a small fill of upload memory, or copy of a title buffer, goes on without waiting for
 /// flights when the title itself wrote the memory since they were given it
-/// (`VICTORY_FILL_TITLE=1`; off by default).
+/// (on by default; `VICTORY_FILL_TITLE=0` turns it off. It was off until the
+/// 480-byte constants ring was found to drain the card once a frame: 43-59 ms of a
+/// 70-84 ms frame, docs/performance/AGENT_REPORTS/06-cpu-threading.md).
 ///
 /// The title's 174 MB heap is declared written as a whole (a root view has
 /// no size), and the title keeps a ring of constants in it: one fill of 480
@@ -2921,7 +2923,7 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
 fn fill_is_titles(src: usize, len: usize) -> bool {
     const SMALL: usize = 64 << 10;
     static ON: OnceLock<bool> = OnceLock::new();
-    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_TITLE").is_some_and(|v| v == "1"));
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_TITLE").is_none_or(|v| v != "0"));
     on && len <= SMALL && (crate::watch::written_since_taken(src, len) || !crate::watch::landed_lately(src, len, 600))
 }
 
