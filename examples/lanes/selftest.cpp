@@ -1205,6 +1205,115 @@ void compute_root_recovery(ID3D12Device* device) {
     }
 }
 
+// A console program under a root of three tables and a root SRV, the layout
+// of some retail compute roots (`shader_fixture.py`). Its records name that
+// root SRV and a raw UAV at slot 2 of table 1, where the title's root declares
+// four SRVs; the title fills the table as the program was compiled to use it.
+// The provider must bind the layout the program's own records give. Against
+// the title's declaration the store has no UAV, so nothing translates the
+// program and view 10 keeps its decoy (or, with stand-ins disabled, the
+// pipeline is not created).
+void compute_root_srv(ID3D12Device* device) {
+    D3D12_DESCRIPTOR_RANGE1 ranges[]{
+        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, 0},
+        {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 1, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, 0},
+        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 3, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, 0}};
+    D3D12_ROOT_PARAMETER1 params[4]{};
+    for (UINT i = 0; i < 3; ++i) {
+        params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[i].DescriptorTable = {1, &ranges[i]};
+    }
+    // The program's record names this parameter t5, space7.
+    params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params[3].Descriptor = {1, 3, D3D12_ROOT_DESCRIPTOR_FLAG_NONE};
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC signature{};
+    signature.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    signature.Desc_1_1 = {4, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ComPtr<ID3DBlob> serialized;
+    check(D3D12SerializeVersionedRootSignature(&signature, &serialized, nullptr), "serialize root with a root SRV");
+    ComPtr<ID3D12RootSignature> root;
+    check(device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+                                      IID_PPV_ARGS(&root)), "create root signature with a root SRV");
+    D3D12_COMPUTE_PIPELINE_STATE_DESC shader{};
+    shader.pRootSignature = root.Get();
+    shader.CS = {root_srv_shader, sizeof(root_srv_shader)};
+    ComPtr<ID3D12PipelineState> pipeline;
+    check(method<CreateComputePipeline>(device, device_create_compute)(device, &shader, 0, nullptr,
+                                                                       IID_PPV_ARGS(&pipeline)),
+          "create pipeline storing through a slot the root declares an SRV");
+
+    // Sixteen raw UAVs of one buffer. Table 0 starts at view 0, table 1 at view
+    // 8 and table 2 at view 12, so the program writes view 10. Every view
+    // starts with a decoy naming it.
+    constexpr UINT views = 16, view_words = 64, decoy = 0xD0000000, written_view = 10;
+    constexpr UINT64 bytes = views * view_words * sizeof(UINT);
+    std::vector<UINT> words(views * view_words);
+    for (UINT i = 0; i < views; ++i) words[i * view_words] = decoy | i;
+    auto seed = buffer(device, D3D12_HEAP_TYPE_UPLOAD, bytes, D3D12_RESOURCE_STATE_GENERIC_READ);
+    compute_fixture::upload(seed.Get(), words.data(), size_t(bytes));
+    auto output = buffer(device, D3D12_HEAP_TYPE_DEFAULT, bytes, D3D12_RESOURCE_STATE_COPY_DEST,
+                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    auto readback = buffer(device, D3D12_HEAP_TYPE_READBACK, bytes, D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, views,
+                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    ComPtr<ID3D12DescriptorHeap> heap;
+    check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap)), "create root view heap");
+    const UINT stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const SIZE_T cpu_base = method<frame_abi::CpuHandle>(heap.Get(), 9)(heap.Get());
+    const UINT64 gpu_base = method<GpuHandle>(heap.Get(), 10)(heap.Get());
+    for (UINT i = 0; i < views; ++i) {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+        view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        view.Format = DXGI_FORMAT_R32_TYPELESS;
+        view.Buffer.FirstElement = UINT64(i) * view_words;
+        view.Buffer.NumElements = view_words;
+        view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        device->CreateUnorderedAccessView(output.Get(), nullptr, &view, {cpu_base + SIZE_T(i) * stride});
+    }
+
+    Queue direct(device, D3D12_COMMAND_LIST_TYPE_DIRECT);
+    ID3D12GraphicsCommandList* list = direct.list.Get();
+    list->CopyBufferRegion(output.Get(), 0, seed.Get(), 0, bytes);
+    compute_fixture::transition(list, output.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12DescriptorHeap* heaps[]{heap.Get()};
+    method<BindHeaps>(list, slot_bind_heaps)(list, 1, heaps);
+    method<SetRoot>(list, slot_compute_root)(list, root.Get());
+    // The program never reads through the root SRV, so the title leaves it unset.
+    constexpr UINT first_view[]{0, 8, 12};
+    for (UINT i = 0; i < 3; ++i)
+        method<SetTable>(list, slot_compute_table)(list, i, {gpu_base + UINT64(first_view[i]) * stride});
+    list->SetPipelineState(pipeline.Get());
+    list->Dispatch(1, 1, 1);
+    compute_fixture::transition(list, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->CopyBufferRegion(readback.Get(), 0, output.Get(), 0, bytes);
+    direct.submit();
+    direct.finish("dispatch storing through a slot the root declares an SRV");
+
+    D3D12_RANGE read{0, SIZE_T(bytes)}, empty{};
+    void* mapped = nullptr;
+    check(readback->Map(0, &read, &mapped), "map root SRV readback");
+    std::vector<UINT> got(views * view_words);
+    std::memcpy(got.data(), mapped, size_t(bytes));
+    readback->Unmap(0, &empty);
+    for (UINT i = 0; i < views; ++i) {
+        for (UINT j = 1; j < view_words; ++j)
+            if (got[i * view_words + j] != 0) throw std::runtime_error("the root SRV program modified a guard word");
+        const UINT expected = i == written_view ? root_shader_expected : decoy | i;
+        const UINT found = got[i * view_words];
+        if (found == expected) continue;
+        char message[160];
+        if (i == written_view && found == (decoy | i))
+            std::snprintf(message, sizeof(message), "view 10 kept its decoy: a stand-in pipeline or a skipped dispatch");
+        else if (found == root_shader_expected)
+            std::snprintf(message, sizeof(message), "view %u was written, not table 1 slot 2 (view 10)", i);
+        else
+            std::snprintf(message, sizeof(message), "view %u: expected %#x, found %#x", i, expected, found);
+        throw std::runtime_error(message);
+    }
+}
+
 ComPtr<ID3D12PipelineState> compute_pipeline(ID3D12Device* device, ComPtr<ID3D12RootSignature>& root,
                                           D3D12_SHADER_BYTECODE bytecode) {
     D3D12_ROOT_PARAMETER params[2]{};
@@ -3162,6 +3271,7 @@ constexpr Scenario scenarios[] = {
     {L"mesh-sampler-single", mesh_sampler_single},
     {L"mesh-sampler-rootless", mesh_sampler_rootless},
     {L"compute-root-recovery", compute_root_recovery},
+    {L"compute-root-srv", compute_root_srv},
     {L"bindless-compute", bindless_compute},
     {L"bindless-sampler", bindless_sampler},
     {L"bindless-heap-read", bindless_heap_read},
@@ -3224,7 +3334,7 @@ const wchar_t* const selftest_scenarios[] = {L"labels",            L"cross-queue
                                              L"xbox-shader", L"wave64-shader", L"mixed-lane",
                                              L"raster-tables", L"lane-spill-interp", L"wave-alloc", L"raster-samplers", L"compute-root",
                                              L"mesh-samplers", L"mesh-sampler-single", L"mesh-sampler-rootless",
-                                             L"compute-root-recovery", L"bindless-compute",
+                                             L"compute-root-recovery", L"compute-root-srv", L"bindless-compute",
                                              L"bindless-sampler", L"bindless-heap-read", L"bindless-texture-store",
                                              L"bindless-table-store", L"bindless-table-compute",
                                              L"raster-heap-stride"};

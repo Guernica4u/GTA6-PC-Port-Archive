@@ -67,6 +67,7 @@ The game also imports Windows core API sets for services such as files, timing a
 | `lane-spill-interp` | A console pixel program whose f16 interpolator's attribute selector matches the number of its lane-spill register ([raster tables](#raster-tables)) |
 | `raster-heap-stride` | A console vertex program reading its positions by index from a structured buffer in the resource heap ([raster tables](#raster-tables)); not part of `all` |
 | `compute-root` | Two root-less console compute programs under a root with three descriptor tables that the provider cannot reflect ([compute roots](#compute-roots)) |
+| `compute-root-srv` | A console compute program under three tables and a root SRV stores through a table slot that the title's root declares an SRV ([compute roots](#a-compute-root-with-a-root-srv-after-its-tables)) |
 | `mesh-samplers` | The same literal sampler in a mesh pipeline, whose mesh root the provider builds ([raster tables](#raster-tables)); not part of `all` |
 | `mesh-sampler-single` | The one-sampler pixel program in a mesh pipeline whose root's `s0` is point-filtered ([raster tables](#raster-tables)); not part of `all` |
 | `mesh-sampler-rootless` | The literal sampler programs in mesh pipelines whose root has no static samplers ([raster tables](#raster-tables)); not part of `all` |
@@ -190,6 +191,21 @@ all other guard words must match; stand-ins are disabled.
 
 ```sh
 python tuxbox.py verify --only lanes-compute-root-recovery --output build/lanes-compute-root-recovery.json
+```
+
+### A compute root with a root SRV after its tables
+
+`compute-root-srv` runs a console program under a version 1.1 root of
+three tables and a root SRV, the layout of some retail compute roots. The
+program's records name that root SRV and a UAV at slot 2 of the second
+table, where the title's root declares four SRVs; the title fills the
+table as the program was compiled to use it. The program's word must
+arrive in that view. Against the title's declaration the store has no UAV
+and the program cannot be translated, so the pipeline is not created.
+Stand-ins are disabled.
+
+```sh
+python tuxbox.py verify --only lanes-compute-root-srv --output build/lanes-compute-root-srv.json
 ```
 
 The `lanes-bindless-compute` verification suite runs three native console programs under direct-indexed roots, each with a roomy and a constrained paged resource heap (resident limit 64 in the constrained run). `bindless-compute` stores through the heap UAV at logical slot 80. `bindless-sampler` samples the heap texture at slot 90 with a linear sampler built from literal words, which the root does not declare, and stores the value through the UAV at slot 85. `bindless-table-compute` is `bindless-compute` under a direct-indexed root that also has a bound table of four UAVs, which the program does not read. `bindless-heap-read` runs the first program beside a guest texture whose UAV sits at slot 100, holds the dispatch on a label while the title rewrites the texture's memory, and fails if the provider then writes the texture back. `bindless-texture-store` stores one word to one texel of that texture and checks the GPU image and the title's memory. Each run requires a translation made against the pipeline's root, the paged map bind and disabled stand-ins.

@@ -147,6 +147,25 @@ def recovered_root_shader():
     return stage_container(0x50060, image(7, first + second, user, used), [(b"PSV0", psv)])
 
 
+def root_srv_shader():
+    """A store through table 1 by a program whose records also name a root SRV.
+
+    The scenario's root is three tables and a root SRV. The record of that
+    root SRV names parameter 3, whose address arrives in s7-s8, and PSV names
+    it a raw buffer, t5, space7; the program does not read through it. The raw
+    UAV at slot 2 (0x40) of table 1 is u4, space2, where the root declares an
+    SRV. Both have user-data records.
+    """
+    info = bytearray(48)
+    info[24] = 5
+    struct.pack_into("<3I", info, 36, ROOT_THREADS, 1, 1)
+    resources = ([4, 7, 5, 5], [7, 2, 4, 4])
+    psv = pack([len(info)]) + info + pack([2, 16, *resources[0], *resources[1]])
+    user = ([1, 0, 2, 5, 0x307], [3, 16, 1, 4, 0x105])
+    used = ([0x100, 0, 5, 1, 0x30704], [0x303, 16, 4, 1, 0x10504])
+    return stage_container(0x50060, image(7, root_code(0x40), user, used), [(b"PSV0", psv)])
+
+
 BINDLESS_INDEX = 80
 BINDLESS_EXPECTED = 0x7AB1E002
 
@@ -301,6 +320,7 @@ def header():
             + declaration("lane_shader", lane_shader())
             + f"constexpr unsigned lane_shader_expected[] = {{{lane_words}}};\n"
             + declaration("recovered_root_shader", recovered_root_shader())
+            + declaration("root_srv_shader", root_srv_shader())
             + declaration("bindless_compute_shader", bindless_compute_shader())
             + declaration("bindless_table_compute_shader", bindless_compute_shader(table=True))
             + f"constexpr unsigned bindless_index = {BINDLESS_INDEX};\nconstexpr unsigned bindless_expected = {BINDLESS_EXPECTED:#x};\n"

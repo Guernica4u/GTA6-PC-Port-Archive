@@ -24,7 +24,7 @@ from .inspect import digest, export_table, image, launch_target
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / "build"
-BASE_SUITES = ("cpu", "xmem", "xapu", "xgameruntime", "xcrdapi", "graphics", "graphics-abi", "guest-frame", "present", "lanes", "lanes-selftest", "lanes-shader-cache", "lanes-raster-tables", "lanes-compute-root", "lanes-compute-root-recovery", "lanes-bindless-compute", "lanes-benchmark",
+BASE_SUITES = ("cpu", "xmem", "xapu", "xgameruntime", "xcrdapi", "graphics", "graphics-abi", "guest-frame", "present", "lanes", "lanes-selftest", "lanes-shader-cache", "lanes-raster-tables", "lanes-compute-root", "lanes-compute-root-recovery", "lanes-compute-root-srv", "lanes-bindless-compute", "lanes-benchmark",
                "cpu-benchmark", "d3d12-exports", "d3d12-features", "d3d12-indirect", "d3d12-queries", "d3d12-queues", "d3d12-tables",
                "d3d12-heaps", "d3d12-placement", "d3d12-copy-resource", "d3d12-draw", "d3d12-stream", "d3d12-frame-events",
                "d3d12-guids", "d3d12-signatures", "xg-provider")
@@ -565,11 +565,25 @@ def lanes_bindless_compute(host, check, gpu_args, pci, memory_symbols):
 def lanes_compute_root_recovery(host, check, gpu_args, pci, memory_symbols):
     """Run the partially reflected second-table shader with paged descriptors."""
     from examples.lanes.shader_fixture import recovered_root_shader
+    lanes_reflected_compute_root(host, check, gpu_args, pci, memory_symbols, "compute-root-recovery",
+                                 recovered_root_shader(), slots=4, heap_limit="64")
+
+
+def lanes_compute_root_srv(host, check, gpu_args, pci, memory_symbols):
+    """Run the program under three tables and a root SRV that stores where the root declares an SRV."""
+    from examples.lanes.shader_fixture import root_srv_shader
+    lanes_reflected_compute_root(host, check, gpu_args, pci, memory_symbols, "compute-root-srv",
+                                 root_srv_shader(), slots=3)
+
+
+def lanes_reflected_compute_root(host, check, gpu_args, pci, memory_symbols, scenario, program, *, slots,
+                                 heap_limit=None):
+    """Run a scenario whose program must be translated against a root the provider reflects."""
     from .runtime_shaders import shader_session
     from .shader_prep import SOURCE_CACHE
 
     sources = Path(host.env["WINEPREFIX"]) / SOURCE_CACHE
-    rootless = {hashlib.sha256(recovered_root_shader()).hexdigest()}
+    rootless = {hashlib.sha256(program).hexdigest()}
     messages = []
 
     def requested(prefix):
@@ -588,20 +602,22 @@ def lanes_compute_root_recovery(host, check, gpu_args, pci, memory_symbols):
         if not compiled:
             return f"the worker translated no program against the two-table root: {messages}"
         if "substituted null compute pipeline" in output:
-            return "the recovered program received a stand-in"
-        if "created compute pipeline with 4 reflected FSSM descriptor slots" not in output:
-            return "the recovered program did not account for both reflected tables"
+            return "the program received a stand-in"
+        if f"created compute pipeline with {slots} reflected FSSM descriptor slots" not in output:
+            return f"the program's pipeline did not reflect {slots} descriptor slots"
         return None
 
     names = ("TUXBOX_LOG", "WINEDEBUG", "TUXBOX_SHADER_SESSION", "TUXBOX_DESCRIPTOR_HEAP_LIMIT", "TUXBOX_NULL_PIPELINES")
     saved = {name: host.env.get(name) for name in names}
-    host.env.update(TUXBOX_LOG="1", WINEDEBUG="-all,+debugstr", TUXBOX_DESCRIPTOR_HEAP_LIMIT="64", TUXBOX_NULL_PIPELINES="0")
+    host.env.update(TUXBOX_LOG="1", WINEDEBUG="-all,+debugstr", TUXBOX_NULL_PIPELINES="0")
+    if heap_limit:
+        host.env["TUXBOX_DESCRIPTOR_HEAP_LIMIT"] = heap_limit
     host.env.pop("TUXBOX_SHADER_SESSION", None)
     try:
         forget(rootless)
         with shader_session(sources.parent, host.env, messages.append):
-            check("lanes-compute-root-recovery", "lanes/lanes.exe", ["--selftest", "compute-root-recovery", *gpu_args, "--report"],
-                  rf"lanes-selftest PASS pci={pci} scenario=compute-root-recovery passed=1",
+            check(f"lanes-{scenario}", "lanes/lanes.exe", ["--selftest", scenario, *gpu_args, "--report"],
+                  rf"lanes-selftest PASS pci={pci} scenario={scenario} passed=1",
                   providers={"lanes/xmem.dll": memory_symbols, "lanes/GameInput.dll": ("#1",),
                              "lanes/d3d12_xs.dll": ("D3D12XboxCreateDevice",)},
                   config="lanes/MicrosoftGame.config", device_factory="xbox", log_check=expect_root_translations)
@@ -1156,6 +1172,8 @@ def verify(host, output, adapter, selected=None, samples=1):
             lanes_bindless_compute(host, check, gpu_args, pci, memory_symbols)
         if "lanes-compute-root-recovery" in selected and host.backend == "proton":
             lanes_compute_root_recovery(host, check, gpu_args, pci, memory_symbols)
+        if "lanes-compute-root-srv" in selected and host.backend == "proton":
+            lanes_compute_root_srv(host, check, gpu_args, pci, memory_symbols)
         if "cpu-benchmark" in selected:
             readings = []
             for _ in range(samples):
@@ -1283,6 +1301,7 @@ GATE_LABELS = {
     "lanes-mesh-samplers": "The same literal sampler in a mesh pipeline, added to the mesh root the provider builds",
     "lanes-mesh-sampler-rootless": "Literal samplers in mesh pipelines whose root has no static samplers",
     "lanes-compute-root-recovery": "Partially reflected compute root with an appended descriptor range and paging",
+    "lanes-compute-root-srv": "A console compute program under three tables and a root SRV that stores where the title's root declares an SRV",
     "lanes-bindless-compute-wide": "A direct-indexed compute program's heap UAV through the paged index map",
     "lanes-bindless-compute-constrained": "The same with fewer resident descriptors than the index it uses",
     "lanes-bindless-sampler-wide": "A direct-indexed compute program's literal sampler, added to its paged root",
