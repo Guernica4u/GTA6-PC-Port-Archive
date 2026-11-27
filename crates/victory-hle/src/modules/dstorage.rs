@@ -884,7 +884,12 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
         let mut packed = vec![0; request.intermediate_size as usize];
-        let n = inflate(&source, &mut packed).map_err(|why| fail(INVALID_DATA, &why))?;
+        let n = inflate(&source, &mut packed).map_err(|why| {
+            fail(
+                INVALID_DATA,
+                &format!("{why}, into the intermediate buffer"),
+            )
+        })?;
         packed.truncate(n);
         Cow::Owned(packed)
     } else {
