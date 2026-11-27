@@ -289,7 +289,7 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
                 let mut r = rounds();
                 let mut asked = r.0 != r.1;
                 while !asked {
-                    let Some(every) = sync_early().filter(|_| last.elapsed().as_millis() < 500) else {
+                    let Some(every) = sync_early().filter(|_| last.elapsed().as_millis() < 100) else {
                         r = SYNC_ROUNDS.1.wait(r).unwrap_or_else(|e| e.into_inner());
                         asked = r.0 != r.1;
                         continue;

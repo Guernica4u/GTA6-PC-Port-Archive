@@ -30,7 +30,8 @@ const FETCH: &str = include_str!("../../../scripts/get-nvidia-sdks.ps1");
 const SETTINGS: &[(&str, &str)] = &[
     // Submission and copy machinery
     ("VICTORY_THIN", "1"),
-    ("VICTORY_JOIN_PARTS", "8"),
+    ("VICTORY_JOIN_PARTS", "16"),
+    ("VICTORY_JOIN_LISTS", "96"),
     ("VICTORY_RELAY", "2"),
     ("VICTORY_RELAY_COPY", "1"),
     ("VICTORY_WIDE_BACK", "1"),

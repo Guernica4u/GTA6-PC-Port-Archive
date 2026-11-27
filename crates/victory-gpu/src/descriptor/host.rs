@@ -3457,10 +3457,10 @@ impl HostHeap {
     }
 
     /// Makes slot `index` (a dynamic one) the view the record `words` names,
-    /// from this thread's descriptor of it if the recording `recording` has
-    /// made one, else as [`HostHeap::make_at`] does, and keeps that
-    /// ([`ListViews`]). What is known of the record in this recording;
-    /// `None` (the slot is not made): not a view kept so.
+    /// from this thread's persistent descriptor cache if valid, else as
+    /// [`HostHeap::make_at`] does, and keeps that ([`ListViews`]). What is
+    /// known of the record in this recording; `None` (the slot is not made):
+    /// not a view kept so.
     pub(crate) fn make_listed(&self, recording: u64, words: [u32; 3], index: u32) -> Option<Listed> {
         if self.sampler {
             return None;
@@ -3471,40 +3471,78 @@ impl HostHeap {
                 *views = Some(ListViews::new()?);
             }
             let views = views.as_mut()?;
-            if views.recording != recording {
-                views.recording = recording;
-                views.made.clear();
+            let frame = crate::frame::current();
+            if views.last_sweep != frame {
+                views.last_sweep = frame;
+                views.evict_stale(frame);
             }
             let twins = self.twins.get(index as usize).is_some();
-            if !views.made.contains_key(&words) {
-                let view = super::view_at(words[1], words[2])?;
-                let at = 2 * views.made.len() as u32;
-                // (A constant buffer's bytes are copied for each draw.)
-                if at >= ListViews::SLOTS || matches!(view, View::Constant(..)) {
-                    return None;
+            if let Some(entry) = views.made.get_mut(&words) {
+                let same_recording = entry.recording == recording;
+                let still_valid = same_recording
+                    || (super::view_at(words[1], words[2]).is_some()
+                        && list_view_valid(&entry.view, &entry.kept, entry.first_shown, entry.base));
+                if still_valid {
+                    entry.frame = frame;
+                    if !same_recording {
+                        entry.recording = recording;
+                        entry.listed.ready = (0, 0, false);
+                        entry.listed.tabled = None;
+                    }
+                    let at = entry.at;
+                    let twin = entry.twin;
+                    let stride_word = entry.stride_word;
+                    let kept = entry.kept.clone();
+                    let listed = entry.listed;
+                    self.copy_from(index, views.slot(at));
+                    if twin && twins {
+                        self.copy_from(self.raw + index, views.slot(at + 1));
+                        self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        self.clear_twin(index);
+                    }
+                    self.write_stride(index, stride_word);
+                    self.keep(index, kept);
+                    return Some(listed);
                 }
-                let twin = twinned(&view);
-                let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
-                let stride_word = view_stride_word(&view);
-                let listed = Listed {
-                    kind: crate::draw::view_kind(&view),
-                    texture: is_texture_view(&view),
-                    ready: (0, 0, false),
-                    tabled: None,
-                };
-                views.made.insert(words, ListView { view, at, twin, stride_word, kept, listed });
+                if let Some(stale) = views.made.remove(&words) {
+                    views.free_slots.push(stale.at);
+                }
             }
-            let made = &views.made[&words];
-            self.copy_from(index, views.slot(made.at));
-            if made.twin && twins {
-                self.copy_from(self.raw + index, views.slot(made.at + 1));
+            let view = super::view_at(words[1], words[2])?;
+            // (A constant buffer's bytes are copied for each draw.)
+            if matches!(view, View::Constant(..)) {
+                return None;
+            }
+            let at = views.alloc_pair()?;
+            let twin = twinned(&view);
+            let Some(kept) = make_twinned(&view, views.slot(at), Some(views.slot(at + 1))) else {
+                views.free_slots.push(at);
+                return None;
+            };
+            let stride_word = view_stride_word(&view);
+            let (first_shown, base) = list_view_tex_state(&view);
+            let listed = Listed {
+                kind: crate::draw::view_kind(&view),
+                texture: is_texture_view(&view),
+                ready: (0, 0, false),
+                tabled: None,
+            };
+            views.order.push_back(words);
+            views.made.insert(
+                words,
+                ListView { recording, frame, view, at, twin, stride_word, kept: kept.clone(), first_shown, base, listed },
+            );
+            self.copy_from(index, views.slot(at));
+            if twin && twins {
+                self.copy_from(self.raw + index, views.slot(at + 1));
                 self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
             } else {
                 self.clear_twin(index);
             }
-            self.write_stride(index, made.stride_word);
-            self.keep(index, made.kept.clone());
-            Some(made.listed)
+            self.write_stride(index, stride_word);
+            self.keep(index, kept);
+            Some(listed)
         })
     }
 
@@ -6902,35 +6940,93 @@ pub(crate) struct Listed {
 }
 
 struct ListView {
+    recording: u64,
+    frame: u64,
     view: View,
     /// Its descriptor's slot in [`ListViews`]; its raw twin's is the next.
     at: u32,
     twin: bool,
     stride_word: u32,
     kept: Kept,
+    first_shown: Option<u32>,
+    base: u32,
     listed: Listed,
 }
 
-/// The descriptors a thread made for one recording of a list, by the record
-/// they were made from, in a heap the card does not see.
+fn list_view_tex_state(view: &View) -> (Option<u32>, u32) {
+    let placed = placed_texture(view);
+    let view = placed.as_ref().unwrap_or(view);
+    if let View::Shader(resource, _) = view {
+        let resource = *resource as crate::object::This;
+        if let Some(copy) = crate::resource::host_copy(resource) {
+            return (crate::resource::first_shown(resource), copy.base);
+        }
+    }
+    (None, 0)
+}
+
+fn list_view_valid(view: &View, kept: &Kept, first_shown: Option<u32>, base: u32) -> bool {
+    use windows::core::Interface;
+    let placed = placed_texture(view);
+    let view = placed.as_ref().unwrap_or(view);
+    let kept_raw = kept.as_ref().map(Interface::as_raw);
+    match view {
+        View::Shader(resource, _) => {
+            let resource = *resource as crate::object::This;
+            if let Some(copy) = crate::resource::host_copy(resource) {
+                return kept_raw == Some(copy.texture.as_raw())
+                    && first_shown == crate::resource::first_shown(resource)
+                    && base == copy.base;
+            }
+            if let Some((shadow, ..)) = buffer_copy(view) {
+                return kept_raw == Some(shadow.buffer.as_raw());
+            }
+            false
+        }
+        View::Unordered(resource, _, _) => {
+            let resource = *resource as crate::object::This;
+            if let Some(texture) = crate::resource::host_resource(resource) {
+                let effective = crate::resource::twin_resource(resource)
+                    .or_else(|| crate::resource::twin_plane_resource(resource))
+                    .unwrap_or(texture);
+                return kept_raw == Some(effective.as_raw());
+            }
+            if let Some((shadow, ..)) = buffer_copy(view) {
+                return kept_raw == Some(shadow.buffer.as_raw());
+            }
+            false
+        }
+        View::Placed(..) => {
+            if let Some((shadow, ..)) = buffer_copy(view) {
+                return kept_raw == Some(shadow.buffer.as_raw());
+            }
+            kept_raw.is_none()
+        }
+        _ => false,
+    }
+}
+
+/// The descriptors a thread made across recordings and frames, by the record
+/// they were made from, in a CPU-only heap the card does not see.
 ///
-/// The title's culling and lighting dispatches each bind a table of their own
-/// that differs in one constant buffer, and the same thirty views beside it:
-/// each was found, checked, made and brought up to date anew for every
-/// dispatch, some 2,500 indirect dispatches in the one recording job the
-/// frame waits for last (timeline waits-2: 24 of 65 ms). Here a list makes a
-/// view once, as it makes a table once (`crate::draw::State::tables`), and
-/// copies its descriptor.
+/// Clearing the cache on every list caused ~60,000 `CreateShaderResourceView`
+/// calls per frame across the translation threads; keeping entries across
+/// recordings and validating their underlying resource/copy cuts view creation
+/// down to new/changed records only.
 struct ListViews {
-    recording: u64,
     heap: ID3D12DescriptorHeap,
     step: usize,
     start: usize,
+    last_sweep: u64,
+    next_slot: u32,
+    free_slots: Vec<u32>,
+    order: std::collections::VecDeque<[u32; 3]>,
     made: std::collections::HashMap<[u32; 3], ListView, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
 }
 
 impl ListViews {
-    const SLOTS: u32 = 8192;
+    const SLOTS: u32 = 16384;
+    const IDLE_FRAMES: u64 = 8;
 
     fn new() -> Option<ListViews> {
         let host = host()?;
@@ -6946,8 +7042,50 @@ impl ListViews {
                 .ok()?;
             let step = host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
             let start = heap.GetCPUDescriptorHandleForHeapStart().ptr;
-            Some(ListViews { recording: 0, heap, step, start, made: Default::default() })
+            Some(ListViews {
+                heap,
+                step,
+                start,
+                last_sweep: 0,
+                next_slot: 0,
+                free_slots: Vec::new(),
+                order: std::collections::VecDeque::new(),
+                made: Default::default(),
+            })
         }
+    }
+
+    fn evict_stale(&mut self, frame: u64) {
+        let mut kept_order = std::collections::VecDeque::with_capacity(self.order.len());
+        while let Some(key) = self.order.pop_front() {
+            if let Some(entry) = self.made.get(&key) {
+                if frame.saturating_sub(entry.frame) > Self::IDLE_FRAMES {
+                    if let Some(evicted) = self.made.remove(&key) {
+                        self.free_slots.push(evicted.at);
+                    }
+                } else {
+                    kept_order.push_back(key);
+                }
+            }
+        }
+        self.order = kept_order;
+    }
+
+    fn alloc_pair(&mut self) -> Option<u32> {
+        if let Some(at) = self.free_slots.pop() {
+            return Some(at);
+        }
+        if self.next_slot + 2 <= Self::SLOTS {
+            let at = self.next_slot;
+            self.next_slot += 2;
+            return Some(at);
+        }
+        while let Some(old_key) = self.order.pop_front() {
+            if let Some(evicted) = self.made.remove(&old_key) {
+                return Some(evicted.at);
+            }
+        }
+        None
     }
 
     fn slot(&self, i: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
@@ -6964,16 +7102,17 @@ thread_local! {
 pub(crate) fn listed_view(recording: u64, words: [u32; 3]) -> Option<View> {
     LIST_VIEWS.with(|views| {
         let views = views.borrow();
-        let views = views.as_ref().filter(|v| v.recording == recording)?;
-        views.made.get(&words).map(|m| m.view.clone())
+        let views = views.as_ref()?;
+        views.made.get(&words).filter(|m| m.recording == recording).map(|m| m.view.clone())
     })
 }
 
 /// Notes what is known of the record `words` in `recording`.
 pub(crate) fn note_listed(recording: u64, words: [u32; 3], listed: Listed) {
     LIST_VIEWS.with(|views| {
-        if let Some(views) = views.borrow_mut().as_mut().filter(|v| v.recording == recording)
+        if let Some(views) = views.borrow_mut().as_mut()
             && let Some(made) = views.made.get_mut(&words)
+            && made.recording == recording
         {
             made.listed = listed;
         }

@@ -1906,6 +1906,7 @@ impl State {
             && let Some(heap) = crate::descriptor::lent_heap()
         {
             once!("a dispatch without a view heap that needs one gets the title's");
+            list.note_heap_picked();
             self.heaps[0] = heap;
         }
         // Heaps first: a root signature with directly indexed heaps must be
@@ -2269,7 +2270,7 @@ impl State {
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
                 let Some(index) = host.dynamic(1).or_else(|| {
-                    crate::host::settle_for_fence();
+                    crate::host::settle_for_dynamic();
                     host.dynamic(1)
                 }) else {
                     return false;
@@ -2343,7 +2344,7 @@ impl State {
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
                 let Some(index) = host.dynamic(1).or_else(|| {
-                    crate::host::settle_for_fence();
+                    crate::host::settle_for_dynamic();
                     host.dynamic(1)
                 }) else {
                     return false;
@@ -2408,6 +2409,7 @@ impl State {
     /// copy. A list refreshes them where it first runs such a shader;
     /// title writes recorded later in the same list are not seen.
     fn heap_buffers(&self, list: &HostList) -> Option<u64> {
+        list.note_heap_picked();
         let heap = self
             .heaps
             .iter()
@@ -2468,6 +2470,7 @@ impl State {
     /// running the bindless heap buffer/texture sweep (for shaders that only
     /// inspect descriptors already mirrored via their descriptor tables).
     fn heap_strides(&self, list: &HostList) -> Option<u64> {
+        list.note_heap_picked();
         let heap = self
             .heaps
             .iter()
@@ -4616,7 +4619,7 @@ impl State {
                 continue;
             }
             let Some(first) = host.dynamic(n).or_else(|| {
-                crate::host::settle_for_fence();
+                crate::host::settle_for_dynamic();
                 host.dynamic(n)
             }) else {
                 // No room: the draw must not run with the title's own

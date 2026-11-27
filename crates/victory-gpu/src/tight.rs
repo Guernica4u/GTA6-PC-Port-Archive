@@ -32,7 +32,10 @@
 //! `readable`) are sized and have no pipeline identity there: not changed.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{
+    Mutex, RwLock,
+    atomic::{AtomicU32, Ordering},
+};
 use std::time::{Duration, Instant};
 
 const BLOCK: u64 = 64 << 10;
@@ -64,7 +67,7 @@ enum Mode {
     Wide,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 struct Foot {
     mode: Mode,
     /// Footprint relative to the root address: `[lo, hi)`.
@@ -72,12 +75,19 @@ struct Foot {
     hi: u64,
     seen: u32,
     decls: u32,
-    since_full: u32,
+    since_full: AtomicU32,
 }
 
 impl Foot {
     fn new() -> Foot {
-        Foot { mode: Mode::Learn, lo: u64::MAX, hi: 0, seen: 0, decls: 0, since_full: 0 }
+        Foot {
+            mode: Mode::Learn,
+            lo: u64::MAX,
+            hi: 0,
+            seen: 0,
+            decls: 0,
+            since_full: AtomicU32::new(0),
+        }
     }
 
     /// A landing at `[from, to)` relative to the root address. True if it
@@ -102,6 +112,26 @@ impl Foot {
         }
     }
 
+    /// Lock-free read path for keys already in `Tight` or `Wide`.
+    fn declare_read(&self, len: u64, every: u32) -> Option<(u64, u64, bool)> {
+        match self.mode {
+            Mode::Wide => Some((0, len, false)),
+            Mode::Learn => None,
+            Mode::Tight => {
+                let next = self.since_full.fetch_add(1, Ordering::Relaxed) + 1;
+                if next >= every {
+                    self.since_full.store(0, Ordering::Relaxed);
+                    return Some((0, len, true));
+                }
+                let (from, to) = (self.lo.min(len), self.hi.min(len));
+                if to <= from {
+                    return Some((0, len, true));
+                }
+                Some((from, to - from, false))
+            }
+        }
+    }
+
     /// The range, from the root address, to declare of `len` bytes; and
     /// whether the declaration is a full one (noted for landings).
     fn declare(&mut self, len: u64, every: u32) -> (u64, u64, bool) {
@@ -113,14 +143,14 @@ impl Foot {
                     self.lo = (self.lo & !(BLOCK - 1)).saturating_sub(MARGIN);
                     self.hi = self.hi.div_ceil(BLOCK) * BLOCK + MARGIN;
                     self.mode = Mode::Tight;
-                    self.since_full = 0;
+                    self.since_full.store(0, Ordering::Relaxed);
                 }
                 (0, len, true)
             }
             Mode::Tight => {
-                self.since_full += 1;
-                if self.since_full >= every {
-                    self.since_full = 0;
+                let next = self.since_full.fetch_add(1, Ordering::Relaxed) + 1;
+                if next >= every {
+                    self.since_full.store(0, Ordering::Relaxed);
                     return (0, len, true);
                 }
                 let (from, to) = (self.lo.min(len), self.hi.min(len));
@@ -152,16 +182,21 @@ const SHARDS: usize = 16;
 type Keys = HashMap<(usize, u32), Foot>;
 type Decls = HashMap<u64, Vec<Decl>>;
 
-static KEYS: [Mutex<Option<Keys>>; SHARDS] = [const { Mutex::new(None) }; SHARDS];
+static KEYS: [RwLock<Option<Keys>>; SHARDS] = [const { RwLock::new(None) }; SHARDS];
 static DECLS: [Mutex<Option<Decls>>; SHARDS] = [const { Mutex::new(None) }; SHARDS];
 
 fn spread(x: u64) -> usize {
     (x.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 60) as usize % SHARDS
 }
 
-fn keys_of(key: (usize, u32)) -> std::sync::MutexGuard<'static, Option<Keys>> {
+fn keys_read(key: (usize, u32)) -> std::sync::RwLockReadGuard<'static, Option<Keys>> {
     let at = spread(key.0 as u64 ^ u64::from(key.1).rotate_left(32));
-    KEYS[at].lock().unwrap_or_else(|e| e.into_inner())
+    KEYS[at].read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn keys_write(key: (usize, u32)) -> std::sync::RwLockWriteGuard<'static, Option<Keys>> {
+    let at = spread(key.0 as u64 ^ u64::from(key.1).rotate_left(32));
+    KEYS[at].write().unwrap_or_else(|e| e.into_inner())
 }
 
 fn decls_of(id: u64) -> std::sync::MutexGuard<'static, Option<Decls>> {
@@ -176,11 +211,19 @@ pub(crate) fn declare(pipeline: usize, param: u32, id: u64, start: u64, address:
         return (0, len);
     }
     let key = (pipeline, param);
-    let (from, n, full) = keys_of(key)
-        .get_or_insert_with(Default::default)
-        .entry(key)
-        .or_insert_with(Foot::new)
-        .declare(len, verify_every());
+    let every = verify_every();
+    let fast = {
+        let guard = keys_read(key);
+        guard.as_ref().and_then(|k| k.get(&key)).and_then(|foot| foot.declare_read(len, every))
+    };
+    let (from, n, full) = match fast {
+        Some(res) => res,
+        None => keys_write(key)
+            .get_or_insert_with(Default::default)
+            .entry(key)
+            .or_insert_with(Foot::new)
+            .declare(len, every),
+    };
     if full {
         let base = address.saturating_sub(start);
         let now = Instant::now();
@@ -224,7 +267,7 @@ pub(crate) fn landed(id: u64, from: usize, to: usize) {
             .collect()
     };
     for (key, a, b) in hits {
-        let widened = keys_of(key).as_mut().and_then(|k| k.get_mut(&key)).is_some_and(|foot| foot.landed(a, b));
+        let widened = keys_write(key).as_mut().and_then(|k| k.get_mut(&key)).is_some_and(|foot| foot.landed(a, b));
         if widened {
             tracing::warn!(
                 pipeline = format_args!("{:#x}", key.0),

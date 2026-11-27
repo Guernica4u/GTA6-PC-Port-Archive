@@ -1538,11 +1538,16 @@ struct Workers {
 }
 
 /// Waits awake until `there` says so, `VICTORY_WIDE_SPIN` microseconds at
-/// most (0, the default: not at all): asleep, a thread is woken in 50 us and
-/// more, 95 times a frame.
+/// most (unset: 60 us while `Host::submit` is preparing, 0 otherwise): asleep,
+/// a thread is woken in 50 us and more, 95 times a frame.
 fn spin(there: impl Fn() -> bool) {
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| std::env::var("VICTORY_WIDE_SPIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    static MOST: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let configured = *MOST.get_or_init(|| std::env::var("VICTORY_WIDE_SPIN").ok().and_then(|v| v.trim().parse().ok()));
+    let most = match configured {
+        Some(us) => us,
+        None if crate::host::submitting_active() => 60,
+        None => 0,
+    };
     if most == 0 {
         return;
     }

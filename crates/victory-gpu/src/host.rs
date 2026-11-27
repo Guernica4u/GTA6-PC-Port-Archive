@@ -1290,6 +1290,9 @@ pub(crate) struct HostList {
     /// The copy of the colour without the interface (`crate::streamline`)
     /// recorded in the list, noted likewise; 0 for none.
     hudless: std::sync::atomic::AtomicU64,
+    /// Whether any draw or dispatch recorded into this list picks
+    /// descriptors from the shader-visible heap (needs `sync_heaps`).
+    heap_picked: std::sync::atomic::AtomicBool,
     /// Left open and empty, as made or reset, for the title's next reset
     /// ([`HostList::leave_open`]): that reset finds nothing to undo. The
     /// list's title calls and epoch then, each plus one (0: not left open).
@@ -3429,6 +3432,21 @@ pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
 }
 
+/// Settles in-flight submissions and recycles every landed list immediately
+/// so dynamic descriptor slots held by those lists are freed at once.
+pub(crate) fn settle_for_dynamic() {
+    settle_now(WHY_FENCE);
+    let landed: Vec<_> = line().landed.drain(..).collect();
+    for (lists, order) in landed {
+        crate::list::recycle(lists, &order);
+    }
+}
+
+/// Whether the submitting thread is currently preparing a submission.
+pub(crate) fn submitting_active() -> bool {
+    SUBMITTING[0].load(Ordering::Relaxed) == 1
+}
+
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
 fn land() {
@@ -4305,6 +4323,7 @@ impl Host {
                 holding: std::sync::atomic::AtomicBool::new(false),
                 upscale: std::sync::atomic::AtomicU64::new(0),
                 hudless: std::sync::atomic::AtomicU64::new(0),
+                heap_picked: std::sync::atomic::AtomicBool::new(false),
                 left_open: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
@@ -5697,9 +5716,10 @@ impl Host {
         // The round of the heaps' records asked for when the title submitted
         // these lists, if that is known (`crate::heap_marks`, 0: not).
         let heaps_mark = if late { crate::heap_marks::needed() } else { 0 };
+        let needs_heaps = late && runs.iter().any(|l| l.heap_picked());
         // Else with [`heap_sync_first`]: the heaps' records begun now, beside
         // the planning of steps done on the card and the look at flights.
-        let first_heaps = (late && heaps_mark == 0 && heap_sync_first()).then(crate::descriptor::begin_sync_heaps);
+        let first_heaps = (needs_heaps && heaps_mark == 0 && heap_sync_first()).then(crate::descriptor::begin_sync_heaps);
         let ahead = Split::begin();
         SPLIT[11].fetch_add(called.elapsed().as_nanos() as u64, Ordering::Relaxed);
         stage.next("submit: steps given to the card");
@@ -5734,22 +5754,26 @@ impl Host {
         // as the round began here saw them; the first is not waited for.)
         // With a mark (`crate::heap_marks`): that round, unless the
         // submission waited for flights, whose landings came after it.
-        let heaps_synced = match first_heaps {
-            Some(first) if !waited_for_flights => {
-                HEAP_SYNC_FIRST[0].fetch_add(1, Ordering::Relaxed);
-                first
-            }
-            first => {
-                if let Some(first) = first {
-                    HEAP_SYNC_FIRST[1].fetch_add(1, Ordering::Relaxed);
-                    std::mem::forget(first);
+        let heaps_synced = if !needs_heaps {
+            None
+        } else {
+            Some(match first_heaps {
+                Some(first) if !waited_for_flights => {
+                    HEAP_SYNC_FIRST[0].fetch_add(1, Ordering::Relaxed);
+                    first
                 }
-                if heaps_mark != 0 && !waited_for_flights {
-                    crate::descriptor::begin_sync_heaps_after(heaps_mark)
-                } else {
-                    crate::descriptor::begin_sync_heaps()
+                first => {
+                    if let Some(first) = first {
+                        HEAP_SYNC_FIRST[1].fetch_add(1, Ordering::Relaxed);
+                        std::mem::forget(first);
+                    }
+                    if heaps_mark != 0 && !waited_for_flights {
+                        crate::descriptor::begin_sync_heaps_after(heaps_mark)
+                    } else {
+                        crate::descriptor::begin_sync_heaps()
+                    }
                 }
-            }
+            })
         };
         // That list runs first, and is one of the submission's from here on.
         let with: Vec<&HostList>;
@@ -6621,6 +6645,7 @@ impl HostList {
         self._alive.used();
         self.upscale.store(0, Ordering::Relaxed);
         self.hudless.store(0, Ordering::Relaxed);
+        self.heap_picked.store(false, Ordering::Relaxed);
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -6663,6 +6688,14 @@ impl HostList {
     /// refreshed.
     pub(crate) fn changed_something(&self) {
         self.epoch.store(next_epoch(), Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_heap_picked(&self) {
+        self.heap_picked.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn heap_picked(&self) -> bool {
+        self.heap_picked.load(Ordering::Relaxed)
     }
 
     /// See [`HostList::changed_something`].
