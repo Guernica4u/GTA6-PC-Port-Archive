@@ -121,7 +121,7 @@ const _: () = assert!(size_of::<MouseState>() == 40);
 
 /// The next cursor reference and the motion since the previous focused sample.
 #[cfg(any(windows, test))]
-fn mouse_delta(
+pub(super) fn mouse_delta(
     previous: Option<(i32, i32)>,
     position: Option<(i32, i32)>,
     size: (i32, i32),
@@ -1259,6 +1259,7 @@ mod host {
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
             // to the pad (the title's start screen) saw nothing.
+            #[cfg(feature = "diagnostics")]
             if slot == 0 {
                 for vk in scripted() {
                     if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
@@ -1270,11 +1271,10 @@ mod host {
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
+            #[cfg(feature = "diagnostics")]
             let mut down = scripted();
-            // LOCAL (11/26): the F1 settings menu takes the keyboard while shown.
-            if victory_gpu::SETTINGS_MENU_OPEN.load(std::sync::atomic::Ordering::Relaxed) {
-                return Vec::new();
-            }
+            #[cfg(not(feature = "diagnostics"))]
+            let mut down = Vec::new();
             if focused_window().is_some() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
@@ -1303,6 +1303,7 @@ mod host {
             if !*ENABLED {
                 return None;
             }
+            let captured = crate::modules::lifecycle::captured_mouse_delta();
             let (mut point, mut rect) = (POINT::default(), RECT::default());
             let position = focused_window().and_then(|window| {
                 // SAFETY: all outputs are local and all coordinates use the same window.
@@ -1316,6 +1317,7 @@ mod host {
             });
             let (cursor, (dx, dy)) =
                 mouse_delta(self.previous_cursor, position, (rect.right, rect.bottom));
+            let (dx, dy) = captured.unwrap_or((dx, dy));
             self.previous_cursor = cursor;
             if cursor.is_none() {
                 self.mouse = MouseState::default();
@@ -1348,6 +1350,7 @@ mod host {
     /// time), with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();

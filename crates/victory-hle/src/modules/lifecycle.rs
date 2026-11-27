@@ -13,8 +13,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
-use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse as keyboard;
 use windows_sys::Win32::UI::WindowsAndMessaging::{self as wm, HMENU};
 use windows_sys::core::{PCSTR, PCWSTR, w};
 
@@ -95,6 +97,249 @@ pub extern "system" fn UnregisterAppConstrainedChangeNotification(registration: 
 
 /// The window procedure a title window had before ours.
 const TITLE_PROC: PCWSTR = w!("victory.wndproc");
+
+const WINDOW_FEATURES: PCWSTR = w!("victory.window.features");
+const CAPTURE: usize = 1;
+const FULLSCREEN: usize = 2;
+const ENGLISH: usize = 4;
+
+fn feature_mask(values: [Option<&str>; 3]) -> usize {
+    values.iter().enumerate().fold(0, |mask, (i, v)| {
+        mask | if *v == Some("0") { 0 } else { 1 << i }
+    })
+}
+
+fn window_features() -> usize {
+    static FLAGS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *FLAGS.get_or_init(|| {
+        let values = [
+            "VICTORY_MOUSE_CAPTURE",
+            "VICTORY_FULLSCREEN",
+            "VICTORY_IME_ENGLISH",
+        ]
+        .map(|key| std::env::var(key).ok());
+        feature_mask(values.each_ref().map(|v| v.as_deref()))
+    })
+}
+
+fn mouse_warp_enabled(capture: bool, value: Option<&str>) -> bool {
+    capture && value == Some("1")
+}
+
+fn mouse_warp() -> bool {
+    static WARP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WARP.get_or_init(|| {
+        mouse_warp_enabled(
+            window_features() & CAPTURE != 0,
+            std::env::var("VICTORY_MOUSE_WARP").ok().as_deref(),
+        )
+    })
+}
+
+fn should_recenter(warp: bool, delta: (i64, i64)) -> bool {
+    warp && delta != (0, 0)
+}
+
+fn english_layout() {
+    static LAYOUT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let layout = LAYOUT.get_or_init(|| {
+        // SAFETY: query the loaded layouts; never install or load a new one.
+        unsafe {
+            let count = keyboard::GetKeyboardLayoutList(0, std::ptr::null_mut());
+            let mut layouts = vec![std::ptr::null_mut(); count.max(0) as usize];
+            let read = keyboard::GetKeyboardLayoutList(count, layouts.as_mut_ptr());
+            let found = layouts
+                .iter()
+                .take(read.max(0) as usize)
+                .find(|&&h| h as usize & 0xffff_ffff == 0x0409_0409)
+                .map(|&h| h as usize);
+            if found.is_none() {
+                tracing::info!(
+                    "en-US keyboard layout unavailable; leaving input language unchanged"
+                );
+            }
+            found
+        }
+    });
+    if let Some(layout) = layout {
+        // SAFETY: a loaded layout, applied only to the window's calling thread.
+        unsafe { keyboard::ActivateKeyboardLayout(*layout as keyboard::HKL, 0) };
+    }
+}
+
+#[derive(Default)]
+struct MouseCapture {
+    window: usize,
+    area: RECT,
+    hidden: i32,
+}
+static MOUSE_CAPTURE: Mutex<MouseCapture> = Mutex::new(MouseCapture {
+    window: 0,
+    area: RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    },
+    hidden: 0,
+});
+
+fn capture_center(area: &RECT) -> Option<(i32, i32)> {
+    (area.right > area.left && area.bottom > area.top).then(|| {
+        (
+            area.left + (area.right - area.left) / 2,
+            area.top + (area.bottom - area.top) / 2,
+        )
+    })
+}
+
+fn capture_motion(point: (i32, i32), area: &RECT) -> (i64, i64) {
+    let size = (area.right - area.left, area.bottom - area.top);
+    let position = (
+        point.0.saturating_sub(area.left),
+        point.1.saturating_sub(area.top),
+    );
+    super::gameinput::mouse_delta(Some((size.0 / 2, size.1 / 2)), Some(position), size).1
+}
+
+/// Runs on the window thread; serializes focus/geometry changes with input sampling.
+fn capture_mouse(hwnd: HWND, active: bool) {
+    if window_features() & CAPTURE == 0 {
+        return;
+    }
+    let mut state = MOUSE_CAPTURE.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: window messages supply hwnd; coordinates and outputs are local.
+    unsafe {
+        let active = active && wm::GetForegroundWindow() == hwnd && wm::IsIconic(hwnd) == 0;
+        if !active {
+            if state.window == hwnd as usize {
+                wm::ClipCursor(std::ptr::null());
+                for _ in 0..state.hidden {
+                    wm::ShowCursor(1);
+                }
+                *state = MouseCapture::default();
+            }
+            return;
+        }
+        if state.window != 0 && state.window != hwnd as usize {
+            return;
+        }
+        let (mut area, mut origin) = (RECT::default(), POINT::default());
+        if wm::GetClientRect(hwnd, &mut area) == 0 || ClientToScreen(hwnd, &mut origin) == 0 {
+            return;
+        }
+        area.left += origin.x;
+        area.right += origin.x;
+        area.top += origin.y;
+        area.bottom += origin.y;
+        let Some(_) = capture_center(&area) else {
+            return;
+        };
+        if wm::ClipCursor(&area) == 0 {
+            return;
+        }
+        if state.window == 0 {
+            // Balance exactly our decrements, even if the initial count exceeds zero.
+            let extra = (wm::ShowCursor(0) + 1).max(0);
+            for _ in 0..extra {
+                wm::ShowCursor(0);
+            }
+            state.hidden = 1 + extra;
+            static LOG: std::sync::Once = std::sync::Once::new();
+            LOG.call_once(|| {
+                tracing::info!(
+                    "mouse capture: clipped=<{},{},{},{}> warp={} window={}x{}",
+                    area.left,
+                    area.top,
+                    area.right,
+                    area.bottom,
+                    mouse_warp(),
+                    area.right - area.left,
+                    area.bottom - area.top
+                );
+            });
+        }
+        state.window = hwnd as usize;
+        state.area = area;
+    }
+}
+
+/// Optional read-before-warp sampling, serialized with focus and geometry changes.
+pub(super) fn captured_mouse_delta() -> Option<(i64, i64)> {
+    let warp = mouse_warp();
+    if !warp {
+        return None;
+    }
+    let state = MOUSE_CAPTURE.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: only the foreground captured window can move the desktop cursor.
+    unsafe {
+        if state.window == 0 || wm::GetForegroundWindow() as usize != state.window {
+            return None;
+        }
+        let mut point = POINT::default();
+        if wm::GetCursorPos(&mut point) == 0 {
+            return Some((0, 0));
+        }
+        let delta = capture_motion((point.x, point.y), &state.area);
+        if should_recenter(warp, delta) {
+            if let Some(center) = capture_center(&state.area) {
+                wm::SetCursorPos(center.0, center.1);
+            }
+        }
+        Some(delta)
+    }
+}
+
+fn configure_window(hwnd: HWND) {
+    let flags = window_features();
+    if flags == 0 {
+        return;
+    } // No new properties, handlers or Win32 effects when disabled.
+    // SAFETY: called on the thread that just created this window.
+    unsafe {
+        let style = wm::GetWindowLongPtrW(hwnd, wm::GWL_STYLE) as u32;
+        if style & wm::WS_CHILD != 0 || !wm::GetWindow(hwnd, wm::GW_OWNER).is_null() {
+            return;
+        }
+        if wm::SetPropW(hwnd, WINDOW_FEATURES, flags as *mut c_void) == 0 {
+            return;
+        }
+        if flags & FULLSCREEN != 0 {
+            let resolution = std::env::var("VICTORY_FULLSCREEN_RES").ok();
+            let size = resolution.as_deref().and_then(parse_window_limit);
+            if resolution.is_some() && size.is_none() {
+                tracing::info!("invalid VICTORY_FULLSCREEN_RES; using primary monitor size");
+            }
+            let (width, height) = size.unwrap_or_else(|| {
+                (
+                    wm::GetSystemMetrics(wm::SM_CXSCREEN),
+                    wm::GetSystemMetrics(wm::SM_CYSCREEN),
+                )
+            });
+            wm::SetWindowLongPtrW(
+                hwnd,
+                wm::GWL_STYLE,
+                (style & !(wm::WS_CAPTION | wm::WS_THICKFRAME)) as isize,
+            );
+            // Window scaling only: preserve the title's fixed 3840x2160 swap chain.
+            wm::SetWindowPos(
+                hwnd,
+                wm::HWND_TOP,
+                0,
+                0,
+                width,
+                height,
+                wm::SWP_FRAMECHANGED | wm::SWP_NOACTIVATE,
+            );
+        }
+        if flags & ENGLISH != 0 {
+            english_layout();
+        }
+        if flags & CAPTURE != 0 {
+            capture_mouse(hwnd, true);
+        }
+    }
+}
 
 pub extern "system" fn CreateWindowExW(
     ex_style: u32,
@@ -238,6 +483,7 @@ fn hook(hwnd: HWND) {
         wm::SetPropW(hwnd, TITLE_PROC, title as *mut c_void);
         wm::SetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC, window_proc as *const () as isize);
     }
+    configure_window(hwnd);
 }
 
 extern "system" fn window_proc(
@@ -246,9 +492,29 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // SAFETY: only windows configured above carry these optional handlers.
+    let flags = unsafe { wm::GetPropW(hwnd, WINDOW_FEATURES) as usize };
+    if flags & CAPTURE != 0 {
+        match message {
+            wm::WM_KILLFOCUS | wm::WM_NCDESTROY | wm::WM_CANCELMODE | wm::WM_ENTERSIZEMOVE => {
+                capture_mouse(hwnd, false)
+            }
+            wm::WM_ACTIVATE => capture_mouse(hwnd, wparam & 0xffff != wm::WA_INACTIVE as usize),
+            wm::WM_SETFOCUS | wm::WM_WINDOWPOSCHANGED | wm::WM_EXITSIZEMOVE => {
+                capture_mouse(hwnd, true)
+            }
+            _ => {}
+        }
+    }
+    if flags & ENGLISH != 0 && message == wm::WM_SETFOCUS {
+        english_layout();
+    }
     // A user close (close button, Alt+F4, window or taskbar menu); a
     // console title never sees one, nor a WM_CLOSE from it.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize {
+        if flags & CAPTURE != 0 {
+            capture_mouse(hwnd, false);
+        }
         end_title("window closed", Box::new(|| {}));
         return 0;
     }
@@ -266,6 +532,9 @@ extern "system" fn window_proc(
         let title = wm::GetPropW(hwnd, TITLE_PROC);
         if message == wm::WM_NCDESTROY {
             wm::RemovePropW(hwnd, TITLE_PROC);
+            if flags != 0 {
+                wm::RemovePropW(hwnd, WINDOW_FEATURES);
+            }
         }
         let title = std::mem::transmute::<*mut c_void, wm::WNDPROC>(title);
         wm::CallWindowProcW(title, hwnd, message, wparam, lparam)
@@ -405,6 +674,58 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_features_are_independent_and_disabled_registers_nothing() {
+        assert_eq!(feature_mask([None; 3]), 7);
+        assert_eq!(feature_mask([Some("0"); 3]), 0);
+        for i in 0..3 {
+            let mut values = [None; 3];
+            values[i] = Some("0");
+            assert_eq!(feature_mask(values), 7 & !(1 << i));
+        }
+    }
+
+    #[test]
+    fn capture_center_and_motion_use_screen_coordinates() {
+        let area = RECT {
+            left: -1920,
+            top: 100,
+            right: -1,
+            bottom: 1181,
+        };
+        let center = capture_center(&area).unwrap();
+        assert_eq!(center, (-961, 640));
+        assert_eq!(capture_motion((-950, 620), &area), (11, -20));
+        assert_eq!(capture_motion(center, &area), (0, 0));
+        assert_eq!(capture_motion((0, 0), &area), (959, -540));
+        assert_eq!(capture_motion((i32::MIN, i32::MAX), &area), (-959, 540));
+        assert_eq!(capture_motion((1, 1), &RECT::default()), (0, 0));
+        assert_eq!(capture_center(&RECT::default()), None);
+    }
+
+    #[test]
+    fn mouse_warp_requires_capture_opt_in_and_motion() {
+        for capture in [false, true] {
+            for value in [None, Some("0"), Some("1")] {
+                let warp = mouse_warp_enabled(capture, value);
+                assert_eq!(warp, capture && value == Some("1"));
+                assert!(!should_recenter(warp, (0, 0)));
+                for delta in [(1, 0), (0, -1), (-7, 9)] {
+                    assert_eq!(should_recenter(warp, delta), warp);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fullscreen_resolution_accepts_only_positive_i32_dimensions() {
+        assert_eq!(parse_window_limit("1920x1080"), Some((1920, 1080)));
+        assert_eq!(parse_window_limit(" 1280 X 720 "), Some((1280, 720)));
+        for bad in ["", "0x1080", "-1x720", "1920x", "1x2x3", "2147483648x1"] {
+            assert_eq!(parse_window_limit(bad), None);
+        }
+    }
 
     extern "system" fn noop(_: u8, _: *mut c_void) {}
 
@@ -556,6 +877,17 @@ mod tests {
             let n = wm::GetWindowTextW(hwnd, text.as_mut_ptr(), 16);
             assert_eq!(String::from_utf16_lossy(&text[..n as usize]), "after");
             assert!(!wm::GetPropW(hwnd, TITLE_PROC).is_null());
+            assert_eq!(wm::GetPropW(hwnd, WINDOW_FEATURES) as usize, window_features());
+            if window_features() & FULLSCREEN != 0 {
+                let style = wm::GetWindowLongPtrW(hwnd, wm::GWL_STYLE) as u32;
+                assert_eq!(style & (wm::WS_CAPTION | wm::WS_THICKFRAME), 0);
+                let mut rect = RECT::default();
+                assert_ne!(wm::GetWindowRect(hwnd, &mut rect), 0);
+                assert_eq!((rect.left, rect.top), (0, 0));
+                if let Ok(res) = std::env::var("VICTORY_FULLSCREEN_RES") {
+                    assert_eq!(parse_window_limit(&res), Some((rect.right, rect.bottom)));
+                }
+            }
             wm::DestroyWindow(hwnd);
         }
     }
