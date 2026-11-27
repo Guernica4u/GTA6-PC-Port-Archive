@@ -57,7 +57,7 @@ Press Left or Right to change lanes, or Space to take a turn in your current lan
 - [Running games](docs/USAGE.md): shader preparation, logs, performance capture and offline launches
 - [Launch options and environment variables](docs/ENVIRONMENT.md): settings and their defaults
 - Game setup: [The Matrix Awakens](docs/MATRIX_AWAKENS.md) · [GTA VI](docs/PROJECTSCARLETT.md)
-- [Shader coverage](docs/SHADERS.md)
+- [Shader coverage](docs/SHADERS.md) · [every RDNA 2 instruction](docs/INSTRUCTIONS.md)
 - [Shader harness](docs/SHADER_HARNESS.md): test a translator change over recorded shaders and on each card
 - [Where to improve](docs/FOCUS.md): open areas for contributors
 - [Roadmap](docs/ROADMAP.md): the plan for shader translation and the project audit, as tasks to take

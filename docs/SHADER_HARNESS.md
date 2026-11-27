@@ -50,6 +50,19 @@ Options for common cases:
 
 Single stages: `survey --xshader BUILD --output FILE`, `compare BEFORE AFTER`, and `explain --xshader BUILD REQUEST` for one program on both hosts.
 
+## The instruction inventory
+
+[INSTRUCTIONS.md](INSTRUCTIONS.md) lists every RDNA 2 instruction with what the translator does with it alone, which cards a GPU check ran it on, and how many recorded shaders use it. It is generated from three files in the repository, and the Rust and Python tests fail when any of them is out of date.
+
+| You changed | Run |
+| --- | --- |
+| What the translator does with an instruction | `TUXBOX_BLESS_INSTRUCTIONS=1 cargo test --manifest-path tools/shader-compiler/Cargo.toml --target x86_64-unknown-linux-gnu instruction_inventory`, then `python tools/shader_harness.py inventory` |
+| A GPU check, or the recorded requests | `python tools/shader_harness.py run`, then `python tools/shader_harness.py inventory --from-run RUN-FOLDER` |
+
+The second saves the run's instruction names and counts under `evidence/shader-instructions/`. It needs `"title"` in the configuration, such as `"ProjectScarlett 1.0.2.1"`, and a passing run of a committed tree on every card you list. Commit the record, the evidence and the document together.
+
+The translator must refuse an instruction it can't translate. The inventory's test fails if any instruction makes it crash.
+
 ## What a pass does not show
 
 Recorded shaders are translated and compiled, but **not executed**. A changed output that compiles can still compute something wrong. The GPU checks run synthetic programs: when you add or fix an instruction, add it to one of them, and use the coverage table to find instructions that have none. A check program holding an instruction does not prove every operand form or lane state was tested. The harness does not run or time the drivers' own pipeline builds.
