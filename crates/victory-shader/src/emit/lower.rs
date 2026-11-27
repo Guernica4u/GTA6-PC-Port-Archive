@@ -72,6 +72,9 @@ pub(crate) struct Lowered {
     /// Whether the module contains the 32-lane half mask (`!31`).
     #[cfg(test)]
     pub has_half_wave_mask: bool,
+    /// The declared `WaveSize` attribute, if any.
+    #[cfg(test)]
+    pub wave_size: Option<u32>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -395,6 +398,18 @@ enum MaskData {
 const LANE_MASK: Why = "a lane mask read as data";
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
+/// Whether a GFX10 DPP modifier operates within 32 lanes (and is therefore
+/// invariant between Wave32 and Wave64).
+fn wave_invariant_dpp(dpp: crate::gfx10::Dpp) -> bool {
+    !matches!(
+        dpp,
+        crate::gfx10::Dpp::Row {
+            ctrl: 0x130 | 0x134 | 0x138 | 0x13c | 0x143,
+            ..
+        }
+    )
+}
+
 /// bit) as a number.
 fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
@@ -568,11 +583,10 @@ impl<'a> Lower<'a> {
             // within one wave, where the console compiler leaves out barriers.
             console_lanes = insts().any(|i| {
                 let n = i.name();
-                n.starts_with("ds_swizzle")
-                    || n.contains("permute")
+                n.contains("permute")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
-                    || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
+                    || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some_and(|d| !wave_invariant_dpp(d)))
                     || reads_mask_as_data(x.st, i)
             }) || {
                 // Masks held as numbers or constant lane sets: the lane
@@ -1412,6 +1426,8 @@ impl<'a> Lower<'a> {
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
             #[cfg(test)]
             has_half_wave_mask: self.s.m.has_i32_const(!31),
+            #[cfg(test)]
+            wave_size: self.s.wave_size,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -2892,6 +2908,10 @@ impl<'a> Lower<'a> {
     /// the console's wave size (lanes are thread ids in group order there).
     /// Pixel lanes match only within a quad.
     fn cross_lane(&mut self, quad: bool) -> Result<(), Why> {
+        self.cross_lane_inner(quad, false)
+    }
+
+    fn cross_lane_inner(&mut self, quad: bool, wave_invariant: bool) -> Result<(), Why> {
         if self.s.mesh.is_some() {
             // shortcut: no wave size for mesh shaders in SM 6.6, so host
             // lanes cannot follow the console's; emulate through group-shared
@@ -2901,7 +2921,7 @@ impl<'a> Lower<'a> {
         if self.s.threads.is_none() && !(quad && self.s.pixel) {
             return Err("a cross-lane operation outside compute");
         }
-        debug_assert!(self.s.threads.is_none() || self.console_lanes);
+        debug_assert!(self.s.threads.is_none() || self.console_lanes || wave_invariant);
         self.s.flags |= flags::WAVE_OPS;
         Ok(())
     }
@@ -3195,7 +3215,7 @@ impl<'a> Lower<'a> {
             // console's, so quad-local swizzles read through quad operations.
             let mesh_quad = self.s.mesh.is_some() && quad;
             if !mesh_quad {
-                self.cross_lane(quad)?;
+                self.cross_lane_inner(quad, true)?;
             }
             // The source sits in the address field.
             let x = self.vgprs(inst, addr.as_ref().ok_or("a swizzle source")?, 1)?[0];
@@ -5842,7 +5862,7 @@ impl<'a> Lower<'a> {
         let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
         let mesh_quad = self.s.mesh.is_some() && quad;
         if !mesh_quad {
-            self.cross_lane(quad)?;
+            self.cross_lane_inner(quad, wave_invariant_dpp(dpp))?;
         }
         let use_quad = mesh_quad || self.helpers_read(quad);
         let c = self.cur;
@@ -12207,5 +12227,74 @@ mod tests {
             lowers(&words, 0),
             Err(crate::ShaderError::Unsupported { what: "GDS", .. })
         ));
+    }
+
+    fn lower_cs_wave64(words: &[u32]) -> Lowered {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [64, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, true, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            view_marks: false,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn wave64_ds_swizzle_with_thread_id_omits_wave_size() {
+        let words = [
+            0xD8D4_80B1, // ds_swizzle_b32 v2, v0 offset:0x80b1
+            0x0200_0000,
+            S_ENDPGM,
+        ];
+        let lowered = lower_cs_wave64(&words);
+        assert_eq!(lowered.wave_size, None);
+        assert!(lowered.wave_ops);
+    }
+
+    #[test]
+    fn wave64_dpp_row_shl_omits_wave_size() {
+        let words = [
+            0x7E04_02FA, // v_mov_b32_dpp v2, v0 row_shl:1
+            0xFF01_0100,
+            S_ENDPGM,
+        ];
+        let lowered = lower_cs_wave64(&words);
+        assert_eq!(lowered.wave_size, None);
+        assert!(lowered.wave_ops);
+    }
+
+    #[test]
+    fn wave64_dpp_wave_shl1_keeps_wave_size_64() {
+        let words = [
+            0x7E04_02FA, // v_mov_b32_dpp v2, v0 wave_shl:1
+            0xFF01_3000,
+            S_ENDPGM,
+        ];
+        let lowered = lower_cs_wave64(&words);
+        assert_eq!(lowered.wave_size, Some(64));
+        assert!(lowered.wave_ops);
     }
 }
