@@ -1604,10 +1604,6 @@ fn remade(k: &MemoryKey) {
     }
 }
 
-/// Whether host texture `t` may be given up: its contents come from title
-/// memory alone (no render target, depth or unordered access, no host copy
-/// or resolve wrote it), so a texture made again has them back.
-#[cfg(windows)]
 /// Once per presented frame, before a submission (`Host::execute`, one at a
 /// time, the last one has run): gives up host textures fed from title memory
 /// that the title has not used for [`IDLE_MS`], and past [`BUDGET_HIGH`] of
@@ -2483,6 +2479,120 @@ mod tests {
         assert!(t.upgrade().is_none(), "freed with its title texture");
         assert_eq!(slot::<Release>(read, 0x10)(read), 0);
         assert_eq!(slot::<Release>(h, 0x10)(h), 0);
+    }
+
+    /// The eviction count follows what may be given up: a texture fed from
+    /// title memory is counted and a candidate, the host writing it takes the
+    /// count back and it is a candidate no more, the GPU writing it never
+    /// counts, and one given up leaves the count where it started.
+    #[cfg(windows)]
+    #[test]
+    fn the_eviction_count_follows_the_textures_that_may_be_given_up() {
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering::Relaxed;
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let count = || EVICTABLE.load(Relaxed);
+        let candidate = |t: &Arc<HostTexture>| candidates().iter().any(|(c, _)| Arc::ptr_eq(c, t));
+        let want = |what: &str, want: u64, got: u64| match got == want {
+            true => Ok(()),
+            false => Err(format!("{what}: {got}, wanted {want}")),
+        };
+        let null = std::ptr::null();
+        let h = heap(8 << 20);
+        let place = |at: u64, offset: u64, desc: &ResourceDesc| {
+            let at = at + offset;
+            let iid = &RESOURCE_IIDS[0];
+            let mut out = null;
+            let made = create_placed(null, h, at, desc, 0, null.cast(), iid, &mut out);
+            assert_eq!(made, S_OK);
+            out
+        };
+        // Tests run side by side, and one making or dropping a texture of its
+        // own moves the count between two reads as well: an attempt that saw
+        // another test's change is given up for the next, at addresses no
+        // earlier attempt used.
+        let attempt = |at: u64| -> Result<(), String> {
+            let start = count();
+            let target = ResourceDesc {
+                flags: 1,
+                ..texture(64, 64, 28, 1)
+            };
+            let read = place(at, 0, &texture(64, 64, 28, 1));
+            let written = place(at, 1 << 18, &target);
+            let again = place(at, 1 << 19, &texture(64, 64, 28, 1));
+            // Fed from title memory: counted while it lives, and one to give up.
+            let said = (|| -> Result<(), String> {
+                let r = host_copy(read).ok_or("no host texture for title memory")?;
+                want("fed from title memory, counted", start + 1, count())?;
+                if !candidate(&r) {
+                    return Err("fed from title memory, yet not a candidate".to_owned());
+                }
+                // The host wrote it: its contents are the host's, so it may not
+                // be given up, and is counted no more.
+                r.note_host_written();
+                want("the host wrote it, counted no more", start, count())?;
+                if candidate(&r) {
+                    return Err("the host wrote it, yet a candidate".to_owned());
+                }
+                drop(r);
+                // The GPU writes it: never counted, never a candidate.
+                let w = host_copy(written).ok_or("no host texture for a render target")?;
+                want("the GPU writes it, not counted", start, count())?;
+                if candidate(&w) {
+                    return Err("the GPU writes it, yet a candidate".to_owned());
+                }
+                drop(w);
+                // Counted until it goes: given up, the count is back where the
+                // attempt started.
+                let a = host_copy(again).ok_or("no host texture for title memory")?;
+                want("counted until it goes", start + 1, count())?;
+                drop(a);
+                want("held by its title texture", start + 1, count())?;
+                if !give_up_now(again) {
+                    return Err("given up, yet not a candidate".to_owned());
+                }
+                want("given up, back where it started", start, count())
+            })();
+            for r in [read, written, again] {
+                assert_eq!(slot::<Release>(r, 0x10)(r), 0);
+            }
+            said
+        };
+        let mut off = String::new();
+        let mut done = false;
+        for i in 0..8u64 {
+            match attempt(i << 20) {
+                Ok(()) => {
+                    done = true;
+                    break;
+                }
+                Err(e) => off = e,
+            }
+        }
+        assert_eq!(slot::<Release>(h, 0x10)(h), 0);
+        assert!(done, "the eviction count is off: {off}");
+    }
+
+    /// The per-frame pass returns early when the count says nothing may be
+    /// given up: a count of zero must then mean the census it would have run
+    /// finds nothing, or the pass skips something to give up for good.
+    /// Run alone: the count is the whole process's, and a test running beside
+    /// this one holding a texture of its own makes this its question, not
+    /// this test's (it then skips).
+    #[cfg(windows)]
+    #[test]
+    fn nothing_may_be_given_up_when_the_count_is_zero() {
+        use std::sync::atomic::Ordering::Relaxed;
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        if EVICTABLE.load(Relaxed) != 0 {
+            return; // another test holds a texture of its own
+        }
+        let listed = candidates();
+        assert_eq!(listed.len(), 0, "a count of zero, yet some to give up");
     }
 
     /// Placed textures asked for from several threads at once: one resource
