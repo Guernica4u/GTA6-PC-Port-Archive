@@ -265,6 +265,10 @@ pub(super) unsafe extern "system" fn extended_cache_barrier(
 
 pub(super) fn global_cache_barrier(state: &mut Recording) {
     let Some(native) = state.enhanced_barriers() else {
+        if matches!(state.list_type, D3D12_COMMAND_LIST_TYPE_DIRECT | D3D12_COMMAND_LIST_TYPE_COMPUTE) {
+            legacy_full_barrier(state);
+            return;
+        }
         crate::diagnostics::recording_error(format_args!("enhanced global barriers unavailable"));
         state.error = E_NOTIMPL;
         return;
@@ -285,6 +289,39 @@ pub(super) fn global_cache_barrier(state: &mut Recording) {
     // SAFETY: the native open list consumes the stack-backed group during Barrier.
     unsafe { native.Barrier(&[group]) };
     state.active.indirect.barrier(barrier.SyncAfter, barrier.AccessAfter);
+}
+
+/// The closest legacy barrier to a global one, for a host without enhanced
+/// barriers: a null UAV barrier orders every unordered access, and a null
+/// aliasing barrier every resource's memory.
+fn legacy_full_barrier(state: &mut Recording) {
+    let barriers = [
+        D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: core::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    pResource: core::mem::ManuallyDrop::new(None),
+                }),
+            },
+        },
+        D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Aliasing: core::mem::ManuallyDrop::new(D3D12_RESOURCE_ALIASING_BARRIER {
+                    pResourceBefore: core::mem::ManuallyDrop::new(None),
+                    pResourceAfter: core::mem::ManuallyDrop::new(None),
+                }),
+            },
+        },
+    ];
+    // SAFETY: the active list is open; null resources hold no references to drop.
+    unsafe { state.native().ResourceBarrier(&barriers) };
+    static FIRST: std::sync::Once = std::sync::Once::new();
+    crate::diagnostics::log_once(&FIRST, || {
+        "no enhanced barriers: a cache barrier became null UAV and aliasing barriers".to_string()
+    });
 }
 
 /// Make the next `ExecuteIndirect` read its arguments after everything
