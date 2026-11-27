@@ -312,6 +312,7 @@ extern "system" fn check_feature_support(
         FORMAT_SUPPORT => {
             // SAFETY: checked size and non-null.
             let q = unsafe { &mut *data.cast::<[u32; 3]>() };
+            // Shortcut: fixed capability masks pending console format measurements.
             q[1] = 0x7fff_ffff;
             q[2] = 0xffff;
             if resource::element(q[0]).is_some_and(|(_, texels)| texels == 4) {
