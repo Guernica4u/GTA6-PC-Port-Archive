@@ -67,7 +67,7 @@ The launcher sets these for a Proton or Wine launch. A value you set yourself is
 | Variable | Effect |
 | --- | --- |
 | `TUXBOX_HOST_PROFILE` | Replace what the [graphics driver reports](USAGE.md#host-profile) |
-| `TUXBOX_PERSISTENT_DXC` | Path of a persistent DXC helper to use during play |
+| `TUXBOX_PERSISTENT_DXC` | On Linux the launcher builds a [DXC helper](PROJECTSCARLETT.md#dxc-helper) that compiles shaders faster; `0` turns it off, a path uses that helper |
 | `TUXBOX_REFERENCE_CBV` | `1` applies the constant-buffer layer to a provider TuxBox didn't build |
 | `TUXBOX_RASTER_ROOT_FALLBACK` | Try an unsupported raster root signature unchanged |
 | `TUXBOX_DESCRIPTOR_HEAP_LIMIT` | Cap shader-visible descriptor heaps to force paging |

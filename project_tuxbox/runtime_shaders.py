@@ -17,7 +17,7 @@ from time import monotonic, sleep
 
 from .dxil_store import COMPUTE_FLAGS, VARIANTS, DxilStore, write_identity
 from .inspect import digest
-from .persistent_dxc import PersistentDxc
+from . import persistent_dxc
 from .shader_diagnostics import refusal_line
 from .shader_blob import MAX_SHADER_BYTES, bounded_shader, exact_marker
 from .shader_prep import SOURCE_CACHE, ToolFailure, compiler_tools, run_tool
@@ -230,10 +230,25 @@ def validated_dxil(dxv, output, stage):
     return data
 
 
-def compile_dxil(dxc, dxv, target, hlsl, output, store, request, stage):
+def compile_dxil(dxc, dxv, target, hlsl, output, store, request, stage, *, persistent=None):
     """Compile HLSL for the requested stage and return fully validated DXIL bytes."""
     entry = [] if target == "lib_6_3" else ["-E", "main"]
     unoptimised = [dxc, "-T", target, *entry, "-O0", "-Fo", output, hlsl]
+
+    def optimised(flags, timeout):
+        """One optimised compile: by the session's DXC helper when it has one,
+        and by the command line when it hasn't or the helper's output fails."""
+        if persistent is not None and persistent.compile(dxc, hlsl, output, target, flags, timeout=timeout):
+            try:
+                return validated_dxil(dxv, output, stage)
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                persistent.report(f"Persistent DXC output rejected, using the CLI: {error}")
+                output.unlink(missing_ok=True)
+        run_tool([dxc, "-T", target, *entry, *flags, "-Fo", output, hlsl], timeout=timeout)
+        if not output.exists():
+            raise ValueError("compiler returned no DXIL output")
+        return validated_dxil(dxv, output, stage)
+
     # With lifetime markers, DXC can spend most of a compile in Jump Threading on
     # generated programs. Every profile but cs_6_6, which has its own variant
     # below, therefore starts without them at the default optimisation level,
@@ -252,11 +267,7 @@ def compile_dxil(dxc, dxv, target, hlsl, output, store, request, stage):
             return validated_dxil(dxv, output, stage)
         try:
             faster = () if target == "lib_6_3" else inlining_flags(dxc)
-            run_tool([dxc, "-T", target, *entry, "-disable-lifetime-markers", *faster,
-                      "-Fo", output, hlsl], timeout=15)
-            if not output.exists():
-                raise ValueError("compiler returned no DXIL output")
-            return validated_dxil(dxv, output, stage)
+            return optimised(("-disable-lifetime-markers", *faster), 15)
         except subprocess.TimeoutExpired:
             if store and not dispatched:
                 store.mark_slow(request, target)
@@ -278,11 +289,7 @@ def compile_dxil(dxc, dxv, target, hlsl, output, store, request, stage):
         # Output that fails with the experimental option is compiled without it.
         for extra in (faster, ()) if faster else ((),):
             try:
-                run_tool([dxc, "-T", target, *entry, *COMPUTE_FLAGS, *extra, "-Fo", output, hlsl],
-                         timeout=COMPUTE_TIMEOUT)
-                if not output.exists():
-                    raise ValueError("compiler returned no DXIL output")
-                return validated_dxil(dxv, output, stage)
+                return optimised((*COMPUTE_FLAGS, *extra), COMPUTE_TIMEOUT)
             except subprocess.TimeoutExpired:
                 if store:
                     store.mark_slow(request, target)
@@ -293,7 +300,7 @@ def compile_dxil(dxc, dxv, target, hlsl, output, store, request, stage):
         run_tool(unoptimised, timeout=o0_timeout(hlsl))
         return validated_dxil(dxv, output, stage)
     try:
-        run_tool([dxc, "-T", target, *entry, "-Fo", output, hlsl], timeout=15)
+        return optimised((), 15)
     except subprocess.TimeoutExpired:
         if store:
             store.mark_slow(request, target)
@@ -471,16 +478,8 @@ def compile_request(source, key, tools, cache, session, *, remember=None, persis
                 with lock:
                     data = reuse_content() if store else None
                     if data is None:
-                        if (persistent is not None and target == "cs_6_0"
-                                and not (store and store.is_slow(key, target))
-                                and persistent.compile(dxc, hlsl, output)):
-                            try:
-                                data = validated_dxil(dxv, output, target_stage)
-                            except (OSError, ValueError, subprocess.SubprocessError) as error:
-                                persistent.report(f"Persistent DXC output rejected, using the CLI: {error}")
-                                output.unlink(missing_ok=True)
-                        if data is None:
-                            data = compile_dxil(dxc, dxv, target, hlsl, output, store, key, target_stage)
+                        data = compile_dxil(dxc, dxv, target, hlsl, output, store, key, target_stage,
+                                            persistent=persistent)
                         if store:
                             store.save(content, data)
             stamp = work / "sha256"
@@ -505,16 +504,7 @@ def serve(session, stop, report, archive=None, jobs=1, *, dxc_helper=None):
     # Cargo can replace the release executable while another title is running.
     # Keep the executable we fingerprint private to this host worker.
     with TemporaryDirectory(prefix="tuxbox-xshader-") as tmp, request_notifications(session / "requests", stop) as (wait, wake):
-        pinned = None
-        if dxc_helper:
-            try:
-                helper = Path(tmp) / "dxc-worker"
-                shutil.copyfile(Path(dxc_helper).expanduser(), helper)
-                helper.chmod(0o700)
-                pinned = helper
-            except OSError as error:
-                report(f"Could not stage persistent DXC, using the CLI: {error}")
-        with PersistentDxc(pinned, jobs, report) if pinned else nullcontext() as persistent:
+        with persistent_dxc.staged(dxc_helper, tmp, jobs, report) as persistent:
             _serve_requests(session, stop, report, Path(tmp) / "xshader", wait, archive, jobs, persistent=persistent, wake=wake)
 
 
@@ -775,7 +765,7 @@ def shader_session(cache, env, report, *, archive=None):
         (session / "requests").mkdir()
         env["TUXBOX_SHADER_SESSION"] = session.name
         stop = Event()
-        helper = env.get("TUXBOX_PERSISTENT_DXC")
+        helper = persistent_dxc.session_helper(env, report)
         options = {"dxc_helper": helper} if helper else {}
         worker = Thread(target=serve, args=(session, stop, report, archive, runtime_jobs(env, report)),
                         kwargs=options, name="shader-compiler", daemon=True)

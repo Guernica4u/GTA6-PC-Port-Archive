@@ -218,29 +218,39 @@ matched across configurations. See `--help` for reproduction arguments and
 
 
 
-### Experimental persistent DXC
+### DXC helper
 
-On Linux, build the helper against the same Microsoft DXC release used by
-TuxBox. Set `DXC_ROOT` to the extracted release directory.
+On Linux, launch-time preparation and the live worker compile through a small
+helper, `tools/dxc_worker.cpp`. It runs DXC's own stages and passes, except
+correlated value propagation, which takes about a quarter of DXC's time on
+translated programs and changes very little in them. On 1,500 recorded
+ProjectScarlett requests, 16 at a time, a cold compile took 51 s instead of
+60 s.
 
-```sh
-mkdir -p build
-c++ -std=c++17 -O2 -isystem "$DXC_ROOT/include" tools/dxc_worker.cpp \
-    -L "$DXC_ROOT/lib" -ldxcompiler -o build/dxc-worker
-export TUXBOX_PERSISTENT_DXC="$PWD/build/dxc-worker"
-```
+The launcher builds the helper into `build/dxc-helper` the first time it is
+needed. That takes a C++ compiler and a Microsoft DXC 1.9.2609 release with
+its headers and library, as the staged toolchain has. Without them, or with
+another release, the launcher says why and uses the `dxc` command line. Set
+`TUXBOX_PERSISTENT_DXC=0` to always use the command line, or give it the path
+of a helper you built.
 
-The live worker starts helpers on demand for optimized `cs_6_0` requests.
+The helper's output differs from the command line's in two ways besides the
+skipped pass. It keeps resource and value names that `dxc` strips, so the
+files are about 38% larger, and its container digest is left empty. DXC's
+first stage does not hand a program's `[WaveSize]` to the later passes, so
+the helper writes it back.
+
 Each helper handles one request at a time and stays open for the session.
 The worker retries once if a helper exits during compilation and falls
-back to the CLI if the helper or validation fails. Each newly compiled
-result still passes DXV before publication. The CLI handles other profiles
-and slow requests. The experimental cache identity includes the helper
-binary. Unset `TUXBOX_PERSISTENT_DXC` to use the default CLI.
+back to the command line if the helper cannot build a program or validation
+fails. A compile that runs out of time is treated as a slow command line
+compile. Each newly compiled result still passes DXV before publication. `-O0`
+compiles always use the command line. The cache identity includes the helper
+binary, so turning it on or off compiles into a separate cache.
 
 For a synthetic comparison, run the worker benchmark described above
-with `--jobs 4` and add `--dxc-helper build/dxc-worker` for the experimental
-variant. Give each run a fresh output path. Compare per-request SHA-256
+with `--jobs 4` and add `--dxc-helper` with the built helper's path for the
+second run. Give each run a fresh output path. Compare per-request SHA-256
 values and latency.
 
 ## Prepare shaders after an update
