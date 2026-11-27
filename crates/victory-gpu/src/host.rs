@@ -2070,14 +2070,14 @@ impl HostList {
                         there
                     })
                 });
-                // SAFETY: an open list and resources the list holds.
                 if !back.is_empty() {
+                    // SAFETY: an open list and resources the list holds.
                     unsafe { list.ResourceBarrier(&back) };
                 }
             }
             let barriers = moves();
-            // SAFETY: an open list and resources the list holds.
             if !barriers.is_empty() {
+                // SAFETY: an open list and resources the list holds.
                 unsafe { list.ResourceBarrier(&barriers) };
             }
             Ok(())
@@ -2090,6 +2090,7 @@ impl HostList {
                 Ok(fresh) => {
                     // The old list is not executing; drop its allocator
                     // rather than let one out-of-memory reset end the run.
+                    // SAFETY: the old list is open and was never submitted.
                     let _ = unsafe { p.list.Close() };
                     *p = fresh;
                     true
