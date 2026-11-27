@@ -16,11 +16,17 @@ const SIXTEEN: u32 = 0x7e08_0290;
 fn program(range_type: u32, view: Option<u32>, threads: u32, words: &[u32]) -> ShaderExtract {
     // A root-level buffer has no descriptor to load: the program copies its address.
     let root_level = view == Some(ROOT_RAW);
-    let start: &[u32] = if root_level { &[COPY_ROOT] } else { &DESCRIPTOR };
+    // A program that reads its own table has no buffer at all.
+    let own_table = view == Some(CODE_TABLE);
+    let start: &[u32] = if root_level { &[COPY_ROOT] } else if own_table { &[] } else { &DESCRIPTOR };
     let isa: Vec<u8> = [start, words, &[END]].concat().iter().flat_map(|w| w.to_le_bytes()).collect();
+    let mut isa_data = isa.clone();
+    if own_table {
+        isa_data.extend(TABLE.iter().flat_map(|w| w.to_le_bytes()));
+    }
     let range = RootRange { range_type, num: 4, base_register: 0, space: 0, offset_in_table: 0 };
     let mut params = vec![RootParam { visibility: 0, kind: RootParamKind::Table(vec![range]) }];
-    let mut resources: Vec<PsvResource> = view.filter(|_| !root_level)
+    let mut resources: Vec<PsvResource> = view.filter(|_| !root_level && !own_table)
         .map(|res_type| PsvResource { res_type, space: 0, lower: 1, upper: 1 }).into_iter().collect();
     let mut fssm = Vec::new();
     if root_level {
@@ -32,7 +38,7 @@ fn program(range_type: u32, view: Option<u32>, threads: u32, words: &[u32]) -> S
     ShaderExtract {
         flat_inputs: Vec::new(), flat_outputs: Vec::new(), stage: Stage::Compute, shader_model: (6, 0),
         required_features: None, bitcode_stripped: true, fspx_config: None, ps09_pixel_inputs: None,
-        fssm, entry: Some("main".into()), isa_data: isa.clone(), isa, isa_offset_in_fssm: 0,
+        fssm, entry: Some("main".into()), isa_data, isa, isa_offset_in_fssm: 0,
         psv_threads: None, isa_preamble: [0, threads, 1, 1], has_input_sig: false, has_output_sig: false,
         has_psv0: false, has_root_sig: true, input_sig: Vec::new(), output_sig: Vec::new(),
         resources,
@@ -45,6 +51,14 @@ fn program(range_type: u32, view: Option<u32>, threads: u32, words: &[u32]) -> S
 const ROOT_RAW: u32 = u32::MAX;
 /// `s_mov_b32 s8, s4`: the root buffer's address, where the typed loads look for a descriptor.
 const COPY_ROOT: u32 = 0xbe88_0304;
+
+/// A view type that stands for no buffer: the program reads the table after its code.
+const CODE_TABLE: u32 = u32::MAX - 1;
+/// The words after the code of the `code` programs.
+const TABLE: [u32; 8] = [0x7ab1_0000, 0x7ab1_0011, 0x7ab1_0022, 0x7ab1_0033, 0x7ab1_0044, 0x7ab1_0055, 0x7ab1_0066, 0x7ab1_0077];
+/// `s_getpc_b64 s[0:1]`, then `v_mov_b32 v4, s0` and `v_mov_b32 v5, s1`: the
+/// address of the second instruction, as the vector address of a flat load.
+const OWN_ADDRESS: [u32; 3] = [0xbe80_1f00, 0x7e08_0200, 0x7e0a_0201];
 
 /// An FSSM with user-data and used-resource rows.
 fn records(user: &[[u32; 5]], used: &[[u32; 5]]) -> Vec<u8> {
@@ -146,6 +160,14 @@ const CASES: &[Case] = &[
     // Two words: four 16-bit channels.
     ("root-16-16-16-16-uint", "root-raw", 0, Some(ROOT_RAW), "v7 v8 v9 v10", "0x404 0x4100 0x505 0x4100",
      &[SIXTEEN, 0xea2b_1000, 0x8002_0704]),
+    // flat_load_dword* v7.., v[4:5] offset:24. The six-word program ends at byte 24
+    // and the address is byte 4, so the load starts at the table's second word.
+    ("code-x1", "code", 0, Some(CODE_TABLE), "v7", "0x7ab10011", words!(OWN_ADDRESS, [0xdc30_0018, 0x077d_0004])),
+    ("code-x2", "code", 0, Some(CODE_TABLE), "v7 v8", "0x7ab10011 0x7ab10022", words!(OWN_ADDRESS, [0xdc34_0018, 0x077d_0004])),
+    ("code-x3", "code", 0, Some(CODE_TABLE), "v7 v8 v9", "0x7ab10011 0x7ab10022 0x7ab10033",
+     words!(OWN_ADDRESS, [0xdc3c_0018, 0x077d_0004])),
+    ("code-x4", "code", 0, Some(CODE_TABLE), "v7 v8 v9 v10", "0x7ab10011 0x7ab10022 0x7ab10033 0x7ab10044",
+     words!(OWN_ADDRESS, [0xdc38_0018, 0x077d_0004])),
     // buffer_store_dword* v5.., v4, s[8:11], 0 offen, then the four words read back
     ("store-x1", "raw-write", 1, Some(7), "v9 v10 v11 v12", "0x11223344 p5 p6 p7",
      words!([SIXTEEN], DATA, [0xe070_1000, 0x8002_0504], BACK4)),
@@ -202,6 +224,7 @@ fn buffer_loads_for_the_gpu_check() {
             "typed" => "Buffer<float4> stb1 : register(t1);",
             "raw-write" => "RWByteAddressBuffer raw_ubuf1 : register(u1);",
             "root-raw" => "ByteAddressBuffer raw_sbuf5 : register(t5);",
+            "code" => "tb_code[",
             _ => "RWBuffer<float4> utb1 : register(u1);",
         };
         assert_eq!(results.split(' ').count(), expected.split(' ').count(), "{name}");

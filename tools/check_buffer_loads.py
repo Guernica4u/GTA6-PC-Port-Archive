@@ -132,7 +132,7 @@ guest = replace(guest, "    D3D12_COMMAND_QUEUE_DESC qd{};", f"""    // The sour
         D3D12_SHADER_RESOURCE_VIEW_DESC srv{{}};
         srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        if (source_kind == "raw" || source_kind == "root-raw") {{
+        if (source_kind == "raw" || source_kind == "root-raw" || source_kind == "code") {{
             srv.Format = DXGI_FORMAT_R32_TYPELESS;
             srv.Buffer.NumElements = source_words;
             srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
