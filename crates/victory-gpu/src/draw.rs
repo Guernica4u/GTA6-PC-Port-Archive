@@ -90,13 +90,13 @@ pub(crate) struct State {
     /// do not break up the runs fresh tables need.
     root_run: (usize, u32, u32),
     /// Slots made for unordered access clears in this list
-    /// ([`State::clear_view`]): (view heap, view, host resource) → dynamic
-    /// slot, so that clears of one view (a stand-in's, at each dispatch of
+    /// ([`State::clear_view`]): keyed by view heap, view, and host view
+    /// identity, so that clears of one view (a stand-in's, at each dispatch of
     /// its program) share one. The slots are among [`Self::dynamic`], held
-    /// until the list is reset (which drops this with them) or released;
-    /// the list keeps the host resource, so its address names no other.
+    /// until the list is reset (which drops this with them) or released.
+    /// The slot holds both the host resource and any arena slice in the key.
     /// Made again in each segment of the list, as root views are.
-    clear_slots: std::collections::BTreeMap<(usize, View, usize), u32>,
+    clear_slots: std::collections::BTreeMap<(usize, View, (usize, usize)), u32>,
     /// What was set straight onto the host list, for the next segment of
     /// the list ([`State::cut`]).
     fixed: Fixed,
@@ -1058,23 +1058,26 @@ impl State {
         };
         let Some(visible) = heap.host() else { return false };
         let at = host.cpu_view();
-        let Some(resource) = crate::descriptor::host::make_view(view, at) else {
+        let Some(made) = crate::descriptor::host::make_cpu_view(view, at) else {
             once!("an unordered access clear of a view the host cannot make");
             return false;
         };
-        let key = (std::ptr::from_ref(heap) as usize, view.clone(), resource.as_raw() as usize);
+        let key = (std::ptr::from_ref(heap) as usize, view.clone(), made.identity());
         let slot = match self.clear_slots.get(&key) {
             Some(&slot) => slot,
             None => {
+                #[cfg(test)]
+                tests::before_clear_slot();
                 let Some(slot) = visible.dynamic(1) else {
                     return false;
                 };
                 self.dynamic.push((key.0, slot, 1));
-                visible.make_at(slot, view);
+                visible.copy_view_at(&host.device, slot, view, &made);
                 self.clear_slots.insert(key, slot);
                 slot
             }
         };
+        let resource = &made.resource;
         let written = UsedResource {
             kind: ResourceType::Uav,
             root: RootType::Table,
@@ -1087,17 +1090,17 @@ impl State {
         };
         readable(list, &written, view, false);
         self.bind_heaps(list, false);
-        list.keep(&resource);
+        list.keep(resource);
         let gpu = visible.gpu(slot);
         // SAFETY: an open list; both slots view the live resource.
         unsafe {
             if float {
                 let values = values.map(f32::from_bits);
                 list.list
-                    .ClearUnorderedAccessViewFloat(gpu, at, &resource, &values, rects);
+                    .ClearUnorderedAccessViewFloat(gpu, at, resource, &values, rects);
             } else {
                 list.list
-                    .ClearUnorderedAccessViewUint(gpu, at, &resource, &values, rects);
+                    .ClearUnorderedAccessViewUint(gpu, at, resource, &values, rects);
             }
         }
         true
@@ -2039,6 +2042,16 @@ const QUAD_STRIP: u32 = 20;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        static BEFORE_CLEAR_SLOT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn before_clear_slot() {
+        if let Some(hook) = BEFORE_CLEAR_SLOT.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+    }
 
     /// A root signature that indexes the heaps directly needs one of each
     /// kind bound before it is set: our sampler heap stands in for a title
@@ -3154,6 +3167,55 @@ void main(uint3 id : SV_DispatchThreadID) {
         let (n, x) = submit();
         assert_eq!(n, 1, "mip 1 alone");
         assert!((x - 64.0 / 255.0).abs() < 1e-6, "mip 0 kept: {x}");
+    }
+
+    /// Another view can reserve an arena slice before a clear installs its
+    /// visible slot. The clear must still write the first view's own slice.
+    #[test]
+    fn an_unaligned_clear_keeps_its_arena_slice_until_the_slot_is_written() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let buffer = buffer(1 << 16);
+        let (bytes, _) = crate::resource::buffer_bytes(buffer).unwrap();
+        let placed = |address: u64| {
+            let resource = [1, 0, 0, 0, 16, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+            let mut desc = [0u32; 16];
+            // One R32G32B32A32_UINT element, off the buffer's 16-byte elements.
+            desc[..10].copy_from_slice(&[3, 1, 0, 0, 1, 0, 0, 0, 0, 0]);
+            (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+            View::Placed(true, resource, desc)
+        };
+        let (first, other) = (placed(bytes as u64 + 4), placed(bytes as u64 + 36));
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        let competitor = std::rc::Rc::new(std::cell::Cell::new(None));
+        let competing_slice = competitor.clone();
+        BEFORE_CLEAR_SLOT.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let (copy, address, _) = crate::descriptor::host::view_copy(&other).unwrap();
+                copy.write_host(address, &0x1234u32.to_le_bytes());
+                competing_slice.set(Some((copy, address)));
+            }));
+        });
+        assert!(state.clear_view(&list, &first, [0x55; 4], false, &[]));
+        let (other, other_at) = competitor.take().expect("another slice was allocated before the slot");
+        let (first, first_at, _) = crate::descriptor::host::view_copy(&first).unwrap();
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(first.read_host(first_at, 1), [0x55], "the slice named by the visible slot");
+        assert_eq!(other.read_host(other_at, 1), [0x1234], "the other slice");
+        list.reset();
+        state.reset(null);
+        crate::object::release(heap);
+        drop((first, other));
+        crate::object::release(buffer);
     }
 
     /// Clears of one view in one list share one dynamic slot (a title
