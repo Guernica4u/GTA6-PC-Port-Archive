@@ -250,6 +250,74 @@ fn loop_ended_by_a_mask_compare() -> Vec<u32> {
     a.finish()
 }
 
+const S_BRANCH: u32 = 0x02;
+
+/// [`uneven_sides`]' barriers, which send the program to console mode, then
+/// the console compiler's waterfall leaving when a counter equals each
+/// lane's count: the count is `thread >> 4` (0 for threads 0-15, 1 to 3 for
+/// the others, so the waves' largest differ). Lanes with 0 stay out
+/// (`v_cmpx_eq_u32 0, v9`, then `s_andn2_b32 exec_lo`); s20 counts up, a
+/// lane drops out when s20 equals its count, and the loop goes round while
+/// any is left (`s_andn2_b32 s16, s16, exec_lo`, then SCC) through a block
+/// that only narrows EXEC and goes back (`s_and_b32 exec_lo, s18, s16`).
+/// Each pass adds 1 to v1: a lane stores its count. With `clobber`, the
+/// body saves EXEC in s18, restores it, then uses s18 as a scalar before
+/// saving EXEC there again.
+fn equality_exit_waterfall(clobber: bool) -> Vec<u32> {
+    let mut a = Asm::default();
+    a.put(PROLOGUE)
+        .put(&[LANES_BELOW_16, SAVE_EXEC_VCC])
+        .branch(S_CBRANCH_EXECZ, "join")
+        .put(&[S0_IS_0])
+        .branch(S_CBRANCH_SCC1, "one")
+        .put(&[S_BARRIER])
+        .label("one")
+        .put(&[S_BARRIER, V1_IS_2])
+        .label("join")
+        .put(&[RESTORE_EXEC, S_BARRIER])
+        .put(&[
+            0x2C12_0084, // v_lshrrev_b32 v9, 4, v0
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xBE8C_037E, // s_mov_b32 s12, exec_lo
+            0x7DA4_1280, // v_cmpx_eq_u32 0, v9
+            0x8A7E_7E0C, // s_andn2_b32 exec_lo, s12, exec_lo
+        ])
+        .branch(S_CBRANCH_EXECZ, "restore")
+        .put(&[
+            0xBE90_037E, // s_mov_b32 s16, exec_lo
+            0xBE94_0380, // s_mov_b32 s20, 0
+        ])
+        .branch(S_BRANCH, "body")
+        .label("top")
+        .put(&[
+            0x877E_1012, // s_and_b32 exec_lo, s18, s16
+            0xBF80_0000, // s_nop 0
+        ])
+        .label("body");
+    if clobber {
+        a.put(&[
+            0xBE92_037E, // s_mov_b32 s18, exec_lo
+            0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+            0xBEFE_0312, // s_mov_b32 exec_lo, s18
+            0x9312_8614, // s_mul_i32 s18, s20, 6
+        ]);
+    } else {
+        a.put(&[0x4A02_0281]); // v_add_nc_u32 v1, 1, v1
+    }
+    a.put(&[
+        0x8114_8114, // s_add_i32 s20, s20, 1
+        0xBE92_037E, // s_mov_b32 s18, exec_lo
+        0x7DA4_1214, // v_cmpx_eq_u32 s20, v9
+        0xBF80_0000, // s_nop 0
+        0x8A10_7E10, // s_andn2_b32 s16, s16, exec_lo
+    ])
+    .branch(S_CBRANCH_SCC1, "top")
+    .label("restore")
+    .put(&[0xBEFE_030C]) // s_mov_b32 exec_lo, s12
+    .put(EPILOGUE);
+    a.finish()
+}
+
 /// The barriers lowering adds on branch edges, by the name of the first
 /// instruction of the block each edge leads into.
 fn padded_edges(words: &[u32]) -> Vec<(&'static str, u32)> {
@@ -528,6 +596,41 @@ fn barrier_programs_decode_as_written() {
             "s_mov_b32",
         ])
     );
+    for clobber in [false, true] {
+        let body: &[&str] = if clobber {
+            &["s_mov_b32", "v_add_nc_u32", "s_mov_b32", "s_mul_i32"]
+        } else {
+            &["v_add_nc_u32"]
+        };
+        let waterfall: Vec<&'static str> = after
+            .iter()
+            .copied()
+            .chain([
+                "v_lshrrev_b32",
+                "v_mov_b32",
+                "s_mov_b32",
+                "v_cmpx_eq_u32",
+                "s_andn2_b32",
+                "s_cbranch_execz",
+                "s_mov_b32",
+                "s_mov_b32",
+                "s_branch",
+                "s_and_b32",
+                "s_nop",
+            ])
+            .chain(body.iter().copied())
+            .chain([
+                "s_add_i32",
+                "s_mov_b32",
+                "v_cmpx_eq_u32",
+                "s_nop",
+                "s_andn2_b32",
+                "s_cbranch_scc1",
+                "s_mov_b32",
+            ])
+            .collect();
+        assert_eq!(names(equality_exit_waterfall(clobber)), with(&waterfall), "clobber {clobber}");
+    }
 }
 
 #[test]
@@ -573,4 +676,24 @@ fn barriers_that_cannot_be_balanced_run_as_the_console_runs_them() {
 #[test]
 fn a_loop_without_barriers_pads_the_side_that_skips_it() {
     assert_eq!(padded_edges(&loop_without_barriers_on_the_heavier_side()), [("s_or_b32", 1)]);
+}
+
+/// In console mode, lanes the wave carries round a waterfall going round
+/// through a block that only narrows EXEC are parked, and so are lanes it
+/// carries into the loop: before, none was (the loop's only latch to the
+/// header is that block's jump), so lanes already done, and threads 0-15,
+/// which never enter, voted to go round and ran the body, and the loop
+/// never ended (the iteration limit, no store).
+#[test]
+fn a_waterfall_going_round_through_a_jump_leaves_when_its_lanes_are_done() {
+    runs_as_the_console("equality-exit waterfall", &equality_exit_waterfall(false), |t| t >> 4);
+}
+
+#[test]
+fn a_waterfall_with_its_saved_exec_reused_as_a_scalar_leaves_too() {
+    runs_as_the_console(
+        "equality-exit waterfall, s18 reused",
+        &equality_exit_waterfall(true),
+        |t| t >> 4,
+    );
 }

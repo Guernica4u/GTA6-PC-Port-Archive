@@ -6,15 +6,28 @@
 
 use super::*;
 
+/// Console mode's latches going round through a block that only jumps back
+/// to the header ([`Lower::park_lanes`]): by such block, its header; and by
+/// header, what the branch before one parks, for its back edge.
+#[derive(Default)]
+pub(super) struct Rounds {
+    via: HashMap<usize, usize>,
+    next: HashMap<usize, V>,
+}
+
 impl<'a> Lower<'a> {
     /// Console mode's parked lanes ([`Lower::parked`]): a phi of whether a
-    /// lane is parked at every loop header, false on entry. A latch whose
-    /// exit is decided for the wave parks the lanes that would have left
+    /// lane is parked at every loop header, set on entry for a lane the
+    /// wave carries in ([`Lower::park_entry`]). A latch whose exit is
+    /// decided for the wave parks the lanes that would have left
     /// ([`Lower::wave_branch`]), and every instruction in the loop is then
-    /// guarded by `!parked` too ([`Lower::unparked`]).
-    // shortcut: a lane is parked only at a latch whose other side leaves
-    // the loop (the do-while shape); a branch going round the loop from
-    // the middle keeps its lanes running to the latch.
+    /// guarded by `!parked` too ([`Lower::unparked`]). The console
+    /// compiler's waterfall goes round through a block that only restores
+    /// EXEC (`s_and_b64 exec, s[18:19], s[16:17]`) and jumps back: the
+    /// branch before such a block parks as a latch does ([`Rounds`]).
+    // shortcut: a lane is parked only at such a latch whose other side
+    // leaves the loop (the do-while shape); a branch going round the loop
+    // from the middle keeps its lanes running to the latch.
     pub(super) fn park_lanes(&mut self, order: &[usize]) {
         let loops = self.barrier_loops(order);
         let headers: Vec<usize> = self.counters.keys().copied().collect();
@@ -45,12 +58,64 @@ impl<'a> Lower<'a> {
                     && matches!(self.x.st.exits[l], LaneExit::Branch { taken, not_taken, .. }
                         if (taken == h && !body[not_taken]) || (not_taken == h && !body[taken]))
             });
-            if !parks {
+            // A latch only jumping back, after a branch decided for the wave
+            // whose other side leaves the loop (`Rounds`).
+            let via: Vec<usize> = latches
+                .iter()
+                .copied()
+                .filter(|&l| {
+                    let [x] = self.x.p.blocks[l].preds[..] else {
+                        return false;
+                    };
+                    let round = |to: usize, out: usize| to == l && !body[out];
+                    matches!(self.x.st.exits[l], LaneExit::Jump(t) if t == h)
+                        && self.wave_branches.contains_key(&x)
+                        && matches!(self.x.st.exits[x], LaneExit::Branch { taken, not_taken, .. }
+                            if round(taken, not_taken) || round(not_taken, taken))
+                })
+                .collect();
+            if !parks && via.is_empty() {
                 continue;
+            }
+            for l in via {
+                self.rounds.via.insert(l, h);
             }
             let blk = self.block[h].expect("reachable");
             let phi = self.s.m.phi(blk, self.s.t.i1);
             self.parked.insert(h, (phi, Vec::new(), body));
+        }
+    }
+
+    /// A forward edge from IR block `from` (DXIL block `via`) into header
+    /// `to`: a lane enters parked unless it comes on its own path (it
+    /// reaches `from`, and `takes`, its own side of a branch the wave
+    /// decided). A lane the wave carries in runs nothing in the loop.
+    pub(super) fn park_entry(&mut self, from: usize, to: usize, via: usize, takes: Option<V>) {
+        if !self.parked.contains_key(&to) {
+            return;
+        }
+        let c = self.cur;
+        let start = match self.boolean(self.x.st.reach[from], c) {
+            Ok(on) => {
+                let on = match takes {
+                    Some(t) => self.s.m.bin(c, Bin::And, on, t),
+                    None => on,
+                };
+                let yes = self.s.m.bool(true);
+                self.s.m.bin(c, Bin::Xor, on, yes)
+            }
+            Err(_) => self.s.m.bool(false),
+        };
+        self.parked.get_mut(&to).expect("parked").1.push((start, via));
+    }
+
+    /// A back edge to header `to` from DXIL block `c`: parked lanes stay
+    /// parked ([`Lower::wave_branch`] may park more, and a latch going
+    /// round through a jump parks them here).
+    pub(super) fn park_round(&mut self, to: usize, c: usize) {
+        let next = self.rounds.next.remove(&to);
+        if let Some((parked, incoming, _)) = self.parked.get_mut(&to) {
+            incoming.push((next.unwrap_or(*parked), c));
         }
     }
 
@@ -131,14 +196,15 @@ impl<'a> Lower<'a> {
             cond
         };
         // A latch whose other side leaves the loop: lanes that would have
-        // left while the wave goes round are parked (`Lower::parked`).
+        // left while the wave goes round are parked (`Lower::parked`). It
+        // may go round through a block that only jumps back (`Rounds`).
         let latch = [(taken, not_taken, false), (not_taken, taken, true)]
             .into_iter()
-            .find(|&(round, out, _)| {
-                back(self, round)
-                    && self.parked.get(&round).is_some_and(|p| !p.2[out])
+            .find_map(|(round, out, t)| {
+                let h = if back(self, round) { round } else { *self.rounds.via.get(&round)? };
+                self.parked.get(&h).is_some_and(|p| !p.2[out]).then_some((h, round, t))
             });
-        if let Some((header, _, leaves_when_taken)) = latch {
+        if let Some((header, round, leaves_when_taken)) = latch {
             let c = self.cur;
             let leaves = if leaves_when_taken {
                 lane
@@ -148,15 +214,19 @@ impl<'a> Lower<'a> {
             };
             let phi = self.parked[&header].0;
             let now = self.s.m.bin(c, Bin::Or, phi, leaves);
-            if let Some(last) = self.parked.get_mut(&header).and_then(|p| p.1.last_mut()) {
+            if round != header {
+                self.rounds.next.insert(header, now);
+            } else if let Some(last) = self.parked.get_mut(&header).and_then(|p| p.1.last_mut()) {
                 *last = (now, c);
             }
         }
         let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
-        for (to, via) in [(taken, t), (not_taken, f)] {
+        let yes = self.s.m.bool(true);
+        let not_lane = self.s.m.bin(self.cur, Bin::Xor, lane, yes);
+        for (to, via, takes) in [(taken, t, lane), (not_taken, f, not_lane)] {
             if !back(self, to) {
                 let from = if Some(via) == self.block[to] { self.cur } else { via };
-                self.enter_loop(b, to, from);
+                self.enter_loop(b, to, from, Some(takes));
             }
         }
         Ok(Term::CondBr(cond, t, f))

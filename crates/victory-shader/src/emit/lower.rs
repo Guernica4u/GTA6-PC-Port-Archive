@@ -251,6 +251,8 @@ struct Lower<'a> {
     /// header's phi, its incoming (value, DXIL block) pairs, and the loop's
     /// last block in RPO ([`Lower::park_lanes`]).
     parked: HashMap<usize, Parked>,
+    /// Latches going round through a jump ([`barriers::Rounds`]).
+    rounds: barriers::Rounds,
     /// Per IR block: a `done` export is behind every lane entering it.
     exported: Vec<bool>,
     /// Reverse-postorder index per IR block.
@@ -714,6 +716,7 @@ impl<'a> Lower<'a> {
             wave_branches: HashMap::new(),
             console_mode: false,
             parked: HashMap::new(),
+            rounds: Default::default(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
@@ -10204,7 +10207,7 @@ impl<'a> Lower<'a> {
                 Term::CondBr(ok, self.block[t].expect("reachable"), abort)
             }
             LaneExit::Jump(t) => {
-                self.enter_loop(b, t, self.cur);
+                self.enter_loop(b, t, self.cur, None);
                 Term::Br(self.block[t].expect("reachable"))
             }
             LaneExit::Branch {
@@ -10259,7 +10262,7 @@ impl<'a> Lower<'a> {
                         } else {
                             via
                         };
-                        self.enter_loop(b, to, from);
+                        self.enter_loop(b, to, from, None);
                     }
                 }
                 Term::CondBr(cond, t, f)
@@ -10282,15 +10285,12 @@ impl<'a> Lower<'a> {
 
     /// A forward edge into loop header `to` (from DXIL block `via`) starts
     /// its count at 0.
-    fn enter_loop(&mut self, _from: usize, to: usize, via: usize) {
+    fn enter_loop(&mut self, from: usize, to: usize, via: usize, takes: Option<V>) {
         if let Some((_, incoming)) = self.counters.get_mut(&to) {
             let z = self.s.m.i32(0);
             incoming.push((z, via));
         }
-        if let Some((_, incoming, _)) = self.parked.get_mut(&to) {
-            let no = self.s.m.bool(false);
-            incoming.push((no, via));
-        }
+        self.park_entry(from, to, via, takes);
     }
 
     /// A back edge to header `to` (a back edge keeps its block, no
@@ -10307,12 +10307,7 @@ impl<'a> Lower<'a> {
             .expect("header")
             .1
             .push((next, c));
-        // Parked lanes stay parked round the loop (`Lower::wave_branch`
-        // may park more).
-        if let Some((parked, incoming, _)) = self.parked.get_mut(&to) {
-            let parked = *parked;
-            incoming.push((parked, c));
-        }
+        self.park_round(to, c);
         self.s.m.cmp(c, p, next, limit)
     }
 
