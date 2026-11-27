@@ -785,7 +785,10 @@ fn partial_dmask_image_stores_write_typed_texture_uavs() {
                 .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
             out.push((label, words));
         }
-        assert!(!out.is_empty(), "neither hardware nor WARP SM 6.6 device available");
+        assert!(
+            !out.is_empty(),
+            "neither hardware nor WARP SM 6.6 device available"
+        );
         out
     };
 
@@ -809,12 +812,15 @@ fn partial_dmask_image_stores_write_typed_texture_uavs() {
             0xBF8C_3F70, // s_waitcnt vmcnt(0)
             0xF020_1008 | (dmask << 8),
             (u32::from(d16) << 31) | 0x0002_0104, // image_store v1, v[4:5], s[8:15] dim:2D unorm
-            0xBF81_0000, // s_endpgm
+            0xBF81_0000,                          // s_endpgm
         ];
         build(
             &code,
             vec![param(RootType::Table, 0), param(RootType::Table, 1)],
-            vec![entry(ResourceType::Uav, 8, 0), entry(ResourceType::Srv, 4, 1)],
+            vec![
+                entry(ResourceType::Uav, 8, 0),
+                entry(ResourceType::Srv, 4, 1),
+            ],
             32,
         )
     };
@@ -863,7 +869,10 @@ fn partial_dmask_image_stores_write_typed_texture_uavs() {
     let xy_shader = build(
         &xy_code,
         vec![param(RootType::Table, 0), param(RootType::Table, 1)],
-        vec![entry(ResourceType::Uav, 8, 0), entry(ResourceType::Srv, 4, 1)],
+        vec![
+            entry(ResourceType::Uav, 8, 0),
+            entry(ResourceType::Srv, 4, 1),
+        ],
         32,
     );
     let f32_pairs: Vec<u32> = (0..32u32)
@@ -894,7 +903,11 @@ fn partial_dmask_image_stores_write_typed_texture_uavs() {
     for (format, stride, data) in [
         (DXGI_FORMAT_R16G16_FLOAT, 0, &f16_pairs),
         (DXGI_FORMAT_R16G16_UINT, VIEW_INTEGER, &u16_pairs),
-        (DXGI_FORMAT_R16G16_SINT, VIEW_INTEGER | VIEW_SIGNED, &i16_pairs),
+        (
+            DXGI_FORMAT_R16G16_SINT,
+            VIEW_INTEGER | VIEW_SIGNED,
+            &i16_pairs,
+        ),
     ] {
         let views = [
             View::TypedTextureUav(format, 32, 1, 1),
@@ -913,7 +926,8 @@ fn partial_dmask_image_stores_write_typed_texture_uavs() {
     let rw_code = [
         0xBE84_0300, // s_mov_b32 s4, s0
         0xBE85_0380, // s_mov_b32 s5, 0
-        0xF40C_0202, 0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], 0
+        0xF40C_0202,
+        0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], 0
         0x7E02_02F0, // v_mov_b32 v1, 0.5
         0x7E04_02F2, // v_mov_b32 v2, 1.0
         0x7E06_02F4, // v_mov_b32 v3, 2.0
@@ -921,11 +935,15 @@ fn partial_dmask_image_stores_write_typed_texture_uavs() {
         0x7E0A_0300, // v_mov_b32 v5, v0 (x)
         0x7E0C_0280, // v_mov_b32 v6, 0 (y)
         0xBF8C_0000,
-        0xF020_1F08, 0x0002_0105, // image_store v[1:4], v[5:6], dmask:0xF
+        0xF020_1F08,
+        0x0002_0105, // image_store v[1:4], v[5:6], dmask:0xF
         0xBF8C_0000,
-        0x7E02_02FF, 0x4180_0000, // v_mov_b32 v1, 16.0
-        0x7E04_02FF, 0x4200_0000, // v_mov_b32 v2, 32.0
-        0xF020_1908, 0x0002_0105, // image_store v[1:2], v[5:6], dmask:0x9
+        0x7E02_02FF,
+        0x4180_0000, // v_mov_b32 v1, 16.0
+        0x7E04_02FF,
+        0x4200_0000, // v_mov_b32 v2, 32.0
+        0xF020_1908,
+        0x0002_0105, // image_store v[1:2], v[5:6], dmask:0x9
         0xBF81_0000,
     ];
     let shader = build(
@@ -936,7 +954,10 @@ fn partial_dmask_image_stores_write_typed_texture_uavs() {
     );
     for (view, texel) in [
         (View::TextureUav(32, 1), &[16.0f32, 0.0, 0.0, 32.0][..]),
-        (View::TypedTextureUav(DXGI_FORMAT_R32G32_FLOAT, 32, 1, 2), &[16.0, 0.0][..]),
+        (
+            View::TypedTextureUav(DXGI_FORMAT_R32G32_FLOAT, 32, 1, 2),
+            &[16.0, 0.0][..],
+        ),
     ] {
         let want: Vec<_> = texel.iter().map(|x| x.to_bits()).collect();
         for (label, words) in run(&shader, &[view], vec![0]) {
@@ -958,7 +979,10 @@ fn partial_dmask_image_stores_write_typed_texture_uavs() {
         },
     ];
     for (label, words) in run(&make_1dw_store(0x5, true), &views, vec![0, 4]) {
-        assert_eq!(words[0], sparse_want, "{label} R16G16B16A16_FLOAT dmask=0x5 d16");
+        assert_eq!(
+            words[0], sparse_want,
+            "{label} R16G16B16A16_FLOAT dmask=0x5 d16"
+        );
     }
 
     // 5. dmask=0x0 is a no-op: writing f32s with dmask=0x1 then storing 0.0
@@ -989,7 +1013,10 @@ fn partial_dmask_image_stores_write_typed_texture_uavs() {
     let noop_shader = build(
         &noop_code,
         vec![param(RootType::Table, 0), param(RootType::Table, 1)],
-        vec![entry(ResourceType::Uav, 8, 0), entry(ResourceType::Srv, 4, 1)],
+        vec![
+            entry(ResourceType::Uav, 8, 0),
+            entry(ResourceType::Srv, 4, 1),
+        ],
         32,
     );
     let views = [
