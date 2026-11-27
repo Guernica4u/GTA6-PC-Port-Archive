@@ -506,6 +506,31 @@ fn library() -> Option<&'static Library> {
         .as_ref()
 }
 
+/// An empty library. D3D12 documents the empty form as a null blob of no
+/// bytes. An empty slice is passed as a non-null address with length 0, and
+/// vkd3d-proton refuses that: under Wine and Proton no library was made
+/// ("no host pipeline library: pipelines are not kept"), so every start
+/// made all of its pipelines again.
+fn empty(device: &ID3D12Device1) -> windows::core::Result<ID3D12PipelineLibrary1> {
+    let mut raw = std::ptr::null_mut();
+    // SAFETY: the method's own signature; no blob is read; a success that
+    // wrote a pointer wrote an owned library.
+    unsafe {
+        (Interface::vtable(device).CreatePipelineLibrary)(
+            Interface::as_raw(device),
+            std::ptr::null(),
+            0,
+            &ID3D12PipelineLibrary::IID,
+            &mut raw,
+        )
+        .ok()?;
+        if raw.is_null() {
+            return Err(windows::Win32::Foundation::E_POINTER.into());
+        }
+        ID3D12PipelineLibrary::from_raw(raw).cast()
+    }
+}
+
 /// The library in `blob`, or an empty one if the host rejects the blob (an
 /// adapter or driver change, damage).
 fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
@@ -541,7 +566,13 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     // The rejected bytes are let go (a mapped file is unmapped) before the
     // empty library is made: nothing reads them any more.
     drop(blob);
-    let library = make(&[]).ok()?;
+    let library = match empty(device) {
+        Ok(library) => library,
+        Err(e) => {
+            tracing::warn!(error = %e, "the host refused an empty pipeline library");
+            return None;
+        }
+    };
     Some(Library {
         library,
         _blob: Blob::None,
@@ -832,6 +863,16 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An empty library is made from a null blob (software adapter; under
+    /// Wine the adapter is not a software one and this is skipped).
+    #[cfg(windows)]
+    #[test]
+    fn an_empty_library_is_made_from_a_null_blob() {
+        let Some(device) = crate::inplace::tests::warp() else { return };
+        let device: ID3D12Device1 = device.cast().expect("ID3D12Device1");
+        empty(&device).expect("an empty pipeline library");
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
