@@ -2147,8 +2147,11 @@ fn is_write_combined(start: u64, len: u64) -> bool {
 
 /// Whether what shaders write into copies in the card's memory of
 /// write-combined title memory stays on the card and is not compared,
-/// fetched and merged into title memory (`VICTORY_WC_NO_BACK=1`; off by
-/// default: an experiment).
+/// fetched and merged into title memory. Always, for copies of
+/// [`wc_no_back_min`] and more (the switch `VICTORY_WC_NO_BACK` is gone: the
+/// launcher had set it in every run since run xd-wcnoback). In the unified
+/// memory model (docs/performance/UNIFIED_MEMORY_ARCHITECTURE.md) this is the
+/// class "written by the card, never read by the CPU": its home is the card.
 ///
 /// The write-back of shader writes (`Shadow::gpu_writes`: hashes after
 /// sends, compare passes after the lists, fetches of the pieces that differ
@@ -2171,20 +2174,17 @@ fn is_write_combined(start: u64, len: u64) -> bool {
 /// - Another host copy of the same bytes (a texture placed there) does not
 ///   see what shaders wrote through title memory.
 fn wc_no_back() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WC_NO_BACK").is_some_and(|v| v == "1"))
+    true
 }
 
 /// The smallest copy whose shader writes [`wc_no_back`] leaves on the card,
-/// in bytes (`VICTORY_WC_NO_BACK_MIN_KB`, 0 unset: all). With every copy
-/// left, the 4070 SUPER's cutscenes went near black (run xd-wcnoback,
-/// 2026-11-26: small results the title reads back, such as exposure, came
-/// back stale) while most of the saving is in a few ranges of hundreds of MB.
+/// in bytes: 1 MiB (the launcher's `VICTORY_WC_NO_BACK_MIN_KB=1024`, now the
+/// code's; the switch is gone). With every copy left, the 4070 SUPER's
+/// cutscenes went near black (run xd-wcnoback, 2026-11-26: small results the
+/// title reads back, such as exposure, came back stale) while most of the
+/// saving is in a few ranges of hundreds of MB.
 fn wc_no_back_min() -> u64 {
-    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MIN.get_or_init(|| {
-        std::env::var("VICTORY_WC_NO_BACK_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) * 1024
-    })
+    1 << 20
 }
 
 /// Bytes shaders were declared to write in write-combined copies and that
