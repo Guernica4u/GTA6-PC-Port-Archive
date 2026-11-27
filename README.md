@@ -144,11 +144,13 @@ The first launch after a build translates every shader and builds about
 
 If Wine or Proton's shader compiler cannot build the indirect argument
 clamp, VIctory retries with Microsoft's DirectX Shader Compiler (DXC).
-Use the x64 `dxcompiler.dll` from the [May 2025 DXC release or
-newer](https://github.com/microsoft/DirectXShaderCompiler/releases).
+Use an x64 `dxcompiler.dll` from the [DXC releases](https://github.com/microsoft/DirectXShaderCompiler/releases).
 Place it beside `victory.exe` or set `VICTORY_DXC` to its absolute
 Windows path. The fallback needs Shader Model 6.0 support from the
 D3D12 runtime.
+
+A related Wine test used DXC 1.9.2609. On native Windows, the February
+2025 Windows SDK build also compiled the clamp.
 
 ### Known problems
 
