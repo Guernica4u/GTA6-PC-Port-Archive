@@ -135,3 +135,45 @@ fn a_count_with_no_host_buffer_to_ask_is_refused() {
     let reason = translate(&buffered(&[&BUFFER, &[LAST]])).err().expect("refused");
     assert!(reason.contains("buffer record count read from a descriptor with no one host buffer"), "{reason}");
 }
+
+/// FSSM with one used-resource row and no user-data rows.
+fn fssm(used: [u32; 5]) -> Vec<u8> {
+    let mut program = vec![0u8; 0x110];
+    program[..8].copy_from_slice(b"FSSM\x01\x01\0\0");
+    for (rows, field, count) in [(&[][..], 0xe8, 0xf8), (&[used][..], 0xf0, 0xfc)] {
+        let offset = (program.len() - 16) as u64;
+        program[field..field + 8].copy_from_slice(&offset.to_le_bytes());
+        program[count..count + 4].copy_from_slice(&(rows.len() as u32).to_le_bytes());
+        program.extend(rows.iter().flatten().copied().flat_map(u32::to_le_bytes));
+    }
+    let size = (program.len() - 16) as u32;
+    program[8..12].copy_from_slice(&size.to_le_bytes());
+    program
+}
+
+/// The three programs `tools/check_buffer_count.py` runs on the GPU: the
+/// count of a raw, a structured (12-byte records) and a typed buffer.
+#[test]
+fn buffer_record_counts_for_the_gpu_check() {
+    let format_load = [0xe0000000, 0x80020000]; // buffer_load_format_x v0, off, s[8:11], 0
+    let mut text = String::new();
+    for (kind, ty, read, query) in [
+        ("raw", 4, READ, "uint n0; raw_sbuf1.GetDimensions(n0);"),
+        ("structured", 5, READ, "uint n0, st0; sbuf1.GetDimensions(n0, st0);"),
+        ("typed", 3, format_load, "uint n0; stb1.GetDimensions(n0);"),
+    ] {
+        let mut ex = tabled(&[&BUFFER, &[LAST], &read]);
+        ex.resources = vec![crate::psv::PsvResource { res_type: ty, space: 0, lower: 1, upper: 1 }];
+        if kind == "structured" {
+            // Slot 1 of table 0 (s4): a 12-byte record.
+            ex.fssm = fssm([0x300, 8, 1, 12, 0x404]);
+        }
+        let hlsl = translate(&ex).unwrap().hlsl;
+        assert!(hlsl.contains(query) && hlsl.contains("s10 = n0;"), "{kind}: {hlsl}");
+        if kind == "structured" {
+            assert!(hlsl.contains("struct TbElem_sbuf1 { uint w[3]; };"), "{hlsl}");
+        }
+        text.push_str(&format!("//// {kind}\n{hlsl}\n"));
+    }
+    println!("BEGIN_HLSL\n{text}END_HLSL");
+}
