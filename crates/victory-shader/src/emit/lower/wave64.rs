@@ -357,7 +357,10 @@ impl Lower<'_> {
                 let in_hi = self.s.m.cmp(c, pred::NE, hi, z);
                 let fhi = self.s.m.select(c, in_hi, fhi, z);
                 let in_lo = self.s.m.cmp(c, pred::NE, lo, z);
-                self.s.m.select(c, in_lo, flo, fhi)
+                let any = self.s.m.bin(c, Bin::Or, in_lo, in_hi);
+                let lane = self.s.m.select(c, in_lo, flo, fhi);
+                let me = self.console_lane(c);
+                self.s.m.select(c, any, lane, me)
             }
         };
         if self.split.is_none() {

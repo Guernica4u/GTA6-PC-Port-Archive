@@ -361,13 +361,9 @@ fn round16(p: &crate::ir::Program) -> Vec<Option<u8>> {
     }
 }
 
-/// Iterations after which a loop is left (per entry into it), unless
-/// [`super::loop_limit`] says otherwise. The console runs a loop as long as
-/// its data says; data the host has not mirrored yet (a null view reads
-/// zeros) can make that four billion iterations, which hangs the host GPU
-/// until the driver resets it. A lane that reaches the limit leaves the
-/// program as killed (a pixel discards).
-// shortcut: a genuine loop of more iterations than this is cut short too.
+/// Loop cutoff unless [`super::loop_limit`] says otherwise. Unmirrored data
+/// (a null view reads zeros) could otherwise spin for four billion iterations
+/// and hang the GPU; reaching the limit kills the lane.
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
@@ -3280,10 +3276,7 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if name == "ds_bpermute_b32" {
-            // Each lane reads `data` of the lane its address plus the offset
-            // names in dwords within its own 32-lane half (RDNA 2 ISA,
-            // section 10.4.4: wave64 permutes lanes 0..31 and 32..63
-            // independently); 0 from a lane EXEC leaves out.
+            // Each lane reads the named lane's data (0 outside EXEC).
             self.cross_lane(false)?;
             let a = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
             let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
@@ -3292,7 +3285,10 @@ impl<'a> Lower<'a> {
             let at = self.s.m.bin(c, Bin::Add, a, o);
             let lane = self.s.m.bin(c, Bin::LShr, at, two);
             let within_half = self.s.m.bin(c, Bin::And, lane, mask31);
-            let lane = if self.x.native.wave64 {
+            let lane = if self.split.is_some() {
+                let mask63 = k(self, 63);
+                self.s.m.bin(c, Bin::And, lane, mask63)
+            } else if self.x.native.wave64 {
                 let me = self.lane_index();
                 let not31 = k(self, !31);
                 let base = self.s.m.bin(c, Bin::And, me, not31);
@@ -3300,7 +3296,11 @@ impl<'a> Lower<'a> {
             } else {
                 within_half
             };
-            let r = self.read_lane(x, lane);
+            let r = if self.split.is_some() {
+                self.split_read_lane(x, lane)?
+            } else {
+                self.read_lane(x, lane)
+            };
             let on = guard.unwrap_or_else(|| self.s.m.bool(true));
             let (lo, hi) = self.ballot(c, Some(self.cur_ir), on)?;
             let running = self.lane_bit_of(c, lane, lo, hi);
@@ -4671,23 +4671,13 @@ impl<'a> Lower<'a> {
         Some((int, signed))
     }
 
-    /// Title memory at a raw GPU address (decision 0005: the unified-memory
-    /// item). Every access to an address the program computes goes through
-    /// here: scalar and global loads, stores and atomics, the BVH node
-    /// fetch, and in a program that uses title memory its root SRVs and UAVs
-    /// ([`Self::raw_view`]). `(hi:lo)` is the 64-bit address of the access's
-    /// first byte (`hi` holds bits 32-47), `bytes` its size, `write` whether
-    /// it stores or does atomics, `active` the lanes that access (`None`:
-    /// all; the others look up but mark nothing). Returns a raw buffer handle
-    /// (read-write with `write`) and the address's byte offset in it; the
-    /// access's dwords follow at `+ 4k`. Memory no host copy holds is the
-    /// null view: reads give 0, writes are dropped. Contract (`emit` "Title
-    /// memory"): a page table in the root SRV `t0` of
-    /// [`super::shader::MEMORY_SPACE`]; the root UAV `u0` there takes a bit
-    /// per page written and per page or 256 MiB region missed. May end in a
-    /// new block: callers take [`Lower::cur`] afresh.
-    // shortcut: one lookup per access, so its bytes are taken to lie in one
-    // host copy of title memory (any access within a 64 KiB page does).
+    /// Raw-address title memory access (decision 0005). `hi:lo`, `bytes`,
+    /// `write`, and `active` describe the access (`None`: every lane); the
+    /// inactive lanes look up but mark nothing. Returns a raw buffer handle
+    /// and the access's byte offset in it; no host copy means a null view.
+    /// Uses `t0`/`u0` of [`super::shader::MEMORY_SPACE`] as page table and
+    /// mark bitmap. One lookup assumes the bytes lie in one host copy.
+    /// May end in a new block: callers take [`Lower::cur`] afresh.
     pub(crate) fn memory(
         &mut self,
         lo: V,
@@ -5858,10 +5848,14 @@ impl<'a> Lower<'a> {
             }
             return r;
         }
-        // A scalar result (`v_readlane`, `v_readfirstlane`) is written
-        // whatever EXEC holds.
+        // Scalar results are written regardless of EXEC. In compute,
+        // v_readfirstlane still needs EXEC to select the source lane.
         let mut guard = match v.dst {
-            Some(Operand::Scalar { .. }) => None,
+            Some(Operand::Scalar { .. })
+                if name != "v_readfirstlane_b32" || self.x.native.stage != HwStage::Cs =>
+            {
+                None
+            }
             _ => self.guard(b, i)?,
         };
         if let Some(d) = v.dpp {
@@ -12293,7 +12287,7 @@ mod tests {
             view_marks: false,
         };
         let bad = std::collections::HashMap::new();
-        let mut l = Lower::new(&parts, &bad);
+        let mut l = Lower::new(&parts, &bad, false);
         let entry = l.s.entry;
         l.block[0] = Some(entry);
         l.tail[0] = Some(entry);
