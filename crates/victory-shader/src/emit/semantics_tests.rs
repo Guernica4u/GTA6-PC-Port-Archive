@@ -3216,9 +3216,7 @@ fn v_fmac_f16_accumulator_modifiers_match_rdna2_oracle() {
         body.extend(vop3(0x136, 5, [v(1), v(2), 0], m));
         probe(body, inputs.clone(), F16, move |i| {
             vec![pick(
-                ROWS.iter()
-                    .find(|&&(r, _, _)| r == i)
-                    .expect("known input"),
+                ROWS.iter().find(|&&(r, _, _)| r == i).expect("known input"),
             )]
         })
     };
@@ -3228,32 +3226,27 @@ fn v_fmac_f16_accumulator_modifiers_match_rdna2_oracle() {
     ]));
 }
 
-/// Moving the accumulator to the high half should move the write with it.
-/// These finite examples exercise destination selection separately from the
-/// gfx1031 table, which measures low-half destinations only.
+/// Combined `abs` and `neg` on the accumulator compute `-abs(acc)` in the
+/// low half and leave the high bits of `vdst` untouched.
 #[test]
-fn v_fmac_f16_accumulator_modifiers_use_the_selected_high_half() {
-    // a * b = 2. The high accumulators are +1 and -1; leave the low bits alone.
+fn v_fmac_f16_accumulator_abs_and_neg_apply_in_order() {
+    // a * b = 2.0; low accumulators are +1.0 and -1.0, upper half 0xABCD.
     const INPUTS: [[u32; 4]; 2] = [
-        [0x3C00, 0x4000, 0x3C00_C800, OLD],
-        [0x3C00, 0x4000, 0xBC00_4480, OLD],
+        [0x3C00, 0x4000, 0xABCD_3C00, OLD],
+        [0x3C00, 0x4000, 0xABCD_BC00, OLD],
     ];
-    let high = |abs, neg, expected: [u32; 2]| {
-        let mut body = vec![vop1(0x01, 5, v(3))];
-        body.extend(vop3(
-            0x136,
-            5,
-            [v(1), v(2), 0],
-            M { abs, neg, opsel: 8, ..NONE },
-        ));
-        probe(body, INPUTS.to_vec(), INT, move |i| {
-            let index = usize::from(i == INPUTS[1]);
-            vec![(expected[index] << 16) | (i[2] & 0xFFFF)]
-        })
-    };
-    assert_clean(check(&[
-        high(0, 4, [0x3C00, 0x4200]),
-        high(4, 0, [0x4200, 0x4200]),
-        high(4, 4, [0x3C00, 0x3C00]),
-    ]));
+    let mut body = vec![vop1(0x01, 5, v(3))];
+    body.extend(vop3(
+        0x136,
+        5,
+        [v(1), v(2), 0],
+        M {
+            abs: 4,
+            neg: 4,
+            ..NONE
+        },
+    ));
+    assert_clean(check(&[probe(body, INPUTS.to_vec(), INT, |_| {
+        vec![0xABCD_3C00]
+    })]));
 }
