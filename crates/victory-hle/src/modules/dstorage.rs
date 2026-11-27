@@ -1424,7 +1424,9 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         let n = hit.bytes();
         let mut hit = Some(hit);
         let served = into_destination(request, size, |out| match hit.take() {
-            Some(hit) if n <= out.len() && hit.read_into(&mut out[..n]) => Ok(n),
+            Some(hit) if n <= out.len() => {
+                if hit.read_into(&mut out[..n]) { Ok(n) } else { Err(INVALID_DATA) }
+            }
             _ => Err(INVALID_DATA),
         });
         if served.is_ok() {
