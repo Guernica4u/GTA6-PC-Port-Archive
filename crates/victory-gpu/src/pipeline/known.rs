@@ -197,6 +197,56 @@ pub fn keys(dir: &Path) -> Vec<String> {
     all
 }
 
+/// The numbers of the pipelines known in `dir` with a compute program that
+/// this process's switches let in although runs leave it out by default
+/// (`make::let_in_names`: the ray-tracing resolves and ray activation of
+/// `VICTORY_RT_RESOLVE=1` and `VICTORY_ACTIVATE_RAYS=1`). No run without the
+/// switch drew with them, so the early list does not have them.
+pub fn let_in(dir: &Path) -> HashSet<usize> {
+    in_programs_named(dir, &super::make::let_in_names())
+}
+
+fn in_programs_named(dir: &Path, names: &[&[u8]]) -> HashSet<usize> {
+    let mut found = HashSet::new();
+    if names.is_empty() {
+        return found;
+    }
+    let mut places = Vec::new();
+    walk_shaders(dir, |stage, hash, at, len| {
+        if STAGES.get(usize::from(stage)) == Some(&"compute") {
+            places.push((hash, at, len));
+        }
+    });
+    let mut named = HashSet::new();
+    if let Ok(mut file) = std::fs::File::open(dir.join(SHADERS)) {
+        let mut bytes = Vec::new();
+        for (hash, at, len) in places {
+            bytes.resize(len as usize, 0);
+            if file.seek(SeekFrom::Start(at)).is_ok()
+                && file.read_exact(&mut bytes).is_ok()
+                && names.iter().any(|n| bytes.windows(n.len()).any(|w| w == *n))
+            {
+                named.insert(hash);
+            }
+        }
+    }
+    if named.is_empty() {
+        return found;
+    }
+    walk_pipelines(dir, |n, entry| {
+        let Some((&count, mut rest)) = entry.get(16..).and_then(<[u8]>::split_first) else { return };
+        for _ in 0..count {
+            let Some((head, after)) = rest.split_first_chunk::<33>() else { return };
+            rest = after;
+            if named.contains(&head[1..]) {
+                found.insert(n);
+                return;
+            }
+        }
+    });
+    found
+}
+
 /// What a driver's cached pipelines depend on besides the title's: the
 /// translator with its settings, and the driver.
 pub fn fingerprint() -> String {
@@ -476,5 +526,40 @@ mod tests {
         assert_eq!(walk_shaders(&dir, |stage, hash, at, len| seen.push((stage, hash[0], at, len))), one);
         assert_eq!(seen, [(5, 9, 37, 4)]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The pipelines `let_in` finds: those with a compute program whose
+    /// container names one of the programs, not a pixel program that does.
+    #[test]
+    fn pipelines_are_found_by_their_compute_programs_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut shaders = Vec::new();
+        let mut put = |stage: u8, tag: u8, code: &[u8]| {
+            shaders.push(stage);
+            shaders.extend([tag; 32]);
+            shaders.extend((code.len() as u32).to_le_bytes());
+            shaders.extend(code);
+        };
+        put(5, 1, b"..CS_RaytracingResolve_Opaque..");
+        put(5, 2, b"..CS_Other..");
+        put(1, 3, b"..CS_RaytracingResolve..");
+        std::fs::write(dir.path().join(SHADERS), &shaders).unwrap();
+        let mut pipelines = Vec::new();
+        for (n, programs) in [[(5u8, 2u8)].as_slice(), &[(5, 1)], &[(1, 3)], &[(0, 9), (5, 1)]].iter().enumerate() {
+            let mut entry = vec![n as u8; 16];
+            entry.push(programs.len() as u8);
+            for &(stage, tag) in *programs {
+                entry.push(stage);
+                entry.extend([tag; 32]);
+            }
+            entry.push(0);
+            pipelines.extend((entry.len() as u32).to_le_bytes());
+            pipelines.extend(entry);
+        }
+        std::fs::write(dir.path().join(PIPELINES), &pipelines).unwrap();
+        let found = in_programs_named(dir.path(), &[b"CS_RaytracingResolve"]);
+        assert_eq!(found, HashSet::from([1, 3]));
+        assert!(in_programs_named(dir.path(), &[]).is_empty());
+        assert!(in_programs_named(dir.path(), &[b"CS_Nothing"]).is_empty());
     }
 }

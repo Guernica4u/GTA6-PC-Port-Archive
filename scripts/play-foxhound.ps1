@@ -7,6 +7,14 @@
 #   .\scripts\play-foxhound.ps1 -Exe ... -SeriesS             Series S profile (1280x720 inside, faster, softer)
 #   .\scripts\play-foxhound.ps1 -Exe ... -Build diag          diagnostics build (slower; captures, timelines)
 #   .\scripts\play-foxhound.ps1 -Exe ... -More @{VICTORY_AMBIENT_SPECULAR='0'}   add or override switches
+#   .\scripts\play-foxhound.ps1 -Exe ... -Rays off            without the fix of the violet stain on paper and posters
+#   .\scripts\play-foxhound.ps1 -Exe ... -SkipWarm            no `victory warm` before the game
+#   .\scripts\play-foxhound.ps1 -Exe ... -WarmOnly            `victory warm` with these settings, then stop
+#
+# Before the game, `victory warm --used` makes ahead the pipelines earlier runs drew with, and those -Rays lets in,
+# so that the driver's own cache has them: after a new build, a new driver or other settings, minutes at the first
+# start (its progress is shown), then seconds; a stamp in the cache's pipelines folder (warm-stamp.txt) says for
+# which build and settings it was done.
 #
 # In the game, F1 opens a settings menu (arrow keys pick and change, Enter does it). What it saves goes to
 # victory-settings.txt in the repository's folder and is applied here at every start, over the options above;
@@ -34,6 +42,14 @@ param(
     # Frames begin every 1/Fps s whatever the title asks (it asks 1/30). 1000, the default: no cap, a frame
     # begins as soon as the last is done. 30: the title's own rate.
     [ValidateRange(1, 1000)][int]$Fps = 1000,
+    # The violet stain on paper, posters and signs: gone with the title's ray-tracing resolve
+    # (VICTORY_RT_RESOLVE=1) and its screen probes' ray activation (VICTORY_ACTIVATE_RAYS=1), both left out without
+    # them. both: the two; resolve, activate: that one alone; off: neither (the stain, as before).
+    [ValidateSet('both', 'resolve', 'activate', 'off')][string]$Rays = 'activate',
+    [switch]$SkipWarm,
+    [switch]$WarmOnly,
+    # Another victory.exe than target\<Build>\victory.exe.
+    [string]$Victory,
     [hashtable]$More = @{}
 )
 $repo = Split-Path $PSScriptRoot -Parent
@@ -84,6 +100,8 @@ $settings = @{
     # Pipelines the title makes are written down, so `victory warm` can make them ahead
     VICTORY_PIPELINE_BOOK = '1'
 }
+if ($Rays -in 'both', 'resolve') { $settings.VICTORY_RT_RESOLVE = '1' }
+if ($Rays -in 'both', 'activate') { $settings.VICTORY_ACTIVATE_RAYS = '1' }
 if (-not $SeriesS) {
     if ($Res -eq '1440') { $settings.VICTORY_NATIVE_1440P = '1' }
     elseif ($Res -eq '1080to1440') { $settings.VICTORY_RENDER_1080P = '1' }
@@ -120,9 +138,12 @@ $settings.VICTORY_MENU_FRAMEGEN = if ($settings.VICTORY_FRAMEGEN -eq '1') { [str
 $settings.VICTORY_MENU_FPS = [string]$fpsWanted
 $settings.VICTORY_MENU_FILE = $menuFile
 $settings.VICTORY_MENU_PLAY = $MyInvocation.MyCommand.Path
-$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })"
+$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build -Rays $Rays" +
+    $(if ($NoFrameGenReady) { ' -NoFrameGenReady' }) + $(if ($SkipWarm) { ' -SkipWarm' }) +
+    $(if ($Victory) { " -Victory '$($Victory -replace "'", "''")'" })
 
-$victory = Join-Path $repo "target\$Build\victory.exe"
+$victory = if ($Victory) { $Victory } else { Join-Path $repo "target\$Build\victory.exe" }
+if ($Victory -and -not (Test-Path -LiteralPath $victory)) { Write-Host "No $victory."; return }
 if (-not (Test-Path $victory)) {
     # Not built yet: built here, once.
     if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) { Write-Host "No $victory, and no cargo to build it with: install Rust (README), then start this again."; return }
@@ -134,11 +155,14 @@ if (-not (Test-Path $victory)) {
     } finally { Pop-Location }
     if (-not (Test-Path $victory)) { Write-Host "The build did not make $victory."; return }
 }
-if (-not (Test-Path -LiteralPath $Exe)) { Write-Host "No $Exe."; return }
+if (-not $WarmOnly -and -not (Test-Path -LiteralPath $Exe)) { Write-Host "No $Exe."; return }
 # Switches left over in this window are cleared; path settings stay (victory.toml gives them otherwise).
 $paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_STREAMLINE_DIR'
 Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
-foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
+# Settings that change neither the translated shaders nor which pipelines are made: not in the warm's stamp, and
+# not given to `victory warm` (with VICTORY_DLSS each of its processes would load Streamline).
+$notWarm = '^VICTORY_(MENU_|DLSS|FRAMEGEN|STREAMLINE_DIR$|TEXTURE_ROOM_PERCENT$|FRAME_INTERVAL_)'
+foreach ($k in $settings.Keys) { if ($k -notmatch $notWarm) { Set-Item "Env:$k" $settings[$k] } }
 
 $logs = Join-Path $env:LOCALAPPDATA 'victory\logs'; New-Item -ItemType Directory -Force $logs | Out-Null
 $log = Join-Path $logs ('foxhound-{0:yyyyMMdd-HHmmss}.log' -f (Get-Date))
@@ -146,5 +170,22 @@ $writer = [IO.StreamWriter]::new($log, $false, [Text.UTF8Encoding]::new($false))
 $writer.WriteLine("# console=$console build=$Build switches: " + (($settings.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' '))
 Write-Host "Log: $log"
 Push-Location $repo   # victory.toml is read from here
-try { & $victory run $Exe --console $console --execute 2>&1 | ForEach-Object { $line = "$_"; $writer.WriteLine($line); $line } }
+try {
+    if (-not $SkipWarm) {
+        # The stamp: this victory.exe, the card's driver and the settings that matter to the warm.
+        $driver = @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | ForEach-Object { $_.DriverVersion } | Sort-Object) -join ','
+        $warmSettings = @($settings.Keys | Where-Object { $_ -notmatch $notWarm } | Sort-Object | ForEach-Object { "$_=$($settings[$_])" }) -join ' '
+        $text = (Get-FileHash -LiteralPath $victory -Algorithm SHA256).Hash + "|$driver|$warmSettings"
+        $sha = [Security.Cryptography.SHA256]::Create()
+        $stamp = ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($text))) -replace '-', '').Substring(0, 32)
+        $sha.Dispose()
+        Write-Host "Pipelines: making ahead what this build and these settings draw with (minutes after a change; -SkipWarm skips it) ..."
+        $writer.WriteLine("# victory warm --used --stamp $stamp")
+        & $victory warm --used --stamp $stamp 2>&1 | ForEach-Object { $line = "$_"; $writer.WriteLine($line); $line }
+        if ($LASTEXITCODE) { Write-Host "victory warm ended with $LASTEXITCODE; the game's first minutes may stutter." }
+    }
+    if ($WarmOnly) { return }
+    foreach ($k in $settings.Keys) { if ($k -match $notWarm) { Set-Item "Env:$k" $settings[$k] } }
+    & $victory run $Exe --console $console --execute 2>&1 | ForEach-Object { $line = "$_"; $writer.WriteLine($line); $line }
+}
 finally { Pop-Location; $writer.Dispose() }

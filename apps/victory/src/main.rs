@@ -122,9 +122,16 @@ enum Command {
         /// Those made before too.
         #[arg(long)]
         again: bool,
-        /// Only the pipelines earlier runs drew with.
+        /// Only the pipelines earlier runs drew with, and those that this
+        /// run's switches let in (`VICTORY_RT_RESOLVE=1`,
+        /// `VICTORY_ACTIVATE_RAYS=1`), which runs without them never drew with.
         #[arg(long)]
         used: bool,
+        /// Nothing is done if the last whole warm in this cache was given the
+        /// same text (`pipelines/warm-stamp.txt`); a whole warm writes it.
+        /// The launcher gives the build's and the settings' hash.
+        #[arg(long)]
+        stamp: Option<String>,
         /// (What the processes it starts are given.)
         #[arg(long, hide = true)]
         these: Option<String>,
@@ -267,7 +274,7 @@ fn main() -> Result<()> {
         }
         Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
         #[cfg(windows)]
-        Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
+        Command::Warm { jobs, limit, again, used, stamp, these } => warm::run(jobs, limit, again, used, these, stamp),
         #[cfg(windows)]
         Command::Play(_) => unreachable!("handled above"),
         #[cfg(windows)]

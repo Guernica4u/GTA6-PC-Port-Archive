@@ -26,10 +26,27 @@ fn folder() -> Result<PathBuf> {
     Ok(cfg.cache_subdir("shaders")?.with_file_name("pipelines"))
 }
 
-pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, these: Option<String>) -> Result<()> {
+/// Where `--stamp` is kept: what the last whole warm was for.
+const STAMP: &str = "warm-stamp.txt";
+
+pub fn run(
+    jobs: Option<usize>,
+    limit: Option<usize>,
+    again: bool,
+    used: bool,
+    these: Option<String>,
+    stamp: Option<String>,
+) -> Result<()> {
     let dir = folder()?;
     if let Some(these) = these {
         return make(&dir, &these);
+    }
+    let stamp_file = dir.join(STAMP);
+    if let Some(stamp) = &stamp
+        && std::fs::read_to_string(&stamp_file).is_ok_and(|was| was.trim() == stamp.trim())
+    {
+        println!("pipelines already warm for this build and these settings ({})", stamp_file.display());
+        return Ok(());
     }
     let began = Instant::now();
     victory_hle::known_pipelines::use_translations(dir.with_file_name("shaders"));
@@ -50,11 +67,17 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     let bad: HashSet<&str> = bad.lines().filter_map(|l| l.split(' ').next()).collect();
     let early = std::fs::read_to_string(dir.join("early-pipelines.txt")).unwrap_or_default();
     let early: HashSet<&str> = early.lines().collect();
+    // With --used, also those this run's switches let in (VICTORY_RT_RESOLVE=1,
+    // VICTORY_ACTIVATE_RAYS=1): runs without the switch left them out, so no
+    // run drew with them and the early list does not have them.
+    let let_in = if used { known::let_in(&dir) } else { HashSet::new() };
     // Those earlier runs drew with first, the others in no order (by key).
     let mut all: Vec<usize> = (0..keys.len())
         .filter(|&n| {
             let key = keys[n].as_str();
-            (again || !done.contains(key)) && !bad.contains(key) && (!used || early.contains(key))
+            (again || !done.contains(key))
+                && !bad.contains(key)
+                && (!used || early.contains(key) || let_in.contains(&n))
         })
         .collect();
     all.sort_by_key(|&n| (!early.contains(keys[n].as_str()), &keys[n]));
@@ -62,15 +85,18 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
     let jobs = jobs.unwrap_or(cores * 2 / 3).max(1);
     println!(
-        "{} pipelines known, {} made before ({fingerprint}), {} bad; {} to make, {jobs} processes",
+        "{} pipelines known, {} made before ({fingerprint}), {} bad, {} let in by this run's switches; {} to make, {jobs} processes",
         keys.len(),
         done.len(),
         bad.len(),
+        let_in.len(),
         all.len()
     );
     let chunks: Vec<&[usize]> = all.chunks(AT_ONCE).collect();
     let next = AtomicUsize::new(0);
     let state = Mutex::new((Vec::<f64>::new(), 0usize, 0usize));
+    // When progress was last told: every 5 s, and every 1,000.
+    let told = Mutex::new(Instant::now());
     let done_out = Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(&done_file)?);
     // (Read back by the runs: these are made beside the others, not before.)
     let slow_out = Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(dir.join("slow-pipelines.txt"))?);
@@ -89,9 +115,12 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
                             state.0.push(ms);
                             state.1 += usize::from(!there);
                             let count = state.0.len();
-                            if count % 1000 == 0 {
+                            let mut told = lock(&told);
+                            if count % 1000 == 0 || told.elapsed() >= Duration::from_secs(5) {
+                                *told = Instant::now();
                                 println!("{count} of {}, {:.0} s", all.len(), began.elapsed().as_secs_f64());
                             }
+                            drop(told);
                             drop(state);
                             let _ = writeln!(lock(&done_out), "{fingerprint} {}", keys[n]);
                         });
@@ -124,6 +153,14 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
         times.last().copied().unwrap_or(0.0),
         times.iter().sum::<f64>() / 1e3
     );
+    // A whole pass (not one cut short by --limit) is what the stamp says;
+    // one stopped half way writes none, and the next goes on where it was.
+    if let Some(stamp) = stamp
+        && limit.is_none()
+        && let Err(e) = std::fs::write(&stamp_file, stamp.trim())
+    {
+        println!("no {}: {e}", stamp_file.display());
+    }
     Ok(())
 }
 

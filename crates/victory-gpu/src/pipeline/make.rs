@@ -99,8 +99,21 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     if water_light_left_out(shaders) {
         return Some("the water's tiled light on a host of 32-lane waves (dark blocks; VICTORY_WATER_LIGHT=1 runs it), left out");
     }
-    static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
-    let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
+    if skip_rt_resolve() && named(shaders, RT_RESOLVE) {
+        return Some("shades ray-tracing hits without BVH, left out");
+    }
+    if skip_activate_rays() && named(shaders, ACTIVATE_RAYS) {
+        return Some("ray activation shader without BVH, left out");
+    }
+    None
+}
+
+const RT_RESOLVE: &[u8] = b"CS_RaytracingResolve";
+const ACTIVATE_RAYS: &[u8] = b"CS_ScreenProbes_ActivateRays";
+
+fn skip_rt_resolve() -> bool {
+    static SKIP: OnceLock<bool> = OnceLock::new();
+    *SKIP.get_or_init(|| {
         let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
         if builder {
             return false;
@@ -108,22 +121,35 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
         // Without BVH, ~1,000 CS_RaytracingResolve shaders shade no hits while
         // clogging the cold compiler queue; skip unless VICTORY_RT_RESOLVE=1.
         std::env::var_os("VICTORY_RT_RESOLVE").is_none_or(|v| v == "0")
-    });
-    if skip_rt && named(shaders, b"CS_RaytracingResolve") {
-        return Some("shades ray-tracing hits without BVH, left out");
-    }
-    static SKIP_ACTIVATE_RAYS: OnceLock<bool> = OnceLock::new();
-    let skip_activate = *SKIP_ACTIVATE_RAYS.get_or_init(|| {
+    })
+}
+
+fn skip_activate_rays() -> bool {
+    static SKIP: OnceLock<bool> = OnceLock::new();
+    *SKIP.get_or_init(|| {
         let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
         if builder {
             return std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0");
         }
         std::env::var_os("VICTORY_ACTIVATE_RAYS").is_none_or(|v| v == "0")
-    });
-    if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
-        return Some("ray activation shader without BVH, left out");
+    })
+}
+
+/// The compute programs left out unless a switch lets them in, that this
+/// process's switches let in (`VICTORY_RT_RESOLVE=1`, `VICTORY_ACTIVATE_RAYS=1`
+/// or `VICTORY_BVH_BUILDER=1`). Runs without the switch never drew with them,
+/// so they are not in the early list: `victory warm --used` makes them too
+/// (`known::let_in`), else the first run with the switch compiles some 1,000
+/// of them while it draws (3 to 9 fps for minutes).
+pub(crate) fn let_in_names() -> Vec<&'static [u8]> {
+    let mut names = Vec::new();
+    if !skip_rt_resolve() {
+        names.push(RT_RESOLVE);
     }
-    None
+    if !skip_activate_rays() {
+        names.push(ACTIVATE_RAYS);
+    }
+    names
 }
 
 /// Confirmed first-scene producers. Prepare these at creation even on a cold
