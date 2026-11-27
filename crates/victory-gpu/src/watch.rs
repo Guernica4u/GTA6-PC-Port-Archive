@@ -563,7 +563,14 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     // askings a frame with the switch on, as without it). They are asked
     // here, once; what is not write-watched stays with `writes`.
     let mut written = Vec::new();
-    for &(start, end) in ranges {
+    // Widest first at each start: a range inside one asked just before is
+    // answered by it and not asked again (the order the lists refreshed
+    // them in asked a small range, then the big one holding it, both).
+    // Which ranges are asked is a subset of before; the pages found are the
+    // same, and all of them are noted under the one number below.
+    let mut ordered: Vec<(usize, usize)> = ranges.to_vec();
+    ordered.sort_unstable_by_key(|&(start, end)| (start, std::cmp::Reverse(end)));
+    for (start, end) in ordered {
         if start >= end || published(start, end) {
             continue;
         }
