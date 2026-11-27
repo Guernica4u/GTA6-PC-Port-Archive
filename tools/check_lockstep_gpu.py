@@ -4,9 +4,10 @@
 Each synthetic wave32 program branches on a lane mask, then runs a reduction
 behind a mask branch, which the translator can only express by branching with
 the whole wave. One program also runs as a ray tracing resolve shader, whose
-interleaved loops go through the block dispatcher. Two more read a lane inside
-a loop that lanes leave at different times: a sum for each distinct key, and a
-read of lanes that have already left. The reference models the console: one program counter per wave,
+interleaved loops go through the block dispatcher, and another exchanges lanes
+in that mode. Two more read a lane inside a loop that lanes leave at different
+times: a sum for each distinct key, and a read of lanes that have already left.
+The reference models the console: one program counter per wave,
 shared scalar registers and per-lane vector writes under EXEC. Only the
 translator's input and output are instrumented. No game data is needed.
 """
@@ -36,6 +37,12 @@ REDUCTION = [0xbe803dc1, 0xd5010002, 0x00020080, 0x4a0404e9, 0xde54c102, 0x4a040
              0xd7600007, 0x00010102, 0xbefe0300]
 OUTPUTS = ("s20", "s21", "v10", "s7")
 COMPARE = f"v_cmp_lt_u32_e32 vcc_lo, 0x{LIMIT:x}, v0"
+# Lanes exchanged in the ray tracing resolve mode: reversed within each quad,
+# then swapped with the neighbour. A lane EXEC has not got gives zero. A scalar
+# write behind a branch on EXEC follows, as in that mode's other program.
+SWIZZLES = ["ds_swizzle_b32 v11, v0 offset:0x801b", "ds_swizzle_b32 v10, v11 offset:0x041f", COMPARE,
+            "s_and_saveexec_b32 s10, vcc_lo", ("branch", "s_cbranch_execz", "done"), "s_mov_b32 s20, 7",
+            ("label", "done"), "s_mov_b32 exec_lo, s10"]
 
 
 def label(name):
@@ -193,6 +200,10 @@ def model(name, active, values):
     some = any(taken)
     s20 = s21 = 0
     v10 = [0] * len(values)
+    if name == "swizzle":
+        v11 = [values[i ^ 3] if active[i] and active[i ^ 3] else 0 for i in lanes]
+        v10 = [v11[i ^ 1] if active[i] and active[i ^ 1] else 0 for i in lanes]
+        s20, name = 7 * some, "none"
     if name == "vccz":
         s20 = int(some)
         v10 = [s20 if active[i] else 0 for i in lanes]
@@ -221,7 +232,7 @@ def model(name, active, values):
             v10 = [v10[i] + int(taken[i]) for i in lanes]
             s22 += 1
             at = "outer" if s20 < 3 else "inner" if s22 < 6 else None
-    else:
+    elif name != "none":
         raise ValueError(name)
     total = sum(v for v, a in zip(values, active) if a) & 0xffffffff if any(active) else 0
     return [(s20, s21, v10[i], total) for i in lanes]
@@ -282,8 +293,9 @@ def main(argv=None):
         trial = Path(tmp)
         expected, shaders = {}, {}
         bodies = BODIES | LANE_READ_BODIES
-        for name, body, resolve in [*((name, name, False) for name in bodies), ("resolve", "dispatch", True)]:
-            words = words_of(program(bodies[body], resolve), args.llvm_mc)
+        for name, body, resolve in [*((name, name, False) for name in bodies), ("resolve", "dispatch", True),
+                                    ("swizzle", "swizzle", True)]:
+            words = words_of(program(SWIZZLES if body == "swizzle" else bodies[body], resolve), args.llvm_mc)
             emitted = subprocess.check_output(
                 [args.emitter.resolve(), *(["resolve"] if resolve else []), str(WIDTH),
                  *(f"{word:08x}" for word in words)], text=True, timeout=30)
