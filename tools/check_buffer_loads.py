@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Read back what translated buffer loads return from buffers of known contents.
+"""Read back what translated buffer loads, stores and atomics do to buffers of known contents.
 
 Generate the input HLSL with:
   cargo test --manifest-path tools/shader-compiler/Cargo.toml --target x86_64-unknown-linux-gnu buffer_loads_for_the_gpu_check -- --nocapture
 Save the text between BEGIN_HLSL and END_HLSL as the --hlsl file. It holds one
-program after each `//// name kind first registers` line.
+program after each `//// name kind registers | expected` line.
 
 Each program loads a descriptor and reads words through it: scalar loads from a
 constant buffer, scalar and vector loads from a raw buffer, and format loads
 from a typed buffer. The buffer holds a different known word at every position,
 so a load from the wrong place, of the wrong width or in the wrong order shows.
+Stores and atomics run in one thread on a writable buffer and read back what
+they left.
 Only the output is instrumented. No game data is needed.
 """
 from pathlib import Path
@@ -50,12 +52,17 @@ def replace(text, old, new):
 programs = {}
 for section in args.hlsl.read_text().split("//// ")[1:]:
     header, source = section.split("\n", 1)
-    name, kind, first, *registers = header.split()
-    source = replace(source, "[numthreads(32, 1, 1)]", "RWByteAddressBuffer output : register(u0);\n[numthreads(32, 1, 1)]")
+    left, right = header.split(" | ")
+    name, kind, *registers = left.split()
+    # `pN` is word N of the source buffer as it was; anything else is a literal.
+    wanted = [pattern(int(token[1:])) if token[0] == "p" else int(token, 16) for token in right.split()]
+    assert len(wanted) == len(registers), name
+    threads = "[numthreads(1, 1, 1)]" if kind.endswith("-write") else "[numthreads(32, 1, 1)]"
+    source = replace(source, threads, "RWByteAddressBuffer output : register(u0);\n" + threads)
     stores = "".join(f"    output.Store({4 * j}u, {register});\n" for j, register in enumerate(registers))
     body, closing = source.rstrip().rsplit("}", 1)
     assert not closing.strip(), name
-    programs[name] = (kind, int(first), len(registers), body + stores + "}\n")
+    programs[name] = (kind, wanted, body + stores + "}\n")
 assert programs, "no programs in the --hlsl file"
 
 RANGES = {"constant": "D3D12_DESCRIPTOR_RANGE_TYPE_CBV", "raw": "D3D12_DESCRIPTOR_RANGE_TYPE_SRV",
@@ -64,23 +71,40 @@ guest = (p / "tools/reference/independent-shaders/compute.cpp").read_text()
 guest = replace(guest, "D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0};", """std::string source_kind;
     if (!(std::ifstream(name + ".kind") >> source_kind))
         throw std::runtime_error("missing buffer kind for " + name);
+    const bool writable = source_kind == "raw-write" || source_kind == "typed-write";
     D3D12_DESCRIPTOR_RANGE range[]{{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0},
-        {source_kind == "constant" ? D3D12_DESCRIPTOR_RANGE_TYPE_CBV : D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1, 0, 1}};""")
+        {source_kind == "constant" ? D3D12_DESCRIPTOR_RANGE_TYPE_CBV
+         : writable ? D3D12_DESCRIPTOR_RANGE_TYPE_UAV : D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1, 0, 1}};""")
 guest = replace(guest, "table.DescriptorTable = {1, &range};", "table.DescriptorTable = {2, range};")
 guest = replace(guest, "D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1,", "D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,")
 guest = replace(guest, "    D3D12_COMMAND_QUEUE_DESC qd{};", f"""    // The source buffer, with a different word at every position.
     const UINT source_words = {SOURCE_WORDS};
-    auto source = buffer(device, source_words * 4, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    auto source_seed = buffer(device, source_words * 4, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     {{
         UINT *mapped{{}};
-        check(source->Map(0, nullptr, reinterpret_cast<void **>(&mapped)), "map source");
+        check(source_seed->Map(0, nullptr, reinterpret_cast<void **>(&mapped)), "map source");
         for (UINT i = 0; i < source_words; ++i)
             mapped[i] = 0x41000000u + 0x101u * i;
-        source->Unmap(0, nullptr);
+        source_seed->Unmap(0, nullptr);
     }}
+    // A writable buffer can't live in the upload heap, so it gets a copy before the dispatch.
+    auto source = writable ? buffer(device, source_words * 4, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST,
+                                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) : source_seed;
     auto source_handle = heap->GetCPUDescriptorHandleForHeapStart();
     source_handle.ptr += device->GetDescriptorHandleIncrementSize(hd.Type);
-    if (source_kind == "constant") {{
+    if (writable) {{
+        D3D12_UNORDERED_ACCESS_VIEW_DESC view{{}};
+        view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        if (source_kind == "raw-write") {{
+            view.Format = DXGI_FORMAT_R32_TYPELESS;
+            view.Buffer.NumElements = source_words;
+            view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        }} else {{
+            view.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            view.Buffer.NumElements = source_words / 4;
+        }}
+        device->CreateUnorderedAccessView(source.Get(), nullptr, &view, source_handle);
+    }} else if (source_kind == "constant") {{
         D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{{source->GetGPUVirtualAddress(), source_words * 4}};
         device->CreateConstantBufferView(&cbv, source_handle);
     }} else {{
@@ -100,6 +124,12 @@ guest = replace(guest, "    D3D12_COMMAND_QUEUE_DESC qd{};", f"""    // The sour
         device->CreateShaderResourceView(source.Get(), &srv, source_handle);
     }}
     D3D12_COMMAND_QUEUE_DESC qd{{}};""")
+guest = replace(guest, "    transition(list.Get(), out.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);",
+                """    transition(list.Get(), out.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (writable) {
+        list->CopyBufferRegion(source.Get(), 0, source_seed.Get(), 0, source_words * 4);
+        transition(list.Get(), source.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }""")
 
 
 def digest(data):
@@ -113,7 +143,7 @@ with TemporaryDirectory(dir=w) as td:
     (trial / "context.h").write_text((p / "tools/reference/independent-shaders/context.h").read_text()
                                      .replace('"../compute_buffers.h"', '"' + str(p / "tools/reference/compute_buffers.h") + '"'))
     expected, shaders = {}, {}
-    for name, (kind, first, count, source) in programs.items():
+    for name, (kind, wanted, source) in programs.items():
         (trial / f"{name}.hlsl").write_text(source)
         blob = trial / f"{name}.cso"
         subprocess.run([str(dxc), "-T", "cs_6_0", "-E", "main", "-Fo", str(blob), str(trial / f"{name}.hlsl")], check=True, timeout=30)
@@ -121,7 +151,7 @@ with TemporaryDirectory(dir=w) as td:
         shaders[name] = digest(blob.read_bytes())
         (trial / f"{name}.kind").write_text(kind + "\n")
         want = [0x76540000 + i for i in range(WORDS)]
-        want[FIRST_WORD:FIRST_WORD + count] = [pattern(first + j) for j in range(count)]
+        want[FIRST_WORD:FIRST_WORD + len(wanted)] = wanted
         expected[name] = want
     (trial / "cases.txt").write_text("".join(f"{name} 0 raw 1\n" for name in expected))
     exe, status, fields = run_gpu_guest(trial / "guest.cpp", "buffer-loads.exe", trial, w, proton,
@@ -135,15 +165,15 @@ with TemporaryDirectory(dir=w) as td:
         differ = [(i - FIRST_WORD, f"{a:#x}", f"{b:#x}") for i, (a, b) in enumerate(zip(got, want)) if a != b]
         if differ:
             wrong.append((name, differ[:6]))
-        rows.append({"case": name, "kind": programs[name][0], "words": programs[name][2], "matched": not differ,
+        rows.append({"case": name, "kind": programs[name][0], "words": len(programs[name][1]), "matched": not differ,
                      "sha256": digest(actual)})
     for name, differ in wrong:
         print(f"WRONG {name}: (word, got, wanted) {differ}")
     assert not wrong, f"{len(wrong)} of {len(rows)} cases read the wrong words"
-    receipt = {"scope": "Synthetic translated scalar, vector and format loads from constant, raw and typed "
-                        "buffers of known contents; instrumented output only",
+    receipt = {"scope": "Synthetic translated loads from constant, raw and typed buffers of known contents, and "
+                        "stores and atomics to writable ones read back in the same thread; instrumented output only",
                "adapter": fields["adapter"], "proton": (proton / "version").read_text().strip(),
                "shader_sha256": shaders, "cases": rows}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(receipt, indent=2) + "\n")
-    print(f"PASS: {len(rows)} cases, {sum(row['words'] for row in rows)} loaded words, 0 mismatches")
+    print(f"PASS: {len(rows)} cases, {sum(row['words'] for row in rows)} words, 0 mismatches")
