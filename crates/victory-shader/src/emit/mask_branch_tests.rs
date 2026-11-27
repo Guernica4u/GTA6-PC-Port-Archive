@@ -23,7 +23,29 @@ fn emit(kind: Program, lanes: u32) -> super::HostShader {
     let io = crate::io::raise(&p, &n).unwrap();
     let bytes = crate::dxbc::build(&[]);
     let c = crate::Container::parse(&bytes).unwrap();
-    super::emit(&c, &n, &p, &st, &io, &res).unwrap()
+    let shader = super::emit(&c, &n, &p, &st, &io, &res).unwrap();
+    // The group's vote needs no wave size: a host whose waves are 32 lanes
+    // must be able to create the Wave64 program's pipeline too.
+    assert_eq!(
+        required_wave_size(&shader.dxil),
+        None,
+        "{kind:?}, {lanes} lanes"
+    );
+    shader
+}
+
+/// The wave size the container's PSV0 requires (`WaveSize`), if any.
+fn required_wave_size(dxil: &[u8]) -> Option<u32> {
+    let word = |at: usize| u32::from_le_bytes(dxil[at..at + 4].try_into().unwrap()) as usize;
+    (0..word(28))
+        .map(|k| word(32 + 4 * k))
+        .find(|&at| &dxil[at..at + 4] == b"PSV0")
+        .and_then(|at| {
+            // Part header (name, size), the info size, then PSInfo: the
+            // minimum and maximum wave lane counts at bytes 16 and 20.
+            let (min, max) = (word(at + 8 + 4 + 16) as u32, word(at + 8 + 4 + 20) as u32);
+            (min != 0 || max != u32::MAX).then_some(min)
+        })
 }
 
 /// The branch's SCC is found, and only for a mask nothing else reads.
@@ -148,4 +170,26 @@ fn every_active_lane_takes_the_arm_of_the_waves_vote_on_gpu() {
         }
     }
     eprintln!("{ran} dispatches");
+}
+
+/// Beyond one console wave there is no group vote: the branch is the
+/// console wave's own, so the host must run waves of that width.
+#[test]
+fn a_group_of_several_console_waves_keeps_the_native_wave_size() {
+    use crate::native::StageIo;
+    for lanes in [32u32, 64] {
+        let mut n = program(Program::Branch, lanes);
+        let StageIo::Cs(io) = &mut n.io else {
+            unreachable!()
+        };
+        io.threads[0] *= 2;
+        let (p, st) = crate::range::build_native(&n).unwrap();
+        let st = st.unwrap();
+        let res = crate::resource::track(&p, &n.layout, n.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &n).unwrap();
+        let bytes = crate::dxbc::build(&[]);
+        let c = crate::Container::parse(&bytes).unwrap();
+        let s = super::emit(&c, &n, &p, &st, &io, &res).unwrap();
+        assert_eq!(required_wave_size(&s.dxil), Some(lanes));
+    }
 }
