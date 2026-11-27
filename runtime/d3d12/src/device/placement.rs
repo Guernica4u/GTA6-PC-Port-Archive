@@ -101,6 +101,32 @@ struct Contents {
     readers: Vec<(ID3D12Fence, u64)>,
 }
 
+impl Contents {
+    /// Keep `bytes` as mip `level`'s snapshot and return the one it replaces,
+    /// for reuse as scratch.
+    fn store(&mut self, level: usize, bytes: Vec<u8>) -> Vec<u8> {
+        // The bytes arrive in the upload scratch buffer, which keeps the
+        // capacity of the largest mip it has compared, with those pages
+        // touched. Snapshots last as long as their texture, so let the system
+        // reclaim the whole pages past this mip's bytes. Shrinking would not:
+        // Wine shrinks a large heap block in place and keeps its pages.
+        let start = (bytes.as_ptr() as usize + bytes.len()).next_multiple_of(4096);
+        let end = (bytes.as_ptr() as usize + bytes.capacity()) & !4095;
+        if end >= start + (64 << 10) {
+            // SAFETY: whole pages inside the Vec's own allocation and past its
+            // length. MEM_RESET keeps them committed; only their contents,
+            // which the Vec does not read, are discarded.
+            unsafe {
+                windows::Win32::System::Memory::VirtualAlloc(
+                    Some(start as *const c_void), end - start,
+                    windows::Win32::System::Memory::MEM_RESET, windows::Win32::System::Memory::PAGE_READWRITE,
+                );
+            }
+        }
+        std::mem::replace(&mut self.previous[level], bytes)
+    }
+}
+
 struct Alias {
     desc: D3D12_RESOURCE_DESC,
     texture: Weak<Texture>,
@@ -811,3 +837,7 @@ pub(crate) unsafe fn submit(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "../tests/device/placement/contents.rs"]
+mod tests;
