@@ -1258,7 +1258,7 @@ fn upload_slab_max_idle_for(val: Option<&str>) -> usize {
     let mb = val
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(UPLOAD_SLAB_DEFAULT_IDLE_MB);
-    (mb << 20) / UPLOAD_SLAB_BYTES
+    mb / (UPLOAD_SLAB_BYTES >> 20)
 }
 
 #[cfg(windows)]
@@ -1349,6 +1349,13 @@ struct SlabPool {
 }
 
 #[cfg(windows)]
+type SlabAlloc = (
+    *mut u8,
+    std::sync::Arc<UploadSlab>,
+    Option<std::sync::Arc<UploadSlab>>,
+);
+
+#[cfg(windows)]
 impl SlabPool {
     const fn new() -> Self {
         Self {
@@ -1357,13 +1364,23 @@ impl SlabPool {
         }
     }
 
-    fn alloc(&mut self, size: usize, align: usize) -> Option<(*mut u8, std::sync::Arc<UploadSlab>)> {
-        if let Some((slab, cursor)) = &mut self.active
-            && let Some((ptr, next)) = carve_from_slab(slab.at, *cursor, size, align)
-        {
-            *cursor = next;
-            slab.used.store(next, std::sync::atomic::Ordering::Relaxed);
-            return Some((ptr, std::sync::Arc::clone(slab)));
+    fn alloc(&mut self, size: usize, align: usize) -> Option<SlabAlloc> {
+        if let Some((slab, cursor)) = &mut self.active {
+            if let Some((ptr, next)) = carve_from_slab(slab.at, *cursor, size, align) {
+                *cursor = next;
+                slab.used.store(next, std::sync::atomic::Ordering::Relaxed);
+                return Some((ptr, std::sync::Arc::clone(slab), None));
+            }
+            // All lists referencing the active slab have already reset: reuse it in place
+            // instead of discarding it on rollover.
+            if std::sync::Arc::strong_count(slab) == 1 {
+                reset_slab_for_reuse(slab);
+                if let Some((ptr, next)) = carve_from_slab(slab.at, 0, size, align) {
+                    *cursor = next;
+                    slab.used.store(next, std::sync::atomic::Ordering::Relaxed);
+                    return Some((ptr, std::sync::Arc::clone(slab), None));
+                }
+            }
         }
         let fresh = match self.idle.pop() {
             Some(slab) => slab,
@@ -1372,15 +1389,21 @@ impl SlabPool {
         let (ptr, next) = carve_from_slab(fresh.at, 0, size, align)?;
         fresh.used.store(next, std::sync::atomic::Ordering::Relaxed);
         let arc = std::sync::Arc::new(fresh);
-        self.active = Some((std::sync::Arc::clone(&arc), next));
-        Some((ptr, arc))
+        let replaced = self
+            .active
+            .replace((std::sync::Arc::clone(&arc), next))
+            .map(|(old, _)| old);
+        Some((ptr, arc, replaced))
     }
 
-    fn recycle(&mut self, slab: UploadSlab, max_idle: usize) {
+    fn recycle(&mut self, slab: UploadSlab, max_idle: usize) -> Option<UploadSlab> {
         if self.idle.len() < max_idle {
             self.idle.push(slab);
+            None
+        } else {
+            // Return excess slab so the caller drops it outside `SLAB_POOL.lock()`.
+            Some(slab)
         }
-        // Else `slab` drops here and releases its VirtualAlloc2 region.
     }
 }
 
@@ -1424,7 +1447,11 @@ impl Drop for SlabHandle {
             let max_idle = upload_slab_max_idle();
             if max_idle > 0 {
                 reset_slab_for_reuse(&slab);
-                SLAB_POOL.lock().unwrap_or_else(|e| e.into_inner()).recycle(slab, max_idle);
+                let excess = SLAB_POOL
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .recycle(slab, max_idle);
+                drop(excess);
             }
         }
     }
@@ -1445,8 +1472,13 @@ impl Upload {
         // `VirtualAlloc2` slabs are 64 KiB aligned, so `align <= 64 KiB` guarantees
         // carving at cursor 0 never fails and never wastes a popped idle slab.
         if upload_slab_enabled() && size <= UPLOAD_SLAB_MAX_ALLOC && align <= (64 << 10) {
-            let mut pool = SLAB_POOL.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some((ptr, slab)) = pool.alloc(size, align) {
+            let alloc = {
+                let mut pool = SLAB_POOL.lock().unwrap_or_else(|e| e.into_inner());
+                pool.alloc(size, align)
+            };
+            if let Some((ptr, slab, replaced)) = alloc {
+                // Drop any replaced active slab outside `SLAB_POOL.lock()`.
+                drop(SlabHandle(replaced));
                 return Some((ptr, Upload::Slab(SlabHandle(Some(slab)))));
             }
         }
@@ -2227,8 +2259,8 @@ mod tests {
         assert_eq!(upload_slab_max_idle_for(Some("6")), 3);
 
         let mut pool = SlabPool::new();
-        let (p1, s1) = pool.alloc(64, 256).expect("first slab alloc");
-        let (p2, s2) = pool.alloc(128, 256).expect("second slab alloc");
+        let (p1, s1, _) = pool.alloc(64, 256).expect("first slab alloc");
+        let (p2, s2, _) = pool.alloc(128, 256).expect("second slab alloc");
         assert!(std::sync::Arc::ptr_eq(&s1, &s2), "small uploads share one slab");
         assert!((p1 as usize).is_multiple_of(256));
         assert!((p2 as usize).is_multiple_of(256));
@@ -2237,15 +2269,16 @@ mod tests {
         unsafe { p1.write_bytes(0x5A, 64) };
 
         // Filling past the slab rolls to a new slab, allowing the first to be recycled once dropped.
-        let (_, s3) = pool.alloc(UPLOAD_SLAB_MAX_ALLOC, 64).expect("half slab");
-        let (_, s4) = pool.alloc(UPLOAD_SLAB_MAX_ALLOC, 64).expect("rolls to new slab");
+        let (_, s3, _) = pool.alloc(UPLOAD_SLAB_MAX_ALLOC, 64).expect("half slab");
+        let (_, s4, replaced) = pool.alloc(UPLOAD_SLAB_MAX_ALLOC, 64).expect("rolls to new slab");
         assert!(!std::sync::Arc::ptr_eq(&s1, &s4));
+        drop(replaced);
         let first_base = s1.at;
         drop(s2);
         drop(s3);
         let unwrapped = std::sync::Arc::try_unwrap(s1).expect("first slab exclusively owned");
         reset_slab_for_reuse(&unwrapped);
-        pool.recycle(unwrapped, 1);
+        assert!(pool.recycle(unwrapped, 1).is_none());
         assert_eq!(pool.idle.len(), 1);
         assert_eq!(pool.idle[0].at, first_base);
         // Recycled slab must be zeroed back to clean state.
@@ -2253,11 +2286,22 @@ mod tests {
         let first_bytes = unsafe { std::slice::from_raw_parts(first_base as *const u8, 64) };
         assert!(first_bytes.iter().all(|&b| b == 0));
 
-        // Recycling past max_idle releases instead of hoarding.
+        // Reset-before-rollover path: when all external handles drop while `active` still holds
+        // the only reference, a subsequent alloc that does not fit reuses `active` in place.
+        let (_, s4b, _) = pool.alloc(64, 64).expect("push cursor past half slab");
+        let active_base = s4.at;
+        drop(s4);
+        drop(s4b);
+        let (p5, s5, r5) = pool.alloc(UPLOAD_SLAB_MAX_ALLOC, 64).expect("in-place reuse");
+        assert!(r5.is_none());
+        assert_eq!(s5.at, active_base, "active slab reused in place on reset-before-rollover");
+        assert_eq!(p5 as usize, active_base);
+
+        // Recycling past max_idle returns the excess slab to be dropped outside the lock.
         drop(pool.active.take());
-        let unwrapped4 = std::sync::Arc::try_unwrap(s4).expect("second slab exclusively owned");
-        pool.recycle(unwrapped4, 1);
-        assert_eq!(pool.idle.len(), 1, "excess slab was freed");
+        let unwrapped5 = std::sync::Arc::try_unwrap(s5).expect("second slab exclusively owned");
+        assert!(pool.recycle(unwrapped5, 1).is_some(), "excess slab returned to drop");
+        assert_eq!(pool.idle.len(), 1, "idle cap enforced");
 
         // Oversized uploads (> UPLOAD_SLAB_MAX_ALLOC) bypass the slab pool cleanly.
         let (big_ptr, big) = Upload::alloc(UPLOAD_SLAB_MAX_ALLOC + 4096, 256).expect("oversized upload");
