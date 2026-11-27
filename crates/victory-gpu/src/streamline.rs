@@ -951,6 +951,7 @@ fn evaluate(host: &crate::host::HostList, up: &Upscale, id: u64) -> bool {
         }
         textures[i] = Some((texture, legal));
     }
+    host.trace_gpu_pass("DLSS Super Resolution", [camera.render[0].into(), camera.render[1].into(), camera.output[0].into(), camera.output[1].into(), id as i64]);
     let recorded = match record(host.list.as_raw(), &textures, &camera, up.pre_exposure, id) {
         Ok(recorded) => recorded,
         Err(why) => return fail(&why),

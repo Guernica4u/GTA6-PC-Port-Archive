@@ -281,10 +281,18 @@ impl Worker {
                 job.record(&self.list);
             }
             self.list.Close()?;
-            self.queue.ExecuteCommandLists(&[Some(self.list.cast()?)]);
+            let lists = [Some(self.list.cast()?)];
+            let trace_start = crate::host::render_trace::active().then(crate::host::now_us);
+            if trace_start.is_some() {
+                crate::host::render_trace::execute(&self.queue, &lists, Some((self.fence.as_raw() as usize, value)));
+            }
+            self.queue.ExecuteCommandLists(&lists);
             self.queue.Signal(&self.fence, value)?;
             // (Without an event: this waits.)
             self.fence.SetEventOnCompletion(value, windows::Win32::Foundation::HANDLE::default())?;
+            if let Some(start) = trace_start {
+                crate::host::render_trace::event("texture_copy_queue_complete", format_args!("fence={:#x}\tvalue={value}\tstart_us={start}\tduration_us={}\tjobs={}", self.fence.as_raw() as usize, crate::host::now_us().saturating_sub(start), jobs.len()));
+            }
         }
         Ok(())
     }

@@ -30,6 +30,8 @@ use windows::Win32::Graphics::Direct3D12::{ID3D12CommandList, ID3D12CommandQueue
 use windows::Win32::Graphics::Dxgi::{DXGI_PRESENT, IDXGISwapChain3};
 
 use super::Host;
+use super::render_trace;
+use windows::core::Interface;
 
 /// What was given to the host queue while a Present was pending: lists in calls cut at
 /// `cuts`, then a fence signal.
@@ -101,6 +103,9 @@ unsafe fn run_on(
     for to in cuts.iter().copied().chain([lists.len()]) {
         let to = to.clamp(from, lists.len());
         if to > from {
+            if render_trace::active() {
+                render_trace::execute(queue, &lists[from..to], signal.map(|(fence, value)| (fence.as_raw() as usize, value)));
+            }
             // SAFETY: the caller's.
             unsafe { queue.ExecuteCommandLists(&lists[from..to]) };
         }
@@ -148,6 +153,9 @@ impl Host {
             return unsafe { run_on(&self.queue, lists, cuts, signal) };
         }
         if gate.pending {
+            if render_trace::active() {
+                render_trace::event("queue_held_for_present", format_args!("lists={}\tfence={:?}", lists.len(), signal.map(|(_, value)| value)));
+            }
             gate.held.push(Held { lists: lists.to_vec(), cuts: cuts.to_vec(), signal: signal.map(|(f, v)| (f.clone(), v)) });
             STATS[HELD].fetch_add(1, Relaxed);
             return Ok(());
@@ -176,6 +184,7 @@ impl Host {
 pub(super) struct Job {
     pub(super) swap_chain: IDXGISwapChain3,
     pub(super) presenting: Option<crate::streamline::Presenting>,
+    pub(super) frame: u64,
 }
 
 // SAFETY: DXGI and Streamline's frame token are used by one thread at a time: the submitting
@@ -232,12 +241,16 @@ pub(super) fn hand_over(job: Job) {
 
 /// The Present, what was held behind it, frame generation's end of the frame and the meter.
 fn present(job: Job) {
-    let Job { swap_chain, presenting } = job;
+    let Job { swap_chain, presenting, frame } = job;
     let mut showing = crate::timeline::span("the host's Present (presenting thread)");
     let called = crate::streamline::present_called(&presenting);
     let began = std::time::Instant::now();
+    let trace_start = render_trace::active().then(super::now_us);
     // SAFETY: our swap chain; nothing else uses it until `present_wait` returns.
-    let _ = unsafe { swap_chain.Present(0, DXGI_PRESENT(0)) };
+    let result = unsafe { swap_chain.Present(0, DXGI_PRESENT(0)) };
+    if let Some(start) = trace_start {
+        render_trace::event("present", format_args!("present_frame={frame}\tstart_us={start}\tduration_us={}\tstatus={:#x}\tasync=true", began.elapsed().as_micros(), result.0));
+    }
     STATS[IN_PRESENT].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     crate::streamline::present_returned(called);
     showing.next("sending what waited behind the present");

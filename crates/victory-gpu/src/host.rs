@@ -5,7 +5,7 @@
 //! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -5872,6 +5872,7 @@ impl Host {
     /// is complete before the title is told anything.
     fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
         let landing = std::time::Instant::now();
+        let trace_start = render_trace::active().then(now_us);
         let mut stage = crate::timeline::span("landing: what is to be looked through");
         {
             let flights: Vec<&Flight> = items
@@ -5938,6 +5939,9 @@ impl Host {
             telling = match item {
                 Late::Run(mut flight) => {
                     last = flight.number;
+                    if trace_start.is_some() {
+                        render_trace::event("relay_readback", format_args!("submission={}\thost_fence={}\tlists={}", flight.number, flight.fence, flight.order.len()));
+                    }
                     for &i in &flight.order {
                         read_backs(flight.lists[i].host());
                     }
@@ -5959,6 +5963,9 @@ impl Host {
                 }
                 Late::Signal(fence, value) => {
                     crate::fence::set(fence as crate::object::This, value);
+                    if trace_start.is_some() {
+                        render_trace::event("title_fence_published", format_args!("fence={fence:#x}\tvalue={value}"));
+                    }
                     crate::land::spent(crate::land::stat::TOLD, telling)
                 }
             };
@@ -5975,6 +5982,9 @@ impl Host {
         self.log_messages();
         crate::land::spent(crate::land::stat::REST, telling);
         RELAY_STATS[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
+        if let Some(start) = trace_start {
+            render_trace::event("relay_complete", format_args!("last_submission={last}\tstart_us={start}\tduration_us={}", landing.elapsed().as_micros()));
+        }
         {
             let mut line = line();
             let Line {
@@ -6523,6 +6533,7 @@ impl Host {
     /// other, as they would have.
     fn submit<'a>(&'a self, runs: &[&HostList], parts: &[usize], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
         let called = std::time::Instant::now();
+        let trace_start = render_trace::active().then(now_us);
         #[cfg(feature = "diagnostics")]
         crate::copystat::submission_begins();
         // One submission at a time from preparation to copy-back: snapshots
@@ -6652,6 +6663,9 @@ impl Host {
         let behind = late && flying();
         stage.next("submit: gathering what to ask about");
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
+        if let Some(start) = trace_start {
+            render_trace::event("submission_preparing", format_args!("submission={this_submission}\tstart_us={start}\tlists={}\tparts={}\tasynchronous={late}", runs.len(), parts.len()));
+        }
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
         let started = std::time::Instant::now();
@@ -6664,7 +6678,7 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::reused();
-        let split = Split::begin();
+        let split = Split::begin().trace(trace_start.map(|_| this_submission));
         // The time a settle of flights takes inside this preparing: the
         // wait for the card and the copy-back have their own places on the
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
@@ -6793,6 +6807,9 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         let sending = crate::timeline::ticks();
+        if let Some(start) = trace_start {
+            render_trace::event("submission_ready", format_args!("submission={this_submission}\tstart_us={start}\tprepare_us={}\tsettled_us={}\tlists={}\tnext_host_fence={}", called.elapsed().as_micros(), settled.as_micros(), lists.len(), *submitted + 1));
+        }
         if late {
             *submitted += 1;
             #[cfg(feature = "diagnostics")]
@@ -7299,12 +7316,19 @@ impl HostList {
         // waits for shader writes)
         self.gpu_time.work();
         self.gpu_time.break_pass();
+        self.trace_gpu_pass("render targets changed", [0; 5]);
     }
 
     /// A pass of ours in this list (`n` tells them apart).
     fn gpu_pass_ours(&self, n: u64, name: &'static str) {
         self.gpu_time.work();
         self.gpu_time.pass(&self.list, u64::MAX - n, gpu_time::OURS, render_trace::Command("host_pass", [0; 5]), || name.to_owned());
+    }
+
+    pub(crate) fn trace_gpu_pass(&self, name: &'static str, args: [i64; 5]) {
+        if render_trace::active() {
+            self.gpu_time.pass(&self.list, u64::MAX, gpu_time::OURS, render_trace::Command("host_pass", args), || name.to_owned());
+        }
     }
 
     /// A step that is not a draw or dispatch is recorded next (the title's
@@ -9003,11 +9027,16 @@ fn heap_sync_first() -> bool {
 static HEAP_SYNC_FIRST: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Counts into [`SPLIT`].
-struct Split(std::cell::Cell<std::time::Instant>);
+struct Split(std::cell::Cell<std::time::Instant>, Option<u64>);
 
 impl Split {
     fn begin() -> Split {
-        Split(std::cell::Cell::new(std::time::Instant::now()))
+        Split(std::cell::Cell::new(std::time::Instant::now()), None)
+    }
+
+    fn trace(mut self, submission: Option<u64>) -> Self {
+        self.1 = submission;
+        self
     }
 
     /// Nanoseconds since the last part.
@@ -9018,7 +9047,21 @@ impl Split {
     /// What came since the last part was part `i`.
     fn part(&self, i: usize) {
         let now = std::time::Instant::now();
-        SPLIT[i].fetch_add((now - self.0.replace(now)).as_nanos() as u64, Ordering::Relaxed);
+        let elapsed = now - self.0.replace(now);
+        SPLIT[i].fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+        if let Some(submission) = self.1 {
+            let phase = match i {
+                0 => "write_watch",
+                1 => "writes_under_flights",
+                2 => "refresh_and_deferred_steps",
+                3 => "snapshots",
+                4 => "card_copies",
+                5 => "queue_send",
+                15 => "heap_records",
+                _ => "other",
+            };
+            render_trace::event("submission_stage", format_args!("submission={submission}\tphase={phase}\tduration_us={}", elapsed.as_micros()));
+        }
     }
 }
 
@@ -11072,6 +11115,7 @@ impl Host {
             let composed = if let Some((over, over_state, base_fmt, over_fmt)) = planes {
                 copy.keep(over);
                 if let Some(composer) = p.composer.as_mut() {
+                    copy.trace_gpu_pass("present: composite display planes", [width.into(), height.into(), 0, 0, 0]);
                     let mut pre = Vec::with_capacity(3);
                     if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
                         pre.push(transition(texture, state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
@@ -11128,6 +11172,9 @@ impl Host {
                 false
             };
             if !composed {
+                if render_trace::active() {
+                    copy.gpu_pass_ours(5, "present: copy to the swap chain");
+                }
                 let mut pre = Vec::with_capacity(2);
                 if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
                     pre.push(transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE));
@@ -11173,6 +11220,9 @@ impl Host {
             } else {
                 crate::popwatch::take(&self.device, list, texture)
             };
+            if render_trace::active() {
+                copy.gpu_pass_ours(6, "present: performance panel and menu");
+            }
             p.panel.draw(self, copy, &back, (width, height), format);
             p.menu.draw(self, copy, &back, (width, height), format);
             #[cfg(not(feature = "diagnostics"))]
@@ -11235,7 +11285,7 @@ impl Host {
             // copy sent ahead, which nothing here waits for.
             if shown::on() && slot.is_some() {
                 showing.end();
-                let job = shown::Job { swap_chain: p.swap_chain.clone(), presenting };
+                let job = shown::Job { swap_chain: p.swap_chain.clone(), presenting, frame };
                 drop(back);
                 drop(presenter);
                 shown::hand_over(job);
@@ -11245,7 +11295,11 @@ impl Host {
                 return Some(false);
             }
             let called = crate::streamline::present_called(&presenting);
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let trace_start = render_trace::active().then(now_us);
+            let result = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            if let Some(start) = trace_start {
+                render_trace::event("present", format_args!("present_frame={frame}\tstart_us={start}\tduration_us={}\tstatus={:#x}\tasync=false", now_us().saturating_sub(start), result.0));
+            }
             crate::streamline::present_returned(called);
             crate::streamline::present_ends(presenting);
             showing.next("the frame meter");

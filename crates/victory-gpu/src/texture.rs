@@ -1147,12 +1147,14 @@ fn record_upload(
 /// An upload of one subresource into `list`: work there, counted with its
 /// bytes (`host::gpu_time`'s steps line).
 fn upload_noted(list: &HostList, footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT) {
-    list.gpu_work();
     let f = &footprint.Footprint;
-    crate::host::count_gpu_step(
-        crate::host::GpuStep::Uploads,
-        u64::from(f.RowPitch) * u64::from(f.Height) * u64::from(f.Depth),
-    );
+    let bytes = u64::from(f.RowPitch) * u64::from(f.Height) * u64::from(f.Depth);
+    if crate::host::render_trace::active() {
+        list.gpu_step(crate::host::GpuStep::Uploads, bytes);
+    } else {
+        list.gpu_work();
+        crate::host::count_gpu_step(crate::host::GpuStep::Uploads, bytes);
+    }
 }
 
 fn fill_plane(

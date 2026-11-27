@@ -925,11 +925,13 @@ unsafe fn private(p: &mut Probe, rig: &mut Rig) {
                 let second = rig.fetch(buffer, 0, 4 * K64).is_ok_and(|got| same(memory, &got));
                 p.part_reads = first && second;
                 p.lines.push(format!("  the GPU reads the memory's bytes: {first}; and those the CPU wrote afterwards, with no call in between: {second}"));
-                mem::ResetWriteWatch(base.cast(), SIZE);
+                crate::watch::with_kernel_write_watch(|| mem::ResetWriteWatch(base.cast(), SIZE));
                 let new: Vec<u8> = (0..K64).map(|i| (i as u8) ^ 0x5a).collect();
                 let copied = rig.store(buffer, 4096, &new).is_ok() && same(memory.add(4096), &new);
                 let (mut found, mut count, mut granularity) = ([0usize; 64], 64usize, 0u32);
-                let watched = mem::GetWriteWatch(0, base.cast(), SIZE, found.as_mut_ptr().cast(), &mut count, &mut granularity) == 0;
+                let watched = crate::watch::with_kernel_write_watch(|| {
+                    mem::GetWriteWatch(0, base.cast(), SIZE, found.as_mut_ptr().cast(), &mut count, &mut granularity)
+                }) == 0;
                 memory.cast::<[u32; 3]>().write([40, 2, 0]);
                 let shaded = rig.shade(buffer.GetGPUVirtualAddress());
                 let shader = shaded.is_ok() && memory.cast::<[u32; 3]>().read()[2] == 42;

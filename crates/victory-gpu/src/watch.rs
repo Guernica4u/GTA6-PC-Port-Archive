@@ -403,6 +403,14 @@ thread_local! {
     static FOUND: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Serializes Windows write-watch calls, including calls on disjoint ranges
+/// of a reservation. Take this after the journal lock if both are needed.
+pub(crate) fn with_kernel_write_watch<T>(call: impl FnOnce() -> T) -> T {
+    static LOCK: Mutex<()> = Mutex::new(());
+    let _kernel = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    call()
+}
+
 /// Appends the pages of `[first, last)` the kernel says were written since it
 /// was last asked, in order, each once, with their written parts, into `out`.
 /// Returns `false` if the range is not write-watched memory of one reservation.
@@ -420,7 +428,7 @@ fn kernel_written_into(first: usize, last: usize, out: &mut Vec<(usize, u16)>) -
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         // SAFETY: the answer buffer holds `count` entries.
-        let failed = unsafe {
+        let failed = with_kernel_write_watch(|| unsafe {
             GetWriteWatch(
                 WRITE_WATCH_FLAG_RESET,
                 (first * PAGE) as *const _,
@@ -429,7 +437,7 @@ fn kernel_written_into(first: usize, last: usize, out: &mut Vec<(usize, u16)>) -
                 &mut count,
                 &mut granularity,
             )
-        } != 0;
+        }) != 0;
         #[cfg(feature = "diagnostics")]
         {
             tally(10, u64::from(failed));
@@ -532,19 +540,16 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     if pieces.len() < 2 {
         return;
     }
-    // The submission's one asking stands ([`ask_once`]): what it does not
-    // hold is left to `writes`.
-    if journal().kept && kept() {
+    let _all = Asking::hold_all();
+    // A submission can publish its asking while we wait. Check before
+    // consuming any dirty bits so every answer we take reaches the journal.
+    if kept() {
         return;
     }
-    let _all = Asking::hold_all();
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     ask_pieces(&pieces, 2, &mut asked, &mut written);
     note_hot(&written);
     let mut j = journal_mut();
-    if j.kept && kept() {
-        return;
-    }
     j.kept = false;
     j.ahead_asked = next_asking();
     j.ahead = joined_pages(asked);
@@ -730,23 +735,25 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     if !once() {
         return;
     }
-    KEPT.store(false, std::sync::atomic::Ordering::Release);
-    ASK_END_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
     let pieces = merged_page_pieces(ranges);
-    if pieces.is_empty() {
+    // A range asking can have reset dirty bits whose answer is still being
+    // published. Wait for it before replacing the standing answer.
+    let _all = Asking::hold_all();
+    ask_once_end();
+    {
         let mut j = journal_mut();
-        if j.kept {
-            j.kept = false;
+        if j.kept || !pieces.is_empty() {
             j.ahead.clear();
+            j.kept = false;
         }
+    }
+    if pieces.is_empty() {
         return;
     }
-    let _all = Asking::hold_all();
     let (mut asked, mut written) = (Vec::with_capacity(pieces.len()), Vec::new());
     ask_pieces(&pieces, 1, &mut asked, &mut written);
     note_hot(&written);
     let mut j = journal_mut();
-    j.ahead.clear();
     let now = next_asking();
     j.ahead_asked = now;
     for (page, parts) in written {

@@ -939,17 +939,32 @@ pub(super) fn drain() {
     }
     let began = Instant::now();
     LANE.drain();
-    STATS[DRAINING].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+    let elapsed = began.elapsed().as_micros() as u64;
+    STATS[DRAINING].fetch_add(elapsed, Relaxed);
+    if crate::host::render_trace::active() {
+        crate::host::render_trace::event("title_queue_drained", format_args!("duration_us={elapsed}"));
+    }
     STATS[DRAINS].fetch_add(1, Relaxed);
 }
 
 /// A submission of `lists` to queue `this`.
 pub(super) fn submit(this: This, lists: &[This]) {
     let queue = this as usize;
+    if crate::host::render_trace::active() {
+        crate::host::render_trace::event("title_submit", format_args!("queue={queue:#x}\tlists={}\tqueued={}", lists.len(), QUEUED.load(Relaxed)));
+    }
     if crate::list::thin::on() {
         let recordings = crate::list::thin::submitted(lists);
         if recordings.is_empty() {
             return;
+        }
+        if crate::host::render_trace::active() {
+            for (index, recording) in recordings.iter().enumerate() {
+                crate::host::render_trace::event(
+                    "title_submit_list",
+                    format_args!("queue={queue:#x}\tindex={index}\trecording={:#x}", std::sync::Arc::as_ptr(recording) as usize),
+                );
+            }
         }
         let before = QUEUED.fetch_add(1, Relaxed);
         STATS[DEPTH].fetch_add(before, Relaxed);

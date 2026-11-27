@@ -42,7 +42,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use super::*;
 
-/// Slots a list takes: its start, up to [`PER_LIST`] passes, its end.
+/// Slots in a block. A normal list uses one block, a traced list takes more
+/// only when it fills its current block.
 const BLOCK: u32 = 64;
 /// Passes a list is timed at, at most.
 const PER_LIST: u32 = BLOCK - 2;
@@ -277,7 +278,15 @@ struct Rec {
 
 struct Trace {
     list: usize,
-    commands: Vec<(usize, u64, u32, u64, render_trace::Command)>,
+    commands: Vec<TraceCommand>,
+}
+
+struct TraceCommand {
+    index: usize,
+    cpu_us: u64,
+    thread: u32,
+    frame: u64,
+    command: render_trace::Command,
 }
 
 fn block(ring: &Ring) -> (u32, u64) {
@@ -313,8 +322,11 @@ impl Rec {
 
     fn trace_mark(&mut self, list: &ID3D12GraphicsCommandList, what: What, command: render_trace::Command) {
         let index = self.marks.len();
-        let trace = self.trace.get_or_insert_with(|| Box::new(Trace { list: list.as_raw() as usize, commands: Vec::new() }));
-        trace.commands.push((index, now_us(), thread_id(), crate::frame::current(), command));
+        let trace = self.trace.get_or_insert_with(|| {
+            let identity = list.cast::<ID3D12CommandList>().map_or_else(|_| list.as_raw() as usize, |base| base.as_raw() as usize);
+            Box::new(Trace { list: identity, commands: Vec::new() })
+        });
+        trace.commands.push(TraceCommand { index, cpu_us: now_us(), thread: thread_id(), frame: crate::frame::current(), command });
         self.mark(list, what);
     }
 
@@ -347,17 +359,18 @@ impl Rec {
         let Some(ring) = ring() else { return };
         // (its block taken by another list meanwhile: not resolved, not read)
         if !owns(self.base, self.taken, &self.extra) {
-            if self.trace.is_some() {
-                render_trace::event("list_trace_lost", format_args!("record={}\treason=reused_before_close", self.taken));
+            if let Some(trace) = &self.trace {
+                render_trace::event("list_trace_lost", format_args!("record={}\tlist={:#x}\treason=reused_before_close", self.taken, trace.list));
             }
             if let Some(acc) = ACC.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
                 acc.lost += 1;
             }
             return;
         }
-        if self.trace.is_some() {
+        if let Some(trace) = &self.trace {
+            let identity = trace.list;
             self.trace_mark(list, What::End, render_trace::Command("list_close", [0; 5]));
-            render_trace::event("list_recorded", format_args!("record={}\tlist={:#x}\tmarks={}", self.taken, list.as_raw() as usize, self.marks.len()));
+            render_trace::event("list_recorded", format_args!("record={}\tlist={identity:#x}\tmarks={}", self.taken, self.marks.len()));
         } else if !self.mark(list, What::End) {
             return;
         }
@@ -443,8 +456,8 @@ fn collect(wait: bool) {
             return true;
         };
         lost += 1;
-        if p.trace.is_some() {
-            render_trace::event("list_trace_lost", format_args!("record={}\treason={reason}", p.taken));
+        if let Some(trace) = &p.trace {
+            render_trace::event("list_trace_lost", format_args!("record={}\tlist={:#x}\treason={reason}", p.taken, trace.list));
         }
         false
     });
@@ -489,14 +502,15 @@ fn trace_landed(record: u64, marks: &[(u64, What)], trace: &Trace, frequency: u6
     let mut batch = String::new();
     let list = trace.list;
     INTERNED.with_names(|names| {
-        for &(index, cpu_us, thread, frame, render_trace::Command(op, args)) in &trace.commands {
+        for &TraceCommand { index, cpu_us, thread, frame, command: render_trace::Command(op, args) } in &trace.commands {
             let (start, what) = marks[index];
             let end = marks.get(index + 1).map_or(start, |mark| mark.0);
             let name = match what {
                 What::Start { name, .. } | What::Pass { name, .. } => &names[name as usize],
                 What::End => "",
             };
-            let _ = writeln!(batch, "gpu_command\trecord={record}\tlist={list:#x}\tseq={index}\tcpu_us={cpu_us}\tthread={thread}\tframe={frame}\top={op}\targs={args:?}\tname={name}\tgpu_start={start}\tgpu_end={end}\tgpu_hz={frequency}");
+            let valid = start != 0 && end >= start;
+            let _ = writeln!(batch, "gpu_command\trecord={record}\tlist={list:#x}\tseq={index}\tcpu_us={cpu_us}\tthread={thread}\tframe={frame}\top={op}\targs={args:?}\tname={name}\tgpu_start={start}\tgpu_end={end}\tgpu_hz={frequency}\ttiming_valid={valid}");
         }
     });
     render_trace::write(batch);
@@ -857,5 +871,43 @@ impl Ours {
         if let Some(rec) = self.0 {
             rec.end(list);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detailed_gpu_timing_resolves_more_than_one_query_block() {
+        let Some(host) = host() else { return };
+        let Some(ring) = ring() else { return };
+        let list = host.make_list().unwrap();
+        let name = INTERNED.intern("query block regression test");
+        let slots: Vec<_> = {
+            let mut state = list.gpu_time.state.lock().unwrap();
+            let rec = state.rec.as_mut().unwrap();
+            for _ in 0..BLOCK + 8 {
+                rec.trace_mark(&list.list, What::Pass { name, kind: OURS }, render_trace::Command("test_marker", [0; 5]));
+            }
+            assert_eq!(rec.extra.len(), 1);
+            rec.marks.iter().map(|mark| mark.0).collect()
+        };
+        list.close();
+        let native = [Some(list.list.cast().unwrap())];
+        // SAFETY: the list is closed and stays alive through its completion.
+        unsafe {
+            let fence: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            host.queue_send(&native, &[], Some((&fence, 1))).unwrap();
+            fence.SetEventOnCompletion(1, HANDLE::default()).unwrap();
+        }
+        let timestamps: Vec<_> = slots.iter().map(|&slot| {
+            // SAFETY: the queue finished resolving these slots into the mapping.
+            unsafe { (ring.data as *const u64).add(slot as usize).read_volatile() }
+        }).collect();
+        assert!(timestamps.iter().all(|&tick| tick != 0));
+        assert!(timestamps.windows(2).all(|pair| pair[0] <= pair[1]));
+        collect(true);
+        render_trace::flush();
     }
 }

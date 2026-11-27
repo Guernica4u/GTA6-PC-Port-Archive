@@ -3830,6 +3830,7 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
+        let trace = crate::host::render_trace::DrawCall::begin(list, self.pipeline, crate::host::render_trace::Command("dispatch", [x.into(), y.into(), z.into(), flags.into(), 0]));
         // It may write the arguments a window holds clamped.
         self.window = None;
         #[cfg(feature = "diagnostics")]
@@ -3899,6 +3900,7 @@ impl State {
             }
         }
         list.gpu_pass(true, self.pipeline, crate::host::render_trace::Command("dispatch", [x.into(), y.into(), z.into(), flags.into(), 0]), || p.name.clone());
+        trace.recorded();
         list.gpu_uav_work();
         // SAFETY: an open list with everything set.
         list.water_dispatch(Some(p), || unsafe { list.list.Dispatch(x, y, z) });
@@ -4424,6 +4426,7 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+        let trace = crate::host::render_trace::DrawCall::begin(list, self.pipeline, crate::host::render_trace::Command("dispatch_mesh", [x.into(), 1, 1, 0, 0]));
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
@@ -4445,6 +4448,7 @@ impl State {
                         once!(x, "a mesh dispatch of more groups than the host takes: cut");
                     }
                     list.gpu_pass(false, self.pipeline, crate::host::render_trace::Command("dispatch_mesh", [x.min(65_535).into(), 1, 1, 0, 0]), || gpu_pass_name(self.pipeline));
+                    trace.recorded();
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
                     self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
@@ -4924,6 +4928,7 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        let trace = crate::host::render_trace::DrawCall::begin(list, self.pipeline, crate::host::render_trace::Command("draw", [vertices.into(), instances.into(), first.into(), first_instance.into(), 0]));
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
@@ -4949,6 +4954,7 @@ impl State {
                 viewports(list, &[viewport]);
             }
             list.gpu_pass(false, self.pipeline, crate::host::render_trace::Command("draw", [count.into(), instances.into(), from.into(), first_instance.into(), 0]), || gpu_pass_name(self.pipeline));
+            trace.recorded();
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -5119,6 +5125,8 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        let command = crate::host::render_trace::Command("draw_indexed", [indices.into(), instances.into(), first.into(), base.into(), first_instance.into()]);
+        let trace = crate::host::render_trace::DrawCall::begin(list, self.pipeline, command);
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
@@ -5135,7 +5143,8 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
-            list.gpu_pass(false, self.pipeline, crate::host::render_trace::Command("draw_indexed", [indices.into(), instances.into(), first.into(), base.into(), first_instance.into()]), || gpu_pass_name(self.pipeline));
+            list.gpu_pass(false, self.pipeline, command, || gpu_pass_name(self.pipeline));
+            trace.recorded();
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -5242,6 +5251,7 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        let trace = crate::host::render_trace::DrawCall::begin(list, self.pipeline, crate::host::render_trace::Command("execute_indirect", [kind.into(), max.into(), arguments as i64, i64::from(count.is_some()), stride.into()]));
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
@@ -5543,6 +5553,7 @@ impl State {
         } else {
             DRAWN.add(1);
         }
+        trace.recorded();
         true
     }
 }

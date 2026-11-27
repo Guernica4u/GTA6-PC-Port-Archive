@@ -440,6 +440,7 @@ fn clamp_into(
     ahead: bool,
 ) -> bool {
     let before = list.indirect_state(dst);
+    list.trace_gpu_pass("indirect argument clamp", [spec.0.into(), spec.1.into(), spec.2.into(), i64::from(ahead), 0]);
     let recorded = record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, ahead);
     if recorded {
         list.indirect_readable(dst);
@@ -603,6 +604,7 @@ pub(crate) fn open_batch(
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
+    list.trace_gpu_pass("indirect argument clamp batch", [0; 5]);
     batch::record(c, &list.list, (&dst, before), budget, sources, jobs);
     // SAFETY: the list's own upload memory of that many bytes, 256-byte
     // aligned, until it is reset.

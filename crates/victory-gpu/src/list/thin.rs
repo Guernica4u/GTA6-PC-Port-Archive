@@ -243,9 +243,18 @@ impl Recording {
                 (chunk, inner.back as This)
             };
             let began = std::time::Instant::now();
+            let trace_start = crate::host::render_trace::active().then(crate::host::now_us);
             let (calls, closed) = translate(back, &chunk, || self.abandoned.load(Acquire));
             STATS[0].fetch_add(calls, Relaxed);
             STATS[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+            if let Some(start) = trace_start {
+                let list = super::host_list_held(back).map_or(0, |host| windows::core::Interface::as_raw(&host.list) as usize);
+                crate::host::render_trace::event(
+                    "translate_list",
+                    format_args!("recording={:#x}\tlist={list:#x}\tstart_us={start}\tduration_us={}\tcalls={calls}\tclosed={closed}",
+                        std::ptr::from_ref(self) as usize, began.elapsed().as_micros()),
+                );
+            }
             let mut inner = held(&self.inner);
             inner.kept.push(chunk);
             if closed {
