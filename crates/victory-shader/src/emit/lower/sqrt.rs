@@ -16,7 +16,8 @@ impl Lower<'_> {
         {
             return Err("binary64 square root modifiers");
         }
-        let (Some(round), Some(denorm)) = (self.mode16.round, self.mode16.denorm) else {
+        let (Some(round), Some(preserve_subnormal)) = (self.mode16.round, self.mode16.denorm_input)
+        else {
             return Err("binary64 square root with unknown floating-point modes");
         };
         let Some(Operand::Vector { reg, .. }) = v.dst else {
@@ -49,7 +50,6 @@ impl Lower<'_> {
         let fraction = m.bin(c, Bin::Or, low, frac_high);
         let no_fraction = m.cmp(c, pred::EQ, fraction, zero);
 
-        let preserve_subnormal = denorm & 1 != 0;
         let zero_operand = if preserve_subnormal {
             m.bin(c, Bin::And, subnormal_or_zero, no_fraction)
         } else {

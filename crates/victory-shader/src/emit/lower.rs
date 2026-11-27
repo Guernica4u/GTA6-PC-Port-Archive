@@ -290,36 +290,55 @@ struct Lower<'a> {
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct FpMode16 {
     round: Option<u8>,
-    denorm: Option<u8>,
+    denorm_input: Option<bool>,
 }
 
 impl FpMode16 {
     // The shader entry convention: nearest-even rounding and preserved
     // input and output subnormals for binary16 and binary64.
-    const INITIAL: Self = Self { round: Some(0), denorm: Some(3) };
+    const INITIAL: Self = Self {
+        round: Some(0),
+        denorm_input: Some(true),
+    };
 
     fn after(self, inst: &Inst) -> Self {
         match (inst.name(), &inst.fields) {
-            ("s_round_mode", Fields::Sopp { imm }) => Self { round: Some((imm >> 2 & 3) as u8), ..self },
-            ("s_denorm_mode", Fields::Sopp { imm }) => Self { denorm: Some((imm >> 2 & 3) as u8), ..self },
+            ("s_round_mode", Fields::Sopp { imm }) => Self {
+                round: Some((imm >> 2 & 3) as u8),
+                ..self
+            },
+            ("s_denorm_mode", Fields::Sopp { imm }) => Self {
+                denorm_input: Some(imm & 4 != 0),
+                ..self
+            },
             (
                 "s_setreg_imm32_b32" | "s_setreg_b32",
-                Fields::Sop { src, imm: Some(h), .. },
-            ) if h & 0x3f == 1 => {
-                let offset = h >> 6 & 0x1f;
-                let end = offset + (h >> 11 & 0x1f) + 1;
-                let update = |old, start| {
-                    if offset >= start + 2 || end <= start {
-                        return old;
-                    }
-                    match src.first() {
-                        Some(&Operand::Literal(bits)) if offset <= start && end >= start + 2 => {
-                            Some((bits >> (start - offset) & 3) as u8)
-                        }
-                        _ => None,
-                    }
+                Fields::Sop {
+                    src, imm: Some(h), ..
+                },
+            ) if h & 0x3F == 1 => {
+                let offset = h >> 6 & 0x1F;
+                let end = offset + (h >> 11 & 0x1F) + 1;
+                let literal = match src.first() {
+                    Some(&Operand::Literal(bits)) => Some(bits),
+                    _ => None,
                 };
-                Self { round: update(self.round, 2), denorm: update(self.denorm, 6) }
+                let round = if offset >= 4 || end <= 2 {
+                    self.round
+                } else if offset <= 2 && end >= 4 {
+                    literal.map(|bits| (bits >> (2 - offset) & 3) as u8)
+                } else {
+                    None
+                };
+                let denorm_input = if (offset..end).contains(&6) {
+                    literal.map(|bits| bits >> (6 - offset) & 1 != 0)
+                } else {
+                    self.denorm_input
+                };
+                Self {
+                    round,
+                    denorm_input,
+                }
             }
             _ => self,
         }
@@ -328,13 +347,15 @@ impl FpMode16 {
     fn join(self, other: Self) -> Self {
         Self {
             round: self.round.filter(|_| self.round == other.round),
-            denorm: self.denorm.filter(|_| self.denorm == other.denorm),
+            denorm_input: self
+                .denorm_input
+                .filter(|_| self.denorm_input == other.denorm_input),
         }
     }
 }
 
-/// Track MODE bits 3:2 and 7:6 independently. A value is unknown after a
-/// dynamic write or a join between paths that disagree.
+/// Track MODE bits 3:2 and the input-denormal bit 6 independently. A field
+/// is unknown after a dynamic write or a join between paths that disagree.
 fn fp_modes16(p: &crate::ir::Program) -> Vec<FpMode16> {
     let mut entry = vec![None; p.blocks.len()];
     entry[0] = Some(FpMode16::INITIAL);
@@ -1384,6 +1405,7 @@ impl<'a> Lower<'a> {
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
                         self.section_inst(b, j, i);
+                        self.mode16 = self.mode16.after(&p.blocks[b].insts[j]);
                     }
                     i = end;
                     continue;

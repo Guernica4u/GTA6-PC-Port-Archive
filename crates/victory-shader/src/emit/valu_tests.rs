@@ -607,6 +607,39 @@ fn sqrt_f64_preserves_signed_zero_when_mode_flushes_subnormals() {
 }
 
 #[test]
+fn sqrt_f64_uses_mode_written_in_whole_wave_section() {
+    let setup = [
+        0xBE8D_3DC1,        // s_or_saveexec_b32 s13, -1
+        0xBFA5_0008,        // s_denorm_mode: flush FP16/FP64 inputs
+        s_mov_b32(126, 13), // s_mov_b32 exec_lo, s13
+    ];
+    let inputs = [1, (1 << 63) | 1, 4.0f64.to_bits()];
+    let wanted = [0, 1 << 63, 2.0f64.to_bits()];
+    for (backend, outputs) in sqrt_f64_results(&setup, &[vop1(0x034, 6, vgpr(1))], &inputs) {
+        assert_eq!(outputs, wanted, "{backend}");
+    }
+}
+
+#[test]
+fn sqrt_f64_keeps_the_input_denorm_mode_across_output_only_changes() {
+    let instruction = [vop1(0x034, 6, vgpr(1))];
+    let inputs = [1, 4.0f64.to_bits()];
+    let output_only = [0xBA80_01C1, 0]; // s_setreg_imm32_b32 hwreg(MODE, 7, 1), 0
+    let join = [
+        0xBF06_8002, // s_cmp_eq_u32 s2, 0
+        0xBF85_0002, // s_cbranch_scc1 -> preserve both input and output
+        0xBFA5_0004, // s_denorm_mode: preserve only FP16/FP64 inputs
+        0xBF82_0001, // s_branch -> join
+        0xBFA5_000C, // s_denorm_mode: preserve both
+    ];
+    let expected = sqrt_f64_results(&[], &instruction, &inputs);
+    assert!(expected.iter().all(|(_, words)| words[0] != 0));
+    for setup in [&output_only[..], &join] {
+        assert_eq!(sqrt_f64_results(setup, &instruction, &inputs), expected);
+    }
+}
+
+#[test]
 fn normalized_buffer_formats_load_their_ends_exactly() {
     // tbuffer_load_format_x.
     let x = 0;
