@@ -1846,6 +1846,10 @@ mod tests {
         assert_eq!(view_kind(&uav(58, 0, 0)), victory_shader::emit::VIEW_NORMALIZED, "R16_SNORM");
         assert_eq!(view_kind(&uav(39, 0, 1)), 0, "raw");
         assert_eq!(view_kind(&uav(0, 16, 0)), 0, "structured");
+        for format in [85, 86, 87, 88, 115] {
+            let srv = View::Shader(0, Some([format, 1, 5768, 0, 0, 0, 64, 0, 0, 0]));
+            assert_eq!(view_kind(&srv), victory_shader::emit::VIEW_NORMALIZED, "DXGI format {format}");
+        }
         // Format, dimension, mapping, first element, count, stride, flags.
         let srv = View::Shader(0, Some([62, 1, 5768, 0, 0, 0, 64, 0, 0, 0]));
         assert_eq!(view_kind(&srv), VIEW_INTEGER, "R8_UINT");

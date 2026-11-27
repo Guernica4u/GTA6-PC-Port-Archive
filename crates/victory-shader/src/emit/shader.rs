@@ -29,7 +29,7 @@ pub const VIEW_NORMALIZED: u32 = 1 << 29;
 
 /// UNORM and SNORM color formats usable for typed buffer elements (DXGI_FORMAT).
 pub fn normalized_buffer_format(format: u32) -> bool {
-    matches!(format, 11 | 13 | 24 | 28 | 31 | 35 | 37 | 49 | 51 | 56 | 58 | 61 | 63)
+    matches!(format, 11 | 13 | 24 | 28 | 31 | 35 | 37 | 49 | 51 | 56 | 58 | 61 | 63 | 85 | 86 | 87 | 88 | 115)
 }
 
 /// Where the title-memory page table is bound: `t0` (a raw root SRV) in

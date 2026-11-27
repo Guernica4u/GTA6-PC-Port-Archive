@@ -748,7 +748,8 @@ fn d16_x_loads_read_r16_uint_and_r16_float_views() {
 #[test]
 fn mubuf_d16_descriptor_rounding() {
     use windows::Win32::Graphics::Dxgi::Common::{
-        DXGI_FORMAT_R16_SNORM, DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R32_FLOAT,
+        DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16_SNORM, DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R32_FLOAT,
+        DXGI_FORMAT_R8G8B8A8_UNORM,
     };
     let shader = build(
         D16_X_LOAD_WAVE32,
@@ -761,6 +762,9 @@ fn mubuf_d16_descriptor_rounding() {
         ("SNORM", DXGI_FORMAT_R16_SNORM, 2, 0xf7fd, 0xac02),
         ("FLOAT", DXGI_FORMAT_R32_FLOAT, 4, 2051.0f32.to_bits(), 0x6801),
         ("UINT", DXGI_FORMAT_R16_UINT, 2, 2051, 2051),
+        // The same color (R=254, G=2, B=1, A=255) in each memory order.
+        ("RGBA", DXGI_FORMAT_R8G8B8A8_UNORM, 4, 0xff01_02fe, 0x3bf8),
+        ("BGRA", DXGI_FORMAT_B8G8R8A8_UNORM, 4, 0xfffe_0201, 0x3bf8),
     ] {
         let data = if size == 2 { vec![input | input << 16; 16] } else { vec![input; 32] };
         let views = [View::Buffer { data: &data, stride: Stride::Format(format, size) }, View::RawUav(32)];
