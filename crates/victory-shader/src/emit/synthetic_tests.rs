@@ -371,11 +371,7 @@ fn permutes_read_the_lane_named_and_zero_from_lanes_left_out() {
     }
 }
 
-/// Builds, DXIL-validates, and runs a single-wave `ds_bpermute_b32` compute
-/// shader (`wave` = 32 or 64) where `body` leaves each lane's result in `v3`.
-fn run_permute_cs(wave64: bool, body: &[u32], want: &[u32]) {
-    let wave = if wave64 { 64 } else { 32 };
-    assert_eq!(want.len(), wave as usize);
+fn permute_cs_words(body: &[u32]) -> Vec<u32> {
     let mut words = vec![
         0xBE84_0300, // s_mov_b32 s4, s0
         0xBE85_0380, // s_mov_b32 s5, 0
@@ -390,6 +386,15 @@ fn run_permute_cs(wave64: bool, body: &[u32], want: &[u32]) {
         0x800A_0310, // buffer_store_dword v3, v16, s[40:43], 0 offen
         0xBF81_0000, // s_endpgm
     ]);
+    words
+}
+
+/// Builds, DXIL-validates, and runs a single-wave `ds_bpermute_b32` compute
+/// shader (`wave` = 32 or 64) where `body` leaves each lane's result in `v3`.
+fn run_permute_cs(wave64: bool, body: &[u32], want: &[u32]) {
+    let wave = if wave64 { 64 } else { 32 };
+    assert_eq!(want.len(), wave as usize);
+    let words = permute_cs_words(body);
     let views = [
         View::Texture(1, 1, &[[0.0; 4]]),
         View::Buffer {
@@ -435,29 +440,47 @@ fn run_permute_cs(wave64: bool, body: &[u32], want: &[u32]) {
     }
 }
 
-#[test]
-fn permutes_mask_high_address_bits_and_divergent_branches() {
+fn divergent_permute_body(active: u32) -> [u32; 14] {
     // High byte-address bits (0x100) and sub-dword bits (+3) are ignored,
     // so only bits 6:2 select the source lane. Lanes above the cutoff skip
     // the permute via `s_cbranch_execz` and keep their old destinations.
     // Cut through a group of four in the second case.
+    [
+        0x4A04_00FF,
+        0x0000_3000, // v_add_nc_u32 v2, 0x3000, v0
+        0x4A06_00FF,
+        0xBEEF_0000, // v_add_nc_u32 v3, 0xbeef0000, v0
+        0x4A02_0088, // v_add_nc_u32 v1, 8, v0
+        0x3402_0282, // v_lshlrev_b32 v1, 2, v1
+        0x4A02_02FF,
+        0x0000_0103, // v_add_nc_u32 v1, 0x103, v1
+        0x7D88_0080 | active, // v_cmp_gt_u32 vcc_lo, active, v0
+        0xBE94_3C6A, // s_and_saveexec_b32 s20, vcc_lo
+        0xBF88_0002, // s_cbranch_execz +2
+        0xDACC_0000,
+        0x0300_0201, // ds_bpermute_b32 v3, v1, v2
+        0xBEFE_0314, // s_mov_b32 exec_lo, s20
+    ]
+}
+
+#[test]
+fn warp_permute_ballots_before_the_entry_branch() {
+    let words = permute_cs_words(&divergent_permute_body(19));
+    let shader = build_wave_with(&words, false, true).expect("lower");
+    let Some(dxil) = super::tests::dump_dxil(&shader.dxil, "permute") else {
+        eprintln!("no dxc.exe; DXIL check skipped");
+        return;
+    };
+    let entry = dxil.split_once("br i1 ").expect("a divergent branch").0;
+    let ballot = entry
+        .lines()
+        .any(|line| line.contains("call ") && line.contains("@dx.op.waveActiveBallot("));
+    assert!(ballot, "the ballot must precede divergence:\n{dxil}");
+}
+
+#[test]
+fn permutes_mask_high_address_bits_and_divergent_branches() {
     for active in [16, 19] {
-        let body = [
-            0x4A04_00FF,
-            0x0000_3000, // v_add_nc_u32 v2, 0x3000, v0
-            0x4A06_00FF,
-            0xBEEF_0000, // v_add_nc_u32 v3, 0xbeef0000, v0
-            0x4A02_0088, // v_add_nc_u32 v1, 8, v0
-            0x3402_0282, // v_lshlrev_b32 v1, 2, v1
-            0x4A02_02FF,
-            0x0000_0103, // v_add_nc_u32 v1, 0x103, v1
-            0x7D88_0080 | active, // v_cmp_gt_u32 vcc_lo, active, v0
-            0xBE94_3C6A, // s_and_saveexec_b32 s20, vcc_lo
-            0xBF88_0002, // s_cbranch_execz +2
-            0xDACC_0000,
-            0x0300_0201, // ds_bpermute_b32 v3, v1, v2
-            0xBEFE_0314, // s_mov_b32 exec_lo, s20
-        ];
         let want: Vec<u32> = (0..32)
             .map(|l| {
                 if l + 8 < active {
@@ -469,7 +492,7 @@ fn permutes_mask_high_address_bits_and_divergent_branches() {
                 }
             })
             .collect();
-        run_permute_cs(false, &body, &want);
+        run_permute_cs(false, &divergent_permute_body(active), &want);
     }
 }
 

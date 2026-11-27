@@ -3305,16 +3305,37 @@ impl<'a> Lower<'a> {
                 within_half
             };
             let direct = (!self.warp_permute).then(|| self.read_lane(x, lane));
-            let on = guard.unwrap_or_else(|| self.s.m.bool(true));
-            let i32t = self.s.t.i32;
-            let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-            let ballot = self
-                .s
-                .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
-            let (lo, hi) = (
-                self.s.m.extract(c, ballot, 0),
-                self.s.m.extract(c, ballot, 1),
-            );
+            // If the entry mask exactly selects the sole edge to this block,
+            // take its ballot before the branch. WARP can misread a ballot
+            // inside the divergent Wave32 block.
+            let entry_mask = if self.warp_permute
+                && !self.x.native.wave64
+                && guard.is_none()
+                && self.x.p.blocks[b].preds == [0]
+                && self.x.p.blocks[0].preds.is_empty()
+                && let Some(exec) = inst.read(Reg::S(EXEC))
+                && self.def_block.get(&exec) == Some(&0)
+                && self.x.st.active.contains(&exec)
+                && self.x.st.masks.get(&exec) == Some(&self.x.st.reach[b])
+            {
+                self.mask_dword(exec).ok()
+            } else {
+                None
+            };
+            let (lo, hi) = if let Some(lo) = entry_mask {
+                (lo, k(self, 0))
+            } else {
+                let on = guard.unwrap_or_else(|| self.s.m.bool(true));
+                let i32t = self.s.t.i32;
+                let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+                let ballot = self
+                    .s
+                    .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
+                (
+                    self.s.m.extract(c, ballot, 0),
+                    self.s.m.extract(c, ballot, 1),
+                )
+            };
             let running = self.lane_bit_of(c, lane, lo, hi);
             let r = direct.unwrap_or_else(|| self.read_lane_on_warp(x, lane, [lo, hi]));
             let z = k(self, 0);

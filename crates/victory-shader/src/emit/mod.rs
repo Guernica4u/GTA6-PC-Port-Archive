@@ -1624,7 +1624,7 @@ mod tests {
     /// The LLVM text `dxc -dumpbin` prints for a DXIL container, when dxc
     /// is installed.
     #[cfg(windows)]
-    fn dump_dxil(container: &[u8]) -> Option<String> {
+    pub(super) fn dump_dxil(container: &[u8], tag: &str) -> Option<String> {
         let dxc = match std::env::var_os("VICTORY_PC_DXC") {
             Some(p) => std::path::PathBuf::from(p),
             None => super::validator::Validator::default_path()?.with_file_name("dxc.exe"),
@@ -1632,7 +1632,7 @@ mod tests {
         if !dxc.exists() {
             return None;
         }
-        let file = std::env::temp_dir().join(format!("victory-interp-{}.dxil", std::process::id()));
+        let file = std::env::temp_dir().join(format!("victory-{tag}-{}.dxil", std::process::id()));
         std::fs::write(&file, container).ok()?;
         let out = std::process::Command::new(dxc)
             .arg("-dumpbin")
@@ -1721,8 +1721,8 @@ mod tests {
             super::emit(&c, &native, &p, &st, &io, &res).unwrap().dxil
         };
         let (Some(low), Some(high)) = (
-            dump_dxil(&dump(false, 0, false)),
-            dump_dxil(&dump(true, 1, true)),
+            dump_dxil(&dump(false, 0, false), "interp"),
+            dump_dxil(&dump(true, 1, true), "interp"),
         ) else {
             eprintln!("no dxc.exe; DXIL check skipped");
             return;
