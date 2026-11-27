@@ -7,7 +7,7 @@ import struct
 import tempfile
 
 from project_tuxbox.verify import (
-    lanes_imports, missing_provider_imports, private_x_server, screen_capture_problem, splash_skip_reason, xauthority_entry)
+    guid_receipt, lanes_imports, missing_provider_imports, private_x_server, screen_capture_problem, splash_skip_reason, xauthority_entry)
 
 
 class SplashSkipTests(unittest.TestCase):
@@ -152,6 +152,20 @@ class ProviderImportTests(unittest.TestCase):
                 missing_provider_imports(modules, Path("xmem.dll"), ("XMemAllocDefault", "XMemFreeDefault")),
                 ["XMemAllocDefault", "XMemFreeDefault"])
         self.assertEqual(missing_provider_imports(modules, Path("GameInput.dll"), ("#1",)), ["#1"])
+
+
+class GuidReceiptTests(unittest.TestCase):
+    def test_named_identifier_imports_are_counted(self):
+        modules = [{"module": "d3d12_xs.dll", "symbols": ["IID_ID3D12Device", "WKPDID_D3DDebugObjectName",
+                                                          "D3D12XboxCreateDevice"]}]
+        self.assertEqual(guid_receipt(modules, Path("d3d12_xs.dll")), "d3d12-guids PASS identifiers=2 bytes=32")
+
+    def test_identifiers_imported_by_ordinal_resolve_against_the_provider(self):
+        # MSVC's link.exe imports the identifiers by ordinal; lld-link and MinGW import them by name.
+        modules = [{"module": "D3D12_XS.DLL", "symbols": ["#23", "#54", "#7"]}]
+        table = ({23: {"IID_ID3D12Device"}, 54: {"WKPDID_D3DDebugObjectName"}, 7: {"D3D12XboxCreateDevice"}}, set())
+        with mock.patch("project_tuxbox.verify.export_table", return_value=table):
+            self.assertEqual(guid_receipt(modules, Path("d3d12_xs.dll")), "d3d12-guids PASS identifiers=2 bytes=32")
 
 
 class MeshWorkerReceiptTests(unittest.TestCase):
