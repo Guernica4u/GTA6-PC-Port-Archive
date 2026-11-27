@@ -11994,6 +11994,14 @@ impl<'a> Lower<'a> {
             let regs = if d16 { count.div_ceil(2) } else { count };
             let mut vals =
                 self.vgprs(inst, data.as_ref().ok_or("buffer store data")?, regs as u8)?;
+            // With `VICTORY_NAN_SCRUB=1` the floats of a typed store are
+            // scrubbed too (`scrub_nan`), as colours and image stores are,
+            // where the view-kind bits say the view is not of an integer
+            // format: halves and the integers such views move are the face
+            // network's, and a view whose kind is not read here is left as
+            // it is (after codec-d/cool_fox, Neptune-VE's NaN guard, which
+            // covers typed buffer stores beside colour exports).
+            let scrub_floats = typed && !halves && nan_scrub();
             if d16 {
                 // Through a view of a table each half is stored as it is
                 // (`halves`, fxceless #927). Reached another way, d16 data
@@ -12025,6 +12033,9 @@ impl<'a> Lower<'a> {
                     let f = self
                         .s
                         .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
+                    // The float alone: through a view of an integer format
+                    // the integer below is stored instead.
+                    let f = if scrub_floats && integer.is_some() { self.scrub_nan(f) } else { f };
                     let mut w = self.as_int(f);
                     if let Some((int, signed)) = integer {
                         let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
@@ -12045,12 +12056,26 @@ impl<'a> Lower<'a> {
                 if count != 4 || *offen || *offset != 0 {
                     return Err("a typed buffer store of some channels or at an offset");
                 }
+                // Whether the view of 32-bit data is of an integer format,
+                // for the scrub (d16 data was scrubbed as it widened).
+                let integer = if scrub_floats && !d16 { self.integer_view(src)? } else { None };
                 // Four unsigned integers for halves, four floats otherwise.
                 let component = if halves { 0x405 } else { 0x409 };
                 args.push(self.handle(site, src, false, (10 | u, component))?);
                 args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
                 for x in vals {
-                    args.push(if halves { x } else { self.as_float(x) });
+                    args.push(if halves {
+                        x
+                    } else {
+                        let f = self.as_float(x);
+                        match integer {
+                            Some((int, _)) => {
+                                let scrubbed = self.scrub_nan(f);
+                                self.s.m.select(self.cur, int, f, scrubbed)
+                            }
+                            None => f,
+                        }
+                    });
                 }
                 (
                     69,
