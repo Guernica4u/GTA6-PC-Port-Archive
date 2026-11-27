@@ -130,6 +130,30 @@ fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
     }
 }
 
+fn log_sample(physical: u64, commit: u64, pressure: bool) {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let mut counters = PROCESS_MEMORY_COUNTERS {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: the output buffer and its byte count match the Windows structure.
+    if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) } != 0 {
+        tracing::info!(
+            target: "victory_gpu::memory",
+            frame = crate::frame::current(),
+            physical_available_mib = physical / MIB,
+            commit_available_mib = commit / MIB,
+            working_set_mib = counters.WorkingSetSize as u64 / MIB,
+            private_commit_mib = counters.PagefileUsage as u64 / MIB,
+            page_faults_total = counters.PageFaultCount,
+            pressure,
+            "host memory sample"
+        );
+    }
+}
+
 /// Called by the once-per-second submission sweep. A failed sample keeps the last good state.
 pub(crate) fn refresh() {
     let Some(status) = memory_status() else { return };
@@ -137,6 +161,10 @@ pub(crate) fn refresh() {
     HEADROOM.store(physical.min(commit), Ordering::Relaxed);
     let was = pressured();
     let pressure = next_pressure(was, physical, commit);
+    static LOG: OnceLock<bool> = OnceLock::new();
+    if *LOG.get_or_init(|| crate::switch::on("VICTORY_MEMORY_SAMPLES")) {
+        log_sample(physical, commit, pressure);
+    }
     if pressure != was {
         PRESSURED.store(pressure, Ordering::Relaxed);
         if pressure {
