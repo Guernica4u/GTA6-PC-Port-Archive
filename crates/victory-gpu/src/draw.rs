@@ -3183,7 +3183,16 @@ impl State {
         // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let (per_frame, span) = if catchup && on_time >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
+        // While a backlog is due the pass is a loading pass: frames are 100-300 ms then,
+        // so a 16 ms slice drained 20,000 slots in minutes (measured, docs/performance).
+        // `VICTORY_TEXTURE_BACKLOG_MS` is the slice then (default 200); it falls back to
+        // the plain one under 1024 due slots.
+        static BACKLOG_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let backlog = std::time::Duration::from_millis(*BACKLOG_MS.get_or_init(|| {
+            std::env::var("VICTORY_TEXTURE_BACKLOG_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(200)
+        }));
+        let (per_frame, span) =
+            if catchup && on_time >= 1024 { (per_frame * 3, (span * 3).max(backlog)) } else { (per_frame, span) };
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
