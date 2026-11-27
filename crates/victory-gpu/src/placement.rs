@@ -363,8 +363,10 @@ mod tests {
             textures.push(texture);
         }
         assert_eq!(heaps.pending.len(), 512, "the backlog the test measures");
-        // What one reap costs with that backlog, and what a placement cost
-        // before: a reap, then the range.
+        // What one reap costs with that backlog, and what a placement costs
+        // when it does not pay one. The timings are printed, not asserted:
+        // the test is about the reap, and a wall-clock ratio flaps on a
+        // loaded machine (the margin is tens of times, but still).
         let t0 = std::time::Instant::now();
         for _ in 0..100 {
             heaps.reap();
@@ -377,16 +379,16 @@ mod tests {
             std::hint::black_box(heaps.take_room(ALIGN, ALIGN));
         }
         let after = t0.elapsed() / 100;
+        assert_eq!(
+            heaps.reaps, reaps,
+            "placing into a heap with room reaps nothing"
+        );
         // With no room left, the reap is what the next placement pays — once.
         while heaps.take_room(ALIGN, ALIGN).is_some() {}
         std::hint::black_box(heaps.allocate(&host.device, ALIGN, ALIGN));
         assert_eq!(heaps.reaps, reaps + 1, "out of room: the reap runs, once");
         eprintln!(
             "512 pending ranges: placement with a reap {before:?}, without {after:?} (one reap {reaps:?}/100 placements)"
-        );
-        assert!(
-            after * 4 < before,
-            "placing into a heap no longer pays the reap: {after:?} against {before:?}"
         );
     }
 
