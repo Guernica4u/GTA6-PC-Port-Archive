@@ -429,20 +429,43 @@ impl Lower<'_> {
     /// In halves, the whole-wave sections the plan runs instruction by
     /// instruction rather than by the simulation's shapes ([`Literal`]):
     /// they are left out of [`Lower::sections`], so each of their steps is
-    /// lowered on its own. Where every thread of the group does not meet,
-    /// or in a group of a part of a console wave, they keep the simulation
-    /// (and the program its refusal).
+    /// lowered on its own. In a block run wave-wide, every thread runs it,
+    /// lanes not in it too: there the steps run in every lane of the console
+    /// wave, as the console's do once the section sets EXEC to all lanes,
+    /// and the EXEC the section saved holds the block's lanes
+    /// ([`Lower::guard`], `v_cndmask_b32`). Where every thread of the group
+    /// does not meet, they keep the simulation and ask for the block's
+    /// region to run wave-wide; in a group of a part of a console wave they
+    /// keep it (and the program its refusal).
     pub(super) fn literal_sections(&mut self) {
         let whole = |t: [u32; 3]| t.iter().product::<u32>().is_multiple_of(2 * HALF);
         if !self.trades() || !self.s.threads.is_some_and(whole) {
             return;
         }
-        let (literal, meet) = (&self.literal.sections, &self.exchange.meet);
+        let (literal, meet, wide) = (
+            &self.literal.sections,
+            &self.exchange.meet,
+            &self.wide.inside,
+        );
+        let mut stepped = Vec::new();
         for (&b, found) in &mut self.sections {
-            if meet.get(b).copied().unwrap_or(false) {
-                found.retain(|&start, _| !literal.contains(&(b, start)));
+            if !meet.get(b).copied().unwrap_or(false) {
+                // Where it runs wave-wide, its threads meet.
+                if found.keys().any(|&start| literal.contains(&(b, start))) {
+                    self.plan.ask(b);
+                }
+                continue;
             }
+            let in_wide = wide.get(b).copied().unwrap_or(false);
+            found.retain(|&start, sec| {
+                let keep = !literal.contains(&(b, start));
+                if !keep && in_wide {
+                    stepped.push((b, start, sec.end));
+                }
+                keep
+            });
         }
+        self.literal_wide = stepped;
         self.sections.retain(|_, found| !found.is_empty());
     }
 

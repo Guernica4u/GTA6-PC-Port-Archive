@@ -2650,3 +2650,92 @@ fn a_16_bit_wave_sum_matches_the_console_in_halves_on_every_gpu() {
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
+
+/// [`sum_kept_by_lanes`]'s section inside a branch of the console lanes
+/// from 8, which the first-lane read of the thread id there makes run
+/// wave-wide: the branch's lanes store their kept register (`v2`), the sum
+/// (`v4`, read from lane 0, which the branch leaves out: the section ran
+/// there too, EXEC being all lanes) and the first lane's thread id (`v5`).
+/// The lanes below 8 store nothing.
+fn sum_kept_in_a_wide_branch() -> Vec<u32> {
+    use crate::ir::EXEC;
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0xD766_0001,
+        0x0002_02C1,           // v_mbcnt_hi_u32_b32 v1, -1, v1
+        vop2(8, 0x25, 129, 0), // v_add_nc_u32 v8, 1, v0
+    ]);
+    let mut body = vec![
+        vop1(12, 0x02, 256), // v_readfirstlane_b32 s12, v0
+        vop1(5, 0x01, 12),   // v_mov_b32 v5, s12
+        sop1(2, 0x25, 193),  // s_or_saveexec_b64 s[2:3], -1
+    ];
+    body.extend(vop3(2, 0x101, 128, 256 + 8, 2)); // v_cndmask_b32 v2, 0, v8, s[2:3]
+    for ctrl in [0xB1, 0x4E, 0x141, 0x140] {
+        body.extend([vop2(2, 0x25, 0xFA, 2), dpp16(2, ctrl)]); // v_add_nc_u32 v2, v2, v2 <dpp>
+    }
+    body.extend(vop3(3, 0x378, 256 + 2, 128, 128)); // v_permlanex16_b32 v3, v2, 0, 0
+    body.push(vop2(2, 0x25, 256 + 3, 2)); // v_add_nc_u32 v2, v3, v2
+    body.extend(vop3(4, 0x360, 256 + 2, 128 + 32, 0)); // v_readlane_b32 s4, v2, 32
+    body.push(vop2(2, 0x25, 4, 2)); // v_add_nc_u32 v2, s4, v2
+    body.extend(vop3(6, 0x360, 256 + 2, 128, 0)); // v_readlane_b32 s6, v2, 0
+    body.push(sop1(EXEC, 0x04, 2)); // s_mov_b64 exec, s[2:3]
+    body.extend([
+        0x7C00_0000 | 0xC4 << 17 | 1 << 9 | 148, // v_cmp_gt_u32 vcc, 20, v1
+        0xBE96_246A,                             // s_and_saveexec_b64 s[22:23], vcc
+        vop1(2, 0x01, 128 + 7),                  // v_mov_b32 v2, 7
+        0xBEFE_0416,                             // s_mov_b64 exec, s[22:23]
+        vop1(4, 0x01, 6),                        // v_mov_b32 v4, s6
+    ]);
+    body.extend(store(2, 0));
+    body.extend(store(4, 4));
+    body.extend(store(5, 8));
+    w.extend([
+        0x7C00_0000 | 0xC3 << 17 | 1 << 9 | 136, // v_cmp_le_u32 vcc, 8, v1
+        0xBE94_246A,                             // s_and_saveexec_b64 s[20:21], vcc
+        0xBF88_0000 | body.len() as u32,         // s_cbranch_execz past it
+    ]);
+    w.extend(body);
+    w.push(0xBEFE_0414); // s_mov_b64 exec, s[20:21]
+    w.push(S_ENDPGM);
+    w
+}
+
+/// What the console stores for [`sum_kept_in_a_wide_branch`]'s thread `l`.
+fn sum_kept_in_a_wide_branch_want(l: u32) -> [u32; 3] {
+    let (base, lane) = (l & !63, l & 63);
+    if lane < 8 {
+        return [0; 3];
+    }
+    let total: u32 = (base + 8..base + 64).map(|k| k + 1).sum();
+    let high: u32 = (base + 32..base + 64).map(|k| k + 1).sum();
+    let kept = match lane {
+        8..20 => 7,
+        20..32 => total,
+        _ => 2 * high,
+    };
+    [kept, total, base + 8]
+}
+
+/// In a block run wave-wide, a section run step by step runs in every lane
+/// of the console wave and sums the block's lanes only: on every hardware
+/// adapter in halves, in groups of 64 and 128.
+#[test]
+fn a_whole_wave_sum_kept_by_lanes_in_a_wide_branch_matches_the_console_in_halves_on_every_gpu() {
+    let mut failed = Vec::new();
+    for threads in [64, 128] {
+        let want: Vec<u32> = (0..threads)
+            .flat_map(sum_kept_in_a_wide_branch_want)
+            .collect();
+        failed.extend(differences_in_halves(
+            &sum_kept_in_a_wide_branch(),
+            threads,
+            3,
+            &want,
+        ));
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}

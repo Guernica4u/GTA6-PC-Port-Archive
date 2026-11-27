@@ -137,7 +137,9 @@ regions. Two cases are lowered, tried in this order after Level 2:
   VGPR write keeps the old value elsewhere, memory is accessed by those
   lanes only, ballots, first lanes and DPP source lanes see only them), the
   phis of the region and of its join pick, lane by lane, the value along
-  the edge the lane came by, and every block of the region is one where
+  the edge the lane came by, a whole-wave section the simulation cannot
+  follow runs step by step over the block's lanes, and every block of the
+  region is one where
   every thread meets, so the halves trade and order LDS there. A lane read
   of a lane outside the block gives its old value, as on the console. A
   lane that gets to an end is in no block after it, and every thread ends
@@ -207,12 +209,12 @@ that 735 compute programs share):
 | regions to the program's end, loops of larger groups | 2,697 |
 | sections step by step, lane permutes per instruction | 2,704 |
 | regions a whole-group branch goes around or into | 2,721 |
+| sections step by step in blocks run wave-wide | 2,723 |
 
 Still refused in halves: 2 first lanes in a region entered by a
 whole-group branch that holds a descriptor chosen by control flow, 1 mask
 in a region of neither shape; 2 programs whose LDS leaves no room for the
-trades' 16 bytes per console wave; 6 tiled group shapes; 2 16-bit sums
-where not every thread of a group of several console waves meets.
+trades' 16 bytes per console wave; 6 tiled group shapes.
 
 Before Levels 2 and 3, a local build that recorded every cross-half site
 (and went on past each refusal, so every block was seen) classified the
@@ -249,7 +251,8 @@ group-shared slots' cost in barriers; loops each lane leaves in its own
 round (the halves going round different numbers of times) with first
 lanes, masks and LDS inside, and a first lane read after such a loop;
 regions a whole-group branch goes around or into, a section run step by
-step whose uneven lanes are kept, a 16-bit sum, and the lane permutes.
+step whose uneven lanes are kept (also in a block run wave-wide), a 16-bit
+sum, and the lane permutes.
 `emit::halves_random_tests` runs random wave64 programs (cross-lane steps
 at the top level, in branches one inside another and in loops each lane
 leaves in its own round, LDS, scalar branches, lanes that end partway,

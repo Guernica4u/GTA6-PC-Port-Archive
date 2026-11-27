@@ -128,6 +128,14 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
             Err(Stop::Fail(ShaderError::Unsupported { what, .. })) if literal.follow(what) => {
                 bad.retain(|_, &mut why| why != SECTION_UNFOLLOWED && why != halves::SUM16_ACROSS);
             }
+            // Such a section where not every thread meets: its region runs
+            // wave-wide next time, where the section may run step by step.
+            Err(Stop::Fail(ShaderError::Unsupported { what, .. }))
+                if (what == SECTION_UNFOLLOWED || what == halves::SUM16_ACROSS)
+                    && wide.grow(parts) =>
+            {
+                bad.retain(|_, &mut why| why != SECTION_UNFOLLOWED && why != halves::SUM16_ACROSS);
+            }
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
                     return Err(ShaderError::Unsupported {
@@ -287,6 +295,12 @@ struct Lower<'a> {
     /// The values whole-wave sections leave without a lowering, with their
     /// section (block, start), for [`Lower::ask_literal`].
     unfollowed: HashMap<Value, (usize, usize)>,
+    /// The sections run step by step in blocks run wave-wide (block, start,
+    /// end), and whether the instruction being lowered is in one: there the
+    /// section's steps run in every lane of the console wave, as on the
+    /// console, and its saved EXEC holds the block's lanes only.
+    literal_wide: Vec<(usize, usize, usize)>,
+    literal_now: bool,
     /// In halves: VGPR values the same in every lane of the console wave
     /// ([`halves::lane_uniform`]), whose first lane either half reads.
     alike: HashSet<Value>,
@@ -768,6 +782,8 @@ impl<'a> Lower<'a> {
             plan,
             literal,
             unfollowed: HashMap::new(),
+            literal_wide: Vec::new(),
+            literal_now: false,
             alike: if halves {
                 halves::lane_uniform(x)
             } else {
@@ -1237,6 +1253,7 @@ impl<'a> Lower<'a> {
                     .get(&mask)
                     .ok_or("a wave reduction's untracked mask")?;
                 let on = self.boolean(m, c)?;
+                let on = self.wide_and(self.cur_ir, on, c);
                 let x = self.i32_of(src)?;
                 let id = self.s.m.i32(ident);
                 return Ok(self.s.m.select(c, on, x, id));
@@ -1260,6 +1277,7 @@ impl<'a> Lower<'a> {
                     .get(&mask)
                     .ok_or("a wave reduction's untracked mask")?;
                 let on = self.boolean(m, c)?;
+                let on = self.wide_and(self.cur_ir, on, c);
                 let x = self.i32_of(src)?;
                 let id = self.s.m.i32(ident);
                 let x = self.s.m.select(c, on, x, id);
@@ -1324,7 +1342,10 @@ impl<'a> Lower<'a> {
             .masks
             .get(&mask)
             .ok_or("a wave reduction's untracked mask")?;
+        // Where the block runs wave-wide, every thread runs it (lanes that
+        // left a loop too): the section's lanes are those of the block.
         let on = self.boolean(m, c)?;
+        let on = self.wide_and(self.cur_ir, on, c);
         let x = self.i32_of(src)?;
         let id = self.s.m.i32(ident);
         let x = self.s.m.select(c, on, x, id);
@@ -1464,7 +1485,12 @@ impl<'a> Lower<'a> {
                     self.s
                         .op(at, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
                 }
+                self.literal_now = self
+                    .literal_wide
+                    .iter()
+                    .any(|&(lb, s, e)| lb == b && s < i && i < e);
                 self.inst(b, i)?;
+                self.literal_now = false;
                 self.mode16 = round16_after(&p.blocks[b].insts[i], self.mode16);
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
@@ -2828,6 +2854,9 @@ impl<'a> Lower<'a> {
             None => None,
             Some(g) => Some(self.boolean(g, self.cur)?),
         };
+        if self.literal_now {
+            return Ok(g);
+        }
         Ok(self.wide_guard(b, g))
     }
 
@@ -6710,7 +6739,12 @@ impl<'a> Lower<'a> {
                                     .copied()
                             })
                             .ok_or("a select on an untracked mask")?;
-                        self.boolean(m, c)?
+                        let on = self.boolean(m, c)?;
+                        if self.literal_now {
+                            self.wide_and(self.cur_ir, on, c)
+                        } else {
+                            on
+                        }
                     }
                     Some(&Operand::Const(k)) => {
                         let x =

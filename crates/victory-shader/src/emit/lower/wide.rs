@@ -79,8 +79,15 @@ impl Plan {
     /// attempts after, and reading it there asks for nothing); whether
     /// another attempt is worth making (some region joined).
     pub(super) fn widen(&mut self, x: &Parts, what: Why) -> bool {
+        super::halves::for_want_of_a_meeting(what) && self.grow(x)
+    }
+
+    /// The regions around the blocks asked for join the plan, whatever the
+    /// refusal (a section run step by step asks for its block's region,
+    /// [`Lower::literal_sections`]); whether some region joined.
+    pub(super) fn grow(&mut self, x: &Parts) -> bool {
         let asked = std::mem::take(self.asked.get_mut());
-        if asked.is_empty() || !super::halves::for_want_of_a_meeting(what) {
+        if asked.is_empty() {
             return false;
         }
         let regions = regions(x);
