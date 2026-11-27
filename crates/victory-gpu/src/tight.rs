@@ -47,16 +47,14 @@ const EXPIRE: Duration = Duration::from_millis(400);
 /// Noted declarations kept per copy.
 const KEEP: usize = 128;
 
-/// `VICTORY_TIGHT_WRITES=1`.
+/// Always on (experimental code: no environment switch).
 pub(crate) fn on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_TIGHT_WRITES").is_ok_and(|v| v.trim() == "1"))
+    true
 }
 
-/// Every this many declarations of a tight key are full (`VICTORY_TIGHT_VERIFY`).
+/// Every this many declarations of a tight key are full.
 fn verify_every() -> u32 {
-    static N: OnceLock<u32> = OnceLock::new();
-    *N.get_or_init(|| std::env::var("VICTORY_TIGHT_VERIFY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(16).max(1))
+    16
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]

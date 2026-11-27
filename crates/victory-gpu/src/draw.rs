@@ -3191,10 +3191,7 @@ impl State {
         // so a 16 ms slice drained 20,000 slots in minutes (measured, docs/performance).
         // `VICTORY_TEXTURE_BACKLOG_MS` is the slice then (default 200); it falls back to
         // the plain one under 1024 due slots.
-        static BACKLOG_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        let backlog = std::time::Duration::from_millis(*BACKLOG_MS.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_BACKLOG_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(200)
-        }));
+        let backlog = std::time::Duration::from_millis(200);
         let (per_frame, span) =
             if catchup && on_time >= 1024 { (per_frame * 3, (span * 3).max(backlog)) } else { (per_frame, span) };
         // A run made early (`State::early_textures`) has a budget of its
