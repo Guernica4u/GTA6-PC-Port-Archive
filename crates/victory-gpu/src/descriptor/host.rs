@@ -2922,7 +2922,7 @@ mod tests {
 
             // Part 1: 20 frames with 3 in-flight batches held simultaneously
             // (all allocations succeed; exercises pure bitmap vs bool scanning).
-            let calls_per_frame = if len <= MIN_DYNAMIC { 450u32 } else { 1_800u32 };
+            let calls_per_frame = if len <= CAPPED_DYNAMIC { 450u32 } else { 1_800u32 };
             let t_churn = std::time::Instant::now();
             for frame in 0..20u32 {
                 if batches.len() == 3
@@ -2966,7 +2966,7 @@ mod tests {
             (churn_elapsed, sat_elapsed, checksum)
         }
 
-        for (label, len) in [("capped_64k (NVIDIA)", MIN_DYNAMIC), ("uncapped_256k", DYNAMIC)] {
+        for (label, len) in [("capped_64k (NVIDIA)", CAPPED_DYNAMIC), ("uncapped_256k", DYNAMIC)] {
             let mut old_churn = Vec::new();
             let mut old_sat = Vec::new();
             let mut new_churn = Vec::new();

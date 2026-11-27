@@ -1250,11 +1250,25 @@ impl Host {
                     .collect::<Vec<_>>()
             })
             .collect();
+        // VICTORY_HEAP_WORKER: post the texture-refresh work to the
+        // background worker before running buffer refreshes, so both happen
+        // in parallel.  On the synchronous path, texture refresh is part of
+        // `bindless::uploads` and runs first.
+        let have_work = !heaps.is_empty() || !textures.is_empty();
+        let worker_on = crate::bindless::heap_worker_on();
+        if worker_on && have_work {
+            let work = crate::bindless::collect_work(&heaps, &textures);
+            crate::texture::recycle();
+            crate::bindless::start_heap_worker(work);
+        }
         #[cfg(feature = "diagnostics")]
         let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
-        let uploads = (!heaps.is_empty() || !textures.is_empty())
-            .then(|| crate::bindless::uploads(&heaps, &textures))
-            .flatten();
+        let uploads = if worker_on {
+            // Worker path: synchronous uploads is skipped; worker list collected after run_deferred.
+            None
+        } else {
+            have_work.then(|| crate::bindless::uploads(&heaps, &textures)).flatten()
+        };
         #[cfg(feature = "diagnostics")]
         drop(uploading);
         let runs: Vec<&HostList> = uploads
@@ -1283,9 +1297,9 @@ impl Host {
                 }
             }
         }
-        let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
+        let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len() + 2);
         // Where each run's lists start in `lists`.
-        let mut firsts = Vec::with_capacity(runs.len());
+        let mut firsts = Vec::with_capacity(runs.len() + 1);
         let mut batch = Batch::default();
         for list in runs {
             list.run_deferred(&mut batch);
@@ -1298,6 +1312,31 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        // Worker path: collect the texture-upload list that ran in parallel
+        // with the buffer refreshes above.  Prepend it to the submission so
+        // textures are ready before any title list samples them.
+        let _worker_list = if worker_on {
+            crate::bindless::wait_heap_worker()
+        } else {
+            None
+        };
+        if let Some(ref wl) = _worker_list {
+            // Build the worker list's state prelude (texture transitions).
+            let prelude = wl.prelude();
+            let prelude_count = usize::from(prelude.is_some());
+            let inserted = prelude_count + 1; // prelude (optional) + main list
+            if let Some(prelude) = prelude {
+                lists.insert(0, Some(prelude));
+            }
+            lists.insert(prelude_count, wl.list.cast().ok());
+            // Shift all existing firsts by the number of slots added.
+            // The worker list is not represented in `firsts` (which is used
+            // for per-list diagnostics timing only); shift existing entries
+            // so they still index their own list slices correctly.
+            for f in firsts.iter_mut() {
+                *f += inserted;
+            }
+        }
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
