@@ -286,6 +286,8 @@ fn levels_of_detail_at_a_triangle_edge_and_after_a_discard() {
                     lo = lo.min(px[1]);
                     hi = hi.max(px[1]);
                     let bad = discard && killed(x, y)
+                        || !px[0].is_finite()
+                        || !px[1].is_finite()
                         || px[0].abs() > 0.02
                         || (px[1] - want).abs() > 0.02;
                     if bad {
