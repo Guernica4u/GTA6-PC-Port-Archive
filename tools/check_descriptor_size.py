@@ -58,7 +58,8 @@ guest = replace(guest, "D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1,", "D3D12_DESC
 guest = replace(guest, "    D3D12_COMMAND_QUEUE_DESC qd{};", """    UINT texture_width = 0, texture_height = 0, texture_mips = 0, first_mip = 0;
     if (!(std::ifstream(name + ".tex") >> texture_width >> texture_height >> texture_mips >> first_mip))
         throw std::runtime_error("missing texture case " + name);
-    D3D12_HEAP_PROPERTIES texture_heap{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_HEAP_PROPERTIES texture_heap{};
+    texture_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC texture_desc{};
     texture_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     texture_desc.Width = texture_width;
