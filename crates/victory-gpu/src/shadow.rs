@@ -90,7 +90,11 @@ pub(crate) struct Shadow {
     /// goes.
     base: u64,
     slice: Option<Slice>,
+    /// Monotonic use stamp for opt-in LRU eviction (`VICTORY_SHADOW_BUDGET_MB`).
+    last_used: std::sync::atomic::AtomicU64,
 }
+
+static USE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Snapshot segments (offset, bytes) and the pieces compared.
 type Snapshot = (Vec<(usize, Vec<u8>)>, std::collections::HashSet<usize>);
@@ -264,6 +268,9 @@ impl Shadow {
             marks,
             base: slice.map_or(0, |s| s.offset),
             slice,
+            last_used: std::sync::atomic::AtomicU64::new(
+                USE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            ),
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -1047,7 +1054,103 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         entry.shadow = Some(Shadow::new(buffer, data, gpu, key.0, len));
         changed();
     }
+    if let Some(s) = &entry.shadow {
+        s.last_used.store(
+            USE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
     entry.shadow.clone()
+}
+
+fn shadow_budget_bytes_for(val: Option<&str>) -> Option<u64> {
+    val.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&mb| mb > 0)
+        .map(|mb| mb.saturating_mul(1 << 20))
+}
+
+fn shadow_budget_bytes() -> Option<u64> {
+    static CAP: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        if cfg!(test) {
+            return None;
+        }
+        shadow_budget_bytes_for(std::env::var("VICTORY_SHADOW_BUDGET_MB").ok().as_deref())
+    })
+}
+
+/// Evicts least-recently-used unreferenced `Shadow` buffer copies from
+/// [`BUFFERS`] until total live shadow bytes are at or below `budget`.
+/// Only copies with `Arc::strong_count == 1` and no pending GPU writebacks
+/// are eligible, so no active command list or descriptor slot is affected.
+fn evict_unused_with_budget(budget: u64) -> (usize, u64) {
+    let mut evicted: Vec<Arc<Shadow>> = Vec::new();
+    let mut freed_bytes = 0u64;
+    {
+        let mut map = buffers();
+        let mut total: u64 = map
+            .values()
+            .filter_map(|e| e.shadow.as_ref())
+            .map(|s| s.len)
+            .sum();
+        if total <= budget {
+            return (0, 0);
+        }
+        let mut candidates: Vec<(u64, (u64, usize), u64)> = map
+            .iter()
+            .filter_map(|(&key, entry)| {
+                let s = entry.shadow.as_ref()?;
+                if Arc::strong_count(s) != 1 {
+                    return None;
+                }
+                if !s.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+                    return None;
+                }
+                if !s.before.lock().unwrap_or_else(|e| e.into_inner()).0.is_empty() {
+                    return None;
+                }
+                Some((
+                    s.last_used.load(std::sync::atomic::Ordering::Relaxed),
+                    key,
+                    s.len,
+                ))
+            })
+            .collect();
+        candidates.sort_unstable_by_key(|&(stamp, _, _)| stamp);
+        for (_, key, len) in candidates {
+            if total <= budget {
+                break;
+            }
+            if let Some(entry) = map.get_mut(&key)
+                && entry.shadow.as_ref().is_some_and(|s| Arc::strong_count(s) == 1)
+                && let Some(shadow) = entry.shadow.take()
+            {
+                total = total.saturating_sub(len);
+                freed_bytes = freed_bytes.saturating_add(len);
+                evicted.push(shadow);
+            }
+        }
+        if !evicted.is_empty() {
+            changed();
+        }
+    }
+    let count = evicted.len();
+    drop(evicted);
+    (count, freed_bytes)
+}
+
+/// Once per presented frame, when `VICTORY_SHADOW_BUDGET_MB` is set, evicts
+/// least-recently-used unreferenced shadow buffer copies past the budget.
+pub(crate) fn evict_unused() {
+    let Some(budget) = shadow_budget_bytes() else {
+        return;
+    };
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    let frame = crate::queue::presented();
+    if LAST.swap(frame, std::sync::atomic::Ordering::Relaxed) == frame {
+        return;
+    }
+    let _ = evict_unused_with_budget(budget);
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (Grand
@@ -1656,5 +1759,42 @@ pub(crate) mod tests {
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+    }
+
+    #[test]
+    fn shadow_budget_evicts_lru_unreferenced_copies_and_keeps_held_ones() {
+        assert_eq!(shadow_budget_bytes_for(None), None);
+        assert_eq!(shadow_budget_bytes_for(Some("0")), None);
+        assert_eq!(shadow_budget_bytes_for(Some("512")), Some(512 << 20));
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let a = crate::watch::tests::pool(2);
+        let b = crate::watch::tests::pool(2);
+        let len = (2 * PAGE) as u64;
+        register(a, a as u64, len);
+        register(b, b as u64, len);
+        let sa = find(a as u64, len).expect("shadow a");
+        let sb = find(b as u64, len).expect("shadow b");
+        // Drop external ref to `a` so it becomes evictable; keep `sb` held.
+        drop(sa);
+        let (evicted, freed) = evict_unused_with_budget(0);
+        assert!(evicted >= 1 && freed >= len, "unreferenced shadow a evicted");
+        // `b` is still held externally (strong_count > 1) and must remain in BUFFERS.
+        assert!(
+            buffers()
+                .get(&(b as u64, b))
+                .is_some_and(|e| e.shadow.is_some()),
+            "externally held shadow b must not be evicted"
+        );
+        assert!(
+            buffers()
+                .get(&(a as u64, a))
+                .is_some_and(|e| e.shadow.is_none()),
+            "evicted shadow a slot cleared"
+        );
+        drop(sb);
+        unregister(a, a as u64);
+        unregister(b, b as u64);
     }
 }
