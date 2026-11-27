@@ -239,7 +239,18 @@ fn mixed_pool_reuses_exact_extent_only_after_com_and_native_fence_then_initializ
         "buffer factory must not grow heaps"
     );
     drop(clone);
+    lock(&TEXTURES).reclaim(now(), SPARE_KEPT, true);
+    assert_eq!(
+        HELD.load(Ordering::Relaxed),
+        held + first.len,
+        "retired texture remains charged before REST"
+    );
     reclaim_after_rest();
+    assert_eq!(
+        HELD.load(Ordering::Relaxed),
+        held + first.len,
+        "pending native fence keeps retired texture charged beyond REST"
+    );
     assert!(
         lock(&TEXTURES).resting.iter().any(|r| r.piece == first),
         "incomplete native fence retains retired extent beyond REST"
@@ -302,11 +313,53 @@ fn mixed_pool_reuses_exact_extent_only_after_com_and_native_fence_then_initializ
         readback.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
     }
     reserved.store(2, Ordering::Release);
+    let borrowed = WINDOW_BYTES.load(Ordering::Relaxed);
+    let occupied = HELD.load(Ordering::Relaxed);
     drop(buffer); // all native uses completed, but retirement fence is only 1.
+    lock(&TEXTURES).reclaim(now(), SPARE_KEPT, true);
+    assert_eq!(
+        WINDOW_BYTES.load(Ordering::Relaxed),
+        borrowed,
+        "final COM release keeps the retired extent's cap before REST"
+    );
+    assert_eq!(
+        HELD.load(Ordering::Relaxed),
+        occupied,
+        "final COM release keeps the retired extent accounted before REST"
+    );
     reclaim_after_rest();
+    assert_eq!(
+        WINDOW_BYTES.load(Ordering::Relaxed),
+        borrowed,
+        "pending fence keeps the retired extent's cap beyond REST"
+    );
+    assert_eq!(
+        HELD.load(Ordering::Relaxed),
+        occupied,
+        "pending fence keeps the retired extent accounted beyond REST"
+    );
+    {
+        let remaining = window_limit() - borrowed;
+        let _others = (remaining != 0)
+            .then(|| WindowBytes::reserve(&WINDOW_BYTES, remaining, window_limit()).unwrap());
+        assert!(
+            window_buffer(host, first.len).is_none(),
+            "retired bytes cannot be borrowed again through another hole"
+        );
+    }
     assert!(lock(&TEXTURES).resting.iter().any(|r| r.piece == first));
     unsafe { retirement.Signal(2) }.expect("second retirement completion");
     reclaim_after_rest();
+    assert_eq!(
+        WINDOW_BYTES.load(Ordering::Relaxed),
+        borrowed - first.len,
+        "completed and rested extent releases its cap exactly once"
+    );
+    assert_eq!(
+        HELD.load(Ordering::Relaxed),
+        occupied - first.len,
+        "completed and rested extent releases accounting exactly once"
+    );
     let texture_c = unsafe { texture(&host.device, &desc, D3D12_RESOURCE_STATE_COMMON) }
         .expect("reclaimed buffer extent as texture C");
     assert_eq!(

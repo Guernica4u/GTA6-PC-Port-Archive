@@ -157,6 +157,8 @@ struct Resting {
     /// None is the unchanged texture-only/staging path, or a creation
     /// failure whose piece was never exposed to any GPU work.
     fence: Option<(ID3D12Fence, u64)>,
+    /// Mixed-heap accounting/cap stays charged until this extent is free.
+    _charge: Option<Occupied<'static>>,
 }
 
 impl Resting {
@@ -418,7 +420,11 @@ impl<B: Clone> Pool<B> {
     }
 
     fn give_fenced(&mut self, piece: Piece, now: u64, fence: Option<(ID3D12Fence, u64)>) {
-        self.resting.push_back(Resting { until: now.saturating_add(REST), piece, fence });
+        self.give_charged(piece, now, fence, None);
+    }
+
+    fn give_charged(&mut self, piece: Piece, now: u64, fence: Option<(ID3D12Fence, u64)>, charge: Option<Occupied<'static>>) {
+        self.resting.push_back(Resting { until: now.saturating_add(REST), piece, fence, _charge: charge });
     }
 
     /// Makes the pieces that rested long enough free, and lets go of empty
@@ -431,11 +437,15 @@ impl<B: Clone> Pool<B> {
         let mut any = false;
         while self.resting.front().is_some_and(|r| r.ready(now))
         {
-            let piece = self.resting.pop_front().unwrap().piece;
+            let retired = self.resting.pop_front().unwrap();
+            let piece = retired.piece;
             if let Some(block) = self.blocks[piece.block].as_mut() {
                 block.free.give(piece.start, piece.len);
                 any |= block.free.whole(BLOCK);
             }
+            // Release accounting only after returning the range, with the
+            // pool lock still excluding another allocation of that range.
+            drop(retired);
         }
         // (Without a piece given back too, once there is less room.)
         let most = limit.min(self.most);
@@ -471,7 +481,8 @@ fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Bytes of the pieces held by textures and pooled window buffers now.
+/// Charged placement bytes. Mixed heaps include retired, unreusable pieces;
+/// legacy texture-only heaps keep their original live-resource accounting.
 static HELD: AtomicU64 = AtomicU64::new(0);
 
 static WINDOW_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -482,8 +493,8 @@ static WINDOW_CAPPED: AtomicU64 = AtomicU64::new(0);
 static WINDOW_FAILED: AtomicU64 = AtomicU64::new(0);
 static WINDOW_UNSUPPORTED: AtomicU64 = AtomicU64::new(0);
 
-/// Cap reservation rolls back on every failure, and lives inside the COM
-/// owner after success, including when a bare resource clone outlives Shadow.
+/// Cap reservation rolls back before an extent is taken. Thereafter it
+/// follows that extent through COM lifetime and fence/REST quarantine.
 struct WindowBytes<'a> {
     counter: &'a AtomicU64,
     bytes: u64,
@@ -507,14 +518,34 @@ impl Drop for WindowBytes<'_> {
     }
 }
 
+/// Only atomics/cap ownership: no resource or pool lock, and no COM cycle.
+struct Occupied<'a> {
+    held: &'a AtomicU64,
+    bytes: u64,
+    _window: Option<WindowBytes<'a>>,
+}
+
+impl<'a> Occupied<'a> {
+    fn new(held: &'a AtomicU64, bytes: u64, window: Option<WindowBytes<'a>>) -> Self {
+        held.fetch_add(bytes, Ordering::Relaxed);
+        Self { held, bytes, _window: window }
+    }
+}
+
+impl Drop for Occupied<'_> {
+    fn drop(&mut self) {
+        self.held.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
 /// Current occupied buffer bytes and cumulative successful placements,
 /// hole misses, cap refusals and native/attachment failures (not residency).
 pub(crate) fn window_counts() -> [u64; 5] {
     [&WINDOW_BYTES, &WINDOW_MADE, &WINDOW_MISSED, &WINDOW_CAPPED, &WINDOW_FAILED].map(|n| n.load(Ordering::Relaxed))
 }
 
-/// Bytes of the texture blocks no texture holds: the card's memory in use
-/// by us that new textures take first.
+/// Uncharged pool backing. Mixed-heap fence/REST quarantine is excluded;
+/// legacy texture-only heaps retain their original accounting.
 pub(crate) fn texture_room() -> u64 {
     (lock(&TEXTURES).blocks() as u64 * BLOCK).saturating_sub(HELD.load(Ordering::Relaxed))
 }
@@ -566,15 +597,15 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     Some((owned, memory.0, piece.start, data))
 }
 
-/// An object the host texture holds and releases when it goes: its piece
-/// is free then.
+/// An object the resource holds until its last COM reference goes. Mixed
+/// pieces transfer their charge to retirement rather than releasing it.
 #[repr(C)]
 struct Reclaim {
     methods: &'static [*const (); 3],
     references: AtomicU32,
     piece: Piece,
     fence: Option<FenceSource>,
-    _window: Option<WindowBytes<'static>>,
+    charge: Option<Occupied<'static>>,
 }
 
 struct Methods([*const (); 3]);
@@ -610,10 +641,16 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
     unsafe {
         let left = (*this.cast::<Reclaim>()).references.fetch_sub(1, Ordering::AcqRel) - 1;
         if left == 0 {
-            let gone = Box::from_raw(this.cast::<Reclaim>());
-            HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
+            let mut gone = Box::from_raw(this.cast::<Reclaim>());
             let fence = gone.fence.as_ref().map(snapshot);
-            lock(&TEXTURES).give_fenced(gone.piece, now(), fence);
+            let charge = gone.charge.take();
+            if fence.is_some() {
+                lock(&TEXTURES).give_charged(gone.piece, now(), fence, charge);
+            } else {
+                // Preserve off-path accounting at final resource release.
+                drop(charge);
+                lock(&TEXTURES).give(gone.piece, now());
+            }
         }
         left
     }
@@ -784,9 +821,9 @@ pub(crate) fn begun_before(texture: &ID3D12Resource) -> Option<u64> {
 /// Makes `texture` give `piece` back when the last reference to it goes.
 const RECLAIM_KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
 
-fn give_back_with(texture: &ID3D12Resource, piece: Piece, fence: Option<FenceSource>) {
+fn give_back_with(texture: &ID3D12Resource, piece: Piece, fence: Option<FenceSource>, charge: Occupied<'static>) {
     let made = Box::into_raw(Box::new(Reclaim {
-        methods: &RECLAIM.0, references: AtomicU32::new(1), piece, fence, _window: None,
+        methods: &RECLAIM.0, references: AtomicU32::new(1), piece, fence, charge: Some(charge),
     }));
     // SAFETY: a COM object of ours with one reference, which this takes and
     // drops at the end; the texture takes its own.
@@ -843,6 +880,7 @@ pub(crate) fn window_buffer(host: &crate::host::Host, size: u64) -> Option<ID3D1
         WINDOW_MISSED.fetch_add(1, Ordering::Relaxed);
         return None;
     };
+    let charge = Occupied::new(&HELD, piece.len, Some(reserved));
     let source = host.pool_retirement_fence();
     let mut made: Option<ID3D12Resource> = None;
     // SAFETY: the validated range belongs to this resource alone. Its
@@ -853,18 +891,17 @@ pub(crate) fn window_buffer(host: &crate::host::Host, size: u64) -> Option<ID3D1
     let made = match (placed, made) {
         (Ok(()), Some(made)) => made,
         _ => {
-            lock(&TEXTURES).give_fenced(piece, now(), Some(snapshot(&source)));
+            lock(&TEXTURES).give_charged(piece, now(), Some(snapshot(&source)), Some(charge));
             WINDOW_FAILED.fetch_add(1, Ordering::Relaxed);
             return None;
         }
     };
-    HELD.fetch_add(piece.len, Ordering::Relaxed);
     let owner = Box::into_raw(Box::new(Reclaim {
-        methods: &RECLAIM.0, references: AtomicU32::new(1), piece, fence: Some(source), _window: Some(reserved),
+        methods: &RECLAIM.0, references: AtomicU32::new(1), piece, fence: Some(source), charge: Some(charge),
     }));
     // SAFETY: the local reference owns our COM object; successful attachment
     // retains its own. On failure neither resource nor owner escapes, so
-    // dropping them rolls back the cap and occupancy instead of leaking it.
+    // dropping them quarantines the charged extent instead of leaking it.
     let attached = unsafe {
         let object = IUnknown::from_raw(owner.cast());
         made.SetPrivateDataInterface(&RECLAIM_KEY, &object)
@@ -969,6 +1006,7 @@ pub(crate) unsafe fn texture(
     }
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
     let (piece, heap, again) = taken?;
+    let mut charge = fence.as_ref().map(|_| Occupied::new(&HELD, piece.len, None));
     let mut made: Option<ID3D12Resource> = None;
     // SAFETY: the piece is no one else's; the heap lives while a piece of
     // it is taken.
@@ -980,8 +1018,8 @@ pub(crate) unsafe fn texture(
     }
     match (result, made) {
         (Ok(()), Some(made)) => {
-            HELD.fetch_add(piece.len, Ordering::Relaxed);
-            give_back_with(&made, piece, fence);
+            let charge = charge.take().unwrap_or_else(|| Occupied::new(&HELD, piece.len, None));
+            give_back_with(&made, piece, fence, charge);
             made_now(&made);
             #[cfg(feature = "diagnostics")]
             {
@@ -1005,7 +1043,7 @@ pub(crate) unsafe fn texture(
             Some(made)
         }
         _ => {
-            lock(&TEXTURES).give_fenced(piece, now(), fence.as_ref().map(snapshot));
+            lock(&TEXTURES).give_charged(piece, now(), fence.as_ref().map(snapshot), charge);
             None
         }
     }
@@ -1108,6 +1146,32 @@ mod tests {
         assert!(!fenced_ready(u64::MAX, REST, u64::MAX, u64::MAX));
         assert!(!fenced_ready(u64::MAX, REST, 10, u64::MAX));
         assert!(fenced_ready(REST, REST, 0, 0));
+    }
+
+    #[test]
+    fn retired_extent_keeps_its_cap_and_accounting_until_reclaimed() {
+        static CAP: AtomicU64 = AtomicU64::new(0);
+        static ACCOUNTED: AtomicU64 = AtomicU64::new(0);
+        let mut pool = Pool::<u32>::new(2);
+        pool.add(1, 0);
+        let (piece, _) = pool.take_existing(65536, 65536, 0, Ripe::ALL, |_| true).unwrap();
+        let window = WindowBytes::reserve(&CAP, piece.len, piece.len).unwrap();
+        let charge = Occupied::new(&ACCOUNTED, piece.len, Some(window));
+        // The same transfer is used on COM release and on failed native
+        // placement after an extent was taken. Native-fence refusal is
+        // covered separately and by the explicit native extent fixture.
+        pool.give_charged(piece, 0, None, Some(charge));
+        for tick in [0, REST - 1] {
+            pool.reclaim(tick, 2, true);
+            assert_eq!(CAP.load(Ordering::Relaxed), piece.len);
+            assert_eq!(ACCOUNTED.load(Ordering::Relaxed), piece.len);
+            assert!(WindowBytes::reserve(&CAP, 1, piece.len).is_none());
+        }
+        pool.reclaim(REST, 2, true);
+        assert_eq!(CAP.load(Ordering::Relaxed), 0);
+        assert_eq!(ACCOUNTED.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.take_existing(piece.len, 65536, REST, Ripe::ALL, |_| true).unwrap().0, piece);
+        assert!(WindowBytes::reserve(&CAP, piece.len, piece.len).is_some());
     }
 
     #[test]
