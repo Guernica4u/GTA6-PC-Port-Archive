@@ -7,7 +7,13 @@ import struct
 import tempfile
 
 from project_tuxbox.verify import (
-    lanes_imports, missing_provider_imports, private_x_server, screen_capture_problem, xauthority_entry)
+    lanes_imports, missing_provider_imports, private_x_server, screen_capture_problem, splash_skip_reason, xauthority_entry)
+
+
+class SplashSkipTests(unittest.TestCase):
+    def test_only_software_presentation_skips_the_splash(self):
+        self.assertIsNone(splash_skip_reason({}))
+        self.assertIn("software", splash_skip_reason({"MESA_VK_WSI_DEBUG": "sw"}))
 
 
 class PrivateXServerTests(unittest.TestCase):

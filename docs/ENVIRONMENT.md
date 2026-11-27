@@ -52,7 +52,7 @@ The launcher sets these for a Proton or Wine launch. A value you set yourself is
 | `TUXBOX_NULL_PIPELINES` | on | `0` fails unsupported pipelines instead of giving empty stand-ins |
 | `TUXBOX_PROGRESS_OVERLAY` | `auto` | `always` or `0` for the progress panel |
 | `TUXBOX_PROGRESS_OVERLAY_POS` | `tr` | `tl`, `tr`, `bl` or `br` |
-| `TUXBOX_CHECK_DISPLAY` | private | The window checks sample a private Xwayland on Wayland desktops; `desktop` uses the current display |
+| `TUXBOX_CHECK_DISPLAY` | private | The window checks sample a private Xwayland on Wayland desktops; `desktop` uses the current display. The splash check is skipped, and reported as skipped, for a GPU that presents to the private server through software |
 | `TUXBOX_CHECK_JOBS` | half the CPU threads, at most 8 | GPU checks run at once: the translator, the D3D12 controls and most Lanes and fixture gates |
 | `TUXBOX_OVERLAY` | off | `1` shows the [performance panel](USAGE.md#performance-overlay) (`run --overlay`) |
 | `TUXBOX_OVERLAY_POS` | `tl` | `tl`, `tr`, `bl` or `br` |
