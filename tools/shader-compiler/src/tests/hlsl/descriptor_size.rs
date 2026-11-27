@@ -130,10 +130,24 @@ fn a_buffer_used_only_as_a_buffer_is_not_asked_for_its_count() {
 }
 
 #[test]
+fn a_buffer_asked_only_for_its_count_is_declared_for_the_query() {
+    // Nothing reads through the descriptor; PSV names t1 a raw buffer.
+    let hlsl = translate(&buffered(&[&BUFFER, &[LAST]])).unwrap().hlsl;
+    assert!(hlsl.contains("ByteAddressBuffer raw_sbuf1 : register(t1);") && hlsl.contains("raw_sbuf1.GetDimensions(n0);"), "{hlsl}");
+}
+
+#[test]
 fn a_count_with_no_host_buffer_to_ask_is_refused() {
-    // Nothing reads through the descriptor, so the translation declares no buffer.
-    let reason = translate(&buffered(&[&BUFFER, &[LAST]])).err().expect("refused");
-    assert!(reason.contains("buffer record count read from a descriptor with no one host buffer"), "{reason}");
+    let refused = |ex: ShaderExtract| translate(&ex).err().expect("refused");
+    let expected = "buffer record count read from a descriptor with no one host buffer";
+    // PSV names no buffer at t1.
+    assert!(refused(tabled(&[&BUFFER, &[LAST]])).contains(expected));
+    // A structured buffer whose stride no record gives: the declared element is a guess.
+    let mut guessed = tabled(&[&BUFFER, &[LAST], &READ]);
+    guessed.resources = vec![crate::psv::PsvResource { res_type: 5, space: 0, lower: 1, upper: 1 }];
+    assert!(refused(guessed.clone()).contains(expected));
+    guessed.fssm = fssm([0x300, 8, 1, 12, 0x404]);
+    assert!(translate(&guessed).unwrap().hlsl.contains("sbuf1.GetDimensions(n0, st0);"));
 }
 
 /// FSSM with one used-resource row and no user-data rows.

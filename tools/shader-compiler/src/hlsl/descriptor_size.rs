@@ -19,7 +19,9 @@
 //! A buffer descriptor keeps its record count in word 2 (`SQ_BUF_RSRC_WORD2`),
 //! which is what `GetDimensions` returned to the program's source: bytes for
 //! a raw buffer, elements otherwise. The count is the whole word, so the load
-//! fills it and every later use is right.
+//! fills it and every later use is right. A structured buffer is counted only
+//! when the translation declares its element with the stride the program's
+//! records give, since a host may divide the view's size by that element.
 use super::*;
 use super::operand_fields::{constant_before, memory, run_start, unused_field};
 use crate::rdna2::clobbers_scalar;
@@ -246,12 +248,29 @@ impl<'a> Emitter<'a> {
                 return None;
             }
             let key = (is_uav, slot);
+            // A buffer the program asks only for its count is declared for the query.
+            if ![self.tbuf.contains(&key), self.raw.contains(&key), self.sbuf.contains_key(&key)].contains(&true) {
+                match ty {
+                    0 => { self.tbuf.insert(key); }
+                    1 => { self.raw.insert(key); }
+                    _ => {
+                        let words = self.table_structured_stride(slot, space, is_uav).or_else(|| {
+                            if space != 0 || (native, space) != (slot, space) { return None; }
+                            fssm_bindings::stride_words(&self.ex.fssm, &self.ex.resources, self.ex.stage, slot, is_uav)
+                        })?;
+                        self.sbuf.insert(key, words);
+                        self.reflected_strides.insert(key);
+                    }
+                }
+            }
             let declared = [self.tbuf.contains(&key), self.raw.contains(&key), self.sbuf.contains_key(&key)];
             let name = |srv: &str, uav: &str| format!("{}{slot}", if is_uav { uav } else { srv });
             match (ty, declared) {
                 (0, [true, false, false]) => Some((name("stb", "utb"), false)),
                 (1, [false, true, false]) => Some((name("raw_sbuf", "raw_ubuf"), false)),
-                (2, [false, false, true]) => Some((name("sbuf", "ubuf"), true)),
+                // A host can count records by the element the shader declares, so
+                // that element must have the stride the program's records give.
+                (2, [false, false, true]) if self.reflected_strides.contains(&key) => Some((name("sbuf", "ubuf"), true)),
                 _ => None,
             }
         });
