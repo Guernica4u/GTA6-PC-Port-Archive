@@ -425,6 +425,33 @@ impl Lower<'_> {
         Ok(self.trade(at, &[(xy.0, 0)])?[0])
     }
 
+    /// In halves, the whole-wave sections the plan runs instruction by
+    /// instruction rather than by the simulation's shapes ([`Literal`]):
+    /// they are left out of [`Lower::sections`], so each of their steps is
+    /// lowered on its own. Where every thread of the group does not meet,
+    /// or in a group of a part of a console wave, they keep the simulation
+    /// (and the program its refusal).
+    pub(super) fn literal_sections(&mut self) {
+        let whole = |t: [u32; 3]| t.iter().product::<u32>().is_multiple_of(2 * HALF);
+        if !self.trades() || !self.s.threads.is_some_and(whole) {
+            return;
+        }
+        let (literal, meet) = (&self.literal.sections, &self.exchange.meet);
+        for (&b, found) in &mut self.sections {
+            if meet.get(b).copied().unwrap_or(false) {
+                found.retain(|&start, _| !literal.contains(&(b, start)));
+            }
+        }
+        self.sections.retain(|_, found| !found.is_empty());
+    }
+
+    /// A value of whole-wave section `section` (block, start) the
+    /// simulation could not lower, read after the section: the plan may run
+    /// the section instruction by instruction next ([`Literal`]).
+    pub(super) fn ask_literal(&self, section: (usize, usize)) {
+        self.literal.asked.borrow_mut().insert(section);
+    }
+
     /// Refuses a whole-wave reduction or prefix sum in halves where not
     /// every thread of the group meets ([`Lower::reduce_halves`]).
     pub(super) fn reduction_meets(&self) -> Result<(), Why> {
@@ -620,6 +647,55 @@ const MASK_APART: Why = "a lane mask read as data, written where not every threa
 
 /// Why a whole-wave reduction or prefix sum stops in halves.
 const REDUCTION_APART: Why = "a wave reduction over both 32-lane halves where not every thread of the group meets (wave64 on a 32-lane host)";
+
+/// Why a 16-bit sum's shape stops in halves: the console wave's, over both
+/// halves ([`Literal`] runs its steps instead).
+pub(super) const SUM16_ACROSS: Why =
+    "a wave reduction over both 32-lane halves (wave64 on a 32-lane host)";
+
+/// The whole-wave sections run instruction by instruction in halves, over
+/// the lowering's attempts ([`super::lower`]), as [`Plan`] does for
+/// regions: an attempt refused for a value a section leaves that the
+/// simulation cannot lower asks for that section, and the next runs its
+/// steps one by one ([`Lower::literal_sections`]).
+///
+/// Such a value has lanes that hold different things, which no shape
+/// describes: the per-half sums and totals of the console compiler's wave64
+/// sums, read after the section in lanes a later write leaves as they
+/// were. Main lowers no step of it and keeps those lanes as zero on every
+/// host; here they get the console's values. Or it is a 16-bit sum over
+/// both halves, whose shape takes the sum in f32 and rounds once where the
+/// console rounds each step, in its own order: here each step is the
+/// console's.
+///
+/// The steps are exact in halves: DPP and `v_permlane*16` read within a
+/// 32-lane half, and the lane reads that cross the halves are traded
+/// where every thread of the group meets. The section sets EXEC to every
+/// lane of the console wave, so only in a group of whole console waves,
+/// where every lane has a host thread to run them.
+#[derive(Default)]
+pub(super) struct Literal {
+    /// By block and start.
+    sections: BTreeSet<(usize, usize)>,
+    /// What the last attempt asked for.
+    asked: std::cell::RefCell<BTreeSet<(usize, usize)>>,
+}
+
+impl Literal {
+    /// After an attempt refused for `what`: the sections the attempts since
+    /// the last call asked for join the plan (a join that read such a value
+    /// is missing in the attempts after it, and its read asks no more);
+    /// whether another attempt is worth making (some joined).
+    pub(super) fn follow(&mut self, what: Why) -> bool {
+        let asked = std::mem::take(self.asked.get_mut());
+        if what != SECTION_UNFOLLOWED && what != SUM16_ACROSS {
+            return false;
+        }
+        let before = self.sections.len();
+        self.sections.extend(asked);
+        self.sections.len() > before
+    }
+}
 
 /// Trades between the two halves of each console wave: where they may
 /// meet, and the group-shared slots they trade through.

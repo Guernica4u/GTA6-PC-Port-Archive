@@ -109,14 +109,22 @@ enum Stop {
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     let mut wide = wide::Plan::default();
+    let mut literal = halves::Literal::default();
     loop {
-        match Lower::new(parts, &bad, &wide).run() {
+        match Lower::new(parts, &bad, &wide, &literal).run() {
             Ok(l) => return Ok(l),
             // In halves, refused for want of a meeting: the regions where
             // one was wanted run wave-wide next time, where values missing
             // for want of one may not be.
             Err(Stop::Fail(ShaderError::Unsupported { what, .. })) if wide.widen(parts, what) => {
                 bad.retain(|_, &mut why| !halves::for_want_of_a_meeting(why));
+            }
+            // In halves, refused for a value a whole-wave section leaves
+            // that the simulation cannot lower: those sections run step by
+            // step next time. What earlier attempts asked counts too: a
+            // join that read such a value is missing in later ones.
+            Err(Stop::Fail(ShaderError::Unsupported { what, .. })) if literal.follow(what) => {
+                bad.retain(|_, &mut why| why != SECTION_UNFOLLOWED && why != halves::SUM16_ACROSS);
             }
             Err(Stop::Retry(v, why)) => {
                 wide.forget();
@@ -272,6 +280,12 @@ struct Lower<'a> {
     /// that a refusal for want of a meeting asks for more of.
     wide: wide::Wide,
     plan: &'a wide::Plan,
+    /// In halves: the whole-wave sections run step by step, and the plan
+    /// that a value they leave without a lowering asks for more of.
+    literal: &'a halves::Literal,
+    /// The values whole-wave sections leave without a lowering, with their
+    /// section (block, start), for [`Lower::ask_literal`].
+    unfollowed: HashMap<Value, (usize, usize)>,
     /// In halves: VGPR values the same in every lane of the console wave
     /// ([`halves::lane_uniform`]), whose first lane either half reads.
     alike: HashSet<Value>,
@@ -429,6 +443,11 @@ enum MaskData {
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
 
+/// What a value a whole-wave section leaves stops with where the simulation
+/// finds no one shape for its lanes (in halves, [`halves::Literal`] may run
+/// the section's steps instead).
+const SECTION_UNFOLLOWED: Why = "a whole-wave section step the simulation does not follow";
+
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
 fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
@@ -576,7 +595,12 @@ fn code_table_start(p: &crate::ir::Program, addresses: &[&crate::resource::Addre
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, plan: &'a wide::Plan) -> Self {
+    fn new(
+        x: &'a Parts<'a>,
+        bad: &'a HashMap<Value, Why>,
+        plan: &'a wide::Plan,
+        literal: &'a halves::Literal,
+    ) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -606,6 +630,7 @@ impl<'a> Lower<'a> {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
+                    || n.starts_with("v_permlane")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
@@ -740,6 +765,8 @@ impl<'a> Lower<'a> {
             exchange: halves::Exchange::new(x, halves, &wide.inside, plan),
             wide,
             plan,
+            literal,
+            unfollowed: HashMap::new(),
             alike: if halves {
                 halves::lane_uniform(x)
             } else {
@@ -1163,22 +1190,28 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        self.literal_sections();
     }
 
     /// An instruction inside a whole-wave section: the values that leave
     /// the section are made from what the simulation found them to be.
     fn section_inst(&mut self, b: usize, i: usize, start: usize) {
-        const UNKNOWN: Why = "a whole-wave section step the simulation does not follow";
         let inst = &self.x.p.blocks[b].insts[i];
         for &(_, w) in &inst.writes {
             let val = if self.section_out.contains(&w) {
                 let shape = self.sections[&b][&start].shapes.get(&w).copied();
-                match shape.ok_or(UNKNOWN).and_then(|sh| self.shape(sh)) {
+                match shape
+                    .ok_or(SECTION_UNFOLLOWED)
+                    .and_then(|sh| self.shape(sh))
+                {
                     Ok(x) => Val::I32(x),
-                    Err(why) => Val::Missing(why),
+                    Err(why) => {
+                        self.unfollowed.insert(w, (b, start));
+                        Val::Missing(why)
+                    }
                 }
             } else {
-                Val::Missing(UNKNOWN)
+                Val::Missing(SECTION_UNFOLLOWED)
             };
             self.vals.insert(w, val);
         }
@@ -1190,7 +1223,6 @@ impl<'a> Lower<'a> {
     /// expanded gives on that wave.
     fn shape(&mut self, shape: super::wave::Shape) -> Result<V, Why> {
         use super::wave::{Op, Shape};
-        const ACROSS: Why = "a wave reduction over both 32-lane halves (wave64 on a 32-lane host)";
         let (op, src, mask, ident, prefix) = match shape {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
             Shape::Value(v) => return self.i32_of(v),
@@ -1211,7 +1243,9 @@ impl<'a> Lower<'a> {
             Shape::Prefix(op, src, mask, ident, inclusive) => {
                 (op, src, mask, ident, Some(inclusive))
             }
-            Shape::Half(..) if self.halves && !self.one_host_wave() => return Err(ACROSS),
+            Shape::Half(..) if self.halves && !self.one_host_wave() => {
+                return Err(halves::SUM16_ACROSS);
+            }
             Shape::Half(_, src, mask, ident, hi) => {
                 // The high half is a console lane's: compute only.
                 if self.mask_data != MaskData::Console {
@@ -1710,7 +1744,12 @@ impl<'a> Lower<'a> {
             Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
                 return self.mask_dword(v).map(Val::I32);
             }
-            Some(&Val::Missing(w)) => return Err(w),
+            Some(&Val::Missing(w)) => {
+                if let Some(&section) = self.unfollowed.get(&v) {
+                    self.ask_literal(section);
+                }
+                return Err(w);
+            }
             Some(&val) => return Ok(val),
             None => {}
         }
@@ -6045,6 +6084,60 @@ impl<'a> Lower<'a> {
         Ok((r, enable))
     }
 
+    /// `v_permlane16_b32` (or with `x16`, `v_permlanex16_b32`): each lane
+    /// takes src0 of a lane of its own row of 16 (of the other row of its 32
+    /// lanes), lane i's pick being nibble i of {src2, src1} (RDNA 2 ISA,
+    /// "Lane-permute Ops"). The lanes read are in the reader's 32-lane half,
+    /// so in halves too it is exact. A lane read that EXEC leaves out gives
+    /// 0 with op_sel[1] (bound_ctrl), else leaves the destination as it was,
+    /// unless op_sel[0] (fetch inactive) reads it all the same.
+    fn permlane(&mut self, inst: &Inst, x16: bool, guard: Option<V>) -> Result<(), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        self.cross_lane(false)?;
+        let (x, lo, hi) = (self.src(inst, 0)?, self.src(inst, 1)?, self.src(inst, 2)?);
+        let c = self.cur;
+        let k = |l: &mut Self, n: u32| l.s.m.i32(n);
+        let (fifteen, eight, seven, two, zero) =
+            (k(self, 15), k(self, 8), k(self, 7), k(self, 2), k(self, 0));
+        let lane = self.lane_index();
+        let pos = self.s.m.bin(c, Bin::And, lane, fifteen);
+        let upper = self.s.m.bin(c, Bin::And, pos, eight);
+        let upper = self.s.m.cmp(c, pred::NE, upper, zero);
+        let word = self.s.m.select(c, upper, hi, lo);
+        let nibble = self.s.m.bin(c, Bin::And, pos, seven);
+        let shift = self.s.m.bin(c, Bin::Shl, nibble, two);
+        let pick = self.s.m.bin(c, Bin::LShr, word, shift);
+        let pick = self.s.m.bin(c, Bin::And, pick, fifteen);
+        let not15 = k(self, !15);
+        let mut row = self.s.m.bin(c, Bin::And, lane, not15);
+        if x16 {
+            let sixteen = k(self, 16);
+            row = self.s.m.bin(c, Bin::Xor, row, sixteen);
+        }
+        let src = self.s.m.bin(c, Bin::Or, row, pick);
+        let read_inactive = v.opsel & 1 != 0;
+        let active = (!read_inactive)
+            .then(|| self.src_lane_active(src, guard, false))
+            .flatten();
+        let Some(active) = active else {
+            let r = self.read_lane(x, src);
+            return self.write_i(inst, r, guard);
+        };
+        let src = self.s.m.select(c, active, src, lane);
+        let r = self.read_lane(x, src);
+        if v.opsel & 2 != 0 {
+            let r = self.s.m.select(c, active, r, zero);
+            return self.write_i(inst, r, guard);
+        }
+        let guard = match guard {
+            Some(g) => self.s.m.bin(c, Bin::And, g, active),
+            None => active,
+        };
+        self.write_i(inst, r, Some(guard))
+    }
+
     fn valu_op(&mut self, inst: &Inst, guard: Option<V>) -> Result<(), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
@@ -6784,6 +6877,9 @@ impl<'a> Lower<'a> {
                 );
                 let r = self.helper_reads_own(a, r);
                 int(self, r)
+            }
+            "v_permlane16_b32" | "v_permlanex16_b32" if self.console_lanes => {
+                self.permlane(inst, name == "v_permlanex16_b32", guard)
             }
             _ => {
                 let r = self.integer(inst, name)?;
@@ -10965,6 +11061,9 @@ impl<'a> Lower<'a> {
                         self.mask_dword(arg).map_err(|w| Stop::Retry(phi.value, w))?
                     }
                     (Some(Val::Missing(why)), _) if read => {
+                        if let Some(&section) = self.unfollowed.get(&arg) {
+                            self.ask_literal(section);
+                        }
                         return Err(Stop::Retry(phi.value, why));
                     }
                     _ if read => {

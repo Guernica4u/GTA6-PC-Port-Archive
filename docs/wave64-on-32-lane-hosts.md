@@ -44,7 +44,7 @@ group does (`lower::wide`), so the halves meet there.
 | DPP8 | within 8 lanes | exact | 1 |
 | `ds_swizzle_b32` | within 32 lanes (bit masks) or a quad | exact | 1 |
 | `ds_bpermute_b32`, `ds_permute_b32` | within each 32-lane half ("as if two independent wave32's", ISA §10.4.4; measured in #573) | exact (`ds_permute_b32` is not lowered yet: #2152) | 1 |
-| `v_permlane16_b32`, `v_permlanex16_b32` | within a row, or between the two rows of a half | exact (modelled only inside whole-wave sections today) | 1 |
+| `v_permlane16_b32`, `v_permlanex16_b32` | within a row, or between the two rows of a half | exact, also outside whole-wave sections (`Lower::permlane`, every host) | 1 |
 | `v_mbcnt_lo/hi`, a lane's bit of a mask held as a number, `v_writelane_b32` | by the console lane | exact (console lane) | 1 |
 | `v_readlane_b32` of a spilled SGPR | the SGPR | resolved in SSA (`Structured::restored`) | 1 |
 | `v_readlane_b32` of a value the same in every lane of the console wave, written where every lane runs | that value | the lane's own | 1 |
@@ -53,7 +53,8 @@ group does (`lower::wide`), so the halves meet there.
 | `v_readfirstlane_b32`, any other | the first lane in EXEC of 64 | each half's first lane in EXEC and whether it has one, traded: the low half's if any (`Lower::first_lane`) | 2, 3 |
 | A lane mask read as data (`s_bcnt1_i32_b64`, `s_ff1_i32_b64`, 64-bit compares, masks stored) | 64 bits | each half's ballot is one dword of it, traded (`Lower::mask_halves`) | 2, 3 |
 | Whole-wave sections (reductions, prefix sums) | over 64 lanes | each half's part, traded and combined, low half first (`Lower::reduce_halves`) | 2, 3 |
-| 16-bit whole-wave sums | over 64 lanes | refused | - |
+| A value a whole-wave section leaves whose lanes hold different things (each half's sum in some, the wave's in others), read after it | each lane's own | where every thread meets, in a group of whole console waves, the section runs step by step, its lane reads across the halves traded (`halves::Literal`); main keeps such a value as zero in lanes a later masked write leaves, and refuses it in halves elsewhere | 2 |
+| 16-bit whole-wave sums | over 64 lanes, each step rounded | step by step as above, each step rounded as the console's (the simulation's form sums in f32 and rounds once); elsewhere refused | 2 |
 | LDS in a group of one console wave (33 to 64 threads), no `s_barrier` | ordered by the wave running one instruction at a time | group barriers put the halves in that order: before an access that may meet an earlier one, and around a region only some lanes run (`halves::Lds`) | 2, 3 |
 | LDS in a group of several console waves | ordered by `s_barrier` | the console's barriers | 1 |
 | Any of the above in a group of 32 threads or fewer | no lane 32-63 exists | one host wave holds the whole console wave: nothing crosses (a ballot's high dword is 0, a lane read below 32 is the host's) | 1 |
@@ -197,12 +198,13 @@ that 735 compute programs share):
 | wave-wide regions | 2,542 |
 | wave-wide loops | 2,650 |
 | regions to the program's end, loops of larger groups | 2,697 |
+| sections step by step, lane permutes per instruction | 2,704 |
 
 Still refused in halves: 9 first lanes, 6 one-wave LDS regions, 4 masks
 and 2 reductions, in a region not entered from one block and left to one
 (nor one of its branches' regions); 2 programs whose LDS leaves no room for
-the trades' 16 bytes per console wave; 6 tiled group shapes and 2 16-bit
-sums.
+the trades' 16 bytes per console wave; 6 tiled group shapes; 2 16-bit sums
+where not every thread of a group of several console waves meets.
 
 Before Levels 2 and 3, a local build that recorded every cross-half site
 (and went on past each refusal, so every block was seen) classified the
@@ -237,7 +239,9 @@ points, in one-half regions and wave-wide, LDS of one-wave groups
 (including a race that only barriers prevent), group shapes, and the
 group-shared slots' cost in barriers; loops each lane leaves in its own
 round (the halves going round different numbers of times) with first
-lanes, masks and LDS inside, and a first lane read after such a loop.
+lanes, masks and LDS inside, and a first lane read after such a loop;
+a section run step by step whose uneven lanes are kept, a 16-bit sum, and
+the lane permutes.
 `emit::halves_random_tests` runs random wave64 programs (cross-lane steps
 at the top level, in branches one inside another and in loops each lane
 leaves in its own round, LDS, scalar branches, lanes that end partway) in
@@ -257,3 +261,6 @@ lane.
 - #1890: split waves, exchanges between them.
 - #2711: treats each half as its own wave (not exact where the console
   reads across halves).
+- #3402: one lane of a whole-wave section's value read after the section,
+  from each lane's own shape; #1568: 64-bit and 16-bit sums in sections;
+  #98: `v_permlane16_b32` in sections; #2997: lane permutes on WARP.

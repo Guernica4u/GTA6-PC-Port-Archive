@@ -175,7 +175,55 @@ fn refusal(words: &[u32], threads: u32, lds_bytes: u32) -> String {
 /// The hand-encoded words are the instructions their comments name.
 #[test]
 fn the_test_programs_are_what_their_comments_say() {
-    let programs: [(Vec<u32>, &[&str]); 29] = [
+    let programs: [(Vec<u32>, &[&str]); 32] = [
+        (
+            sum16(),
+            &[
+                "v_cvt_f16_u16 v3, v1",
+                "s_or_saveexec_b64 s[2:3], -1",
+                "v_cndmask_b32 v4, 0, v3, s[2:3]",
+                "v_add_f16",
+                "row_mirror",
+                "v_permlanex16_b32 v5, v4, 0, 0",
+                "v_add_f16 v4, v5, v4",
+                "v_readlane_b32 s4, v4, 31",
+                "v_readlane_b32 s5, v4, 63",
+                "v_add_f16 v6, s4, v7",
+            ],
+        ),
+        (
+            sum_kept_by_lanes(),
+            &[
+                "v_add_nc_u32 v8, 1, v0",
+                "s_or_saveexec_b64 s[2:3], -1",
+                "v_cndmask_b32 v2, 0, v8, s[2:3]",
+                "quad_perm:[1,0,3,2]",
+                "quad_perm:[2,3,0,1]",
+                "row_half_mirror",
+                "row_mirror",
+                "v_permlanex16_b32 v3, v2, 0, 0",
+                "v_add_nc_u32 v2, v3, v2",
+                "v_readlane_b32 s4, v2, 32",
+                "v_add_nc_u32 v2, s4, v2",
+                "v_readlane_b32 s6, v2, 0",
+                "s_mov_b64 exec, s[2:3]",
+                "v_cmp_gt_u32 vcc, 20, v1",
+                "v_mov_b32 v2, 7",
+            ],
+        ),
+        (
+            permlanes(),
+            &[
+                "v_mul_u32_u24 v2, 3, v0",
+                "s_mov_b32 s10, lit(0x89abcdef)",
+                "v_permlane16_b32 v3, v2, s10, s11",
+                "v_permlanex16_b32 v4, v2, s10, s11",
+                "v_and_b32 v9, 1, v1",
+                "v_cmp_eq_u32 vcc, 0, v9",
+                "v_permlane16_b32 v6, v2, s10, s11 bound_ctrl:1",
+                "v_permlane16_b32 v7, v2, s10, s11 fi:1",
+            ],
+        ),
         (
             lanes_that_end(),
             &[
@@ -2214,4 +2262,224 @@ fn wave64_programs_in_halves_match_the_console_on_every_gpu() {
 "
         )
     );
+}
+
+/// A wave64 sum written the way the console compiler expands one (the
+/// idiom `wave::sections` reads), of `v8` (the thread id plus one) over the
+/// lanes EXEC holds: row sums by DPP, the other row of each 32 by
+/// `v_permlanex16_b32`, each half's sum; then lane 32's (the high half's
+/// sum) added in every lane, so that lanes 0-31 hold
+/// the wave's sum and lanes 32-63 twice the high half's, and the wave's sum
+/// read from lane 0 (`s6`). After it, lanes below 20 write 7 to that
+/// register and the others keep what the section left: each lane stores
+/// it, and the sum.
+fn sum_kept_by_lanes() -> Vec<u32> {
+    use crate::ir::EXEC;
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0xD766_0001,
+        0x0002_02C1,           // v_mbcnt_hi_u32_b32 v1, -1, v1
+        vop2(8, 0x25, 129, 0), // v_add_nc_u32 v8, 1, v0
+        sop1(2, 0x25, 193),    // s_or_saveexec_b64 s[2:3], -1
+    ]);
+    w.extend(vop3(2, 0x101, 128, 256 + 8, 2)); // v_cndmask_b32 v2, 0, v8, s[2:3]
+    for ctrl in [0xB1, 0x4E, 0x141, 0x140] {
+        // v_add_nc_u32 v2, v2, v2 quad_perm:[1,0,3,2], [2,3,0,1], row_half_mirror, row_mirror
+        w.extend([vop2(2, 0x25, 0xFA, 2), dpp16(2, ctrl)]);
+    }
+    w.extend(vop3(3, 0x378, 256 + 2, 128, 128)); // v_permlanex16_b32 v3, v2, 0, 0
+    w.push(vop2(2, 0x25, 256 + 3, 2)); // v_add_nc_u32 v2, v3, v2
+    w.extend(vop3(4, 0x360, 256 + 2, 128 + 32, 0)); // v_readlane_b32 s4, v2, 32
+    w.push(vop2(2, 0x25, 4, 2)); // v_add_nc_u32 v2, s4, v2
+    w.extend(vop3(6, 0x360, 256 + 2, 128, 0)); // v_readlane_b32 s6, v2, 0
+    w.push(sop1(EXEC, 0x04, 2)); // s_mov_b64 exec, s[2:3]
+    w.extend([
+        0x7C00_0000 | 0xC4 << 17 | 1 << 9 | 148, // v_cmp_gt_u32 vcc, 20, v1
+        0xBE94_246A,                             // s_and_saveexec_b64 s[20:21], vcc
+        vop1(2, 0x01, 128 + 7),                  // v_mov_b32 v2, 7
+        0xBEFE_0414,                             // s_mov_b64 exec, s[20:21]
+        vop1(4, 0x01, 6),                        // v_mov_b32 v4, s6
+    ]);
+    w.extend(store(2, 0));
+    w.extend(store(4, 4));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// What the console stores for [`sum_kept_by_lanes`]'s thread `l`.
+fn sum_kept_by_lanes_want(l: u32) -> [u32; 2] {
+    let base = l & !63;
+    let total: u32 = (base..base + 64).map(|k| k + 1).sum();
+    let high: u32 = (base + 32..base + 64).map(|k| k + 1).sum();
+    let kept = match l - base {
+        0..20 => 7,
+        20..32 => total,
+        _ => 2 * high,
+    };
+    [kept, total]
+}
+
+/// In halves, [`sum_kept_by_lanes`] runs its section step by step: on every
+/// hardware adapter, in groups of 64 and 128, the lanes that keep the
+/// section's register get the console's values in both halves (main keeps
+/// them as zero, which is what one wave64 on a 64-lane host still stores).
+/// In a group of a part of a console wave it is refused as before.
+#[test]
+fn a_whole_wave_sum_kept_by_lanes_matches_the_console_in_halves_on_every_gpu() {
+    let partial = refusal(&sum_kept_by_lanes(), 48, 0);
+    assert!(
+        partial.contains("a whole-wave section step the simulation does not follow"),
+        "{partial}"
+    );
+    let mut failed = Vec::new();
+    for threads in [64, 128] {
+        let want: Vec<u32> = (0..threads).flat_map(sum_kept_by_lanes_want).collect();
+        failed.extend(differences_in_halves(
+            &sum_kept_by_lanes(),
+            threads,
+            2,
+            &want,
+        ));
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// `v_permlane16_b32` and `v_permlanex16_b32` of `v2` (three times the
+/// thread id plus one), each lane reading lane 15 - i of its row of 16 (of
+/// the other row of its 32 with x16): with every lane (`v3`, `v4`), then
+/// with the even lanes only, the odd ones they read left out: as it is
+/// (`v5`), with bound_ctrl (`v6`) and with fi (`v7`). Each register holds
+/// 0x3333.. 0x7777 before.
+fn permlanes() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0xD766_0001,
+        0x0002_02C1,               // v_mbcnt_hi_u32_b32 v1, -1, v1
+        vop2(2, 0x0B, 128 + 3, 0), // v_mul_u32_u24 v2, 3, v0
+        vop2(2, 0x25, 129, 2),     // v_add_nc_u32 v2, 1, v2
+        sop1(10, 0x03, 255),
+        0x89AB_CDEF, // s_mov_b32 s10, 0x89abcdef
+        sop1(11, 0x03, 255),
+        0x0123_4567, // s_mov_b32 s11, 0x01234567
+    ]);
+    for d in 3..8u8 {
+        w.extend([vop1(d, 0x01, 255), 0x1111 * u32::from(d)]); // v_mov_b32 vd, 0xdddd
+    }
+    w.extend(vop3(3, 0x377, 256 + 2, 10, 11)); // v_permlane16_b32 v3, v2, s10, s11
+    w.extend(vop3(4, 0x378, 256 + 2, 10, 11)); // v_permlanex16_b32 v4, v2, s10, s11
+    w.extend([
+        vop2(9, 0x1B, 129, 1),                   // v_and_b32 v9, 1, v1
+        0x7C00_0000 | 0xC2 << 17 | 9 << 9 | 128, // v_cmp_eq_u32 vcc, 0, v9
+        0xBE94_246A,                             // s_and_saveexec_b64 s[20:21], vcc
+    ]);
+    for (d, op_sel) in [(5u8, 0u32), (6, 2), (7, 1)] {
+        let [a, b] = vop3(d, 0x377, 256 + 2, 10, 11); // v_permlane16_b32 vd, v2, s10, s11
+        w.extend([a | op_sel << 11, b]);
+    }
+    w.push(0xBEFE_0414); // s_mov_b64 exec, s[20:21]
+    for (slot, d) in (3..8).enumerate() {
+        w.extend(store(d, 4 * slot as u32));
+    }
+    w.push(S_ENDPGM);
+    w
+}
+
+/// What the console stores for [`permlanes`]'s thread `l` in a group of
+/// `threads`.
+fn permlanes_want(threads: u32, l: u32) -> [u32; 5] {
+    let base = l & !63;
+    let lane = l - base;
+    let (row, pos) = (lane & !15, lane & 15);
+    // A lane past the group's is not in EXEC: its reader keeps its own.
+    let read = |src: u32, kept: u32| {
+        if base + src < threads {
+            3 * (base + src) + 1
+        } else {
+            kept
+        }
+    };
+    let (own, other) = (row + 15 - pos, (row ^ 16) + 15 - pos);
+    let even = pos % 2 == 0;
+    [
+        read(own, 0x3333),
+        read(other, 0x4444),
+        0x5555,
+        if even { 0 } else { 0x6666 },
+        if even { read(own, 0x7777) } else { 0x7777 },
+    ]
+}
+
+/// [`permlanes`] on every hardware adapter, in halves and as one wave64
+/// where the adapter runs those, in groups of 48, 64 and 128.
+#[test]
+fn permlanes_match_the_console_on_every_gpu() {
+    let mut failed = Vec::new();
+    for threads in [48, 64, 128] {
+        let want: Vec<u32> = (0..threads)
+            .flat_map(|l| permlanes_want(threads, l))
+            .collect();
+        failed.extend(differences(&permlanes(), threads, 5, &want));
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// A 16-bit sum of the console lanes (`v_cvt_f16_u16` of `v1`) as the
+/// console compiler writes a whole-wave one: `v_add_f16` with DPP over each
+/// row, `v_permlanex16_b32` for the other row of each 32, then lanes 31 and
+/// 63 (each half's sum) read and added. Every lane stores its half's sum
+/// and the wave's, as f16 in the low half of the dword. The sums are
+/// integers below 2,048, so every step is exact in f16, in any order.
+fn sum16() -> Vec<u32> {
+    use crate::ir::EXEC;
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0xD766_0001,
+        0x0002_02C1,            // v_mbcnt_hi_u32_b32 v1, -1, v1
+        vop1(3, 0x01, 128),     // v_mov_b32 v3, 0
+        vop1(6, 0x01, 128),     // v_mov_b32 v6, 0
+        vop1(3, 0x50, 256 + 1), // v_cvt_f16_u16 v3, v1
+        sop1(2, 0x25, 193),     // s_or_saveexec_b64 s[2:3], -1
+    ]);
+    w.extend(vop3(4, 0x101, 128, 256 + 3, 2)); // v_cndmask_b32 v4, 0, v3, s[2:3]
+    for ctrl in [0xB1, 0x4E, 0x141, 0x140] {
+        // v_add_f16 v4, v4, v4 quad_perm:[1,0,3,2], [2,3,0,1], row_half_mirror, row_mirror
+        w.extend([vop2(4, 0x32, 0xFA, 4), dpp16(4, ctrl)]);
+    }
+    w.extend(vop3(5, 0x378, 256 + 4, 128, 128)); // v_permlanex16_b32 v5, v4, 0, 0
+    w.push(vop2(4, 0x32, 256 + 5, 4)); // v_add_f16 v4, v5, v4
+    w.extend(vop3(4, 0x360, 256 + 4, 128 + 31, 0)); // v_readlane_b32 s4, v4, 31
+    w.extend(vop3(5, 0x360, 256 + 4, 128 + 63, 0)); // v_readlane_b32 s5, v4, 63
+    w.push(vop1(7, 0x01, 5)); // v_mov_b32 v7, s5
+    w.push(vop2(6, 0x32, 4, 7)); // v_add_f16 v6, s4, v7
+    w.push(sop1(EXEC, 0x04, 2)); // s_mov_b64 exec, s[2:3]
+    w.extend(store(4, 0));
+    w.extend(store(6, 4));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// [`sum16`] in halves on every hardware adapter, in groups of 64 and 128:
+/// each half's 16-bit sum (496 and 1,520) and the wave's (2,016), as f16.
+#[test]
+fn a_16_bit_wave_sum_matches_the_console_in_halves_on_every_gpu() {
+    const LOW: u32 = 0x5FC0; // 496.0
+    const HIGH: u32 = 0x65F0; // 1520.0
+    const WAVE: u32 = 0x67E0; // 2016.0
+    let mut failed = Vec::new();
+    for threads in [64, 128] {
+        let want: Vec<u32> = (0..threads)
+            .flat_map(|l| [if l & 63 < 32 { LOW } else { HIGH }, WAVE])
+            .collect();
+        failed.extend(differences_in_halves(&sum16(), threads, 2, &want));
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
