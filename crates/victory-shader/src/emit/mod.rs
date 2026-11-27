@@ -207,6 +207,8 @@ mod crosslane_tests;
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod flow_tests;
+#[cfg(all(test, windows))]
+mod gather_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 #[cfg(all(test, windows))]
