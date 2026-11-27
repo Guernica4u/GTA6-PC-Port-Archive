@@ -250,9 +250,11 @@ impl Lower<'_> {
             return Ok(false);
         }
         let refused = |why| unsupported(code[start].machine.offset, why);
-        if !std::env::var_os("VICTORY_WAVE_PAIRS_FP32")
+        let fp32_ok = std::env::var_os("VICTORY_WAVE_PAIRS_FP32")
             .is_some_and(|mode| mode == "non-ieee-rne-ftz")
-        {
+            || (super::super::paired_fp32_fallback()
+                && std::env::var_os("VICTORY_WAVE_PAIRS_FP32").is_none());
+        if !fp32_ok {
             return Err(refused(
                 "paired FP32 reduction requires a confirmed non-IEEE RNE/FTZ guest mode",
             ));

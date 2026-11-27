@@ -40,53 +40,53 @@ fn lane_loop_exit_includes_repeated_postdominators() {
     assert_eq!(lower::branches_around_with_loop_exits(&st, &[3], true), Some(vec![]));
 }
 
-const EXEC: u32 = 126;
-const LIT: u32 = 255;
+pub(super) const EXEC: u32 = 126;
+pub(super) const LIT: u32 = 255;
 
-const fn v(n: u32) -> u32 {
+pub(super) const fn v(n: u32) -> u32 {
     256 + n
 }
 
-const fn k(n: u32) -> u32 {
+pub(super) const fn k(n: u32) -> u32 {
     128 + n
 }
 
-const fn sop1(op: u32, sdst: u32, src0: u32) -> u32 {
+pub(super) const fn sop1(op: u32, sdst: u32, src0: u32) -> u32 {
     0xBE80_0000 | sdst << 16 | op << 8 | src0
 }
 
-const fn sop2(op: u32, sdst: u32, src0: u32, src1: u32) -> u32 {
+pub(super) const fn sop2(op: u32, sdst: u32, src0: u32, src1: u32) -> u32 {
     0x8000_0000 | op << 23 | sdst << 16 | src1 << 8 | src0
 }
 
 /// A branch by `imm` dwords from the next instruction (or `s_barrier`, `imm` 0).
-const fn sopp(op: u32, imm: i16) -> u32 {
+pub(super) const fn sopp(op: u32, imm: i16) -> u32 {
     0xBF80_0000 | op << 16 | imm as u16 as u32
 }
 
-const fn vop1(op: u32, vdst: u32, src0: u32) -> u32 {
+pub(super) const fn vop1(op: u32, vdst: u32, src0: u32) -> u32 {
     0x7E00_0000 | vdst << 17 | op << 9 | src0
 }
 
-const fn vop2(op: u32, vdst: u32, src0: u32, vsrc1: u32) -> u32 {
+pub(super) const fn vop2(op: u32, vdst: u32, src0: u32, vsrc1: u32) -> u32 {
     op << 25 | vdst << 17 | vsrc1 << 9 | src0
 }
 
-const fn vopc(op: u32, src0: u32, vsrc1: u32) -> u32 {
+pub(super) const fn vopc(op: u32, src0: u32, vsrc1: u32) -> u32 {
     0x7C00_0000 | op << 17 | vsrc1 << 9 | src0
 }
 
-const fn vop3(op: u32, dst: u32, src0: u32, src1: u32) -> [u32; 2] {
+pub(super) const fn vop3(op: u32, dst: u32, src0: u32, src1: u32) -> [u32; 2] {
     [0xD400_0000 | op << 16 | dst, src0 | src1 << 9]
 }
 
 /// `buffer_store_dword v<data>, v<addr>, s[8:11], 0 offen offset:<offset>`
-const fn store(data: u32, addr: u32, offset: u32) -> [u32; 2] {
+pub(super) const fn store(data: u32, addr: u32, offset: u32) -> [u32; 2] {
     [0xE070_1000 | offset, 0x8002_0000 | data << 8 | addr]
 }
 
 /// `v<regs>` stored as each thread's dwords of the UAV, the thread's index (v0) times 16 on.
-fn stores(regs: [u32; 4]) -> Vec<u32> {
+pub(super) fn stores(regs: [u32; 4]) -> Vec<u32> {
     let mut w = vec![vop2(0x1A, 15, k(4), 0)]; // v_lshlrev_b32 v15, 4, v0
     for (n, r) in regs.into_iter().enumerate() {
         w.extend(store(r, 15, 4 * n as u32));
@@ -835,7 +835,7 @@ fn paired_lds_respects_host_shared_memory_limit() {
     let bytes = crate::dxbc::build(&[]);
     let c = crate::dxbc::Container::parse(&bytes).unwrap();
     let old = lower::TEST_HOST_WAVE.replace(Some(32));
-    for (threads, lds_units, allowed) in [(64, 64, true), (64, 65, false), (128, 64, false)] {
+    for (threads, lds_units, allowed) in [(64, 64, true), (64, 65, false), (128, 64, true), (128, 65, false)] {
         let mut native = native(&body);
         let StageIo::Cs(cs) = &mut native.io else {
             unreachable!()

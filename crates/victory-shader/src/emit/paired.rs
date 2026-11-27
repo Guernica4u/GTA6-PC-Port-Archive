@@ -165,7 +165,12 @@ impl<'a> Lower<'a> {
         if accesses_lds(inst) {
             let write = !name.starts_with("ds_read");
             if write || self.lds_last != Some(false) {
-                self.group_sync(self.cur);
+                if matches!(self.x.native.io, StageIo::Cs(cs) if cs.threads.iter().product::<u32>() > 64) {
+                    let (mode, void) = (self.s.m.i32(8), self.s.t.void);
+                    self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+                } else {
+                    self.group_sync(self.cur);
+                }
             }
             self.lds_last = Some(write);
         }

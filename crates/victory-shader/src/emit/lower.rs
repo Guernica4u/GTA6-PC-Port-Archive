@@ -1775,8 +1775,11 @@ impl<'a> Lower<'a> {
             s.threads = Some([32 * waves, 1, 1]);
             s.lds_dwords = cs.lds_bytes() / 4;
             if waves > 1 {
-                halves = Some(s.lds_dwords);
-                s.lds_dwords += 1;
+                // `wave_base`'s counter: a dword past the program's LDS, or the program's
+                // first where it takes all a host group has (32 KiB).
+                let slot = if s.lds_dwords < 8192 { s.lds_dwords } else { 0 };
+                s.lds_dwords = s.lds_dwords.max(slot + 1);
+                halves = Some(slot);
             }
             console_lanes = true;
             s.wave_size = Some(32);
@@ -5747,7 +5750,7 @@ impl<'a> Lower<'a> {
             let two = l.s.m.i32(2);
             l.s.m.bin(c, Bin::LShr, at, two)
         };
-        if let Some(dwords) = paired_lds {
+        if let Some(dwords) = paired_lds && supports_paired_lds(name) {
             return self.paired_lds(inst, a, guard, dwords);
         }
         // Shortcut: other modes take LDS addresses as dword-aligned and in bounds.
@@ -5788,7 +5791,15 @@ impl<'a> Lower<'a> {
                 || name.ends_with("_d16_hi")
         });
         if let Some(bits) = sub {
-            let p = dword(self, offset);
+            let (p_unpaired, paired_idx_on) = if let Some(dwords) = paired_lds {
+                let idx = index(self, offset);
+                let bound = self.s.m.i32(dwords);
+                let inside = self.s.m.cmp(self.cur, pred::IULT, idx, bound);
+                let on = guard.map_or(inside, |g| self.s.m.bin(self.cur, Bin::And, g, inside));
+                (None, Some((idx, on)))
+            } else {
+                (Some(dword(self, offset)), None)
+            };
             let o = self.s.m.i32(offset);
             let at = self.s.m.bin(c, Bin::Add, a, o);
             let three = self.s.m.i32(3);
@@ -5797,14 +5808,24 @@ impl<'a> Lower<'a> {
             let mask = self.s.m.i32((1u32 << bits) - 1);
             if name.starts_with("ds_read") {
                 let reg = dst_reg.ok_or("an LDS read result")?;
-                let w = self.s.m.load(c, p);
-                let x = self.s.m.bin(c, Bin::LShr, w, sh);
+                let w = if let Some((idx, on)) = paired_idx_on {
+                    let join = self.begin_guarded(Some(on));
+                    let lds = self.s.lds();
+                    let p = self.s.m.element(self.cur, lds, idx);
+                    let w = self.s.m.load(self.cur, p);
+                    let zero = self.s.m.i32(0);
+                    self.end_guarded(join, &[(w, zero)])[0]
+                } else {
+                    self.s.m.load(c, p_unpaired.unwrap())
+                };
+                let cur = self.cur;
+                let x = self.s.m.bin(cur, Bin::LShr, w, sh);
                 let x = if base.contains("_i") {
                     let k = self.s.m.i32(32 - bits);
-                    let x = self.s.m.bin(c, Bin::Shl, x, k);
-                    self.s.m.bin(c, Bin::AShr, x, k)
+                    let x = self.s.m.bin(cur, Bin::Shl, x, k);
+                    self.s.m.bin(cur, Bin::AShr, x, k)
                 } else {
-                    self.s.m.bin(c, Bin::And, x, mask)
+                    self.s.m.bin(cur, Bin::And, x, mask)
                 };
                 let x = if base == name {
                     x
@@ -5814,15 +5835,15 @@ impl<'a> Lower<'a> {
                         None => self.s.m.i32(0),
                     };
                     let half = self.s.m.i32(0xFFFF);
-                    let x = self.s.m.bin(c, Bin::And, x, half);
+                    let x = self.s.m.bin(cur, Bin::And, x, half);
                     let (x, keep) = if name.ends_with("_hi") {
                         let k16 = self.s.m.i32(16);
-                        (self.s.m.bin(c, Bin::Shl, x, k16), half)
+                        (self.s.m.bin(cur, Bin::Shl, x, k16), half)
                     } else {
                         (x, self.s.m.i32(0xFFFF_0000))
                     };
-                    let old = self.s.m.bin(c, Bin::And, old, keep);
-                    self.s.m.bin(c, Bin::Or, old, x)
+                    let old = self.s.m.bin(cur, Bin::And, old, keep);
+                    self.s.m.bin(cur, Bin::Or, old, x)
                 };
                 self.write(inst, Reg::V(reg), x, guard);
             } else {
@@ -5840,7 +5861,15 @@ impl<'a> Lower<'a> {
                 let ones = self.s.m.i32(u32::MAX);
                 let keep = self.s.m.bin(c, Bin::Xor, m, ones);
                 use super::bitcode::Rmw;
-                let at = self.begin_guarded(guard);
+                let at = self.begin_guarded(paired_idx_on.map_or(guard, |(_, on)| Some(on)));
+                let p = match (p_unpaired, paired_idx_on) {
+                    (Some(p), _) => p,
+                    (_, Some((idx, _))) => {
+                        let lds = self.s.lds();
+                        self.s.m.element(self.cur, lds, idx)
+                    }
+                    _ => unreachable!(),
+                };
                 self.s.m.atomic(self.cur, Rmw::And, p, keep);
                 self.s.m.atomic(self.cur, Rmw::Or, p, x);
                 self.end_guarded(at, &[]);
@@ -5859,8 +5888,21 @@ impl<'a> Lower<'a> {
             let mut n = 0;
             for (off, w) in elements {
                 for k in 0..w {
-                    let p = dword(self, off + 4 * k);
-                    let x = self.s.m.load(self.cur, p);
+                    let x = if let Some(dwords) = paired_lds {
+                        let idx = index(self, off + 4 * k);
+                        let bound = self.s.m.i32(dwords);
+                        let inside = self.s.m.cmp(self.cur, pred::IULT, idx, bound);
+                        let on = guard.map_or(inside, |g| self.s.m.bin(self.cur, Bin::And, g, inside));
+                        let join = self.begin_guarded(Some(on));
+                        let lds = self.s.lds();
+                        let p = self.s.m.element(self.cur, lds, idx);
+                        let val = self.s.m.load(self.cur, p);
+                        let zero = self.s.m.i32(0);
+                        self.end_guarded(join, &[(val, zero)])[0]
+                    } else {
+                        let p = dword(self, off + 4 * k);
+                        self.s.m.load(self.cur, p)
+                    };
                     self.write(inst, Reg::V(reg + n), x, guard);
                     n += 1;
                 }
@@ -5882,12 +5924,26 @@ impl<'a> Lower<'a> {
                     stores.push((off + 4 * k as u32, x));
                 }
             }
-            let at = self.begin_guarded(guard);
-            for (off, x) in stores {
-                let p = dword(self, off);
-                self.s.m.store(self.cur, p, x);
+            if let Some(dwords) = paired_lds {
+                for (off, x) in stores {
+                    let idx = index(self, off);
+                    let bound = self.s.m.i32(dwords);
+                    let inside = self.s.m.cmp(self.cur, pred::IULT, idx, bound);
+                    let on = guard.map_or(inside, |g| self.s.m.bin(self.cur, Bin::And, g, inside));
+                    let join = self.begin_guarded(Some(on));
+                    let lds = self.s.lds();
+                    let p = self.s.m.element(self.cur, lds, idx);
+                    self.s.m.store(self.cur, p, x);
+                    self.end_guarded(join, &[]);
+                }
+            } else {
+                let at = self.begin_guarded(guard);
+                for (off, x) in stores {
+                    let p = dword(self, off);
+                    self.s.m.store(self.cur, p, x);
+                }
+                self.end_guarded(at, &[]);
             }
-            self.end_guarded(at, &[]);
             return Ok(());
         }
         // Atomics: the old value returns with `_rtn`.
@@ -5920,21 +5976,41 @@ impl<'a> Lower<'a> {
             Some((_, v)) => self.i32_of(v).unwrap_or(self.s.m.i32(0)),
             None => self.s.m.i32(0),
         };
-        let p = dword(self, offset);
+        let (p_unpaired, paired_idx_on, outside) = if let Some(dwords) = paired_lds {
+            let idx = index(self, offset);
+            let bound = self.s.m.i32(dwords);
+            let inside = self.s.m.cmp(self.cur, pred::IULT, idx, bound);
+            let on = guard.map_or(inside, |g| self.s.m.bin(self.cur, Bin::And, g, inside));
+            (None, Some((idx, on)), self.s.m.i32(0))
+        } else {
+            (Some(dword(self, offset)), None, outside)
+        };
+        let atomic_guard = paired_idx_on.map_or(guard, |(_, on)| Some(on));
+        let write_guard = if paired_lds.is_some() { guard } else { None };
+        let ptr = |l: &mut Self| match (p_unpaired, paired_idx_on) {
+            (Some(p), _) => p,
+            (_, Some((idx, _))) => {
+                let lds = l.s.lds();
+                l.s.m.element(l.cur, lds, idx)
+            }
+            _ => unreachable!(),
+        };
         if let Some(max) = match op.as_str() {
             "max_f32" => Some(true),
             "min_f32" => Some(false),
             _ => None,
         } {
-            let at = self.begin_guarded(guard);
+            let at = self.begin_guarded(atomic_guard);
+            let p = ptr(self);
             let r = self.lds_float_min_max(p, v0, max);
             let r = self.end_guarded(at, &[(r, outside)])[0];
             if let Some(reg) = dst_reg {
-                self.write(inst, Reg::V(reg), r, None);
+                self.write(inst, Reg::V(reg), r, write_guard);
             }
             return Ok(());
         }
-        let at = self.begin_guarded(guard);
+        let at = self.begin_guarded(atomic_guard);
+        let p = ptr(self);
         let r = match rmw {
             Some(op) => self.s.m.atomic(self.cur, op, p, v0),
             // Compare with data0, store data1.
@@ -5945,7 +6021,7 @@ impl<'a> Lower<'a> {
         };
         let r = self.end_guarded(at, &[(r, outside)])[0];
         if let Some(reg) = dst_reg {
-            self.write(inst, Reg::V(reg), r, None);
+            self.write(inst, Reg::V(reg), r, write_guard);
         }
         Ok(())
     }
@@ -9456,7 +9532,11 @@ impl<'a> Lower<'a> {
                     row = self.s.m.bin(c, Bin::Xor, row, k16);
                 }
                 let src = self.s.m.bin(c, Bin::Or, row, pick);
-                let r = if fetch_inactive {
+                // Inside `replay_paired_fp32`, every lane of the paired whole-wave
+                // section is active (EXEC is all-ones and never written), so the
+                // inactive-lane fallback (old `vdst`, which may be unseen scratch from
+                // an earlier section) is never taken.
+                let r = if fetch_inactive || self.paired_fp32 {
                     self.read_lane(x, src)
                 } else {
                     // Ballot the console EXEC guard as well as the host's active

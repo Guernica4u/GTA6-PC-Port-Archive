@@ -555,6 +555,38 @@ fn listed_wave_pairs_scope_is_restored() {
     assert!(!WAVE_PAIRS_HERE.get());
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test override for `VICTORY_WAVE_PAIRS`.
+    static TEST_PAIRS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// Allows exact non-IEEE FP32 paired replay when paired Wave64 is used as a last resort.
+    static PAIRED_FP32_FALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(super) fn paired_fp32_fallback() -> bool {
+    PAIRED_FP32_FALLBACK.get()
+}
+
+fn paired_fallback(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PAIRED_FP32_FALLBACK.set(self.0);
+        }
+    }
+    let _restore = Restore(PAIRED_FP32_FALLBACK.replace(true));
+    paired_with(c, native, p, Some((io, res)))
+}
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
     c: &Container,
@@ -570,7 +602,7 @@ pub fn emit(
         native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32;
     let listed = WAVE_PAIRS_HERE.get();
     if listed && wave32_compute {
-        match paired(c, native, p) {
+        match paired_with(c, native, p, Some((io, res))) {
             Ok((shader, Some(32))) => {
                 eprintln!("WAVE64-PAIRS-ONLY translated with paired Wave64");
                 return Ok(shader);
@@ -599,7 +631,7 @@ pub fn emit(
             || lower::crosses_halves(p, st)
                 && (original.is_err() || lower::wave_local(p, st).is_err()))
     {
-        let again = paired(c, native, p);
+        let again = paired_with(c, native, p, Some((io, res)));
         if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
             match &again {
                 Ok((_, wave)) => eprintln!("WAVE64-RETRY paired Wave64: wave {wave:?}"),
@@ -737,7 +769,7 @@ pub fn emit(
         for exact in [true, false] {
             if !exact {
                 if pairs_on {
-                    let again = paired(c, native, p);
+                    let again = paired_with(c, native, p, Some((io, res)));
                     report("paired Wave64", &again);
                     if done(&again) {
                         return again.map(|(shader, _)| shader);
@@ -851,18 +883,37 @@ pub fn emit(
     let original = original.and_then(supported);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
-    if !matches!(original, Err(ShaderError::Unsupported { .. })) {
-        return original;
+    let result = if matches!(original, Err(ShaderError::Unsupported { .. })) {
+        let edges = threading::constant_edges(p, st);
+        if edges.is_empty() {
+            original
+        } else {
+            let p = ir::thread_edges(p, &edges)?;
+            let st = structure::structure(&p)?;
+            let io = io::raise(&p, native)?;
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+            emit_program(c, native, &p, &st, &io, &res).and_then(supported)
+        }
+    } else {
+        original
+    };
+    if matches!(&result, Err(ShaderError::Unsupported { .. }))
+        && wave32_compute
+        && !listed
+        && std::env::var_os("VICTORY_WAVE_PAIRS").is_none_or(|v| v != "0")
+    {
+        let again = paired_fallback(c, native, p, io, res);
+        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            match &again {
+                Ok((_, wave)) => eprintln!("WAVE64-RETRY paired Wave64 (fallback): wave {wave:?}"),
+                Err(e) => eprintln!("WAVE64-RETRY paired Wave64 (fallback): {e}"),
+            }
+        }
+        if let Ok((shader, Some(32))) = again {
+            return Ok(shader);
+        }
     }
-    let edges = threading::constant_edges(p, st);
-    if edges.is_empty() {
-        return original;
-    }
-    let p = ir::thread_edges(p, &edges)?;
-    let st = structure::structure(&p)?;
-    let io = io::raise(&p, native)?;
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_program(c, native, &p, &st, &io, &res).and_then(supported)
+    result
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
@@ -987,14 +1038,28 @@ fn widen(
 }
 
 fn wave_pairs_on() -> bool {
+    #[cfg(test)]
+    if let Some(v) = TEST_PAIRS.get() {
+        return v;
+    }
     std::env::var_os("VICTORY_WAVE_PAIRS").is_some_and(|v| v == "1")
 }
 
 // Paired lanes from PR #854 (PiloteCode), including the per-wave CFG used by 840243e2.
+#[cfg(test)]
 fn paired(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
+    paired_with(c, native, p, None)
+}
+
+fn paired_with(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    io_res: Option<(&io::Io, &resource::Resources)>,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     let crate::native::StageIo::Cs(cs) = native.io else {
         return Err(ShaderError::Unsupported {
@@ -1022,7 +1087,7 @@ fn paired(
         });
     }
     let lds = cs.lds_bytes();
-    if lds + 4 * u32::from(threads > 64) > 32 * 1024 {
+    if lds > 32 * 1024 {
         return Err(ShaderError::Unsupported {
             offset: 0,
             what: "paired Wave64 exceeds the compute group shared-memory limit",
@@ -1030,21 +1095,16 @@ fn paired(
     }
     let insts = || p.blocks.iter().flat_map(|b| &b.insts);
     let accesses_lds = insts().any(lower::accesses_lds);
-    if accesses_lds
-        && (lds == 0 || insts().filter(|i| lower::accesses_lds(i)).any(|i| {
-            !lower::supports_paired_lds(i.name())
-        }))
-    {
+    if accesses_lds && lds == 0 {
         return Err(ShaderError::Unsupported {
             offset: 0,
             what: "an LDS operation not supported by paired Wave64",
         });
     }
-    let waits = accesses_lds || insts().any(|i| i.name() == "s_barrier");
-    // Independently progressing waves cannot rendezvous after a divergent exit.
-    if (threads > 64 && p.blocks.len() > 1 && waits)
-        || (group_sync() == 0 && (threads > 64 || waits))
-    {
+    let waits = (accesses_lds && threads <= 64) || insts().any(|i| i.name() == "s_barrier");
+    // Multi-wave paired programs fence LDS between instructions and do not wait at
+    // synthetic barriers; only explicit title s_barrier or single-wave barriers wait.
+    if group_sync() == 0 && (threads > 64 || waits) {
         return Err(ShaderError::Unsupported {
             offset: 0,
             what: "paired Wave64 would require an unavailable group rendezvous",
@@ -1066,9 +1126,18 @@ fn paired(
         }
         wide.extend(lanes);
     };
-    let io = io::raise(p, native)?;
-    let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-    lower::with_paired_lanes(|| emit_program(c, native, p, &st, &io, &res))
+    let owned;
+    let (io, res) = match io_res {
+        Some(pair) => pair,
+        None => {
+            owned = (
+                io::raise(p, native)?,
+                resource::track(p, &native.layout, native.stage, Some(&st))?,
+            );
+            (&owned.0, &owned.1)
+        }
+    };
+    lower::with_paired_lanes(|| emit_program(c, native, p, &st, io, res))
 }
 
 /// The translated program, and the wave size it requires of the host.
