@@ -5938,27 +5938,109 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
 
         // 5) 1 evicted placed texture (4 victim slots out of 85,000 total).
+        // Evict fresh before EACH side (and alternate which path runs first)
+        // because the placed-texture map is global: without a fresh eviction
+        // before the second path, the second side would find the texture
+        // already re-created by the first side instead of paying the cold
+        // re-creation cost itself.
+        use windows::core::Interface;
         let (mut evict_before, mut evict_after) = (Vec::new(), Vec::new());
         for k in 0..ITERS {
             let addr = placed_base + ((32 + k) as u64) * (64 << 10);
             for j in 0..VICTIM_SLOTS {
                 both_placed(victim_placed_slot + j, addr);
             }
+            crate::queue::pass_frame();
             let _ = drain_bindless(&h_full, false);
             let _ = drain_bindless(&h_inc, true);
 
-            crate::queue::pass_frame();
-            crate::watch::title_memory_remapped(addr as usize, 64 << 10);
+            let host_before = {
+                let b = h_full.bindless.lock().unwrap();
+                b.uses
+                    .get(&(victim_placed_slot as u32))
+                    .and_then(|u| u.retained.clone())
+                    .unwrap()
+            };
 
-            reset_budget(&h_full);
-            let t0 = std::time::Instant::now();
-            let pf = h_full.bindless_plan_with(false).unwrap();
-            evict_before.push(t0.elapsed().as_nanos());
+            let (pf, pi, host_full, host_inc) = if k % 2 == 0 {
+                crate::queue::pass_frame();
+                crate::watch::title_memory_remapped(addr as usize, 64 << 10);
+                reset_budget(&h_full);
+                let t0 = std::time::Instant::now();
+                let pf = h_full.bindless_plan_with(false).unwrap();
+                evict_before.push(t0.elapsed().as_nanos());
+                let host_full = h_full
+                    .bindless
+                    .lock()
+                    .unwrap()
+                    .uses
+                    .get(&(victim_placed_slot as u32))
+                    .and_then(|u| u.retained.clone())
+                    .unwrap();
 
-            reset_budget(&h_inc);
-            let t1 = std::time::Instant::now();
-            let pi = h_inc.bindless_plan_with(true).unwrap();
-            evict_after.push(t1.elapsed().as_nanos());
+                crate::queue::pass_frame();
+                crate::watch::title_memory_remapped(addr as usize, 64 << 10);
+                reset_budget(&h_inc);
+                let t1 = std::time::Instant::now();
+                let pi = h_inc.bindless_plan_with(true).unwrap();
+                evict_after.push(t1.elapsed().as_nanos());
+                let host_inc = h_inc
+                    .bindless
+                    .lock()
+                    .unwrap()
+                    .uses
+                    .get(&(victim_placed_slot as u32))
+                    .and_then(|u| u.retained.clone())
+                    .unwrap();
+                (pf, pi, host_full, host_inc)
+            } else {
+                crate::queue::pass_frame();
+                crate::watch::title_memory_remapped(addr as usize, 64 << 10);
+                reset_budget(&h_inc);
+                let t1 = std::time::Instant::now();
+                let pi = h_inc.bindless_plan_with(true).unwrap();
+                evict_after.push(t1.elapsed().as_nanos());
+                let host_inc = h_inc
+                    .bindless
+                    .lock()
+                    .unwrap()
+                    .uses
+                    .get(&(victim_placed_slot as u32))
+                    .and_then(|u| u.retained.clone())
+                    .unwrap();
+
+                crate::queue::pass_frame();
+                crate::watch::title_memory_remapped(addr as usize, 64 << 10);
+                reset_budget(&h_full);
+                let t0 = std::time::Instant::now();
+                let pf = h_full.bindless_plan_with(false).unwrap();
+                evict_before.push(t0.elapsed().as_nanos());
+                let host_full = h_full
+                    .bindless
+                    .lock()
+                    .unwrap()
+                    .uses
+                    .get(&(victim_placed_slot as u32))
+                    .and_then(|u| u.retained.clone())
+                    .unwrap();
+                (pf, pi, host_full, host_inc)
+            };
+            assert_ne!(
+                host_full.as_raw(),
+                host_before.as_raw(),
+                "bench_evict_{k}: full-scan side must re-create evicted placed texture"
+            );
+            assert_ne!(
+                host_inc.as_raw(),
+                host_before.as_raw(),
+                "bench_evict_{k}: incremental side must re-create evicted placed texture"
+            );
+            assert_ne!(
+                host_inc.as_raw(),
+                host_full.as_raw(),
+                "bench_evict_{k}: each side must re-create its own placed texture independently"
+            );
+            drop((host_before, host_full, host_inc));
             assert_plans_cross_heap_equal(&pi, &pf, &format!("bench_evict_{k}"));
         }
 
