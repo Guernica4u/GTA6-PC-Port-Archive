@@ -45,7 +45,18 @@ struct Heaps {
     /// Ranges whose texture may still be held elsewhere, with a holder of
     /// our own.
     pending: Vec<(ID3D12Resource, Placement)>,
+    /// Ranges added since the last reap: a reap walks every pending range
+    /// (an `AddRef`/`Release` pair each), so it waits for [`REAP_EVERY`]
+    /// of them instead of running per texture.
+    since_reap: usize,
+    /// Reaps run, for the test that places into a heap with room.
+    #[cfg(test)]
+    reaps: u64,
 }
+
+/// Ranges given back before a reap walks the pending list: bounds both the
+/// walk's share of a placement and how much free space sits unreclaimed.
+const REAP_EVERY: usize = 64;
 
 // SAFETY: D3D12 heaps and resources are free-threaded; used under the lock.
 unsafe impl Send for Heaps {}
@@ -101,6 +112,11 @@ impl Heaps {
     /// Frees the pending ranges nothing else holds now, and releases empty
     /// heaps past [`SPARE`].
     fn reap(&mut self) {
+        self.since_reap = 0;
+        #[cfg(test)]
+        {
+            self.reaps += 1;
+        }
         let mut i = 0;
         while i < self.pending.len() {
             if last_holder(&self.pending[i].0) {
@@ -123,13 +139,40 @@ impl Heaps {
         });
     }
 
-    /// A range of `size` bytes: in a heap with room, else in a new heap.
-    fn allocate(&mut self, device: &ID3D12Device, size: u64, align: u64) -> Option<(ID3D12Heap, Placement)> {
+    /// A range of `size` bytes in a heap that holds one now, if any does:
+    /// nothing is reaped for it.
+    fn take_room(&mut self, size: u64, align: u64) -> Option<(ID3D12Heap, Placement)> {
         for h in &mut self.heaps {
             if let Some(offset) = take(&mut h.free, size, align) {
-                return Some((h.heap.clone(), Placement { heap: h.id, offset, size }));
+                return Some((
+                    h.heap.clone(),
+                    Placement {
+                        heap: h.id,
+                        offset,
+                        size,
+                    },
+                ));
             }
         }
+        None
+    }
+
+    /// A range of `size` bytes: in a heap with room, else in a new heap.
+    /// The pending ranges are reaped only when no heap holds the range, so
+    /// placing into a heap does not walk them.
+    fn allocate(&mut self, device: &ID3D12Device, size: u64, align: u64) -> Option<(ID3D12Heap, Placement)> {
+        if let Some(room) = self.take_room(size, align) {
+            return Some(room);
+        }
+        self.reap();
+        if let Some(room) = self.take_room(size, align) {
+            return Some(room);
+        }
+        self.new_heap(device, size, align)
+    }
+
+    /// A new heap with a range of `size` bytes taken from it.
+    fn new_heap(&mut self, device: &ID3D12Device, size: u64, align: u64) -> Option<(ID3D12Heap, Placement)> {
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: HEAP,
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
@@ -192,7 +235,12 @@ pub(crate) fn free(resource: ID3D12Resource, p: Placement) {
     let mut heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(h) = heaps.as_mut() {
         h.pending.push((resource, p));
-        h.reap();
+        h.since_reap += 1;
+        // A reap per texture walked every pending range for each one given
+        // back: wait for a batch of them.
+        if h.since_reap >= REAP_EVERY {
+            h.reap();
+        }
     }
 }
 
@@ -260,6 +308,80 @@ mod tests {
         heaps.reap();
         let (_, c) = heaps.allocate(&host.device, ALIGN, ALIGN).unwrap();
         assert_eq!(c, a, "nothing holds it: free again");
+    }
+
+    /// A reap walks every pending range (an `AddRef`/`Release` pair each),
+    /// so it is not what a placement with room in a heap pays: measured
+    /// here against the reap-per-placement it replaces.
+    #[test]
+    fn a_placement_with_room_does_not_walk_the_pending_ranges() {
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 256,
+            Height: 256,
+            DepthOrArraySize: 1,
+            MipLevels: 9,
+            Format: DXGI_FORMAT_BC1_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        let mut heaps = Heaps::default();
+        let (heap, _) = heaps.new_heap(&host.device, ALIGN, ALIGN).unwrap();
+        // 512 ranges given back whose textures are still held: the backlog a
+        // new shot leaves behind (a heap has room for 1,024 of these).
+        let mut textures = Vec::new();
+        for _ in 0..512 {
+            let (_, p) = heaps.take_room(ALIGN, ALIGN).expect("room in the heap");
+            let mut texture: Option<ID3D12Resource> = None;
+            // SAFETY: a range of the heap, our out pointer.
+            unsafe {
+                host.device.CreatePlacedResource(
+                    &heap,
+                    p.offset(),
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut texture,
+                )
+            }
+            .expect("a placed texture");
+            let texture = texture.unwrap();
+            heaps.pending.push((texture.clone(), p));
+            textures.push(texture);
+        }
+        assert_eq!(heaps.pending.len(), 512, "the backlog the test measures");
+        // What one reap costs with that backlog, and what a placement cost
+        // before: a reap, then the range.
+        let t0 = std::time::Instant::now();
+        for _ in 0..100 {
+            heaps.reap();
+            std::hint::black_box(heaps.take_room(ALIGN, ALIGN));
+        }
+        let before = t0.elapsed() / 100;
+        let reaps = heaps.reaps;
+        let t0 = std::time::Instant::now();
+        for _ in 0..100 {
+            std::hint::black_box(heaps.take_room(ALIGN, ALIGN));
+        }
+        let after = t0.elapsed() / 100;
+        // With no room left, the reap is what the next placement pays — once.
+        while heaps.take_room(ALIGN, ALIGN).is_some() {}
+        std::hint::black_box(heaps.allocate(&host.device, ALIGN, ALIGN));
+        assert_eq!(heaps.reaps, reaps + 1, "out of room: the reap runs, once");
+        eprintln!(
+            "512 pending ranges: placement with a reap {before:?}, without {after:?} (one reap {reaps:?}/100 placements)"
+        );
+        assert!(
+            after * 4 < before,
+            "placing into a heap no longer pays the reap: {after:?} against {before:?}"
+        );
     }
 
     #[test]
