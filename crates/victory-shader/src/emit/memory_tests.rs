@@ -728,7 +728,7 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
         };
         let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
         // The heap's base is 0 in the user data (`emit`, "Binding").
-        let ud = vec![0u32; shader.user_data_dwords() as usize];
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         let out = host
             .dispatch(
                 &root,
