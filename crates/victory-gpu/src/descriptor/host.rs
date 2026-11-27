@@ -2055,6 +2055,59 @@ mod tests {
         assert!(host.kept(read), "made for the read");
     }
 
+    /// A read slot stamps the texture it views, every submission and not
+    /// only the one that makes its view: `make_read` resolves the slot once
+    /// (`mirror` hands the view back) and the stamp takes that view. Without
+    /// the stamp a texture a shader reads every frame would look unused and
+    /// `crate::resource::evict` would give it up.
+    #[test]
+    fn a_read_slot_stamps_the_texture_it_views() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 4, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(
+            crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap),
+            0
+        );
+        let title_heap = crate::descriptor::heap(heap);
+        let read = 0u32;
+        // A 4x1 RGBA8 texture, linear, in memory of its own, and a 2D view.
+        let memory = vec![0u8; 1 << 16];
+        let address = memory.as_ptr() as u64;
+        let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let mut view = [0u32; 16];
+        view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+        crate::descriptor::create_placed_srv(null, &words, &view, title_heap.start);
+        let host = title_heap.host().expect("a host view heap");
+        // A draw reads the slot through a table, which makes its texture: a
+        // texture made then is stamped by its making, so what this test sees
+        // stamped afterwards is the read's stamp alone.
+        assert!(host.mirror(read, title_heap.start, true).is_some());
+        assert!(host.kept(read), "made for the draw");
+        let texture = crate::resource::texture_at(address, &words).expect("its resource");
+        let copy = crate::resource::made_copy(texture).expect("a host texture");
+        copy.unstamp();
+        assert_eq!(copy.last_used().0, u64::MAX, "its uses forgotten");
+        // The shaders read the slot, whose view is made already: stamped all
+        // the same, or a texture read every frame looks unused a frame after
+        // it was read (`crate::resource::evict` gives up what is not).
+        crate::descriptor::make_read(&[read]);
+        assert!(
+            copy.last_used().0 != u64::MAX,
+            "the read stamped the texture it views"
+        );
+    }
+
     /// A heap sync makes the slots whose records the title changed as bytes
     /// (a copy of another slot's record, a record cleared) and passes the
     /// others by.
