@@ -841,6 +841,32 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
 
+/// The same waits in milliseconds, at about 20 frames a second: the title
+/// fills memory by the clock, not by the frame, and at 3-10 frames a second
+/// 400 frames were 40-130 s. A wait is the shorter of the two.
+const RECHECK_MS: [u64; 5] = [200, 600, 2_000, 6_000, 20_000];
+
+/// Frames after which look number `stage` (0 for the first) is made, with a
+/// frame taking `frame_ms` lately.
+fn recheck_in(stage: usize, frame_ms: u64) -> u64 {
+    RECHECK_FRAMES[stage].min((RECHECK_MS[stage] / frame_ms.max(1)).max(1))
+}
+
+/// Milliseconds a frame took over the last second or so (16 until known).
+fn frame_ms(frame: u64, now: u64) -> u64 {
+    static WINDOW: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(16)];
+    let (began, first) = (WINDOW[0].load(Ordering::Relaxed), WINDOW[1].load(Ordering::Relaxed));
+    if first == 0 || frame < first {
+        WINDOW[0].store(now, Ordering::Relaxed);
+        WINDOW[1].store(frame, Ordering::Relaxed);
+    } else if frame > first && now.saturating_sub(began) >= 1000 {
+        WINDOW[2].store(((now - began) / (frame - first)).clamp(1, 1000), Ordering::Relaxed);
+        WINDOW[0].store(now, Ordering::Relaxed);
+        WINDOW[1].store(frame, Ordering::Relaxed);
+    }
+    WINDOW[2].load(Ordering::Relaxed)
+}
+
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
 pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -3066,7 +3092,7 @@ impl State {
             Some(mb) => mb << 20,
             None => {
                 let base = staging_budget_per_frame(memory.map(|[budget, ..]| budget));
-                if crate::residency::limited_host_ram() {
+                if crate::residency::textures_limited_by_ram() {
                     base.min(128 << 20)
                 } else {
                     base
@@ -3079,6 +3105,9 @@ impl State {
         if FRAME.swap(frame, Ordering::Relaxed) != frame {
             SPENT.store(0, Ordering::Relaxed);
         }
+        // The loading gate and the texture book's housekeeping (it limits
+        // itself to twice a second).
+        crate::texture::ledger::tick(frame, drawn());
         // No more of them are made while the card has no room
         // (`resource::room`): by what is alive now, not by what was ever
         // staged (4 GB in all, after which later textures stayed empty for
@@ -3163,6 +3192,8 @@ impl State {
         let now = crate::host::now_ms();
         let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
         let most = (4000 / took).clamp(16, 256);
+        // What a frame takes lately: the looks again are counted in time.
+        let per_frame_ms = frame_ms(frame, now);
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
             kind: ResourceType::Srv,
@@ -3194,6 +3225,15 @@ impl State {
         let backlog = std::time::Duration::from_millis(200);
         let (per_frame, span) =
             if catchup && on_time >= 1024 { (per_frame * 3, (span * 3).max(backlog)) } else { (per_frame, span) };
+        // On a loading screen (seen in the title's DirectStorage stream while
+        // it draws little: `texture::ledger::loading`) frames are not what
+        // matters: four times the bytes and a slice of at least 120 ms. The
+        // ceilings that follow (`prefetch_limit`, `room`, commit) still hold.
+        let (per_frame, span) = if !required && asked.is_none() && crate::texture::ledger::loading() {
+            (per_frame.saturating_mul(4), span.max(std::time::Duration::from_millis(120)))
+        } else {
+            (per_frame, span)
+        };
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
@@ -3212,7 +3252,7 @@ impl State {
                 bytes_at_most,
                 crate::residency::pressured(),
                 crate::residency::critical_commit(),
-                crate::residency::limited_host_ram(),
+                crate::residency::textures_limited_by_ram(),
                 crate::texture::live_staging_bytes(),
             )
         };
@@ -3264,7 +3304,7 @@ impl State {
             // title paints all the time through another view of their pages
             // (all their blocks are shown at other addresses too), and each
             // was shown four frames late, over and over.
-            let mut again_in = RECHECK_FRAMES[0];
+            let mut again_in = recheck_in(0, per_frame_ms);
             // What the queue knew of it when the slots due were taken, while
             // its marks say it holds the write handed out still; else (or with
             // `VICTORY_QUEUE_BATCH=0`) asked now.
@@ -3277,7 +3317,8 @@ impl State {
                 if looked == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     outcome(slot_outcome::UNCHANGED);
-                    tells.tell(index, write, match RECHECK_FRAMES.get(usize::from(looks) + 1) {
+                    let next = usize::from(looks) + 1;
+                    tells.tell(index, write, match (next < RECHECK_FRAMES.len()).then(|| recheck_in(next, per_frame_ms)) {
                         Some(wait) => Told::Recheck(frame + wait, (at, len), print, looks + 1, uploaded),
                         None => Told::Done(None),
                     });
@@ -3320,12 +3361,20 @@ impl State {
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     outcome(slot_outcome::AWAY);
+                    // Not what the title kept (the texture book drops it).
+                    crate::texture::ledger::gone(address);
                     // Streamed out: what the slot showed is let go.
                     rest(0, || host.texture_slot_gone(index));
                     tells.tell(index, write, Told::Later(frame, most));
                     continue;
                 }
                 rest(0, || host.texture_slot_here(index));
+                // Named and all there: the texture book links the request
+                // that filled it to this description (and counts a texture it
+                // made ready as adopted).
+                if mapped >= len {
+                    crate::texture::ledger::named(address, resource, first);
+                }
                 there = Some(mapped);
                 if mapped < len {
                     if mapped <= rest(0, || host.texture_slot_mapped(index)) {

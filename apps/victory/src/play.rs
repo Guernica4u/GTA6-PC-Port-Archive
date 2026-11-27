@@ -207,10 +207,8 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
         if let Some(x) = framegen_x {
             set("VICTORY_FRAMEGEN", "1");
             set("VICTORY_FRAMEGEN_X", &x.to_string());
-            // Frame generation takes 1.5 to 2 GB of the card's memory, which the layer
-            // otherwise fills with textures: on from the start it is left a fifth of the
-            // budget; ready but off, a little less is held back.
-            set("VICTORY_TEXTURE_ROOM_PERCENT", if framegen { "80" } else { "86" });
+            // (The texture line leaves frame generation its room by itself:
+            // `resource::room_line`, a constant there, not a switch here.)
         }
     }
     set("VICTORY_FRAME_INTERVAL_US", &(1_000_000.0 / f64::from(fps)).round().to_string());
@@ -435,7 +433,7 @@ mod tests {
         assert_eq!(get("VICTORY_STREAMLINE_DIR"), Some(r"C:\nvidia"));
         // frame generation ready, off, with a little memory held back for it
         assert_eq!((get("VICTORY_FRAMEGEN"), get("VICTORY_FRAMEGEN_X")), (Some("1"), Some("0")));
-        assert_eq!(get("VICTORY_TEXTURE_ROOM_PERCENT"), Some("86"));
+        assert_eq!(get("VICTORY_TEXTURE_ROOM_PERCENT"), None);
         assert_eq!(get("VICTORY_FRAME_INTERVAL_US"), Some("1000"));
         assert_eq!((get("VICTORY_MENU_DLSS"), get("VICTORY_MENU_FRAMEGEN")), (Some("quality"), Some("0")));
         assert_eq!((get("VICTORY_MENU_CONSOLE"), get("VICTORY_MENU_FPS")), (Some("series-x"), Some("1000")));
@@ -462,7 +460,7 @@ mod tests {
         // the Series S profile has no picture size of its own
         assert_eq!(get("VICTORY_NATIVE_1440P"), None);
         assert_eq!((get("VICTORY_DLSS_MODE"), get("VICTORY_FRAMEGEN_X")), (Some("performance"), Some("6")));
-        assert_eq!(get("VICTORY_TEXTURE_ROOM_PERCENT"), Some("80"));
+        assert_eq!(get("VICTORY_TEXTURE_ROOM_PERCENT"), None);
         assert_eq!(get("VICTORY_FRAME_INTERVAL_US"), Some("16667"));
         // a switch with a value is set, an empty one unset; the menu's own choices are not switches
         assert_eq!((get("VICTORY_AMBIENT"), get("VICTORY_EARLY_DEPTH")), (Some("0.5"), None));

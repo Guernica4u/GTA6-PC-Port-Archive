@@ -145,3 +145,73 @@ is told" for that frame. An exact fallback needs a card-side whole-range compare
 card steps, not touched here) or a shader-side bounds flag. Attribution is a superset (any noted declaration of the
 copy overlapping a landing), so errors widen, never narrow. Measure: log of `footprint of 64 KiB blocks`, and
 shadow/flight lines with the switch on vs off. Code was not compiled or tested (instruction); unit tests in tight.rs.
+
+## perf/texture-book: textures delivered as the title's DirectStorage requests land (UNCOMPILED, UNMEASURED; on by default)
+
+Problem (report 05): the texture queue is empty for the ~95 s loading screen, then 26k slots / 82k textures / 5 GB are
+made, detiled and uploaded on the frame-recording thread at 4-13 fps for ~3 min.
+
+Principle: watch what the title requests and deliver it translated, in real time; nothing the title did not ask for.
+
+1. Live, request-driven (`texture/ledger.rs`, re-exported as `victory_gpu::texture_book`). `dstorage.rs::work` calls
+   `landed` after every successful request: the destination address (a plain address, or for page destinations the one
+   run of title addresses `xmem::shown_at` returns for the written pages) and the request key go to
+   `request_done`. If the description of the texture at that address is known and the request covers its bytes, the
+   "texture book" thread (after 120 ms, and only if no other request overwrote that memory since) checks card room
+   (`resource::room`), host commit (`admit_texture_pass`) and that the memory is mapped, makes the placed resource
+   (`resource::texture_at`) and hands the upload to `texture/ahead.rs` (copy queue, detile on its workers). When the
+   title later names the slot, `texture::unchanged` finds the host copy holding exactly the memory's bytes and the pass
+   adopts it with no upload (outcome SAME; `adopted_by_slots` in the book line).
+   Which case holds for the metadata (evidence): the streamed textures are views of memory without a resource object.
+   Their description arrives only with the descriptor write: `descriptor.rs:1659 create_placed_srv` (device 0x230,
+   `device.rs:457`) records `View::Placed(false, resource_desc, view_desc)`; `resource.rs:3269 texture_at` makes the
+   resource lazily "the first time a draw reads one". Only `resource.rs:3129 create_at_address` (device 0x428) gives a
+   description at creation, for resources the title makes as objects. So at request completion the format/size/mips/
+   tiling are usually NOT known yet on the first fill of an address; they are known when (a) a view named that address
+   earlier in the run (`ledger::desc_known` from `texture_at`, `ledger::named` from the pass), which is the common case
+   for memory the title streams out and back in, or (b) the book on disk recorded that this very request (file, offset,
+   sizes, options) filled a texture a slot named and kept, in an earlier run. (b) only fills in metadata for a request
+   the title has just made; it never starts a load. Without either, nothing is done for that request.
+2. Book on disk: `<cache>/textures/book.bin` ("VTB2", run number, entries of request key -> 14 resource words, first
+   level, use count, last run). An entry is written only when a slot named the texture whole and resident; entries whose
+   memory was seen overwritten by another request or streamed out (and not named again) are dropped at save; entries
+   unused for 6 runs age out; at most 150,000, most used first. Saved every 30 s by a thread once 256 textures were
+   named in the session. Offsets, hashes and layout words only (asset policy).
+3. Converted-asset cache, write-through (`texture/converted.rs`, `victory_gpu::converted_cache`): in
+   `dstorage.rs::execute`, a BCPack request (or zlib from 1 MiB) from a file with an output of 64 KiB or more is looked
+   up by key; the entry is checked against a digest of the source bytes read (so a changed pack misses); a hit is read
+   straight into the destination (no zlib, no BCPack); a miss decodes as before and queues the output to a writer
+   thread (at most 512 MB waiting). Disk bound 24 GiB, trimmed to 90 % by least recent use (file time, touched on each
+   hit). Folder `<cache>/textures/converted/<xx>/<hex>`, beside the shader cache (`d3d12x::use_shader_cache` sets it
+   from the checked cache root), never in the repo or game folder.
+   Entry format: `"VCV1"`, u32 version 1, u64 file (FNV-1a of the lower-cased opened path), u64 offset, u32 source
+   size, u32 destination size, u64 options, u128 source digest (`texture::digest`), u64 output bytes, then the bytes
+   exactly as written to the destination. File name: 32 hex digits of `texture::digest` over the 32 key bytes.
+   What is cached is the decoded (still tiled) output, not the detiled texture: the detile now runs on the copy-queue
+   workers off the frame thread, and reading a detiled file is not cheaper than detiling RAM-resident memory; the
+   decode is what costs.
+4. Loading gate from the request stream: `ledger::tick` (from the pass and from finished requests, twice a second):
+   requests completing (>= 4 or >= 4 MB in the half second, or a `.rpf` opened in the last 8 s) while under 200 draws a
+   frame (or no frame) -> loading, held 3 s after the last sign. While loading the pass gets 4x bytes and a slice of
+   at least 120 ms; the copy queue may have half of free RAM in flight (a third otherwise).
+5. Budgets from the real working set: `residency::textures_limited_by_ram` (< 24 GB installed) replaces
+   `limited_host_ram` (<= 32 GB) for the texture pass byte cap and prefetch limit, so a 32 GB machine is no longer
+   capped at 128 MB/frame and 32 MB in flight. `residency::staging_ceiling`: uploads in flight = free RAM / 3 (/ 2 while
+   loading), 96 MB to 6 GiB; 32 MB on < 24 GB machines, <= 64 MB under pressure. Ahead workers: cores/4, 2 to 4;
+   batch 32 MB / 128 textures. VRAM line: the launcher no longer sets `VICTORY_TEXTURE_ROOM_PERCENT` 80/86;
+   `resource::room_line` uses constants: 88 % of the budget with frame generation on, 90 % ready but off,
+   `line_for` (>= 90 %) without it; the render-target reserve (`targets_room_kept`) is unchanged on top.
+6. Rechecks in time: `RECHECK_MS = [200, 600, 2000, 6000, 20000]`; the wait is the shorter of the frame count and the
+   time at the measured frame rate (so 400 frames at 5 fps is 100 frames, 20 s).
+
+Not done: moving the per-slot pass itself off the recording thread (the make-ready work and detiles now are); an
+overlay. No env switches added. Log lines to check:
+- `texture book: read what earlier runs kept` (entries, run) at start;
+- `texture book: loading screen seen in the request stream; staging budgets raised` / `... is over` (seconds);
+- every 5 s `texture book: the title's requests since the start`: `requests_done`, `texture_known`, `made_ready`,
+  `adopted_by_slots` (the goal: most of `made_ready`), `unnamed_mb`, `no_room`, `no_host_ram`, `not_mapped`,
+  `not_taken`, `overwritten`;
+- every 30 s `converted cache: since the start` (hits, hit_mb, stored, evicted, on_disk_mb) and once
+  `converted cache: decoded DirectStorage outputs kept on disk`;
+- `textures uploaded ahead of the lists` (turned down count) and the queue line `textures picked by index, the queue`
+  (peak should drop well under 26k on the second run), time from `core_restofworld.rpf` open to queue < 500.

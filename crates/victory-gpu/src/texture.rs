@@ -16,6 +16,8 @@
 //! (every mip and array slice), depth and stencil planes are not.
 
 pub(crate) mod ahead;
+pub mod converted;
+pub mod ledger;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

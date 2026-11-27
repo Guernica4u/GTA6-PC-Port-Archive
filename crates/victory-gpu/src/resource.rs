@@ -1987,8 +1987,34 @@ pub(crate) fn room_line(budget: u64) -> u64 {
     if *SET.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ROOM_PERCENT").is_some()) {
         budget / 100 * room_percent()
     } else {
-        line_for(budget)
+        match framegen_planned() {
+            // Frame generation takes 1.5 to 2 GB of the card's memory when on;
+            // the targets' own reserve (`targets_room_kept`) is on top of this.
+            Some(true) => line_for(budget).min(budget / 100 * LINE_FRAMEGEN_PERCENT),
+            Some(false) => line_for(budget).min(budget / 100 * LINE_FRAMEGEN_READY_PERCENT),
+            None => line_for(budget),
+        }
     }
+}
+
+/// The texture line's share of the budget with frame generation on from the
+/// start, and ready but off. (The launcher set 80 and 86 by a switch; the
+/// textures the title asks for are the budget now, and 4.7 GB of 9 GB was
+/// used at the 80 % line in the last measured run, so these are nearer 90.)
+#[cfg(windows)]
+const LINE_FRAMEGEN_PERCENT: u64 = 88;
+#[cfg(windows)]
+const LINE_FRAMEGEN_READY_PERCENT: u64 = 90;
+
+/// Whether frame generation was planned at the start (`Some(true)`: on,
+/// `Some(false)`: ready but off), from what the launcher told the GPU side.
+#[cfg(windows)]
+fn framegen_planned() -> Option<bool> {
+    static PLANNED: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *PLANNED.get_or_init(|| {
+        (std::env::var("VICTORY_FRAMEGEN").is_ok_and(|v| v.trim() == "1"))
+            .then(|| !std::env::var("VICTORY_FRAMEGEN_X").is_ok_and(|x| x.trim() == "0"))
+    })
 }
 
 /// The budget less what is left free for the host's own needs that are
@@ -3320,6 +3346,9 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     map.insert((address, *desc), out as usize);
+    // What lives at that address is known from now on: a DirectStorage
+    // request landing there later can be made ready (`texture::ledger`).
+    crate::texture::ledger::desc_known(address, desc);
     crate::texture::placed_in_host_written(address, desc);
     placed_inside_target(address, out);
     resource(out)

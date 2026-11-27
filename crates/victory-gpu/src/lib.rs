@@ -112,6 +112,14 @@ mod texback;
 #[cfg(windows)]
 pub use host::on_failure;
 
+/// The texture book: the title's DirectStorage requests followed as they
+/// finish, and what they fill made ready for the card (`texture::ledger`).
+#[cfg(windows)]
+pub use texture::ledger as texture_book;
+/// Decoded DirectStorage outputs kept across runs (`texture::converted`).
+#[cfg(windows)]
+pub use texture::converted as converted_cache;
+
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
 /// off while the title runs (`ab`).
 #[cfg(all(windows, feature = "diagnostics"))]
