@@ -59,6 +59,25 @@ def float_bits(value):
     return struct.unpack("<I", struct.pack("<f", float(value)))[0]
 
 
+def byte_permute(a, b, selectors):
+    """`v_perm_b32`: each selector byte picks a byte of {S0, S1}, a sign fill or a constant.
+    S1 holds bytes 0 to 3 and S0 bytes 4 to 7."""
+    source = (a << 32) | b
+    out = 0
+    for position in range(4):
+        select = (selectors >> (8 * position)) & 0xff
+        if select >= 13:
+            byte = 0xff
+        elif select == 12:
+            byte = 0
+        elif select >= 8:
+            byte = 0xff * ((source >> (16 * (select - 8) + 15)) & 1)
+        else:
+            byte = (source >> (8 * select)) & 0xff
+        out |= byte << (8 * position)
+    return out
+
+
 def median(values):
     return sorted(values)[1]
 
@@ -114,6 +133,11 @@ OPERATIONS = {
     "v_mad_u32_u24": (3, lambda a, b, c: ((a & 0xffffff) * (b & 0xffffff) + c) & M),
     "v_mad_i32_i24": (3, lambda a, b, c: (s24(a) * s24(b) + s32(c)) & M),
     "v_sad_u32": (3, lambda a, b, c: (abs(a - b) + c) & M),
+    "v_xad_u32": (3, lambda a, b, c: ((a ^ b) + c) & M),
+    "v_bcnt_u32_b32": (2, lambda a, b, c: (bin(a).count("1") + b) & M),
+    "v_bfm_b32": (2, lambda a, b, c: (((1 << (a & 31)) - 1) << (b & 31)) & M),
+    "v_perm_b32": (3, lambda a, b, c: byte_permute(a, b, c)),
+    **{f"v_cvt_f32_ubyte{n}": (1, lambda a, b, c, n=n: float_bits((a >> (8 * n)) & 0xff)) for n in range(4)},
 }
 
 
@@ -181,6 +205,7 @@ SCALAR = {
     "s_flbit_i32_b32": (1, lambda a: (leading_zeros(a) if a else M, None)),
     "s_sext_i32_i8": (1, lambda a: (((a & 0xff) - (0x100 if a & 0x80 else 0)) & M, None)),
     "s_sext_i32_i16": (1, lambda a: (((a & 0xffff) - (0x10000 if a & 0x8000 else 0)) & M, None)),
+    "s_abs_i32": (1, lambda a: nonzero(abs(s32(a)) & M)),
 }
 OUTPUTS = 8
 
@@ -212,8 +237,11 @@ class Float:
     zero of the same sign, as the float mode decides. `ulps` allows for
     approximate console instructions, and `any_zero` for an undefined zero sign."""
 
-    def __init__(self, bits, ulps=0, any_zero=False):
+    def __init__(self, bits, ulps=0, any_zero=False, absolute=0.0, also=()):
         self.bits, self.ulps, self.any_zero = bits, ulps, any_zero
+        # `absolute` allows an error in value, for results near zero. `also`
+        # lists other results the documentation leaves open.
+        self.absolute, self.also = absolute, also
 
     def matches(self, got):
         want = self.bits
@@ -223,11 +251,25 @@ class Float:
             return True
         if self.any_zero and not want & 0x7fffffff and not got & 0x7fffffff:
             return True
+        if got in self.also:
+            return True
+        if self.absolute and not is_nan(got) and got & 0x7fffffff < 0x7f800000 \
+                and abs(to_float(got) - to_float(want)) <= self.absolute:
+            return True
         same_sign = not (got ^ want) & 0x80000000
         return same_sign and not is_nan(got) and abs((got & 0x7fffffff) - (want & 0x7fffffff)) <= self.ulps
 
     def __repr__(self):
         return f"{self.bits:#010x}" + (f"~{self.ulps}ulp" if self.ulps else "")
+
+
+def distance(got, want):
+    """How many representable floats lie between a result and an approximate
+    instruction's exact one, or None where that has no meaning."""
+    if not isinstance(want, Float) or not want.ulps or is_nan(want.bits) or is_nan(got) or (got ^ want.bits) >> 31 \
+            or want.bits & 0x7fffffff < 0x00800000 or 0x7f800000 in (got & 0x7fffffff, want.bits & 0x7fffffff):
+        return None
+    return abs((got & 0x7fffffff) - (want.bits & 0x7fffffff))
 
 
 def matches(got, want):
@@ -293,8 +335,87 @@ def to_integer(function, low, high):
     return model
 
 
+def legacy_multiply(a, b, c):
+    """DX9 rules: zero times anything, infinity and NaN included, is zero."""
+    if not a & 0x7fffffff or not b & 0x7fffffff:
+        return Float(0, any_zero=True)
+    return Float(to_bits(to_float(a) * to_float(b)))
+
+
+def fraction(a, b, c):
+    """`x - floor(x)`. A tiny negative input rounds to 1.0; the manual doesn't say
+    whether the console returns that or the float below it, so either passes."""
+    value = to_float(a)
+    if not math.isfinite(value):
+        return Float(0x7fc00000)
+    result = to_bits(float(Fraction(value) - math.floor(value)))
+    return Float(result, any_zero=True, also=(0x3f7fffff,) if result == 0x3f800000 else ())
+
+
+def turns(function, at_zero):
+    """Sine or cosine of an angle in turns. The manual gives no accuracy, so a
+    small error in value passes. An input too large to hold a fraction is whole."""
+    def model(a, b, c):
+        value = to_float(a)
+        if not math.isfinite(value):
+            return Float(0x7fc00000)
+        part = Fraction(value) - math.floor(value)
+        result = function(2 * math.pi * float(part)) if part else at_zero
+        return Float(to_bits(result), any_zero=True, absolute=TRIG_ERROR)
+    return model
+
+
+def median_float(a, b, c):
+    values = [to_float(x) for x in (a, b, c)]
+    if any(math.isnan(v) for v in values):
+        return extreme(min, 3)(a, b, c)
+    return Float(to_bits(sorted(values)[1]), any_zero=True)
+
+
+def power_of_two(value):
+    try:
+        return 2.0 ** value
+    except OverflowError:
+        return INFINITY
+
+
+def log_two(value):
+    if value == 0:
+        return -INFINITY
+    return math.log2(value) if value > 0 else float("nan")
+
+
+def multiply_add(a, b, c):
+    """The console's fused result. HLSL has no fused single-precision operation
+    a host must honour, so a host that rounds the product first also passes;
+    the receipt names the instructions seen doing that under `alternatives`."""
+    product = to_float(to_bits(to_float(a) * to_float(b)))
+    return Float(fused(a, b, c), also=(to_bits(product + to_float(c)),))
+
+
+TRIG_ERROR = 2.0 ** -20
+# The manual gives these 1 ULP on the console, and both hosts measured stay within it.
+APPROXIMATE = 1
+# NVIDIA's log2 was 11 ULP out for inputs just below 1; RADV's was within 1.
+LOGARITHM = 16
+ADDEND = 0x40490fdb
+
 # name: (source count, model returning a word or an expected `Float`)
 FLOATS = {
+    "v_mul_legacy_f32": (2, legacy_multiply),
+    "v_fract_f32": (1, fraction),
+    "v_sin_f32": (1, turns(math.sin, 0.0)),
+    "v_cos_f32": (1, turns(math.cos, 1.0)),
+    "v_med3_f32": (3, median_float),
+    "v_rsq_f32": (1, arithmetic(lambda a, b, c: 1 / math.sqrt(a) if a > 0 else
+                                (math.copysign(INFINITY, a) if a == 0 else float("nan")), ulps=APPROXIMATE)),
+    "v_rcp_iflag_f32": (1, arithmetic(lambda a, b, c: 1 / a if a else math.copysign(INFINITY, a), ulps=1)),
+    "v_exp_f32": (1, arithmetic(lambda a, b, c: power_of_two(a), ulps=APPROXIMATE)),
+    "v_log_f32": (1, arithmetic(lambda a, b, c: log_two(a), ulps=LOGARITHM)),
+    # The destination is the third source.
+    "v_fmac_f32": (3, multiply_add),
+    # The addend is a literal in the instruction.
+    "v_fmaak_f32": (2, lambda a, b, c: multiply_add(a, b, ADDEND)),
     "v_add_f32": (2, arithmetic(lambda a, b, c: a + b)),
     "v_sub_f32": (2, arithmetic(lambda a, b, c: a - b)),
     "v_subrev_f32": (2, arithmetic(lambda a, b, c: b - a)),
@@ -348,6 +469,15 @@ COMPARES = {
 }
 FLOAT_COMPARES = {f"v_cmp_{name}_f32": (2, float_relation(name))
                   for name in ("eq", "lt", "gt", "le", "ge", "lg", "o", "u", "neq", "nlt", "ngt", "nle", "nge")}
+# Comparisons into EXEC: 1 where the lane stays active.
+EXEC_COMPARES = {
+    **{f"v_cmpx_{name}_u32": (2, lambda a, b, c, name=name: int(RELATIONS[name](a, b)))
+       for name in ("eq", "ne", "lt", "gt", "le", "ge")},
+    **{f"v_cmpx_{name}_i32": (2, lambda a, b, c, name=name: int(RELATIONS[name](s32(a), s32(b))))
+       for name in ("eq", "ne", "lt", "gt", "le", "ge")},
+}
+FLOAT_EXEC_COMPARES = {f"v_cmpx_{name}_f32": (2, float_relation(name))
+                       for name in ("eq", "lt", "gt", "le", "ge", "lg", "o", "u", "neq", "nlt", "ngt", "nle", "nge")}
 SCALAR_COMPARES = {
     **{f"s_cmp_{name}_u32": (2, lambda a, b, name=name: int(RELATIONS[name](a, b)))
        for name in ("eq", "lg", "lt", "gt", "le", "ge")},
@@ -357,7 +487,7 @@ SCALAR_COMPARES = {
 
 
 def is_float(name):
-    return name in FLOATS or name in FLOAT_COMPARES
+    return name in FLOATS or name in FLOAT_COMPARES or name in FLOAT_EXEC_COMPARES
 
 
 def count(name):
@@ -369,6 +499,14 @@ def count(name):
 
 def lines_for(name, destination):
     """Assembly leaving the instruction's results from `v{destination}` on."""
+    if name == "v_fmac_f32":
+        return [f"v_mov_b32_e32 v{destination}, v6", f"{name} v{destination}, v4, v5"]
+    if name == "v_fmaak_f32":
+        return [f"{name} v{destination}, v4, v5, 0x{ADDEND:x}"]
+    if name in EXEC_COMPARES or name in FLOAT_EXEC_COMPARES:
+        # The write of 1 runs only where the comparison leaves the lane active.
+        return [f"v_mov_b32_e32 v{destination}, 0", "s_mov_b32 s26, exec_lo", f"{name}_e32 v4, v5",
+                f"v_mov_b32_e32 v{destination}, 1", "s_mov_b32 exec_lo, s26"]
     if name in OPERATIONS or name in FLOATS:
         sources = ", ".join(f"v{4 + j}" for j in range({**OPERATIONS, **FLOATS}[name][0]))
         return [f"{name} v{destination}, {sources}"]
@@ -389,7 +527,7 @@ def lines_for(name, destination):
 
 
 def results(name, values):
-    for table in (OPERATIONS, FLOATS, COMPARES, FLOAT_COMPARES):
+    for table in (OPERATIONS, FLOATS, COMPARES, FLOAT_COMPARES, EXEC_COMPARES, FLOAT_EXEC_COMPARES):
         if name in table:
             return [table[name][1](*values)]
     if name in SCALAR_COMPARES:
@@ -454,7 +592,8 @@ def main():
         ap.error("choose a fresh receipt")
     a.work.mkdir(parents=True, exist_ok=False)
     rng = random.Random(0x414c5531)
-    every = [*OPERATIONS, *SCALAR, *COMPARES, *SCALAR_COMPARES, *FLOATS, *FLOAT_COMPARES]
+    every = [*OPERATIONS, *SCALAR, *COMPARES, *SCALAR_COMPARES, *EXEC_COMPARES, *FLOATS, *FLOAT_COMPARES,
+             *FLOAT_EXEC_COMPARES]
     supported, refused = probe(every, a.emitter, a.llvm_mc)
     expected, chunks = {}, {}
     with TemporaryDirectory(dir=a.work) as td:
@@ -507,24 +646,35 @@ def main():
                                           a.prefix, a.provider, a.compiler_dir)
         if status or fields.get("adapter") != a.adapter:
             raise RuntimeError(f"guest failed: {status} {fields}")
-        wrong = {}
+        wrong, worst, alternatives = {}, {}, set()
         for label, chunk in chunks.items():
             observed = struct.unpack("<384I", (trial / (label + ".bin")).read_bytes())
             wanted = expected[label]
             for index, (got_word, want_word) in enumerate(zip(observed, wanted)):
-                if matches(got_word, want_word):
-                    continue
                 lane, column = divmod(index - 96, STRIDE)
                 owners = [name for name in chunk for _ in range(count(name))]
                 name = owners[column - 3] if 0 <= lane < GROUPS and 3 <= column < 3 + len(owners) else "guard"
+                apart = distance(got_word, want_word)
+                if apart is not None:
+                    worst[name] = max(worst.get(name, 0), apart)
+                if isinstance(want_word, Float) and got_word != want_word.bits and got_word in want_word.also:
+                    alternatives.add(name)
+                if matches(got_word, want_word):
+                    continue
                 wrong.setdefault(name, {"shader": label, "inputs": list(wanted[96 + STRIDE * lane:99 + STRIDE * lane]),
                                         "got": got_word, "wanted": repr(want_word)})
     receipt = {"schema": 1, "adapter": a.adapter, "tools_sha256": {n: digest(getattr(a, n))
                                                                    for n in ("emitter", "dxc", "provider")},
-               "checked": supported, "refused": refused, "wrong": wrong, "inputs": a.rounds * GROUPS}
+               "checked": supported, "refused": refused, "wrong": wrong, "inputs": a.rounds * GROUPS,
+               # The largest error seen from each approximate instruction, in units in the last place.
+               "worst_ulps": dict(sorted(worst.items())),
+               # Instructions that gave a documented alternative to the console's result.
+               "alternatives": sorted(alternatives)}
     a.output.write_text(json.dumps(receipt, indent=2) + "\n")
     for name, reason in refused.items():
         print(f"refused {name}: {reason[:150]}")
+    print("gave an accepted alternative result: " + (", ".join(sorted(alternatives)) or "none"))
+    print("largest errors in units in the last place: " + ", ".join(f"{n} {v}" for n, v in sorted(worst.items())))
     for name, detail in wrong.items():
         print(f"WRONG {name}: {detail}")
     print(f"{'FAIL' if wrong else 'PASS'} {len(supported)} instructions on {a.rounds * GROUPS} inputs, "

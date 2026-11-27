@@ -532,11 +532,17 @@ impl<'a> Emitter<'a> {
             "v_mul_f32" => Some(format!("{} * {}", fa()?, fb()?)),
             "v_min_f32" => Some(format!("min({}, {})", fa()?, fb()?)),
             "v_max_f32" => Some(format!("max({}, {})", fa()?, fb()?)),
-            "v_mac_f32" | "v_fmac_f32" => Some(format!("{} * {} + asfloat({dn})", fa()?, fb()?)),
-            "v_madmk_f32" | "v_fmamk_f32" => Some(format!("{} * {k} + {}", fa()?, fb()?)),
-            "v_madak_f32" | "v_fmaak_f32" => Some(format!("{} * {} + {k}", fa()?, fb()?)),
+            // The fused forms round once. `mad` asks the host for its fused
+            // multiply-add; a product and a sum may be rounded twice.
+            "v_fmac_f32" => Some(format!("mad({}, {}, asfloat({dn}))", fa()?, fb()?)),
+            "v_fmamk_f32" => Some(format!("mad({}, {k}, {})", fa()?, fb()?)),
+            "v_fmaak_f32" => Some(format!("mad({}, {}, {k})", fa()?, fb()?)),
+            "v_mac_f32" => Some(format!("{} * {} + asfloat({dn})", fa()?, fb()?)),
+            "v_madmk_f32" => Some(format!("{} * {k} + {}", fa()?, fb()?)),
+            "v_madak_f32" => Some(format!("{} * {} + {k}", fa()?, fb()?)),
             "v_mad_f32" if legacy => Some(format!("tb_mull({}, {}) + {}", fa()?, fb()?, fc()?)),
-            "v_mad_f32" | "v_fma_f32" => Some(format!("{} * {} + {}", fa()?, fb()?, fc()?)),
+            "v_fma_f32" => Some(format!("mad({}, {}, {})", fa()?, fb()?, fc()?)),
+            "v_mad_f32" => Some(format!("{} * {} + {}", fa()?, fb()?, fc()?)),
             "v_min3_f32" => Some(format!("min(min({}, {}), {})", fa()?, fb()?, fc()?)),
             "v_max3_f32" => Some(format!("max(max({}, {}), {})", fa()?, fb()?, fc()?)),
             // ISA: any NaN operand -> V_MIN3_F32 of the three; otherwise the median.
@@ -566,12 +572,14 @@ impl<'a> Emitter<'a> {
             "v_rcp_f32" | "v_rcp_iflag_f32" => Some(format!("1.0 / {}", fa()?)),
             "v_rsq_f32" => Some(format!("rsqrt({})", fa()?)),
             "v_sqrt_f32" => Some(format!("sqrt({})", fa()?)),
-            "v_sin_f32" => Some(format!("sin({} * 6.28318530718)", fa()?)),
+            // The angle is in turns. Dropping whole turns first is exact, where the
+            // product with 2 pi loses a large angle's fraction or overflows.
+            "v_sin_f32" => Some(format!("sin(({0} - round({0})) * 6.28318530718)", fa()?)),
             "v_cubema_f32" => Some(format!("tb_cubema({}, {}, {})", fa()?, fb()?, fc()?)),
             "v_cubesc_f32" => Some(format!("tb_cubesc({}, {}, {})", fa()?, fb()?, fc()?)),
             "v_cubetc_f32" => Some(format!("tb_cubetc({}, {}, {})", fa()?, fb()?, fc()?)),
             "v_cubeid_f32" => Some(format!("tb_cubeid({}, {}, {})", fa()?, fb()?, fc()?)),
-            "v_cos_f32" => Some(format!("cos({} * 6.28318530718)", fa()?)),
+            "v_cos_f32" => Some(format!("cos(({0} - round({0})) * 6.28318530718)", fa()?)),
             _ => None,
         };
         if let Some(e) = fexpr {
