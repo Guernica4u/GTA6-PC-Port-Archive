@@ -24,10 +24,9 @@
 //! their side effects are dropped too, and what they compute is only read
 //! through derivatives.
 
-use crate::hash::{HashMap, HashSet};
-
 use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
+use crate::hash::{HashMap, HashSet};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, VCC, Value};
 use crate::resource::lane_of;
 

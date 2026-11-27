@@ -11,9 +11,8 @@
 //! sequence is matched; any step the simulation does not model leaves the
 //! values it writes unknown.
 
-use crate::hash::HashMap;
-
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
+use crate::hash::HashMap;
 use crate::ir::{EXEC, Inst, Program, Reg, Value};
 
 /// An associative operation and its identity.
