@@ -39,13 +39,16 @@ impl PastHeap {
         }
     }
 
-    /// Counts a title slot past a heap of `count` slots: the highest index
-    /// seen among them.
-    fn note(&self, index: u32, count: u32) -> u32 {
+    /// Counts every skip, returning the highest index seen and whether this
+    /// observation first reaches a new warning range. The atomic's previous
+    /// maximum keeps a repeat from warning again.
+    fn note(&self, index: u32, count: u32) -> (u32, bool) {
         self.skips.fetch_add(1, Ordering::Relaxed);
-        let highest = self.highest.fetch_max(index, Ordering::Relaxed).max(index);
+        let previous = self.highest.fetch_max(index, Ordering::Relaxed);
+        let highest = previous.max(index);
         self.count.store(count, Ordering::Relaxed);
-        highest
+        let warn = worth_a_warning(slots_past(count, previous), slots_past(count, highest));
+        (highest, warn)
     }
 
     /// The skips so far, the highest index seen, and the heap's size.
@@ -67,11 +70,13 @@ pub(crate) fn slots_past(count: u32, highest: u32) -> u32 {
     highest.saturating_sub(count.saturating_sub(1))
 }
 
-/// Whether the `past`th title slot past the host heap is worth a warning:
-/// the first one, and then every doubling, so the log shows how far past the
-/// heap the title went without a line per slot.
-fn worth_a_warning(past: u32) -> bool {
-    past > 0 && past.is_power_of_two()
+/// Whether an observation at `past` title slots past the host heap is worth
+/// a warning, when the slots seen so far reach `previous`: the first one,
+/// and then each newly reached power-of-two range, so the log shows how far
+/// past the heap the title went without a line per slot. A repeat of a slot
+/// already past the heap stays in the range it reached and does not warn.
+fn worth_a_warning(previous: u32, past: u32) -> bool {
+    past > previous && (previous == 0 || past.ilog2() > previous.ilog2())
 }
 
 pub(crate) struct HostHeap {
@@ -785,9 +790,9 @@ impl HostHeap {
             // Diagnostic (NVIDIA heap cap): the title's slots past the host
             // heap. The count of them is in the run's statistics; a warning
             // per slot floods the log.
-            let highest = PAST_HEAP.note(index, self.count);
+            let (highest, warn) = PAST_HEAP.note(index, self.count);
             let past = slots_past(self.count, highest);
-            if worth_a_warning(past) {
+            if warn {
                 tracing::warn!(
                     past,
                     index,
@@ -1897,27 +1902,99 @@ mod tests {
     fn the_slots_past_a_capped_heap_are_counted_and_the_log_names_a_few() {
         let past = PastHeap::new();
         assert_eq!(past.get(), (0, 0, 0));
-        assert_eq!(past.note(1_245_183, 934_464), 1_245_183);
-        assert_eq!(past.note(934_464, 934_464), 1_245_183);
+        assert_eq!(past.note(1_245_183, 934_464), (1_245_183, true));
+        assert_eq!(past.note(934_464, 934_464), (1_245_183, false));
         assert_eq!(past.get(), (2, 1_245_183, 934_464));
         // The warnings: the first slot past the heap and then every doubling.
-        assert!(worth_a_warning(1));
-        assert!(worth_a_warning(2));
-        assert!(!worth_a_warning(3));
-        assert!(worth_a_warning(4));
-        assert!(!worth_a_warning(5));
-        assert!(worth_a_warning(1 << 20));
-        assert!(!worth_a_warning((1 << 20) + 1));
-        assert!(!worth_a_warning(0));
+        assert!(worth_a_warning(0, 1));
+        assert!(worth_a_warning(1, 2));
+        assert!(!worth_a_warning(2, 3));
+        assert!(worth_a_warning(3, 4));
+        assert!(!worth_a_warning(4, 5));
+        assert!(worth_a_warning((1 << 20) - 1, 1 << 20));
+        assert!(!worth_a_warning(1 << 20, (1 << 20) + 1));
+        assert!(!worth_a_warning(0, 0));
         // A title 310 720 slots past the heap names 19 of them, however many
         // times the slots are skipped.
-        let named = (1..=310_720).filter(|n| worth_a_warning(*n)).count();
+        let ascending = PastHeap::new();
+        let named = (934_464..=1_245_183)
+            .filter(|&index| ascending.note(index, 934_464).1)
+            .count();
         assert_eq!(named, 19);
         // The title's slots are numbered from zero: the ones past the heap
         // are those from the heap's last slot to the highest index seen.
         assert_eq!(slots_past(934_464, 1_245_183), 310_720);
         assert_eq!(slots_past(934_464, 934_463), 0);
         assert_eq!(slots_past(934_464, 934_464), 1);
+    }
+
+    /// A slot past the heap asked for again, or an older one, does not warn
+    /// again: only a newly reached distance does.
+    #[test]
+    fn capped_heap_repeats_and_older_indices_do_not_warn_again() {
+        let past = PastHeap::new();
+        let count = 934_464;
+        let indices = [
+            count,
+            count,
+            count,
+            count + 1,
+            count + 2,
+            count + 3,
+            count + 2,
+            count + 3,
+        ];
+        let warnings = indices
+            .into_iter()
+            .filter(|&index| past.note(index, count).1)
+            .count();
+        assert_eq!(warnings, 3);
+        assert_eq!(past.get(), (8, count + 3, count));
+    }
+
+    /// A slot past the heap that jumps over a distance warns when it crosses
+    /// into a new range, and one that stays in the range does not.
+    #[test]
+    fn capped_heap_sparse_indices_warn_when_crossing_a_range() {
+        let past = PastHeap::new();
+        let count = 934_464;
+        let observations = [
+            (count + 2, true),
+            (count + 2, false),
+            (count + 4, true),
+            (count + 3, false),
+            (count + 6, false),
+            (count + 8, true),
+        ];
+        for (index, warn) in observations {
+            assert_eq!(past.note(index, count).1, warn, "index {index}");
+        }
+        assert_eq!(past.get(), (6, count + 8, count));
+    }
+
+    /// Threads asking for the same slot past the heap at once: one warning,
+    /// every skip counted.
+    #[test]
+    fn capped_heap_concurrent_repeats_warn_once_but_count_every_skip() {
+        use std::sync::{Arc, Barrier};
+        let past = Arc::new(PastHeap::new());
+        let barrier = Arc::new(Barrier::new(16));
+        let workers: Vec<_> = (0..16)
+            .map(|_| {
+                let (past, barrier) = (past.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    past.note(934_464, 934_464).1
+                })
+            })
+            .collect();
+        let warnings = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(|&warn| warn)
+            .count();
+        assert_eq!(warnings, 1);
+        assert_eq!(past.get(), (16, 934_464, 934_464));
     }
 
     /// Typed buffer views of integer formats carry their kind in the
