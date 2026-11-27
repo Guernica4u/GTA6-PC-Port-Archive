@@ -17,7 +17,16 @@ use victory_hle::streamline::Mode;
 use victory_loader::PreparedImage;
 
 const RETAIL_BUILD: &str = "b99f876b74d4a77f03af5f878223b27bd647b5c35a79d5decd9f716504239e93";
-pub(super) const WIDTH: u32 = 2560;
+/// The output's width: 2560, or 3440 (21:9, 3440x1440) with
+/// `VICTORY_ULTRAWIDE=1`. The title derives its 21:9 projection from the
+/// output size by itself (its aspect table at +0x654fc80 has 21:9): only the
+/// size changes, the projection needs no patch.
+pub(super) fn width() -> u32 {
+    if ultrawide() { 3440 } else { 2560 }
+}
+pub(super) fn ultrawide() -> bool {
+    std::env::var("VICTORY_ULTRAWIDE").as_deref() == Ok("1")
+}
 pub(super) const HEIGHT: u32 = 1440;
 const SDR_MODE: u32 = 0x0615_c100;
 const STOCK_SDR_MODE: [u8; 16] = [0, 15, 0, 0, 112, 8, 0, 0, 60, 0, 0, 0, 1, 0, 0, 0];
@@ -28,6 +37,7 @@ const UI_VIEWPORT_LOAD: u32 = 0x0580_48d4;
 /// Patches `image` for a 2560x1440 output; the scene is drawn at 2560x1440,
 /// or at 1920x1080 with `render_1080p`. Returns the scene's size.
 pub(super) fn prepare(image: &mut PreparedImage, render_1080p: bool) -> Result<(u32, u32)> {
+    let width = width();
     ensure!(
         image.original_hash.to_hex().as_str() == RETAIL_BUILD,
         "1440p output is only known for the retail build {RETAIL_BUILD}"
@@ -35,14 +45,14 @@ pub(super) fn prepare(image: &mut PreparedImage, render_1080p: bool) -> Result<(
 
     let mode = field::<16>(image, SDR_MODE)?;
     ensure!(*mode == STOCK_SDR_MODE, "unexpected Series X SDR mode");
-    mode[..4].copy_from_slice(&WIDTH.to_le_bytes());
+    mode[..4].copy_from_slice(&width.to_le_bytes());
     mode[4..8].copy_from_slice(&HEIGHT.to_le_bytes());
 
     // Two 64 KiB-aligned, tiled RGBA8 scanout buffers. The reservation is
     // rounded to 2 MiB, matching the title's allocation check.
     let texture = Texture::new(&TextureDesc {
         dimension: Dimension::Tex2d,
-        width: WIDTH,
+        width: width,
         height: HEIGHT,
         depth_or_array: 1,
         mips: 1,
@@ -59,8 +69,8 @@ pub(super) fn prepare(image: &mut PreparedImage, render_1080p: bool) -> Result<(
 
     let scale = field::<4>(image, TEMPORAL_SCALE)?;
     ensure!(*scale == (2.0f32 / 3.0).to_le_bytes(), "unexpected Series X temporal scene scale");
-    let (render_width, render_height) = if render_1080p { (1920, 1080) } else { (WIDTH, HEIGHT) };
-    *scale = (render_width as f32 / WIDTH as f32).to_le_bytes();
+    let (render_width, render_height) = if render_1080p { (width * 1080 / 1440, 1080) } else { (width, HEIGHT) };
+    *scale = (render_width as f32 / width as f32).to_le_bytes();
 
     // Settings lays out its preview panels with a viewport setter of its
     // own that loads the legacy UI size (3840x2160) even when a 1440p UI
@@ -165,10 +175,10 @@ mod tests {
             let mut image = victory_loader::prepare(&bytes).unwrap();
             assert_eq!(prepare(&mut image, render_1080p).unwrap(), scene);
             let mode = *field::<16>(&mut image, SDR_MODE).unwrap();
-            assert_eq!(mode[..4], WIDTH.to_le_bytes());
+            assert_eq!(mode[..4], width().to_le_bytes());
             assert_eq!(mode[4..8], HEIGHT.to_le_bytes());
             let scale = f32::from_le_bytes(*field::<4>(&mut image, TEMPORAL_SCALE).unwrap());
-            assert_eq!((WIDTH as f32 * scale) as u32, scene.0);
+            assert_eq!((width() as f32 * scale) as u32, scene.0);
             let load = *field::<8>(&mut image, UI_VIEWPORT_LOAD).unwrap();
             let disp = i32::from_le_bytes(load[4..].try_into().unwrap());
             assert_eq!(UI_VIEWPORT_LOAD.wrapping_add(8).wrapping_add_signed(disp), SDR_MODE);
