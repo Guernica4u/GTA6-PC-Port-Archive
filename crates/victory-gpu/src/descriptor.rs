@@ -178,41 +178,23 @@ pub(crate) fn sync_heaps() {
             continue;
         };
         let step = u64::from(step);
-        let page_size = crate::watch::PAGE;
         let limit = u64::from(heap.desc.count);
         let mut ranges: Vec<(u32, u32)> = Vec::new();
         for (from, to) in written.take(start as usize, usize::MAX) {
-            // By page: one with nothing mapped (the title unmaps heap pages
-            // too) holds no records.
-            for page in (from & !(page_size - 1)..to).step_by(page_size) {
-                let (page, end) = (page.max(from), (page + page_size).min(to));
-                if !crate::host::read_into(page as *const u8, &mut [0u8; 4]) {
-                    continue;
-                }
-                let first = ((page as u64 - start) / step).min(limit) as u32;
-                let last = (end as u64 - start).div_ceil(step).min(limit) as u32;
-                if first < last {
-                    ranges.push((first, last));
-                }
+            let first = ((from as u64 - start) / step).min(limit) as u32;
+            let last = (to as u64 - start).div_ceil(step).min(limit) as u32;
+            if first < last {
+                ranges.push((first, last));
             }
         }
         if ranges.is_empty() {
             continue;
         }
-        ranges.sort_unstable();
-        let mut merged: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
-        for (a, b) in ranges {
-            match merged.last_mut() {
-                Some(last) if a <= last.1 => last.1 = last.1.max(b),
-                _ => merged.push((a, b)),
-            }
-        }
+        let synced = host.sync_ranges(&ranges, start, step);
         #[cfg(feature = "diagnostics")]
-        {
-            let total: u64 = merged.iter().map(|&(a, b)| u64::from(b - a)).sum();
-            crate::copystat::add(crate::copystat::C::SyncSlots, total);
-        }
-        host.sync_ranges(&merged, start, step);
+        crate::copystat::add(crate::copystat::C::SyncSlots, synced);
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = synced;
     }
 }
 

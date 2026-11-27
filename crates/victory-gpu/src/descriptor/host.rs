@@ -695,47 +695,88 @@ impl HostHeap {
 
     /// A heap sync of slot ranges `ranges` (`first..last`), whose records are
     /// at `start` + index × `step`: [`HostHeap::mirror`] of each slot whose
-    /// record differs from what the slot holds, diffing all ranges under one
-    /// `self.made` lock and one `VIEWS` lock with no per-page temporary buffers
-    /// and skipping `VIEWS` for empty unchanged slots.
-    pub(crate) fn sync_ranges(&self, ranges: &[(u32, u32)], start: u64, step: u64) {
+    /// record differs from what the slot holds.
+    ///
+    /// Normalizes `ranges` once, reads each mapped 64 KiB page chunk into a
+    /// reusable buffer via [`crate::host::read_into`] **before** taking any
+    /// lock (so concurrently unmapped heap pages are skipped cleanly without
+    /// faulting), then holds `self.made` and `VIEWS` (in the same `made` ->
+    /// `VIEWS` order as [`HostHeap::mirror`]) across the in-memory diff pass,
+    /// skipping the `VIEWS` lookup for slots whose tag is not `VIEW_TAG`.
+    /// Returns the number of readable slots scanned.
+    pub(crate) fn sync_ranges(&self, ranges: &[(u32, u32)], start: u64, step: u64) -> u64 {
+        debug_assert!(step >= 12);
         let at = |i: u32| start + u64::from(i) * step;
-        let mut past_cap: Option<u32> = None;
-        let mut raw_clamped: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
-        for &(first, last) in ranges {
-            if last > self.count {
-                let high = last - 1;
-                past_cap = Some(past_cap.map_or(high, |m| m.max(high)));
-            }
-            let a = first.min(self.count);
-            let b = last.min(self.count);
-            if a < b {
-                raw_clamped.push((a, b));
-            }
-        }
-        if let Some(highest) = past_cap {
+        let (clamped, past_cap) = merge_ranges(ranges, self.count);
+        if let Some(highest) = past_cap
+            && crate::host::read_into(at(highest) as *const u8, &mut [0u8; 4])
+        {
             self.mirror(highest, at(highest), false);
         }
-        if raw_clamped.is_empty() {
-            return;
+        if clamped.is_empty() {
+            return 0;
         }
-        raw_clamped.sort_unstable();
-        let mut clamped: Vec<(u32, u32)> = Vec::with_capacity(raw_clamped.len());
-        for (a, b) in raw_clamped {
-            match clamped.last_mut() {
-                Some((_, end)) if a <= *end => *end = (*end).max(b),
-                _ => clamped.push((a, b)),
+        let total_slots: usize = clamped.iter().map(|&(a, b)| (b - a) as usize).sum();
+        let page_size = crate::watch::PAGE as u64;
+        let mut page_buf: Vec<u8> = Vec::new();
+        let mut readable: Vec<(u32, u32)> = Vec::with_capacity(clamped.len());
+        let mut records: Vec<[u32; 3]> = Vec::with_capacity(total_slots);
+        for &(first, last) in &clamped {
+            let mut i = first;
+            while i < last {
+                let addr = at(i);
+                let next_page = (addr & !(page_size - 1)) + page_size;
+                // Advance at least one slot (handles test buffers whose start
+                // is not page-aligned and may straddle a page boundary).
+                let fit = ((next_page - addr) / step).max(1);
+                let j = last.min(i.saturating_add(fit as u32));
+                let n = (j - i) as usize;
+                let bytes = (n - 1) * step as usize + 12;
+                if page_buf.len() < bytes {
+                    page_buf.resize(bytes, 0);
+                }
+                if crate::host::read_into(addr as *const u8, &mut page_buf[..bytes]) {
+                    readable.push((i, j));
+                    for k in 0..n {
+                        let off = k * step as usize;
+                        records.push([
+                            u32::from_ne_bytes([
+                                page_buf[off],
+                                page_buf[off + 1],
+                                page_buf[off + 2],
+                                page_buf[off + 3],
+                            ]),
+                            u32::from_ne_bytes([
+                                page_buf[off + 4],
+                                page_buf[off + 5],
+                                page_buf[off + 6],
+                                page_buf[off + 7],
+                            ]),
+                            u32::from_ne_bytes([
+                                page_buf[off + 8],
+                                page_buf[off + 9],
+                                page_buf[off + 10],
+                                page_buf[off + 11],
+                            ]),
+                        ]);
+                    }
+                }
+                i = j;
             }
         }
+        if readable.is_empty() {
+            return 0;
+        }
+        let synced = records.len() as u64;
         let stale: Vec<u32> = {
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             with_views(|views| {
                 let mut out = Vec::new();
-                for &(first, last) in &clamped {
+                let mut rec_idx = 0usize;
+                for &(first, last) in &readable {
                     for i in first..last {
-                        // SAFETY: records in title heap memory the caller found mapped.
-                        let [tag, id, generation] =
-                            unsafe { (at(i) as *const [u32; 3]).read_unaligned() };
+                        let [tag, id, generation] = records[rec_idx];
+                        rec_idx += 1;
                         let cur_made = made[i as usize];
                         if tag != VIEW_TAG {
                             if cur_made != 0 {
@@ -762,6 +803,7 @@ impl HostHeap {
         for i in stale {
             self.mirror(i, at(i), false);
         }
+        synced
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
@@ -1870,6 +1912,33 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
 }
 
+/// Clamps `ranges` to `cap`, sorts, and merges overlapping or adjacent ranges.
+/// Also returns the highest requested slot index `>= cap`, if any.
+fn merge_ranges(ranges: &[(u32, u32)], cap: u32) -> (Vec<(u32, u32)>, Option<u32>) {
+    let mut past_cap: Option<u32> = None;
+    let mut raw: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
+    for &(first, last) in ranges {
+        if last > cap {
+            let high = last - 1;
+            past_cap = Some(past_cap.map_or(high, |m| m.max(high)));
+        }
+        let a = first.min(cap);
+        let b = last.min(cap);
+        if a < b {
+            raw.push((a, b));
+        }
+    }
+    raw.sort_unstable();
+    let mut merged: Vec<(u32, u32)> = Vec::with_capacity(raw.len());
+    for (a, b) in raw {
+        match merged.last_mut() {
+            Some((_, end)) if a <= *end => *end = (*end).max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    (merged, past_cap)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2512,6 +2581,20 @@ mod tests {
         assert_eq!(host.log_messages(), None);
     }
 
+    /// Clamps `ranges` to `cap`, sorts, and merges overlapping or adjacent ranges.
+    #[test]
+    fn merge_ranges_sorts_clamps_and_merges_adjacent_and_overlapping() {
+        assert_eq!(
+            merge_ranges(&[(16, 32), (0, 16), (40, 48)], 64),
+            (vec![(0, 32), (40, 48)], None)
+        );
+        assert_eq!(
+            merge_ranges(&[(32, 68), (0, 16), (16, 20), (10, 35)], 64),
+            (vec![(0, 64)], Some(67))
+        );
+        assert_eq!(merge_ranges(&[(70, 80), (10, 10)], 64), (vec![], Some(79)));
+    }
+
     /// `sync_ranges` merges overlapping, adjacent, and out-of-order ranges
     /// under a single diff pass, mirroring new/rewritten slots and clearing
     /// zeroed slots while handling out-of-bounds ranges safely.
@@ -2549,8 +2632,9 @@ mod tests {
         write_srv(&mut records, 40, 512);
         write_srv(&mut records, 63, 768);
 
-        // Pass 1: unsorted, overlapping, and past-cap ranges.
-        heap.sync_ranges(&[(32, 68), (0, 20), (10, 35)], start, step);
+        // Pass 1: unsorted, adjacent (0, 16) + (16, 32), overlapping, and past-cap ranges.
+        let synced = heap.sync_ranges(&[(32, 68), (16, 32), (0, 16), (10, 35)], start, step);
+        assert_eq!(synced, 64);
         assert_eq!(heap.address_at(2), Some(base));
         assert_eq!(heap.address_at(15), Some(base + 256));
         assert_eq!(heap.address_at(40), Some(base + 512));
@@ -2560,7 +2644,8 @@ mod tests {
         // Pass 2: rewrite slot 15 and clear slot 40.
         write_srv(&mut records, 15, 1024);
         records[40] = [0u32; 8];
-        heap.sync_ranges(&[(12, 45), (0, 16)], start, step);
+        let synced = heap.sync_ranges(&[(12, 45), (0, 16)], start, step);
+        assert_eq!(synced, 45);
         assert_eq!(heap.address_at(2), Some(base));
         assert_eq!(heap.address_at(15), Some(base + 1024));
         assert_eq!(heap.address_at(40), Some(0));
