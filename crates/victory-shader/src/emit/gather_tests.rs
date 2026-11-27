@@ -2,10 +2,11 @@
 //! (`image_sample_lz`) take near a texel boundary, without the console's
 //! compiler. Each pixel looks up at `t = x + d` texels in u and v (a
 //! gather's footprint and a point sample's texel start at `floor(t)`): away
-//! from a boundary the texels are fixed; just below one (`d = -1/1024`) the
-//! hardware's fixed-point coordinate decides whether `t` rounds up to `x`
-//! or stays below it (`x - 1`), which hosts may do differently from the
-//! console.
+//! from a boundary the texels are fixed; just below one the hardware's
+//! fixed-point coordinate decides whether `t` rounds up to `x` or stays
+//! below it (`x - 1`). The console rounds `t` to 1/256 of a texel, half up;
+//! hosts may not, so gathers are translated to take the console's
+//! footprint (`lower/gather.rs`).
 
 use windows::Win32::Graphics::Direct3D12::*;
 
@@ -113,18 +114,20 @@ fn param(root: RootType, user_data: u8, slot: u8) -> RootParam {
     }
 }
 
-/// Draws `op` (with `dmask`) at `t = x + d` for each `d`, from a full-screen
-/// triangle on the hardware adapter and WARP. The program's coordinate is
-/// `x + 0.5 + d + shift` texels: a gather's footprint starts half a texel
-/// back from it (shift 0), a point sample's texel at it (shift -0.5). `exact` cases
-/// must all take `value(floor(t))`; the others report whether each host
-/// rounded `t` up to `x`. Returns the failures.
+/// Draws `op` (with `dmask`) at `t = x + d` for each case's `d`, from a
+/// full-screen triangle on the hardware adapter and WARP. The program's
+/// coordinate is `x + 0.5 + d + shift` texels: a gather's footprint starts
+/// half a texel back from it (shift 0), a point sample's texel at it (shift
+/// -0.5). A case with `Some(k)` must take `value(x + k)` at every pixel; with
+/// `None` it reports whether each host rounded `t` up to `x` (`k` 0) or kept
+/// it below (`k` -1). Returns the failures.
 fn lookups(
     name: &str,
     op: u32,
     dmask: u32,
     shift: f32,
     value: fn(i32, i32) -> [f32; 4],
+    cases: &[(f32, Option<i32>)],
 ) -> Vec<String> {
     let vs_code = [0xF800_08CF, 0x0706_0504, S_ENDPGM]; // exp pos0 v4..v7 done
     let vs = translate(
@@ -175,7 +178,7 @@ fn lookups(
         .collect();
     assert!(!hosts.is_empty(), "no SM 6.6 device");
     let mut failures = Vec::new();
-    for (d, exact) in [(0.25f32, true), (0.75, true), (-1.0 / 1024.0, false)] {
+    for &(d, expect) in cases {
         let ps = translate(
             &NativeProgram {
                 stage: HwStage::Ps,
@@ -237,8 +240,9 @@ fn lookups(
             for (n, px) in pixels.iter().enumerate() {
                 let (x, y) = ((n as u32 % 16) as i32, (n as u32 / 16) as i32);
                 let at = |k: i32| value(x + k, y + k);
-                // At floor(t): x where t is inside texel x, x - 1 just below it.
-                if *px == at(if exact { 0 } else { -1 }) {
+                // Kept below the edge (x - 1, floor(t) just below x) or
+                // rounded up to it (x); inside a texel both are x.
+                if d < 0.0 && *px == at(-1) {
                     floor += 1;
                 } else if *px == at(0) {
                     rounded += 1;
@@ -250,15 +254,20 @@ fn lookups(
                 }
             }
             eprintln!(
-                "{label}: 256 pixels, at floor(t) {floor}, rounded up to x {rounded}, neither {other}{}",
+                "{label}: 256 pixels, kept below {floor}, at x {rounded}, neither {other}{}",
                 first
                     .as_deref()
                     .map(|f| format!(", first {f}"))
                     .unwrap_or_default()
             );
-            if other > 0 || exact && floor != 256 {
+            let wanted = match expect {
+                Some(0) => rounded,
+                Some(_) => floor,
+                None => 256 - other,
+            };
+            if wanted != 256 {
                 failures.push(format!(
-                    "{label}: floor {floor}, rounded {rounded}, neither {other}"
+                    "{label}: kept below {floor}, at x {rounded}, neither {other}"
                 ));
             }
         }
@@ -266,24 +275,46 @@ fn lookups(
     failures
 }
 
-/// `image_gather4_lz` takes the 2x2 footprint at `floor(t)` where `t` lies
-/// a quarter texel inside a texel (`d` 0.25 and 0.75). Just below a
-/// boundary (`d = -1/1024`) it reports which way each host rounds, without
-/// failing: the console's hardware keeps 8 fractional bits.
+/// `image_gather4_lz` takes the console's 2x2 footprint: at `floor(t)` with
+/// `t` rounded to 1/256 of a texel, half up. Inside a texel (`d` 0.25 and
+/// 0.75) that is `x`; just below an edge, 1/1024 and the tie of 1/512 round
+/// up to `x`, while 1/512 + 1/65536 and 3/1024 stay at `x - 1`, on every
+/// host.
 #[test]
 fn gathers_take_the_footprint_at_the_coordinate() {
-    let failures = lookups("gather", 0x47, 0x1, 0.0, gathered);
+    let failures = lookups(
+        "gather",
+        0x47,
+        0x1,
+        0.0,
+        gathered,
+        &[
+            (0.25, Some(0)),
+            (0.75, Some(0)),
+            (-1.0 / 1024.0, Some(0)),
+            (-1.0 / 512.0, Some(0)),
+            (-(1.0 / 512.0 + 1.0 / 65536.0), Some(-1)),
+            (-3.0 / 1024.0, Some(-1)),
+        ],
+    );
     assert!(failures.is_empty(), "{}", failures.join("; "));
 }
 
 /// `image_sample_lz` with a point sampler takes the texel at `floor(t)`
-/// (`t = u * SIZE`), and reports the same boundary case.
+/// (`t = u * SIZE`), and reports which way each host takes `d = -1/1024`.
 #[test]
 fn point_samples_take_the_texel_at_the_coordinate() {
     let texel = |i: i32, j: i32| {
         let n = i.rem_euclid(SIZE as i32) + SIZE as i32 * j.rem_euclid(SIZE as i32);
         [n as f32, 0.0, 0.0, 1.0]
     };
-    let failures = lookups("point", 0x27, 0xF, -0.5, texel);
+    let failures = lookups(
+        "point",
+        0x27,
+        0xF,
+        -0.5,
+        texel,
+        &[(0.25, Some(0)), (0.75, Some(0)), (-1.0 / 1024.0, None)],
+    );
     assert!(failures.is_empty(), "{}", failures.join("; "));
 }
