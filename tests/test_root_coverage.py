@@ -1,7 +1,7 @@
 import struct
 import unittest
 
-from tools.report_root_coverage import covers, declarations, parse_root, rts0_payload
+from tools.report_root_coverage import covers, declarations, explain, parse_root, rts0_payload
 
 
 def serialized(flags=0, table=(), constants=None):
@@ -48,7 +48,7 @@ class RootCoverage(unittest.TestCase):
         # The shape the retail root signatures use: a CBV at space 1 register 16
         # while the translated program asks for an SRV there.
         version, flags, params = parse_root(
-            serialized(table=[(0, 1, 16, 1), (1, 1, 7, 0)])
+            serialized(table=[(2, 1, 16, 1), (0, 1, 7, 0)])
         )
         self.assertEqual(version, 2)
         self.assertEqual(flags, 0)
@@ -58,7 +58,7 @@ class RootCoverage(unittest.TestCase):
         self.assertIsNone(covers(params, flags, "cbv", 0, 7))
 
     def test_a_range_reaches_every_register_it_declares(self):
-        _, flags, params = parse_root(serialized(table=[(1, 8, 232, 1)]))
+        _, flags, params = parse_root(serialized(table=[(0, 8, 232, 1)]))
         self.assertEqual(covers(params, flags, "srv", 1, 232), "table")
         self.assertEqual(covers(params, flags, "srv", 1, 239), "table")
         self.assertIsNone(covers(params, flags, "srv", 1, 240))
@@ -69,7 +69,7 @@ class RootCoverage(unittest.TestCase):
         self.assertIsNone(covers(params, flags, "srv", 0, 500))
 
     def test_a_directly_indexed_heap_covers_any_srv_but_not_a_sampler(self):
-        _, flags, params = parse_root(serialized(flags=0x400, table=[(1, 1, 0, 0)]))
+        _, flags, params = parse_root(serialized(flags=0x400, table=[(0, 1, 0, 0)]))
         self.assertEqual(covers(params, flags, "srv", 1, 239), "heap")
         self.assertIsNone(covers(params, flags, "sampler", 1, 239))
 
@@ -87,6 +87,23 @@ class RootCoverage(unittest.TestCase):
         self.assertIn(("srv", 0, 24), found)
         self.assertIn(("uav", 0, 3), found)
         self.assertNotIn(("cbv", 1, 5), found, "a declaration nobody reads is not a binding")
+
+    def test_an_unreachable_binding_says_why(self):
+        # No SRV range in space 1 at all.
+        _, flags, params = parse_root(serialized(table=[(0, 1, 16, 1), (1, 1, 7, 0)]))
+        self.assertEqual(explain(params, flags, "srv", 2, 16), "no srv range in space 2")
+        # A range that stops short names its span.
+        _, flags, params = parse_root(serialized(table=[(0, 4, 232, 1)]))
+        self.assertEqual(explain(params, flags, "srv", 1, 239),
+                         "nearest srv range in space 1: 232..235")
+        # A sampler the root never declares.
+        self.assertEqual(explain(params, flags, "sampler", 0, 66),
+                         "no sampler range in space 0")
+
+    def test_a_space_that_binds_another_kind_is_named(self):
+        _, flags, params = parse_root(serialized(table=[(2, 1, 16, 1)]))
+        self.assertEqual(explain(params, flags, "srv", 1, 16),
+                         "space 1 binds cbv at 16, not srv")
 
     def test_the_root_signature_is_read_from_its_rts0_chunk(self):
         payload = serialized(table=[(1, 1, 7, 0)])

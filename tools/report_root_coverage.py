@@ -20,6 +20,12 @@ reporting coverage gaps rather than hiding them.
 
 Usage:
     python tools/report_root_coverage.py REQUESTS [--xshader PATH] [--limit N]
+    python tools/report_root_coverage.py --failures RUN.tsv --capture DIR
+
+The second form joins a run's pipeline-failure report to the stages captured
+during it (TUXBOX_CAPTURE_RASTER_ROOTS / TUXBOX_CAPTURE_SHADER_INPUTS) and says,
+for each failing stage, which binding its own pipeline's signature cannot reach
+and why.
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -31,7 +37,9 @@ from pathlib import Path
 
 HEAP_INDEXED = 0x400
 SAMPLER_HEAP_INDEXED = 0x800
-RANGE_TYPES = {0: "cbv", 1: "srv", 2: "uav", 3: "sampler"}
+# D3D12_DESCRIPTOR_RANGE_TYPE: the serialized root uses SRV 0, UAV 1, CBV 2,
+# sampler 3. runtime/dxbc's Binding kind uses the same numbers.
+RANGE_TYPES = {0: "srv", 1: "uav", 2: "cbv", 3: "sampler"}
 PARAM_TYPES = {0: "table", 1: "constants", 2: "cbv", 3: "srv", 4: "uav"}
 REGISTER_KINDS = {"t": "srv", "b": "cbv", "u": "uav", "s": "sampler"}
 DEFAULT_XSHADER = Path("build/shader-compiler/x86_64-unknown-linux-gnu/release/xshader")
@@ -116,6 +124,28 @@ def covers(params, flags, kind, space, register):
     return None
 
 
+def explain(params, flags, kind, space, register):
+    """Why a binding has no element in the signature, in a few words."""
+    same_space = [
+        (base, num) for _, param_kind, detail in params if param_kind == "table"
+        for range_kind, num, base, range_space in detail
+        if range_kind == kind and range_space == space
+    ]
+    other_kind = [
+        range_kind for _, param_kind, detail in params if param_kind == "table"
+        for range_kind, num, base, range_space in detail
+        if range_kind != kind and range_space == space and base <= register < base + num
+    ]
+    if flags & (SAMPLER_HEAP_INDEXED if kind == "sampler" else HEAP_INDEXED):
+        return "directly indexed heap"
+    if other_kind:
+        return f"space {space} binds {other_kind[0]} at {register}, not {kind}"
+    if not same_space:
+        return f"no {kind} range in space {space}"
+    nearest = min(same_space, key=lambda row: min(abs(row[0] - register), abs(row[0] + row[1] - register)))
+    return f"nearest {kind} range in space {space}: {nearest[0]}..{nearest[0] + nearest[1] - 1}"
+
+
 def declarations(hlsl):
     """The resources an emitted program declares and reads, as (kind, space, register, name)."""
     found = []
@@ -165,15 +195,80 @@ def inspect(xshader, request, work):
     return digest, uncovered, None
 
 
+def attribute(failures, capture, xshader, work):
+    """Report, per failing stage, the bindings its own captured signature cannot reach."""
+    stages = {}
+    for line in failures.read_text(encoding="utf-8", errors="replace").splitlines():
+        fields = line.split("\t")
+        if len(fields) != 4 or not fields[0].isdigit() or int(fields[0]) <= 0:
+            continue
+        count, detail = int(fields[0]), fields[3]
+        for name, digest in re.findall(r"\b(VS|PS|DS|HS|GS|CS|AS|MS)=([0-9a-f]{64})", detail):
+            stages[(name, digest)] = stages.get((name, digest), 0) + count
+
+    reasons = Counter()
+    rows = 0
+    for (stage, digest), count in sorted(stages.items()):
+        shader = capture / "shaders" / f"{digest}.dxbc"
+        signatures = sorted((capture / "roots").glob(f"{digest}-*.rootsig"))
+        if not signatures or not shader.is_file():
+            reasons["stage not captured"] += 1
+            continue
+        hlsl, refusal = translate(xshader, shader, work)
+        if hlsl is None:
+            reasons[f"could not translate: {refusal[:60]}"] += 1
+            continue
+        declared = declarations(hlsl)
+        for signature in signatures:
+            try:
+                _, flags, params = parse_root(signature.read_bytes())
+            except (ValueError, struct.error) as error:
+                reasons[f"unreadable signature: {error}"] += 1
+                continue
+            uncovered = [
+                (kind, space, register, explain(params, flags, kind, space, register))
+                for kind, space, register, _ in declared
+                if covers(params, flags, kind, space, register) is None
+            ]
+            for _, _, _, why in uncovered:
+                reasons[why] += 1
+            if uncovered:
+                rows += 1
+                print(f"{stage} {digest[:12]} x{count} root {signature.name.split('-', 1)[1][:12]}")
+                for kind, space, register, why in uncovered:
+                    print(f"    {kind:8} {space}:{register:<5} {why}")
+    print(f"\n{rows} failing stage/signature pairs with an unreachable binding; "
+          f"{len(stages)} distinct failing stages in the report")
+    for why, count in reasons.most_common(10):
+        print(f"  {count:5d}  {why}")
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
-    parser.add_argument("requests", type=Path, help="directory of recorded request .dxbc files")
+    parser.add_argument("requests", type=Path, nargs="?", help="directory of recorded request .dxbc files")
+    parser.add_argument("--failures", type=Path,
+                        help="a pipeline-failures .tsv to attribute instead of scanning requests")
+    parser.add_argument("--capture", type=Path,
+                        help="the capture directory TUXBOX_CAPTURE_RASTER_ROOTS wrote, for --failures")
     parser.add_argument("--xshader", type=Path, default=DEFAULT_XSHADER)
     parser.add_argument("--work", type=Path, help="scratch directory for emitted HLSL")
     parser.add_argument("--limit", type=int, default=0, help="stop after this many requests")
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--show", action="store_true", help="print a line per request with a gap")
     args = parser.parse_args(argv)
+
+    if args.failures is not None:
+        if args.capture is None:
+            parser.error("--failures needs --capture, the directory the provider wrote")
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory(prefix="root-coverage-") as scratch:
+            work = args.work or Path(scratch)
+            work.mkdir(parents=True, exist_ok=True)
+            return attribute(args.failures, args.capture, args.xshader, work)
+
+    if args.requests is None:
+        parser.error("give a request directory, or --failures with --capture")
 
     requests = sorted(args.requests.glob("*.dxbc"))
     if args.limit:
