@@ -20,10 +20,10 @@ use crate::host::host;
 pub(crate) static PAST_HEAP: PastHeap = PastHeap::new();
 
 /// How many times a title slot past the host heap was skipped, the highest
-/// index among them, and the size of the heap. The skips are what a run's
-/// statistics name: a warning per skip floods the log (310 720 lines in one
-/// world load), and the highest index is what says how far past the heap the
-/// title went.
+/// index among them, and the size of the heap. The highest index is what
+/// says how far past the heap the title went, and the count of the slots
+/// past the heap is what a run's statistics name: a warning per slot past
+/// the heap floods the log (310 720 lines in one world load).
 pub(crate) struct PastHeap {
     skips: std::sync::atomic::AtomicU64,
     highest: std::sync::atomic::AtomicU32,
