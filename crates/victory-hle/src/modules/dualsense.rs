@@ -214,7 +214,6 @@ fn open_pad() -> Option<Pad> {
 /// Every present HID interface's NUL-terminated device path.
 fn device_paths() -> Vec<Vec<u16>> {
     const DETAIL_SIZE: usize = std::mem::size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>();
-    const PATH_OFFSET: usize = std::mem::offset_of!(SP_DEVICE_INTERFACE_DETAIL_DATA_W, DevicePath);
     let mut paths = Vec::new();
     // SAFETY: the HID interface class, no enumerator or parent window.
     let set: HDEVINFO = unsafe {
@@ -281,19 +280,30 @@ fn device_paths() -> Vec<Vec<u16>> {
                 continue;
             }
         }
-        let capacity = (required as usize - PATH_OFFSET) / std::mem::size_of::<u16>();
-        // SAFETY: the UTF-16 field is aligned and the slice is inside the initialized buffer.
-        let path = unsafe {
-            let start = buffer.as_ptr().cast::<u8>().add(PATH_OFFSET).cast::<u16>();
-            std::slice::from_raw_parts(start, capacity)
-        };
-        if let Some(end) = path.iter().position(|&unit| unit == 0) {
-            paths.push(path[..=end].to_vec());
+        if let Some(path) = detail_path(&buffer, required as usize) {
+            paths.push(path);
         }
     }
     // SAFETY: the set is ours.
     unsafe { SetupDiDestroyDeviceInfoList(set) };
     paths
+}
+
+/// The device path in a filled interface detail `buffer` of which the API
+/// reported `required` bytes, with its NUL terminator kept for `CreateFileW`.
+/// `None` when the size leaves no room for a path or the path is unterminated.
+fn detail_path(buffer: &[u32], required: usize) -> Option<Vec<u16>> {
+    const PATH_OFFSET: usize = std::mem::offset_of!(SP_DEVICE_INTERFACE_DETAIL_DATA_W, DevicePath);
+    let size = required.min(std::mem::size_of_val(buffer));
+    let capacity = size.checked_sub(PATH_OFFSET)? / std::mem::size_of::<u16>();
+    // SAFETY: the UTF-16 field is aligned (the buffer is u32 words and the
+    // offset even) and `capacity` code units end inside `buffer`.
+    let path = unsafe {
+        let start = buffer.as_ptr().cast::<u8>().add(PATH_OFFSET).cast::<u16>();
+        std::slice::from_raw_parts(start, capacity)
+    };
+    let end = path.iter().position(|&unit| unit == 0)?;
+    Some(path[..=end].to_vec())
 }
 
 /// A declared usage's value in `report`, if the descriptor has it.
@@ -424,6 +434,57 @@ mod tests {
 
     fn pad(usages: &[u16], hat: u32) -> Reading {
         state(CENTER, [0, 0], hat, usages)
+    }
+
+    /// A detail buffer as SetupAPI fills it: the header, then `path` at
+    /// the DevicePath offset, padded to whole u32 words.
+    fn detail_buffer(path: &[u16]) -> (Vec<u32>, usize) {
+        let offset = std::mem::offset_of!(SP_DEVICE_INTERFACE_DETAIL_DATA_W, DevicePath);
+        let required = offset + std::mem::size_of_val(path);
+        let mut bytes = vec![0xaau8; required.div_ceil(4) * 4];
+        for (index, unit) in path.iter().enumerate() {
+            bytes[offset + index * 2..offset + index * 2 + 2].copy_from_slice(&unit.to_le_bytes());
+        }
+        let words = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| u32::from_le_bytes(*word))
+            .collect();
+        (words, required)
+    }
+
+    #[test]
+    fn detail_path_keeps_a_terminator_at_the_last_code_unit() {
+        let (buffer, required) = detail_buffer(&[0x5c, 0x5c, 0x3f, 0]);
+        assert_eq!(
+            detail_path(&buffer, required),
+            Some(vec![0x5c, 0x5c, 0x3f, 0])
+        );
+    }
+
+    #[test]
+    fn detail_path_refuses_a_path_without_a_terminator() {
+        let (mut buffer, required) = detail_buffer(&[0x41, 0x42, 0x43]);
+        // Units past the reported size are not part of the path, even if NUL.
+        buffer.push(0);
+        assert_eq!(detail_path(&buffer, required), None);
+    }
+
+    #[test]
+    fn detail_path_refuses_a_size_short_of_the_path() {
+        let offset = std::mem::offset_of!(SP_DEVICE_INTERFACE_DETAIL_DATA_W, DevicePath);
+        let (buffer, _) = detail_buffer(&[0]);
+        assert_eq!(detail_path(&buffer, offset - 1), None);
+        assert_eq!(detail_path(&buffer, offset), None);
+        assert_eq!(detail_path(&buffer, offset + 1), None);
+    }
+
+    #[test]
+    fn detail_path_reads_no_further_than_the_buffer() {
+        let (buffer, required) = detail_buffer(&[0x41, 0x42, 0x43, 0x44]);
+        // A reported size beyond the buffer is clamped to it.
+        assert_eq!(detail_path(&buffer, required + 64), None);
     }
 
     #[test]
