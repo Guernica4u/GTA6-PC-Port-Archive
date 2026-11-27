@@ -26,6 +26,8 @@ pub mod console;
 mod copystat;
 #[cfg(windows)]
 mod copystat_footprint;
+#[cfg(windows)]
+mod tight;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod faultbook;
 #[cfg(windows)]

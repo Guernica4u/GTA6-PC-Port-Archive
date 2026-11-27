@@ -118,3 +118,21 @@ R8 (`host.rs`, submit's sweep): the forced `settle(WHY_SYNC)` every 1.5 s behind
 R3 (`card_steps.rs::record`): not a gather kernel. Reading the code shows the report's premise is too high: a fill that goes to a descriptor slot (`To::Slot`, stage 1) records no command at all; reads are deduplicated per place (a few hundred, "2,800 fills of a few hundred places"), only copies and stage-2 buffer fills write. With `VICTORY_FILL_TITLE` on by default the small ring fills are mostly no longer taken here. The 4.6-8.6 ms "planning" is CPU planning (`does_of`, `plan`, `holder`, `mapped` page-table probes, 5.4k `constant_slot` writes), which a kernel would not touch. A real gather also needs a new PSO, a mapped upload table per `Own`, and a per-source/per-destination state scheme (NON_PIXEL_SHADER_RESOURCE/UAV instead of COPY_SOURCE/DEST, with the "both" case), and the scatter kernel in `send.rs` is one destination UAV per dispatch, so it is not reusable as is. Not done until a capture shows the command count. Done instead: runs touching in both buffers (reads may cross equal under-256-byte padding) go in one `CopyBufferRegion`; `VICTORY_JOIN_STEPS=0` restores one each. Measure with `--timing detailed` on the card-steps list.
 
 R7 not done. Present cannot simply move: the next `present_planes` reads `GetCurrentBackBufferIndex` and records into that buffer, so it must come after the previous `Present` call, which makes the move a hand-off with a wait; Streamline's `present_begins/called/returned/ends` and the tags belong to one thread per frame (frame-gen semantics); and the resize path settles and calls `ResizeBuffers` under the presenter lock. What would be left to overlap is ~1.5 ms/frame (`Present`) plus `panel/menu/meter.frame`, which are bookkeeping (a once-a-second log). Not worth the ordering risk without an in-game Streamline test.
+
+## perf/tight-writes: learned footprint for root UAV declarations (UNCOMPILED, UNMEASURED; default OFF)
+
+`VICTORY_TIGHT_WRITES=1` enables `tight.rs`. Root UAVs (`Draw::root_uav`) have no size; they declared the rest of the
+title's buffer as shader-written. Now, per (pipeline, root parameter), the footprint relative to the root address is
+learned from what lands (hook in `copystat_footprint::gpu_wrote`, which `land_card`/`land_back` already call). Learn:
+full declaration, noted per copy for 400 ms, landings inside widen the footprint. After 8 landings and 32
+declarations: tight, footprint +-256 KiB in 64 KiB blocks. Tight keys declare the footprint only, except every 16th
+declaration (`VICTORY_TIGHT_VERIFY`) which is full and noted; a landing outside the footprint in a noted full
+declaration makes the key wide for good (warn log). Keys that never saw a landing never tighten.
+Not done: table UAV views in `readable` (sized, no pipeline identity there), persistence across runs, static shader
+analysis. The view and `refresh` stay wide; only `gpu_writes` is narrowed.
+Why default OFF: a write outside the footprint between two verifications is not declared, so it stays on the card
+until the next declared write of its 64 KiB or verification; that violates "must reach title memory before the title
+is told" for that frame. An exact fallback needs a card-side whole-range compare declared as compare-and-land (host.rs
+card steps, not touched here) or a shader-side bounds flag. Attribution is a superset (any noted declaration of the
+copy overlapping a landing), so errors widen, never narrow. Measure: log of `footprint of 64 KiB blocks`, and
+shadow/flight lines with the switch on vs off. Code was not compiled or tested (instruction); unit tests in tight.rs.

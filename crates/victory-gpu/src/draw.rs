@@ -2194,13 +2194,17 @@ impl State {
             }
             Some(s)
         };
+        let pipeline = self.pipeline;
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
             if writes {
                 #[cfg(feature = "diagnostics")]
-                crate::host::wide_write(a, len, self.pipeline);
-                s.gpu_writes(list, a, len);
+                crate::host::wide_write(a, len, pipeline);
+                // The footprint this pipeline's shader wrote through this
+                // parameter, once learned (`VICTORY_TIGHT_WRITES=1`).
+                let (from, n) = crate::tight::declare(pipeline, param, s.id(), s.span().0, a, len);
+                s.gpu_writes(list, a + from, n);
             }
         };
         if !crate::pipeline::host::bounded_root_srvs() {
