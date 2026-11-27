@@ -611,6 +611,40 @@ fn nvidia_paired_fp32_min_max() {
     }
 }
 
+fn fp32_with_mode_write(offset: u32, width: u32) -> NativeProgram {
+    let mut program = fp32_program(3, 0, [1.0f32.to_bits(); 3], false);
+    // SOPK s_setreg_imm32_b32, HW_REG_MODE, literal zero.
+    let hwreg = 1 | (offset << 6) | ((width - 1) << 11);
+    let words = [0xb000_0000 | (0x15 << 23) | hwreg, 0];
+    program.code.splice(0..0, words.into_iter().flat_map(u32::to_le_bytes));
+    program
+}
+
+#[test]
+#[ignore = "requires NVIDIA Wave32 hardware and VICTORY_WAVE_PAIRS_FP32=non-ieee-rne-ftz"]
+fn nvidia_paired_fp32_mode_writes() {
+    assert_eq!(std::env::var("VICTORY_WAVE_PAIRS_FP32").as_deref(), Ok("non-ieee-rne-ftz"));
+    let program = fp32_with_mode_write(2, 2);
+    crate::emit::with_wave_pairs(true, || {
+        execute_wave32(&program, &[(0, 0), (33, 2.0f32.to_bits()), (64, 2.0f32.to_bits())], |n, src| {
+            fp32_expected(3, 0, [src, 1.0f32.to_bits(), 1.0f32.to_bits(), 1.0f32.to_bits()], n, false)
+        });
+    });
+    // FP32 rounding, denormals, DX10_CLAMP and IEEE must still be rejected.
+    let bytes = crate::dxbc::build(&[]);
+    let c = crate::dxbc::Container::parse(&bytes).unwrap();
+    for (offset, width) in [(0, 2), (4, 2), (8, 1), (9, 1), (2, 8)] {
+        let program = fp32_with_mode_write(offset, width);
+        let p = crate::spill::build(&program).unwrap();
+        let old = lower::TEST_HOST_WAVE.replace(Some(32));
+        let result = crate::emit::paired(&c, &program, &p);
+        lower::TEST_HOST_WAVE.set(old);
+        assert!(matches!(result, Err(ShaderError::Unsupported {
+            what: "paired FP32 reduction with fast math or an unknown MODE change", ..
+        })), "MODE offset={offset}, width={width}: expected conservative refusal");
+    }
+}
+
 #[test]
 fn paired_fp32_refuses_an_unconfirmed_guest_mode() {
     const TEST: &str = "WAVE64_FP32_MODE_TEST";

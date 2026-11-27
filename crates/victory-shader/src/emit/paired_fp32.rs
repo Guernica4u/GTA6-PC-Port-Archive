@@ -5,6 +5,19 @@ fn ordered_fp32(shape: Shape) -> bool {
     matches!(shape, Shape::Active(Op::AddF | Op::MinF | Op::MaxF, ..))
 }
 
+// Only the observed immediate write to FP16/FP64 rounding is harmless
+// to the FP32 contract. Other HW_REG_MODE fields remain unmodelled.
+fn independent_rounding_write(i: &Inst) -> bool {
+    if i.name() != "s_setreg_imm32_b32" {
+        return false;
+    }
+    let Fields::Sop { imm: Some(hwreg), src, .. } = &i.fields else {
+        return false;
+    };
+    let (id, offset, width) = (hwreg & 63, (hwreg >> 6) & 31, (hwreg >> 11) + 1);
+    id == 1 && offset == 2 && width == 2 && matches!(src.as_slice(), [Operand::Literal(0)])
+}
+
 impl Lower<'_> {
     pub(super) fn replay_paired_fp32(
         &mut self,
@@ -40,44 +53,59 @@ impl Lower<'_> {
                         | "s_round_mode"
                         | "s_denorm_mode"
                         | "s_swappc_b64"
-                )
+                ) && !independent_rounding_write(i)
             })
         {
             return Err(refused(
                 "paired FP32 reduction with fast math or an unknown MODE change",
             ));
         }
-        if live().any(|(_, v)| {
+        let why_on = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+        if let Some((_, v)) = live().find(|(_, v)| {
             !matches!(
                 section.shapes.get(v),
                 Some(Shape::Active(..) | Shape::Masked(..) | Shape::Value(..) | Shape::K(_))
             )
-        }) || code[start + 1..end].iter().any(|i| {
+        }) {
+            if why_on {
+                eprintln!("WAVE64-FP32 section {:#x}: unsupported live-out shape {:?}",
+                    code[start].machine.offset, section.shapes.get(v));
+            }
+            return Err(refused("a paired FP32 section with an unsupported live-out shape"));
+        }
+        for i in &code[start + 1..end] {
             let float_modifiers = matches!(i.name(), "v_add_f32" | "v_min_f32" | "v_max_f32")
                 && matches!(&i.fields, Fields::Valu(v)
                     if v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0 || v.sdwa.is_some() || v.opsel != 0);
-            float_modifiers || i.write(Reg::S(EXEC)).is_some()
-                || i.write(Reg::S(EXEC + 1)).is_some()
-                || !matches!(
-                    i.name(),
-                    "v_add_f32"
-                        | "v_min_f32"
-                        | "v_max_f32"
-                        | "v_cndmask_b32"
-                        | "v_mov_b32"
-                        | "v_bfrev_b32"
-                        | "v_readlane_b32"
-                        | "v_permlanex16_b32"
-                        | "s_mov_b32"
-                        | "s_and_b32"
-                        | "s_and_b64"
-                        | "s_nop"
-                        | "s_waitcnt"
-                )
-        }) {
-            return Err(refused(
-                "a paired FP32 section without a proven full reduction",
-            ));
+            let why = if float_modifiers {
+                "a paired FP32 section with floating-point modifiers"
+            } else if i.write(Reg::S(EXEC)).is_some() || i.write(Reg::S(EXEC + 1)).is_some() {
+                "a paired FP32 section with an EXEC write"
+            } else if !matches!(
+                i.name(),
+                "v_add_f32"
+                    | "v_min_f32"
+                    | "v_max_f32"
+                    | "v_cndmask_b32"
+                    | "v_mov_b32"
+                    | "v_bfrev_b32"
+                    | "v_readlane_b32"
+                    | "v_permlanex16_b32"
+                    | "s_mov_b32"
+                    | "s_and_b32"
+                    | "s_and_b64"
+                    | "s_nop"
+                    | "s_waitcnt"
+            ) {
+                "a paired FP32 section with an unsupported opcode"
+            } else {
+                continue;
+            };
+            if why_on {
+                eprintln!("WAVE64-FP32 section {:#x}: instruction {:#x} {}: {why}",
+                    code[start].machine.offset, i.machine.offset, i.name());
+            }
+            return Err(refused(why));
         }
         // Replay the guest operands in order. Lane sets alone lose intermediate rounding and NaN priority.
         self.paired_fp32 = true;
