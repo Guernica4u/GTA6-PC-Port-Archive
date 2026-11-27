@@ -341,10 +341,11 @@ thread_local! {
     static FOUND: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// The pages of `[first, last)` the kernel says were written since it was
-/// last asked, in order, each once, with their written parts; `None` if the range is not write-watched
-/// memory of one reservation. The caller holds the range ([`Asking`]).
-fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
+/// Appends the pages of `[first, last)` the kernel says were written since it
+/// was last asked, in order, each once, with their written parts, into `out`.
+/// Returns `false` if the range is not write-watched memory of one reservation.
+/// The caller holds the range ([`Asking`]).
+fn kernel_written_into(first: usize, last: usize, out: &mut Vec<(usize, u16)>) -> bool {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     FOUND.with(|found| {
@@ -373,7 +374,7 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
             tally(11, started.elapsed().as_nanos() as u64);
         }
         if failed {
-            return None;
+            return false;
         }
         #[cfg(feature = "diagnostics")]
         {
@@ -385,16 +386,26 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
             tally(0, 1);
             tally(1, ((last - first) * (PAGE >> 10)) as u64);
         }
-        let mut pages: Vec<(usize, u16)> = Vec::new();
+        let start = out.len();
         for &at in &found[..count] {
             let (page, part) = (at / PAGE, 1u16 << (at % PAGE / KERNEL_PAGE));
-            match pages.last_mut() {
-                Some((last, parts)) if *last == page => *parts |= part,
-                _ => pages.push((page, part)),
+            if out.len() > start
+                && let Some((last, parts)) = out.last_mut()
+                && *last == page
+            {
+                *parts |= part;
+            } else {
+                out.push((page, part));
             }
         }
-        Some(pages)
+        true
     })
+}
+
+/// [`kernel_written_into`] allocating a `Vec` for standalone callers.
+fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
+    let mut pages = Vec::new();
+    kernel_written_into(first, last, &mut pages).then_some(pages)
 }
 
 /// Ranges of one submission closer than this are asked about together:
@@ -411,28 +422,29 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// submissions refresh thousands of host copies (6,664 askings a frame,
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
-pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
-    if kept() || ranges.len() < 2 {
-        return;
-    }
+/// Collects, sorts, and merges overlapping non-published page intervals for `ranges`.
+fn merged_page_pieces(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
-        // Not view memory known by its bits: the kernel would refuse the
-        // asking (and, asked together with others, theirs).
         .filter(|r| r.0 < r.1 && !published(r.0, r.1))
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
-    if pieces.len() < 2 {
-        return;
+    if pieces.len() > 1 {
+        pieces.sort_unstable();
+        let mut out: Vec<(usize, usize)> = Vec::with_capacity(pieces.len());
+        for (a, b) in pieces {
+            match out.last_mut() {
+                Some(last) if a <= last.1 => last.1 = last.1.max(b),
+                _ => out.push((a, b)),
+            }
+        }
+        return out;
     }
-    pieces.sort_unstable();
-    // The submission's one asking stands ([`ask_once`]): what it does not
-    // hold is left to `writes`.
-    if journal().kept {
-        return;
-    }
-    let _all = Asking::hold_all();
-    let (mut asked, mut written) = (Vec::new(), Vec::new());
+    pieces
+}
+
+/// Coalesces sorted `pieces` within `AHEAD_GAP` / `AHEAD_MAX` and asks the kernel.
+fn ask_pieces(pieces: &[(usize, usize)], min_run: usize, asked: &mut Vec<(usize, usize)>, written: &mut Vec<(usize, u16)>) {
     let mut i = 0;
     while i < pieces.len() {
         let first = pieces[i].0;
@@ -445,9 +457,27 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
             last = last.max(pieces[k].1);
             k += 1;
         }
-        ask_run(&pieces[i..k], &mut asked, &mut written);
+        ask_run(&pieces[i..k], min_run, asked, written);
         i = k;
     }
+}
+
+pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    if kept() || ranges.len() < 2 {
+        return;
+    }
+    let pieces = merged_page_pieces(ranges);
+    if pieces.len() < 2 {
+        return;
+    }
+    // The submission's one asking stands ([`ask_once`]): what it does not
+    // hold is left to `writes`.
+    if journal().kept {
+        return;
+    }
+    let _all = Asking::hold_all();
+    let (mut asked, mut written) = (Vec::new(), Vec::new());
+    ask_pieces(&pieces, 2, &mut asked, &mut written);
     note_hot(&written);
     let mut j = journal_mut();
     j.ahead_asked = next_asking();
@@ -627,74 +657,37 @@ pub(crate) fn once() -> bool {
 }
 
 /// With [`once`]: asks about `ranges` (everything a submission's lists
-/// refresh) as [`ask_ahead`] does, and lets that asking stand until
+/// refresh) in a single coalesced pass, and lets that asking stand until
 /// [`ask_once_end`].
 pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     if !once() {
         return;
     }
-    ask_once_end();
-    ask_ahead(ranges);
-    ask_rest(ranges);
-}
-
-/// [`ask_once`] after its [`ask_ahead`]: what that left to `writes`, and the
-/// asking stands.
-fn ask_rest(ranges: &[(usize, usize)]) {
-    let _all = Asking::hold_all();
-    let mut ahead = {
+    KEPT.store(false, std::sync::atomic::Ordering::Release);
+    ASK_END_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+    let pieces = merged_page_pieces(ranges);
+    if pieces.is_empty() {
         let mut j = journal_mut();
-        std::mem::take(&mut j.ahead)
-    };
-    // `ask_ahead` leaves a range that lies alone to `writes`, which asks
-    // once per flush: with one asking for the submission that was every
-    // such range asked again at each of its 70 flushes (run 76: 2,300
-    // askings a frame with the switch on, as without it). They are asked
-    // here, once; what is not write-watched stays with `writes`.
-    let mut written = Vec::new();
-    // Widest first at each start: a range inside one asked just before is
-    // answered by it and not asked again (the order the lists refreshed
-    // them in asked a small range, then the big one holding it, both).
-    // Which ranges are asked is a subset of before; the pages found are the
-    // same, and all of them are noted under the one number below.
-    let mut ordered: Vec<(usize, usize)> = ranges.to_vec();
-    ordered.sort_unstable_by_key(|&(start, end)| (start, std::cmp::Reverse(end)));
-    // (What `ask_ahead` asked is in order and apart; what is asked here
-    // comes in order of its start, so only the last of it can hold the next.)
-    let before = joined_pages(std::mem::take(&mut ahead));
-    let mut run: Option<(usize, usize)> = None;
-    for (start, end) in ordered {
-        if start >= end || published(start, end) {
-            continue;
+        if j.kept {
+            j.kept = false;
+            j.ahead.clear();
         }
-        let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if covers(&before, first, last) || run.is_some_and(|(a, b)| a <= first && last <= b) {
-            continue;
-        }
-        if let Some(pages) = kernel_written(first, last) {
-            written.extend(pages);
-            ahead.push((first, last));
-            run = match run {
-                Some((a, b)) if first <= b => Some((a, b.max(last))),
-                _ => Some((first, last)),
-            };
-        }
+        return;
     }
-    ahead.extend(before);
+    let _all = Asking::hold_all();
+    let (mut asked, mut written) = (Vec::with_capacity(pieces.len()), Vec::new());
+    ask_pieces(&pieces, 1, &mut asked, &mut written);
     note_hot(&written);
     let mut j = journal_mut();
-    // A number of its own, and the one this asking stands under: between
-    // the two parts another thread may have asked about a range of the
-    // second, copied it, and the title written it since. Under the first
-    // part's number that write was older than the copy, and never copied.
+    j.ahead.clear();
     let now = next_asking();
     j.ahead_asked = now;
     for (page, parts) in written {
         j.note(page, parts, now);
     }
-    j.kept = !ahead.is_empty();
+    j.ahead = joined_pages(asked);
+    j.kept = !j.ahead.is_empty();
     KEPT.store(j.kept, std::sync::atomic::Ordering::Release);
-    j.ahead = joined_pages(ahead);
 }
 
 /// The submission's one asking stands no longer: its refreshes are done,
@@ -746,22 +739,23 @@ fn elsewhere(at: usize, len: usize) -> Vec<(usize, Vec<usize>)> {
 
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
 /// fails, as a run across two reservations or into memory that is not
-/// write-watched does. A piece alone is left to [`writes`]. Adds what was
-/// asked to `asked` and the pages found written to `written`.
-fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: &mut Vec<(usize, u16)>) {
-    if pieces.len() < 2 {
+/// write-watched does. Runs with fewer than `min_run` pieces are skipped.
+fn ask_run(pieces: &[(usize, usize)], min_run: usize, asked: &mut Vec<(usize, usize)>, written: &mut Vec<(usize, u16)>) {
+    if pieces.len() < min_run || pieces.is_empty() {
         return;
     }
     let first = pieces[0].0;
     let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
-    if let Some(pages) = kernel_written(first, last) {
-        written.extend(pages);
+    if kernel_written_into(first, last, written) {
         asked.push((first, last));
         return;
     }
+    if pieces.len() < 2 {
+        return;
+    }
     let (a, b) = pieces.split_at(pieces.len() / 2);
-    ask_run(a, asked, written);
-    ask_run(b, asked, written);
+    ask_run(a, min_run, asked, written);
+    ask_run(b, min_run, asked, written);
 }
 
 /// What [`writes`] would say of `[start, end)` from the journal alone, if
@@ -3845,13 +3839,11 @@ mod tests {
             VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
         } as usize;
         assert_ne!(p, 0);
-        // One range: `ask_ahead` leaves it.
         let ranges = [(p, p + 4 * PAGE)];
-        ask_ahead(&ranges);
         let (copied, _) = writes(p, p + 4 * PAGE, false).expect("watched");
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE) as *mut u8).write_volatile(1) };
-        ask_rest(&ranges);
+        ask_once(&ranges);
         let last = journal().written.get(&(p / PAGE + 1)).copied();
         ask_once_end();
         assert!(last.is_some_and(|last| last > copied), "{last:?} is not after {copied}");

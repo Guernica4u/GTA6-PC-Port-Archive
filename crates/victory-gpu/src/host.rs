@@ -4425,7 +4425,7 @@ impl Host {
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
         const RESULTS: u64 = 1 << 20;
-        let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
+        let (differs, data) = self.shared_buffer_cpu(RESULTS).ok_or_else(windows::core::Error::empty)?;
         name(&differs, || "card compare results".into());
         // SAFETY: the blob's own bytes; the root signature is inside the
         // shader.
@@ -4813,7 +4813,7 @@ impl Host {
                     };
                     let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
                     let event = CreateEventW(None, false, false, None)?;
-                    let staging = self.shared_buffer(256 << 10).map(|(r, p)| (r, p as usize, 256 << 10));
+                    let staging = self.shared_buffer_cpu(256 << 10).map(|(r, p)| (r, p as usize, 256 << 10));
                     Ok(DemandFetch {
                         list,
                         queue,
@@ -4835,7 +4835,7 @@ impl Host {
         let need = len as u64;
         if df.staging.as_ref().is_none_or(|b| b.2 < need) {
             let size = need.next_multiple_of(64 << 10);
-            df.staging = self.shared_buffer(size).map(|(r, p)| (r, p as usize, size));
+            df.staging = self.shared_buffer_cpu(size).map(|(r, p)| (r, p as usize, size));
         }
         let Some((staging, data, _)) = df.staging.clone() else {
             return false;
@@ -5040,7 +5040,7 @@ impl Host {
         };
         if f.buffer.as_ref().is_none_or(|b| b.2 < total) {
             let size = total.next_multiple_of(16 << 20);
-            f.buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+            f.buffer = self.shared_buffer_cpu(size).map(|(buffer, data)| (buffer, data as usize, size));
         }
         let Some((buffer, data, _)) = f.buffer.clone() else {
             fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes, VICTORY_RELAY=1)"));
@@ -5358,7 +5358,7 @@ impl Host {
         if !pieces.is_empty() {
             if work.fetched.as_ref().is_none_or(|f| f.2 < total) {
                 let size = total.next_multiple_of(16 << 20);
-                work.fetched = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+                work.fetched = self.shared_buffer_cpu(size).map(|(buffer, data)| (buffer, data as usize, size));
             }
             let Some((fetched, data, _)) = &work.fetched else {
                 fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes)"));
@@ -7499,7 +7499,7 @@ impl HostList {
     /// shortcut: one buffer per copy; pool them once uploads are frequent.
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         // With [`card_steps`] the card may be the one that fills it.
-        let (buffer, data) = if card_steps::stage() > 1 { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
+        let (buffer, data) = if card_steps::stage() > 1 { host.shared_buffer_cpu(size)? } else { host.upload_buffer(size)? };
         name(&buffer, || format!("list upload {size:#x}"));
         self.deferred().hold_upload(buffer.clone(), size);
         Some((buffer, data))
@@ -7568,7 +7568,7 @@ impl HostList {
         let (buffer, data) = self
             .budget
             .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
+                let (b, d) = host()?.shared_buffer_cpu(256)?;
                 Some((b, d as usize))
             })
             .as_ref()?;
@@ -8658,6 +8658,11 @@ impl Batch {
         if self.ahead.get(&key).is_some_and(|&(from, to)| from <= address && end <= to) {
             return;
         }
+        if crate::watch::light() && shadow.fast_nothing_new(address, len) {
+            FLUSHES[1].fetch_add(1, Ordering::Relaxed);
+            FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         match self.index.get(&key) {
             Some(&at) => {
                 let r = &mut self.refreshes[at];
@@ -9392,7 +9397,7 @@ impl Host {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident(),
+                    D3D12_HEAP_FLAG_NONE,
                     &desc,
                     D3D12_RESOURCE_STATE_GENERIC_READ,
                     None,
@@ -9400,7 +9405,6 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -10479,6 +10483,17 @@ impl Host {
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.shared_buffer_with(size, true)
+    }
+
+    /// Like [`Host::shared_buffer`], without synchronous `MakeResident` /
+    /// copy-queue `mapped()` waits for CPU staging, readback, and relay buffers
+    /// that are only referenced by command lists submitted after creation.
+    pub(crate) fn shared_buffer_cpu(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.shared_buffer_with(size, false)
+    }
+
+    fn shared_buffer_with(&self, size: u64, wait_map: bool) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[2].fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -10508,7 +10523,7 @@ impl Host {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident(),
+                    if wait_map { not_resident() } else { D3D12_HEAP_FLAG_NONE },
                     &desc,
                     D3D12_RESOURCE_STATE_COMMON,
                     None,
@@ -10516,8 +10531,10 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
-                    mapped(&self.device)?;
+                    if wait_map {
+                        resident(&self.device, b)?;
+                        mapped(&self.device)?;
+                    }
                     b.Map(0, None, Some(&mut data))
                 })
         };

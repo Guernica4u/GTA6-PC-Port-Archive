@@ -4366,6 +4366,7 @@ impl Shadow {
             return false;
         }
         (watched == GUARDED && crate::watch::published(from, to))
+            || (watched == 1 && crate::watch::kept() && self.asked_ahead())
             || ask_end == self.clean_ask_end.load(Ordering::Relaxed)
     }
 
@@ -5971,7 +5972,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         mb.unwrap_or(4096) << 20
     });
     let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
-    let (staging, data) = host.shared_buffer(len)?;
+    let (staging, data) = host.shared_buffer_cpu(len)?;
     let on_card = if room && USED.fetch_add(len, Ordering::Relaxed) + len <= most {
         host.uav_buffer(len)
     } else {
