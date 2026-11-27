@@ -58,7 +58,12 @@ fn paired_once(ex: &ShaderExtract) -> Result<Translated, String> {
     let live_in = em.live_in();
     em.live = live_in.clone();
     em.emit_body(false)?;
-    if em.compute_derivatives {
+    // The console differences the four lanes of a quad. In a group that is one row those
+    // are four threads in a row, and the host's quads of a one-row group are the same four
+    // lanes. In a group with rows the console numbers a derivative-taking program's threads
+    // two by two (measured on RDNA2), which `prologue` follows for even widths and heights.
+    let [x, y, z] = compute_group(ex);
+    if em.compute_derivatives && !(z == 1 && (y == 1 || (x % 2 == 0 && y % 2 == 0))) {
         return Err("paired wave64: implicit derivatives".into());
     }
     let mut hlsl = em.finish(false, &[], None)?;
@@ -152,8 +157,16 @@ pub(super) fn prologue(em: &Emitter<'_>, header: &mut String, group_register: us
     }
     // Full subgroups follow the thread index, so each run of 32 threads is one wave.
     let _ = writeln!(header, "    uint tb_pair = WaveGetLaneIndex(), tb_first = (gtid.x / 32u) * 64u;");
+    // A program that takes derivatives in a group with rows has its threads two by two:
+    // lanes 4k to 4k+3 are the block k, left to right and then down.
+    let blocks = em.compute_derivatives && y > 1;
     for lane in 0..2 {
         let flat = format!("(tb_first + tb_pair + {}u)", 32 * lane);
+        if blocks {
+            let across = x / 2;
+            let _ = writeln!(header, "    v0__[{lane}] = 2u * (({flat} / 4u) % {across}u) + ({flat} & 1u); v1__[{lane}] = 2u * (({flat} / 4u) / {across}u) + (({flat} >> 1u) & 1u); v2__[{lane}] = 0u;");
+            continue;
+        }
         let _ = writeln!(header, "    v0__[{lane}] = {flat} % {x}u; v1__[{lane}] = ({flat} / {x}u) % {y}u; v2__[{lane}] = {flat} / {}u;", x * y);
     }
     let g = group_register;

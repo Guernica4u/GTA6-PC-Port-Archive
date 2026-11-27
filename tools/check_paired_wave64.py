@@ -27,6 +27,32 @@ from project_tuxbox.dxil_store import COMPUTE_FLAGS  # noqa: E402
 from project_tuxbox.inspect import digest  # noqa: E402
 
 OUTPUTS = ("v10", "v11", "s20", "s21")
+# A program that samples at its own thread coordinates with implicit derivatives, and the
+# group shapes it runs in. In a group with rows a console program that takes derivatives
+# has its threads two by two, so lanes 4k to 4k+3 are one two-by-two block: measured on
+# RDNA2 with tools/measure_compute_quads.py. The stand-in texture returns the four
+# derivatives and the coordinates it was given (see `instrument`).
+QUADS = ['v_readfirstlane_b32 s24, v2', 's_lshl_b32 s24, s24, 5', 's_load_dwordx8 s[32:39], s[10:11], s24',
+         's_lshl_b32 s25, s24, 4', 's_load_dwordx4 s[40:43], s[14:15], s25', 'v_cvt_f32_u32_e32 v4, v0',
+         'v_cvt_f32_u32_e32 v5, v1', 'image_sample v[10:11], v[4:5], s[32:39], s[40:43] dmask:0x3 dim:SQ_RSRC_IMG_2D',
+         's_mov_b32 s20, s32', 's_bcnt1_i32_b64 s21, exec']
+QUAD_GROUPS = {"heap_quads_8x8": (8, 8), "heap_quads_16x8": (16, 8), "heap_quads_4x16": (4, 16), "heap_quads_64x1": (64, 1)}
+
+
+def thread_of(lane, x, y):
+    """The thread in console lane `lane` of a derivative-taking group: (x, y)."""
+    if y == 1:
+        return lane, 0
+    block, across = lane // 4, x // 2
+    return 2 * (block % across) + (lane & 1), 2 * (block // across) + ((lane >> 1) & 1)
+
+
+def bits(value):
+    return struct.unpack('<I', struct.pack('<f', float(value)))[0]
+
+
+def number(word):
+    return struct.unpack('<f', struct.pack('<I', word))[0]
 M32, M64 = 0xffffffff, (1 << 64) - 1
 WAVES = 256
 START = ['v_lshrrev_b32_e32 v3, 31, v0', 'v_and_b32_e32 v0, 0x7fffffff, v0', 'v_cmpx_ne_u32_e32 0, v3']
@@ -246,6 +272,8 @@ def step(w, text):
             a, b = w.scalar(ops[1]), w.scalar(ops[2])
             x = a & b if base == 's_and_b32' else a << (b & 31)
             w.store(ops[0], x); w.scc = int(x & M32 != 0)
+        elif base == 's_load_dwordx4':
+            w.store('s' + re.match(r's\[(\d+)', ops[0])[1], w.scalar(ops[2]) >> 4)
         elif base == 's_load_dwordx8':
             # The translation keeps a heap descriptor as its index, in the first word.
             w.store('s' + re.match(r's\[(\d+)', ops[0])[1], w.scalar(ops[2]) >> 5)
@@ -269,6 +297,17 @@ def step(w, text):
             else:
                 partner = (l & ~31) | (((l & (off & 31)) | ((off >> 5) & 31)) ^ ((off >> 10) & 31))
             w.v[int(ops[0][1:])][l] = old[partner]
+        return
+    if base == 'image_sample':
+        # The hardware differences the lanes of a quad, whether or not EXEC has them.
+        x, y = (int(n) for n in re.fullmatch(r'v\[(\d+):(\d+)\]', ops[1]).groups())
+        at = [(number(w.v[x][l]), number(w.v[y][l])) for l in range(64)]
+        first = int(re.match(r'v\[?(\d+)', ops[0])[1])
+        for l in range(64):
+            if not w.active(l): continue
+            slope = lambda k, step: at[l | step][k] - at[l & ~step][k]
+            w.v[first][l] = bits(slope(0, 1) + 16 * slope(0, 2) + 256 * slope(1, 1) + 4096 * slope(1, 2))
+            w.v[first + 1][l] = bits(at[l][0] + 256 * at[l][1])
         return
     if base == 'image_load':
         slot = w.scalar('s' + re.match(r's\[(\d+)', ops[2])[1])
@@ -357,6 +396,7 @@ def step(w, text):
                       'v_or_b32': lambda: a | x[0], 'v_xor_b32': lambda: a ^ x[0], 'v_max_u32': lambda: max(a, x[0]),
                       'v_lshlrev_b32': lambda: x[0] << (a & 31), 'v_lshrrev_b32': lambda: x[0] >> (a & 31),
                       'v_cndmask_b32': lambda: x[0] if (select >> l) & 1 else a,
+                      'v_cvt_f32_u32': lambda: bits(a),
                       'v_mbcnt_lo_u32_b32': lambda: x[0] + bin(a & ((1 << min(l, 32)) - 1)).count('1'),
                       'v_mbcnt_hi_u32_b32': lambda: x[0] + bin(a & ((1 << max(l - 32, 0)) - 1)).count('1')}[base]() & M32
     for l, result in results.items(): w.v[dst][l] = result
@@ -368,12 +408,16 @@ def heap_texel(slot, x, y):
 
 
 HEAP = ('struct TBHeapTexture { uint slot; float4 Load(int3 at) '
-        '{ return float4(float(slot * 4096u + uint(at.x) * 64u + uint(at.y)), 0.0, 0.0, 0.0); } };\n'
+        '{ return float4(float(slot * 4096u + uint(at.x) * 64u + uint(at.y)), 0.0, 0.0, 0.0); }\n'
+        '    float4 Sample(uint sampler, float2 at) { return float4(ddx_fine(at.x) + 16.0 * ddy_fine(at.x) '
+        '+ 256.0 * ddx_fine(at.y) + 4096.0 * ddy_fine(at.y), at.x + 256.0 * at.y, 0.0, 0.0); } };\n'
         'TBHeapTexture tb_heap_texture(uint slot) { TBHeapTexture texture; texture.slot = slot; return texture; }\n')
 
 
-def model(items, inputs, group, started=64):
+def model(items, inputs, group, started=64, threads=None):
     w = Wave(inputs, group, started)
+    if threads:
+        w.v[0], w.v[1], w.v[2] = [t[0] for t in threads], [t[1] for t in threads], [0] * 64
     labels = {item[1]: at for at, item in enumerate(items) if not isinstance(item, str) and item[0] == 'label'}
     at = steps = 0
     while at < len(items):
@@ -388,7 +432,7 @@ def model(items, inputs, group, started=64):
     return [[w.v[int(r[1:])][l] if r[0] == 'v' else w.s[int(r[1:])] for r in OUTPUTS] for l in range(64)]
 
 
-def instrument(hlsl, threads):
+def instrument(hlsl, threads, own_threads=False):
     start = re.search(r'^    s\d+ = gid\.x; s\d+ = gid\.y; s\d+ = gid\.z;\n', hlsl, re.M)
     assert start and '[WaveSize(32)]' in hlsl, 'unexpected prologue'
     # A group holds whole console waves, or the started half of one.
@@ -402,10 +446,12 @@ def instrument(hlsl, threads):
             written = rf'\b{register}__\[\w+\] = ' if register[0] == 'v' else rf'\b{name} = '
             value = name if re.search(written, hlsl) else '0u'
             stores += f'    tb_out.Store(({index[h]} * 4u + {column}u) * 4u, {value});\n'
-    hlsl = hlsl[:start.end()] + load + hlsl[start.end():]
+    # A program that reads its thread coordinates keeps the ones the translation gave it.
+    hlsl = hlsl[:start.end()] + ('' if own_threads else load) + hlsl[start.end():]
     if 'ResourceDescriptorHeap' in hlsl:
         # The guest binds no heap. Each slot is a texture whose texels name the slot and the coordinate.
         hlsl = re.sub(r'Texture2D<float4> (tb_heap_\w+);', r'TBHeapTexture \1;', hlsl)
+        hlsl = re.sub(r'SamplerState (\w+) = SamplerDescriptorHeap\[[^;]*\];', r'uint \1 = 0u;', hlsl)
         hlsl = HEAP + re.sub(r'ResourceDescriptorHeap\[([^\]]+)\]', r'tb_heap_texture(\1)', hlsl)
         assert 'ResourceDescriptorHeap' not in hlsl and 'Texture2D' not in hlsl, 'unexpected heap access'
     end = hlsl.rstrip().rfind('}')
@@ -431,7 +477,8 @@ def selected():
     four = [(f"{name}_x4", PROGRAMS[name], 256) for name in ("saveexec", "waterfall", "permlane", "dispatch")]
     # Shared memory nothing wrote is undefined, and half the lanes never write.
     half = [(f"{name}_half", body, 32) for name, body in PROGRAMS.items() if name != "shared"]
-    return single + four + half
+    quads = [(name, QUADS, x * y) for name, (x, y) in QUAD_GROUPS.items()]
+    return single + four + half + quads
 
 
 def main(argv=None):
@@ -448,13 +495,15 @@ def main(argv=None):
         trial = Path(tmp)
         expected, shaders, cases = {}, {}, []
         for name, body, threads in selected():
-            items = START + body
+            shape = QUAD_GROUPS.get(name)
+            items = body if shape else START + body
             emitted = subprocess.check_output(
-                [args.emitter.resolve(), *(["heap"] if name.startswith("heap_") else []), str(threads),
+                [args.emitter.resolve(), *(["heap"] if name.startswith("heap_") else []),
+                 f"{shape[0]}x{shape[1]}" if shape else str(threads),
                  *(f"{w:08x}" for w in words_of(args.llvm_mc, items))],
                 text=True, timeout=60)
             source, blob = trial / f"{name}.hlsl", trial / f"{name}.cso"
-            source.write_text(instrument(emitted, threads))
+            source.write_text(instrument(emitted, threads, own_threads=bool(shape)))
             subprocess.run([args.dxc, "-T", "cs_6_6", "-E", "main", *COMPUTE_FLAGS, "-Fo", blob, source],
                            check=True, timeout=60, capture_output=True)
             subprocess.run([args.dxv, blob], check=True, timeout=60, capture_output=True)
@@ -464,7 +513,10 @@ def main(argv=None):
             if name.startswith("shared"):
                 data = [word | 0x80000000 for word in data]
             (trial / f"{name}.input").write_bytes(struct.pack(f"<{len(data)}I", *data))
-            expected[name] = [model(items, data[w * 64:w * 64 + 64], w, min(threads, 64)) for w in range(WAVES)]
+            waves = max(threads, 64) // 64
+            expected[name] = [model(items, data[w * 64:w * 64 + 64], w, min(threads, 64),
+                                    shape and [thread_of(w % waves * 64 + l, *shape) for l in range(64)])
+                              for w in range(WAVES)]
             cases.append(f"{name} {name} {name}.input {WAVES * 64 // max(threads, 64)} {WAVES * 64}\n")
         (trial / "cases.txt").write_text("".join(cases))
         exe, status, fields = run_gpu_guest(
