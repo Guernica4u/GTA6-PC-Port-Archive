@@ -887,6 +887,88 @@ fn lower_first_lane_reads_ignores_unused_vop3_s0_padding() {
     assert_eq!(insns[2].src, vec![Opnd::Vgpr(39)]);
 }
 
+fn first_lane_election(offset: usize) -> Insn {
+    Insn {
+        offset, enc: Enc::Sop1, op: 0x14, mnemonic: "s_ff1_i32_b64".into(),
+        dst: vec![Opnd::Sgpr(0)], src: vec![Opnd::Sgpr(0)], aux: Default::default(), dwords: 1, raw: vec![0],
+    }
+}
+
+fn sop2_at(offset: usize, mnemonic: &str, dst: Vec<Opnd>, src: Vec<Opnd>) -> Insn {
+    Insn {
+        offset, enc: Enc::Sop2, op: 0, mnemonic: mnemonic.into(), dst, src,
+        aux: Default::default(), dwords: 1, raw: vec![0],
+    }
+}
+
+fn branch_at(offset: usize, mnemonic: &str) -> Insn {
+    Insn {
+        offset, enc: Enc::Sopp, op: 2, mnemonic: mnemonic.into(), dst: vec![], src: vec![],
+        aux: Default::default(), dwords: 1, raw: vec![0],
+    }
+}
+
+#[test]
+fn lower_first_lane_reads_allows_a_branch_after_the_result_is_consumed() {
+    let mut read = sgpr_lane_readlane(57, 0, 18);
+    read.offset = 8;
+    let mut insns = vec![
+        first_lane_election(0),
+        read,
+        sop2_at(0x10, "s_add_u32", vec![Opnd::Sgpr(18)], vec![Opnd::Sgpr(18), Opnd::ConstInt(1)]),
+        branch_at(0x14, "s_cbranch_scc1"),
+        branch_at(0x18, "s_endpgm"),
+    ];
+    lower_first_lane_reads(&mut insns);
+    assert_eq!(insns[1].mnemonic, "v_readfirstlane_b32");
+    assert_eq!(insns[1].dst, vec![Opnd::Sgpr(18)]);
+    assert_eq!(insns[1].src, vec![Opnd::Vgpr(57)]);
+}
+
+#[test]
+fn lower_first_lane_reads_keeps_a_live_lane_index_across_a_branch() {
+    let mut read = sgpr_lane_readlane(57, 0, 18);
+    read.offset = 8;
+    let mut insns = vec![
+        first_lane_election(0),
+        read,
+        branch_at(0x10, "s_cbranch_scc1"),
+        sop2_at(0x14, "s_add_u32", vec![Opnd::Sgpr(0)], vec![Opnd::Sgpr(0), Opnd::ConstInt(1)]),
+        branch_at(0x18, "s_endpgm"),
+    ];
+    lower_first_lane_reads(&mut insns);
+    assert_eq!(insns[1].mnemonic, "v_readlane_b32");
+}
+
+#[test]
+fn lower_first_lane_reads_finds_an_election_past_sixty_four_instructions() {
+    let mut insns = vec![first_lane_election(0)];
+    insns.extend((1..=70).map(|i| Insn {
+        offset: 4 * i, enc: Enc::Sopp, op: 0, mnemonic: "s_nop".into(),
+        dst: vec![], src: vec![], aux: Default::default(), dwords: 1, raw: vec![0],
+    }));
+    let mut read = sgpr_lane_readlane(57, 0, 18);
+    read.offset = 4 * 71;
+    insns.push(read);
+    insns.push(branch_at(4 * 72, "s_endpgm"));
+    lower_first_lane_reads(&mut insns);
+    assert_eq!(insns[71].mnemonic, "v_readfirstlane_b32");
+}
+
+#[test]
+fn lower_first_lane_reads_stops_at_an_exec_write() {
+    let mut read = sgpr_lane_readlane(57, 0, 18);
+    read.offset = 0x10;
+    let cmp = Insn {
+        offset: 8, enc: Enc::Vopc, op: 0, mnemonic: "v_cmpx_eq_u32".into(),
+        dst: vec![], src: vec![Opnd::Sgpr(7), Opnd::Vgpr(8)],
+        aux: Default::default(), dwords: 1, raw: vec![0],
+    };
+    let mut insns = vec![first_lane_election(0), cmp, read, branch_at(0x14, "s_endpgm")];
+    lower_first_lane_reads(&mut insns);
+    assert_eq!(insns[2].mnemonic, "v_readlane_b32");
+}
+
 #[test]
 fn const_lane_readlane_still_group_read_when_group_reads() {
     let mut insns = vec![const_lane_readlane(4, 3, 7)];
