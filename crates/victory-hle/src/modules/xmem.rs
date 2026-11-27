@@ -161,7 +161,7 @@ pub extern "system" fn XMemVirtualAlloc(
             GetCurrentProcess(),
             base,
             size,
-            if lazy_eligible && constrained { alloc_kind } else { if constrained { alloc_kind } else { kind } },
+            if constrained { alloc_kind } else { kind },
             protect,
             if constrained {
                 parameter
@@ -1846,7 +1846,7 @@ mod lazy_commit {
             return;
         }
         let first = start & !(PAGE - 1);
-        let end = start.saturating_add(len);
+        let end = start.saturating_add(len).div_ceil(PAGE).saturating_mul(PAGE);
         let mut g = LAZY.write().unwrap_or_else(|e| e.into_inner());
         let to_remove: Vec<usize> = g.range(first..end).copied().collect();
         for p in to_remove {
