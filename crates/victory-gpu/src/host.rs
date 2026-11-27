@@ -7896,10 +7896,17 @@ impl HostList {
     }
 }
 
-/// The numbers of [`HostList::epoch`].
+/// The numbers of [`HostList::epoch`]: unique, never 0. Only compared for
+/// equality, so each thread takes them from a block of its own
+/// (`crate::sharded::Numbers`): a list's epoch moves at state changes of
+/// the draws every translating thread records, and one count for all of
+/// them was a line the threads took from each other at each.
 fn next_epoch() -> u64 {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed)
+    static NEXT: crate::sharded::Numbers = crate::sharded::Numbers::new(1);
+    thread_local! {
+        static OWN: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+    }
+    OWN.try_with(|own| NEXT.next(own)).unwrap_or_else(|_| NEXT.one())
 }
 
 /// A table by a copy's address.

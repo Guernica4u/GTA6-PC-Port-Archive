@@ -650,11 +650,13 @@ fn mesh_kept(pipeline: usize) -> bool {
 }
 
 /// Draws recorded on the host GPU since the last frame line.
-static DRAWN: AtomicU64 = AtomicU64::new(0);
+/// (One place per thread, `crate::sharded`: every draw on every recording
+/// and translating thread adds to it.)
+static DRAWN: crate::sharded::Counter = crate::sharded::Counter::new();
 
 /// Draws run on the host so far.
 pub(crate) fn drawn() -> u64 {
-    DRAWN.load(Ordering::Relaxed)
+    DRAWN.load()
 }
 
 /// The draws traced since the last present (diagnostics builds, with
@@ -671,13 +673,13 @@ pub(crate) fn take_frame() -> Vec<String> {
 /// The draws dropped since [`take_dropped`].
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) fn dropped_now() -> u64 {
-    DROPPED.load(Ordering::Relaxed)
+    DROPPED.load()
 }
 
 /// Draws, mesh dispatches and dispatches recorded but not run on the host
 /// (no host pipeline) since the last call.
 pub(crate) fn take_dropped() -> u64 {
-    DROPPED.swap(0, Ordering::Relaxed)
+    DROPPED.take()
 }
 /// A root SRV's dynamic slot in a list, and the host copy it shows.
 type RootSlot = (u32, Option<std::sync::Arc<crate::shadow::Shadow>>);
@@ -1109,7 +1111,7 @@ fn before<T>(slot: usize, f: impl FnOnce() -> T) -> T {
 /// bake draw), their loops' nanoseconds by kind, and the passes that stopped
 /// at their time and at their bytes.
 pub(crate) static HEAP_TEXTURE_PASSES: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
-static DROPPED: AtomicU64 = AtomicU64::new(0);
+static DROPPED: crate::sharded::Counter = crate::sharded::Counter::new();
 
 /// Marks the last traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
@@ -1121,10 +1123,10 @@ fn dropped(pipeline: usize) {
 }
 
 /// Dispatches run on the host so far.
-static DISPATCHED: AtomicU64 = AtomicU64::new(0);
+static DISPATCHED: crate::sharded::Counter = crate::sharded::Counter::new();
 
 pub(crate) fn dispatched() -> u64 {
-    DISPATCHED.load(Ordering::Relaxed)
+    DISPATCHED.load()
 }
 
 /// What a render target or depth view of the host is made from: the host
@@ -3746,13 +3748,13 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            DROPPED.add(1);
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            DROPPED.add(1);
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
@@ -3765,7 +3767,7 @@ impl State {
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            DROPPED.add(1);
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_drop(self.pipeline as This);
@@ -3778,7 +3780,7 @@ impl State {
             return;
         }
         if !self.bind(list, p, true) {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            DROPPED.add(1);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
             if crate::pipeline::is_builder(self.pipeline as This) {
@@ -3813,7 +3815,7 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         self.buffers_written();
-        DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        DISPATCHED.add(1);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on()
             && self.ambient(list, p, role)
@@ -4358,13 +4360,13 @@ impl State {
                     unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
                     self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
                     self.mesh_scissor(list, false);
-                    DRAWN.fetch_add(1, Ordering::Relaxed);
+                    DRAWN.add(1);
                     true
                 }
                 Err(_) => false,
             };
         if !ran {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            DROPPED.add(1);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -4848,10 +4850,10 @@ impl State {
                 viewports(list, &self.viewports);
             }
             self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
-            DRAWN.fetch_add(1, Ordering::Relaxed);
+            DRAWN.add(1);
         }
         if !ran {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            DROPPED.add(1);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -5031,10 +5033,10 @@ impl State {
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
             self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
-            DRAWN.fetch_add(1, Ordering::Relaxed);
+            DRAWN.add(1);
         }
         if !ran {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            DROPPED.add(1);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -5420,9 +5422,9 @@ impl State {
         // the window reads it with no barrier, and the next clamp moves it
         // back (`crate::indirect`).
         if kind == DISPATCH {
-            DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            DISPATCHED.add(1);
         } else {
-            DRAWN.fetch_add(1, Ordering::Relaxed);
+            DRAWN.add(1);
         }
         true
     }

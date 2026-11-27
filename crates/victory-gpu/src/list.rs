@@ -1931,7 +1931,7 @@ mod state {
 }
 
 fn count_draw() {
-    DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    DRAWS.add(1);
 }
 
 /// Draws of the kinds the host does not run yet (indirect, mesh), and
@@ -2010,20 +2010,21 @@ pub(crate) fn take_indirect() -> u64 {
 }
 static INDIRECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 fn count_dispatch() {
-    DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    DISPATCHES.add(1);
 }
 #[cfg(not(windows))]
 extern "system" fn dispatch(_: This) {
     count_dispatch();
 }
-static DRAWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// (Added to by every draw on every recording and translating thread: one
+/// place per thread, `crate::sharded`.)
+static DRAWS: crate::sharded::Counter = crate::sharded::Counter::new();
+static DISPATCHES: crate::sharded::Counter = crate::sharded::Counter::new();
 
 /// Draws (any kind, mesh and indirect included) and compute dispatches
 /// recorded since the last call.
 pub(crate) fn take_counts() -> (u64, u64) {
-    use std::sync::atomic::Ordering::Relaxed;
-    (DRAWS.swap(0, Relaxed), DISPATCHES.swap(0, Relaxed))
+    (DRAWS.take(), DISPATCHES.take())
 }
 
 /// A GPU wait for a memory value: the list's commands after it run when
