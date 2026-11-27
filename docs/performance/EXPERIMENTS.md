@@ -68,3 +68,43 @@ one kernel call per heap (usually one or two shader-visible heaps), not one per 
 ### Invariants kept
 No behaviour changed: descriptor slots, dynamic-slot release on GPU completion and upload-before-show are
 untouched; only atomics and clock reads were added.
+
+## Branch perf/memory-footprint (report 02: measurement, R4, R3)
+
+All three items are UNMEASURED in-game. Build: `cargo build --release -p victory` ok; `cargo test -p victory-gpu`
+415 pass, 2 fail (`indirect::tests::host_list_budget_starts_empty_at_each_submission`, `warp_batch_charges_every_execution`),
+both fail identically on the base branch.
+
+### 1. Footprint counters (measurement only) - `copystat_footprint.rs`
+Per host copy, distinct 64 KiB blocks (since the copy was made): written by shaders (bytes that landed in title
+memory: `land_card` / `land_back`, merged > 0), changed by the title's CPU after shaders had written them
+(`Shadow::take` runs, `take_landed` non-echo, `copy`), and written by the title while pending
+(`merge_under_writes` runs). Logged every ~10 s from the frame-line block in `host.rs` (not diagnostics-gated):
+one total line and the top 8 copies. `VICTORY_FOOTPRINT=0` turns it off. Cost: one global mutex per event
+(hundreds per frame), 1 bit per block.
+Read it for: shader-written % of the 174 MB heap's 2,784 blocks (report 02 R1 decision: under ~20 % means a learned
+footprint pays), and `pending title` vs `also shaders'` (pending-and-never-shader blocks are the false sharing behind
+the 9.6 ms of merge-under-writes).
+Caveats: "then title" is an upper bound where a refresh copies whole pages (`copy()`), and for copies in PC memory a
+landing's own write shows as a title write (the card path filters those with the echo compare, the PC path does not).
+
+### 2. R4, batched write-watch ask: mostly already there; one small change
+Per-submission batching exists and is on by default (`VICTORY_ASK_ONCE`: `watch::ask_once` -> `ask_ahead` merges
+ranges within 8 MiB, `ask_rest` takes what is left). Report 02's many asks therefore come from asks that miss the
+standing journal (after `ask_once_end`, `merge_under_writes` -> `writes`, flights' late merges), not from the
+submission's own refresh groups. Done: `ask_rest` sorts ranges by start, widest first, so a range contained in one
+just asked is answered by it (before, refresh order could ask the small range and then the big one holding it).
+Same pages found, same journal, never more kernel calls than before. Expected gain: small, unmeasured.
+Not done: one ask per region per FRAME. A title write between two submissions of a frame would then be seen a frame
+late by the later submission's refresh (stale bytes on the card), which breaks "title writes reach the copy before
+the submission that reads them". A real gain needs the miss counts first (diagnostics build: `copystat` watches per
+frame, split by caller).
+
+### 3. R3, per-copy write epoch so `defer_refresh` is one compare: NOT DONE
+`defer_refresh` only records a `Step::Refresh` (which also keeps the copy alive until the list is reset); the work
+(`nothing_new`, `update`) runs at submission. Skipping the step at record time on an epoch compare would read the
+copy's state before the title's later writes in the same frame: a write between recording and submission would be
+missed (audit invariant R2). Doing the compare at submission instead needs a per-copy epoch bumped on every journal
+`note()` for pages of that copy, i.e. a page -> copy map on the fault/ask path (`watch.rs on_write`, `Journal::note`);
+a global epoch is useless since the title writes every frame. That is a new structure on the hottest path and needs
+the step 1 counters and a diagnostics run first.
