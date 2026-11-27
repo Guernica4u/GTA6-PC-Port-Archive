@@ -241,6 +241,39 @@ PAIRS = {
     "s_cmp_eq_u64": lambda x, y, scc: int(x == y),
     "s_cmp_lg_u64": lambda x, y, scc: int(x != y),
 }
+# Group memory, in one thread: v20 is an address from the first input, and the
+# second and third inputs are data. `{0}` and `{1}` are the result registers.
+# name: (instructions, model of the results)
+WRITE, READ = "ds_write_b32 v20, v5", "ds_read_b32 {0}, v20"
+GROUP_MEMORY = {
+    "ds_or_b32": ([WRITE, "ds_or_b32 v20, v6", READ], lambda b, c: [b | c]),
+    "ds_and_b32": ([WRITE, "ds_and_b32 v20, v6", READ], lambda b, c: [b & c]),
+    "ds_xor_b32": ([WRITE, "ds_xor_b32 v20, v6", READ], lambda b, c: [b ^ c]),
+    "ds_add_u32": ([WRITE, "ds_add_u32 v20, v6", READ], lambda b, c: [(b + c) & M]),
+    "ds_min_u32": ([WRITE, "ds_min_u32 v20, v6", READ], lambda b, c: [min(b, c)]),
+    "ds_max_u32": ([WRITE, "ds_max_u32 v20, v6", READ], lambda b, c: [max(b, c)]),
+    # The returning form also gives the word as it was.
+    "ds_add_rtn_u32": ([WRITE, "ds_add_rtn_u32 {1}, v20, v6", READ], lambda b, c: [(b + c) & M, b]),
+    "ds_write2_b32": (["ds_write2_b32 v20, v5, v6 offset1:1", READ, "ds_read_b32 {1}, v20 offset:4"],
+                      lambda b, c: [b, c]),
+    "ds_read2_b32": ([WRITE, "ds_write_b32 v20, v6 offset:4", "ds_read2_b32 v[{0n}:{1n}], v20 offset1:1"],
+                     lambda b, c: [b, c]),
+    # The second offset counts in units of 64 words.
+    "ds_write2st64_b32": (["ds_write2st64_b32 v20, v5, v6 offset1:1", READ, "ds_read_b32 {1}, v20 offset:256"],
+                          lambda b, c: [b, c]),
+    "ds_read2st64_b32": ([WRITE, "ds_write_b32 v20, v6 offset:256", "ds_read2st64_b32 v[{0n}:{1n}], v20 offset1:1"],
+                         lambda b, c: [b, c]),
+    "ds_write_b16": ([WRITE, "ds_write_b16 v20, v6", READ], lambda b, c: [(b & 0xffff0000) | (c & 0xffff)]),
+    "ds_write_b8": ([WRITE, "ds_write_b8 v20, v6", READ], lambda b, c: [(b & 0xffffff00) | (c & 0xff)]),
+    "ds_read_u16": ([WRITE, "ds_read_u16 {0}, v20"], lambda b, c: [b & 0xffff]),
+    "ds_read_u8": ([WRITE, "ds_read_u8 {0}, v20"], lambda b, c: [b & 0xff]),
+    "ds_read_i16": ([WRITE, "ds_read_i16 {0}, v20"], lambda b, c: [((b & 0xffff) - (0x10000 if b & 0x8000 else 0)) & M]),
+    "ds_read_i8": ([WRITE, "ds_read_i8 {0}, v20"], lambda b, c: [((b & 0xff) - (0x100 if b & 0x80 else 0)) & M]),
+    # The D16_HI forms use the high half of the register and leave its low half.
+    "ds_read_u16_d16_hi": ([WRITE, "v_mov_b32_e32 {0}, v6", "ds_read_u16_d16_hi {0}, v20"],
+                           lambda b, c: [(b & 0xffff) << 16 | (c & 0xffff)]),
+    "ds_write_b16_d16_hi": ([WRITE, "ds_write_b16_d16_hi v20, v6", READ], lambda b, c: [(b & 0xffff0000) | c >> 16]),
+}
 OUTPUTS = 8
 
 INFINITY = float("inf")
@@ -816,6 +849,8 @@ def is_float(name):
 
 def count(name):
     """Result words one instruction produces: scalar ones also report SCC."""
+    if name in GROUP_MEMORY:
+        return len(GROUP_MEMORY[name][1](1, 1))
     if name in PAIRS:
         result = PAIRS[name](1, 1, 1)
         return 1 if isinstance(result, int) else 2 if result[1] is None else 3
@@ -850,6 +885,12 @@ def lines_for(name, destination):
         if count(name) == 3:
             program += ["s_cselect_b32 s26, 1, 0", f"v_mov_b32_e32 v{destination + 2}, s26"]
         return program + [f"v_mov_b32_e32 v{destination}, s24", f"v_mov_b32_e32 v{destination + 1}, s25"]
+    if name in GROUP_MEMORY:
+        # A word-aligned address within the first 64 bytes.
+        return ["v_and_b32_e32 v20, 0x3c, v4"] + [
+            line.format(f"v{destination}", f"v{destination + 1}") if "{0n}" not in line
+            else line.replace("{0n}", str(destination)).replace("{1n}", str(destination + 1))
+            for line in GROUP_MEMORY[name][0]]
     if name in MIX:
         instruction, selection = name.split("@")
         low = ",".join(str(int(pick == "h")) for pick in selection)
@@ -920,6 +961,8 @@ def results(name, values):
             return [result]
         value, flag = result
         return [value & M, value >> 32] + ([] if flag is None else [flag])
+    if name in GROUP_MEMORY:
+        return GROUP_MEMORY[name][1](values[1], values[2])
     if name in CONSTANT_COMPARES:
         return [CONSTANT_COMPARES[name][1](values[0])]
     if name in CONSTANT or name in IN_PLACE:
@@ -994,7 +1037,7 @@ def main():
         ap.error("choose a fresh receipt")
     a.work.mkdir(parents=True, exist_ok=False)
     rng = random.Random(0x414c5531)
-    every = [*OPERATIONS, *SCALAR, *PAIRS, *IN_PLACE, *CONSTANT, *CONSTANT_COMPARES, *COMPARES, *SCALAR_COMPARES,
+    every = [*OPERATIONS, *SCALAR, *GROUP_MEMORY, *PAIRS, *IN_PLACE, *CONSTANT, *CONSTANT_COMPARES, *COMPARES, *SCALAR_COMPARES,
              *EXEC_COMPARES, *HALF, *PACKED, *HALF_COMPARES, *HALF_EXEC_COMPARES, *FLOATS, *FLOAT_COMPARES,
              *FLOAT_EXEC_COMPARES]
     supported, refused = probe(every, a.emitter, a.llvm_mc)
