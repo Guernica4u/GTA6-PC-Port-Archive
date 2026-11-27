@@ -56,8 +56,12 @@ enum ConstantView {
     /// the code's own test (a root view has no size); without one, the
     /// view's own size bounds the reads (zeros past it).
     Raw(V, Option<u32>),
-    /// Through a constant buffer view (a table's, when the host keeps no raw
-    /// twins of its view slots).
+    /// As a structured buffer of dwords (stride 4) through this handle: the
+    /// view slot holds a structured view whose first element is the title's
+    /// address (any 4 bytes) and whose size is the CBV's (zeros past it).
+    Structured(V),
+    /// Through a constant buffer view (a descriptor neither a root view nor
+    /// in the view heap: none the host binds).
     Cbuffer(V),
 }
 
@@ -7272,22 +7276,23 @@ impl<'a> Lower<'a> {
         x
     }
 
-    /// How the constant buffer `src` read at `site` is read: as raw bytes
-    /// wherever the host can bind a raw view of it, which needs 4 bytes (root
-    /// descriptors) or 16 (view slots) where a constant buffer view needs
-    /// 256. The console's constants lie on 16, mostly not on 256: as raw
-    /// bytes the host reads them where the title wrote them (`victory-gpu`
-    /// `port`) instead of copying each into upload memory per draw.
+    /// How the constant buffer `src` read at `site` is read. Never through a
+    /// constant buffer view: its address must lie on 256 bytes on the host,
+    /// the console's constants lie on 16, and the host reads them where the
+    /// title wrote them (`victory-gpu` `port`) only through views that begin
+    /// on any 4 bytes:
     ///
-    /// - A root constant buffer: the root SRV `t<slot>`
+    /// - A root constant buffer: raw bytes through the root SRV `t<slot>`
     ///   ([`super::shader::Shader::root_constants_handle`]) at the title's
     ///   address; zeros past [`super::shader::ROOT_CONSTANT_BYTES`].
-    /// - One in a table, or picked from the heap: the raw twin of its slot
-    ///   ([`Lower::raw_twin`]), which the host makes as a raw view of the
-    ///   constant buffer view's bytes (its size rounded to 256, as the view's)
-    ///   wherever it makes such a view; zeros past it.
-    /// - Without raw twins ([`super::shader::raw_views`] 0): the constant
-    ///   buffer view, as before.
+    /// - One in a table: a structured buffer of dwords through its own slot,
+    ///   which the host makes a structured view (stride 4) of the CBV's bytes
+    ///   (`HostHeap::constant_at`, the mirror's `make_twinned`); zeros past
+    ///   it. No raw twin is needed (NVIDIA's heaps have no room for them).
+    /// - One picked from the heap by a computed index: where the host keeps
+    ///   raw twins ([`super::shader::raw_views`]), raw bytes through the twin
+    ///   of its slot ([`Lower::raw_twin`]: an index from wrong data meets a
+    ///   null raw view there, not a texture); else as in a table.
     fn constant_view(&mut self, site: Site, src: &Source) -> Result<ConstantView, Why> {
         if self.root_copy.is_none()
             && let Source::Built { address, .. } = src
@@ -7306,18 +7311,30 @@ impl<'a> Lower<'a> {
                 return Ok(ConstantView::Raw(h, Some(super::shader::ROOT_CONSTANT_BYTES)));
             }
         }
-        let in_heap = |leaf: &&Source| {
-            let (Source::Loaded { load, .. } | Source::Fetched { load, .. }) = leaf else {
-                return false;
-            };
-            self.scalar
-                .get(load)
-                .and_then(|a| self.x.native.layout.get(a.param))
-                .is_some_and(|p| matches!(p.root, RootType::Table | RootType::ResourceHeap))
-        };
-        if super::shader::raw_views() != 0 && src.leaves().iter().all(in_heap) {
+        // The root parameter kind each leaf's descriptor is loaded through.
+        let roots: Vec<Option<RootType>> = src
+            .leaves()
+            .iter()
+            .map(|leaf| {
+                let (Source::Loaded { load, .. } | Source::Fetched { load, .. }) = leaf else {
+                    return None;
+                };
+                self.scalar
+                    .get(load)
+                    .and_then(|a| self.x.native.layout.get(a.param))
+                    .map(|p| p.root)
+            })
+            .collect();
+        let tables = roots.iter().all(|r| *r == Some(RootType::Table));
+        let in_heap = roots
+            .iter()
+            .all(|r| matches!(r, Some(RootType::Table | RootType::ResourceHeap)));
+        if in_heap && !tables && super::shader::raw_views() != 0 {
             let h = self.handle(site, src, false, (11, 0))?;
             return Ok(ConstantView::Raw(h, None));
+        }
+        if in_heap {
+            return Ok(ConstantView::Structured(self.handle(site, src, false, (12, 4))?));
         }
         Ok(ConstantView::Cbuffer(self.handle(site, src, false, (13, 0x1_0000))?))
     }
@@ -7328,6 +7345,24 @@ impl<'a> Lower<'a> {
     fn constant_dword(&mut self, view: ConstantView, a: V) -> V {
         let (h, most) = match view {
             ConstantView::Cbuffer(h) => return self.cbuffer_dword(h, a),
+            ConstantView::Structured(h) => {
+                // Element `a / 4`, its only dword.
+                let c = self.cur;
+                let two = self.s.m.i32(2);
+                let element = self.s.m.bin(c, Bin::LShr, a, two);
+                let zero = self.s.m.i32(0);
+                let (mask, al) = (self.s.m.i8(1), self.s.m.i32(4));
+                let r = self.s.op(
+                    c,
+                    "rawBufferLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    139,
+                    &[h, element, zero, mask, al],
+                );
+                let x = self.s.m.extract(c, r, 0);
+                return self.as_int(x);
+            }
             ConstantView::Raw(h, most) => (h, most),
         };
         let c = self.cur;

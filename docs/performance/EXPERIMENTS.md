@@ -380,3 +380,42 @@ for that index (index past `twins.len()`) reads zeros; (c) twins are made on eve
 descriptor traffic, but the in-place path adds one `HostList::keep` (QueryInterface/AddRef) per bound constant
 buffer, ~6.5k a frame; (d) same coherence assumptions as the port (ring discipline; first shader write to a page
 read before it lands), now over ~17x more views.
+
+## perf/raw-constants, revision: table constants as structured views of dwords (NOT COMPILED, UNMEASURED; no switch)
+
+Measured after the first version (merged as perf/radical-refactor f597b66; log play-20261127-114321-28084): no root
+signature or pipeline refusals, but per frame only ~108 constant views read in place, 2,841-4,075 "not aligned for
+their raw view (4 root, 16 table)", 2,574-3,669 fills read out of ported memory, submitting thread 69.8 ms, 13.8 fps.
+
+Cause, from code and log: (b), not (a). `descriptor/host.rs` `probe_view_limit` gives raw twins only when a heap of
+2 x `RAW_TWINS` (2 x 2^21) descriptors can be made; NVIDIA caps shader-visible view heaps at 1,000,000
+(`PORTABLE_VIEWS`), and the log says `host view heaps hold 1000000 views ... raw_twins=false`. With no twins,
+`HostHeap::constant_align` returned 256, so every table constant fell back (and the merged `make_twinned` asked for
+256 without a twin too). Twins cannot be made to fit: they sit at `2^21 + index` for every title slot, and the
+title's heap alone is ~1,000,000 slots.
+
+Fix (no twins needed, no residual offset needed):
+- A constant buffer's slot (fresh table slots, `constant_at`; title slots, `make_twinned`; null ones,
+  `null_constant_at` / `null_for`) is a structured view (`DXGI_FORMAT_UNKNOWN`, stride 4) of the CBV's bytes
+  (`constant_bytes`: rounded up to 256, at most 64 KiB, cut at the buffer's end): `descriptor/host.rs`
+  `constant_views`. A structured view's first element is any dword, so it begins at the title's own address (any 4
+  bytes): no residual exists to pass. Its raw twin (AMD, where twins fit) is still made for picked reads.
+- Translator (`emit/lower.rs` `constant_view`): constants loaded through tables read element `byte / 4` with a
+  structured load (props 12, stride 4) of their own slot; picked ones read the raw twin where twins exist, else the
+  same structured slot; root ones are unchanged (raw root SRV). The CBV path is left only for descriptors neither
+  in a root view nor in the heap (none the host binds).
+- `port::constants(address, len, Use)`: one alignment, `ALIGN` = 4 bytes, for every binder; `Use::{Root, Table,
+  Mirror}` splits the counts.
+
+Why not the per-slot residual table the request named: with structured views there is no residual (the view begins
+at the exact dword); a residual table would need a root SRV in every shader that reads table constants, the host to
+keep a per-slot dword up to date in both heaps' tables, and a dependent load before every constant read.
+
+Log line now: `renderer port 1: ... per frame: N constant views read in place (... T in tables' slots, M in title
+slots, the rest root views) ... not in place: off 4 bytes R root, T' in tables' slots, M' in title slots, S on pages
+shaders write, O outside the regions; on the CPU F fills read out of them`. Expected: N in the thousands, R/T'/M'
+~0, F ~0 (only constants on pages shaders write, or outside the region, still fill).
+
+Risks: (a) structured loads of a slot that holds something else (a picked index from wrong data on a host without
+twins) mismatch the descriptor kind, as the CBV reads did before; (b) mirror slots made in place hold the region
+buffer until the title rewrites them; (c) translator hash changes again: one more cold retranslation.

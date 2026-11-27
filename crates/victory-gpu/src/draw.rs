@@ -1157,7 +1157,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     // Constants no shader writes, in the title's graphics heap: read where
     // the title wrote them (`crate::port`), with nothing refreshed, filled
     // or waited for. The list holds the buffer.
-    if !srv && let Some((buffer, gpu)) = crate::port::constants(address, 1 << 16, crate::port::ROOT_ALIGN) {
+    if !srv && let Some((buffer, gpu)) = crate::port::constants(address, 1 << 16, crate::port::Use::Root) {
         list.keep(&buffer);
         return Some(gpu);
     }
@@ -1166,7 +1166,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         .left(address)
         .min(if srv { limit } else { 1 << 16 });
     let gpu = shadow.gpu(address);
-    if srv || gpu % crate::port::ROOT_ALIGN == 0 {
+    if srv || gpu % crate::port::ALIGN == 0 {
         shadow.refresh(list, address, len);
         #[cfg(feature = "diagnostics")]
         crate::book::root(gpu, len);
@@ -4505,8 +4505,8 @@ impl State {
 
     /// The descriptors a shader reads through tables. Tables holding a
     /// constant buffer are made afresh for the draw in dynamic slots. The
-    /// shaders read constant buffers as raw bytes through the slots' raw
-    /// twins (16 bytes, where a CBV needs 256 and the console only 16): one
+    /// shaders read constant buffers as structured buffers of dwords (any 4
+    /// bytes, where a CBV needs 256 and the console only 16): one
     /// in the title's graphics heap that no shader writes is shown where the
     /// title wrote it (`crate::port`); any other has its data copied to
     /// upload memory when the list is submitted. Returns those tables' new byte offsets by root
@@ -4739,19 +4739,16 @@ impl State {
                         // shader: the slot shows the title's bytes
                         // themselves (`crate::port`); the slot and the list
                         // hold the buffer. Else a fill of upload memory at
-                        // submission, as before.
-                        // Shaders read it as raw bytes through the slot's raw
-                        // twin (`victory_shader::emit::raw_views`), which
-                        // needs 16 bytes where its CBV needs 256: a slot off
-                        // 256 gets a null CBV and the twin alone
-                        // (`HostHeap::constant_at`).
-                        if let Some((buffer, gpu)) = crate::port::constants(address, u64::from(size), host.constant_align()) {
+                        // submission, as before. Shaders read it as a
+                        // structured buffer of dwords (`HostHeap::constant_at`),
+                        // whose view begins on any 4 bytes.
+                        if let Some((buffer, gpu)) = crate::port::constants(address, u64::from(size), crate::port::Use::Table) {
                             list.keep(&buffer);
                             host.constant_at(index, &buffer, gpu, size);
                             continue;
                         }
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
-                            host.make_null(index);
+                            host.null_constant_at(index);
                             continue;
                         };
                         let slot = (std::ptr::from_ref(heap) as usize, index);
@@ -4781,7 +4778,12 @@ impl State {
                         }
                     }
                     None => {
-                        host.make_null(index);
+                        // Read as constants: a null view of their kind.
+                        if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                            host.null_constant_at(index);
+                        } else {
+                            host.make_null(index);
+                        }
                         if used.is_some() {
                             once!(slot, "a table entry without a view");
                         }

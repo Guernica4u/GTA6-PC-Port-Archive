@@ -38,10 +38,14 @@
 //! VIEW needs its address on 256 bytes on the host; the title places its
 //! constants on 16, so 6,185 of 6,556 views a frame could not be bound here
 //! (run play-20261127-111731). The translation now reads every constant
-//! buffer as raw bytes (`victory_shader::emit::HostShader::root_cbvs`, and
-//! the raw twin of a table's slot), whose views need 4 bytes (root SRVs,
-//! [`ROOT_ALIGN`]) or 16 (raw views in slots, [`TABLE_ALIGN`]): the caller
-//! says which ([`constants`]' `align`).
+//! buffer as raw bytes (`victory_shader::emit::HostShader::root_cbvs`), and
+//! one in a view slot as a structured buffer of dwords (the slot holds a
+//! structured view, stride 4): both need the address on 4 bytes only
+//! ([`ALIGN`]), so every constant buffer of the title can be read here. (A
+//! first try read tables' through the slots' raw twins: raw views begin on
+//! 16, and NVIDIA's heaps have no room for twins, run
+//! play-20261127-114321: 108 read in place, 2,841-4,075 not.) The caller
+//! says what binds it ([`Use`]), for the counts.
 //!
 //! "No shader writes it", per 4 KiB page ([`PAGE_MARKS`]): no read-back
 //! into title memory was ever recorded for it ([`gpu_bound`]: for good), no
@@ -89,18 +93,24 @@ const MOST: u64 = 512 << 20;
 /// The most bytes a constant buffer view reads (4,096 vectors).
 const CONSTANTS_MOST: u64 = 64 << 10;
 
-/// The alignment a root constant buffer needs to be read in place: it is a
-/// raw root SRV (`victory_shader::emit::HostShader::root_cbvs`), whose
-/// address needs 4 bytes.
-pub(crate) const ROOT_ALIGN: u64 = 4;
+/// The alignment a constant buffer needs to be read in place: a root one is
+/// a raw root SRV (`victory_shader::emit::HostShader::root_cbvs`), one in a
+/// view slot a structured view of dwords
+/// (`crate::descriptor::host::HostHeap::constant_at`): both begin on any 4
+/// bytes.
+pub(crate) const ALIGN: u64 = 4;
 
-/// The alignment a constant buffer in a table needs to be read in place: it
-/// is read through the raw twin of its slot, a raw view, which begins on 16
-/// bytes (`crate::descriptor::host::HostHeap::constant_align`).
-pub(crate) const TABLE_ALIGN: u64 = 16;
-
-/// The alignment a constant buffer view needs (heaps without raw twins).
-pub(crate) const VIEW_ALIGN: u64 = 256;
+/// What binds a constant buffer asked about ([`constants`]), for the counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Use {
+    /// A root view (`crate::draw` `root_view`).
+    Root,
+    /// A table's slot made afresh for a draw (`crate::draw` `tables`).
+    Table,
+    /// A title slot made by the descriptor mirror
+    /// (`crate::descriptor::host` `make_twinned`).
+    Mirror,
+}
 
 /// Frames before memory that could not be opened is asked about again
 /// (pages of a stretch may not be committed yet).
@@ -159,12 +169,13 @@ static PAGE_MARKS: [AtomicU32; PAGES] = [const { AtomicU32::new(0) }; PAGES];
 // section, not committed, no view of it could be made, the host refused, no
 // buffer could be placed; regions forgotten because the title mapped other
 // pages there. Then, since the last line: constant buffer views bound in
-// place and their bytes; not, because not aligned, because a shader
-// writes a page of it, because outside every region (not aligned: off the
-// 4 or 16 bytes the raw view it is read through needs, or the 256 of a
-// CBV where the host keeps no raw twins); fills of upload memory
-// read out of ported memory on the CPU and their bytes; title buffer copies
-// on the CPU that touch it and their bytes.
+// place and their bytes; not, because off 4 bytes (as a root view), because
+// a shader writes a page of it, because outside every region; fills of
+// upload memory read out of ported memory on the CPU and their bytes; title
+// buffer copies on the CPU that touch it and their bytes; small stream views
+// in place and their bytes; not in place because off 4 bytes in a table's
+// slot, in a title slot (mirror); in place in a table's slot, in a title
+// slot (the rest of [`READ`] are root views).
 const OPENED: usize = 0;
 const OPENED_BYTES: usize = 1;
 const NOT_STRETCH: usize = 2;
@@ -184,21 +195,28 @@ const COPIES: usize = 15;
 const COPY_BYTES: usize = 16;
 const STREAM_READ: usize = 17;
 const STREAM_READ_BYTES: usize = 18;
-static STATS: [AtomicU64; 19] = [const { AtomicU64::new(0) }; 19];
+const MISALIGNED_TABLE: usize = 19;
+const MISALIGNED_MIRROR: usize = 20;
+const READ_TABLE: usize = 21;
+const READ_MIRROR: usize = 22;
+static STATS: [AtomicU64; 23] = [const { AtomicU64::new(0) }; 23];
 
 /// A constant buffer of `len` bytes at title address `address`, read in
 /// place: the buffer to bind and hold (the caller's list and slot keep it),
-/// and the host address of `address` in it (on `align` bytes: what the view
-/// the caller binds needs, [`ROOT_ALIGN`], [`TABLE_ALIGN`] or
-/// [`VIEW_ALIGN`]). `None`: bind the card copy or fill upload memory, as
-/// before. In place only if the view's bytes (`len` rounded up to 256, 64
-/// KiB at most: what a CBV of it shows) lie in a region and no shader writes
-/// any of their pages.
-pub(crate) fn constants(address: u64, len: u64, align: u64) -> Option<(ID3D12Resource, u64)> {
+/// and the host address of `address` in it (on [`ALIGN`] bytes, what every
+/// view a constant buffer is read through needs). `None`: bind the card copy
+/// or fill upload memory, as before. In place only if the view's bytes
+/// (`len` rounded up to 256, 64 KiB at most: what a CBV of it shows) lie in
+/// a region and no shader writes any of their pages. `by`: what binds it.
+pub(crate) fn constants(address: u64, len: u64, by: Use) -> Option<(ID3D12Resource, u64)> {
     if len == 0 || address >= LOW {
         return None;
     }
-    debug_assert!(align.is_power_of_two());
+    let misaligned = match by {
+        Use::Root => MISALIGNED,
+        Use::Table => MISALIGNED_TABLE,
+        Use::Mirror => MISALIGNED_MIRROR,
+    };
     let size = len.min(CONSTANTS_MOST).next_multiple_of(256);
     let end = address.checked_add(size)?;
     if end > LOW {
@@ -206,9 +224,9 @@ pub(crate) fn constants(address: u64, len: u64, align: u64) -> Option<(ID3D12Res
     }
     // Regions begin on 64 KiB and their buffer with them: the host address
     // is aligned as the title's is.
-    if address % align != 0 {
+    if address % ALIGN != 0 {
         if touches(address as usize, size as usize) {
-            STATS[MISALIGNED].fetch_add(1, Ordering::Relaxed);
+            STATS[misaligned].fetch_add(1, Ordering::Relaxed);
         }
         return None;
     }
@@ -218,8 +236,8 @@ pub(crate) fn constants(address: u64, len: u64, align: u64) -> Option<(ID3D12Res
     };
     // SAFETY: a live buffer.
     let gpu = unsafe { whole.GetGPUVirtualAddress() } + (address - start);
-    if gpu % align != 0 {
-        STATS[MISALIGNED].fetch_add(1, Ordering::Relaxed);
+    if gpu % ALIGN != 0 {
+        STATS[misaligned].fetch_add(1, Ordering::Relaxed);
         return None;
     }
     if !written_by_no_shader(address, size) {
@@ -228,6 +246,15 @@ pub(crate) fn constants(address: u64, len: u64, align: u64) -> Option<(ID3D12Res
     }
     STATS[READ].fetch_add(1, Ordering::Relaxed);
     STATS[READ_BYTES].fetch_add(len.min(CONSTANTS_MOST), Ordering::Relaxed);
+    match by {
+        Use::Root => {}
+        Use::Table => {
+            STATS[READ_TABLE].fetch_add(1, Ordering::Relaxed);
+        }
+        Use::Mirror => {
+            STATS[READ_MIRROR].fetch_add(1, Ordering::Relaxed);
+        }
+    }
     Some((whole, gpu))
 }
 
@@ -503,17 +530,21 @@ pub(crate) fn log(frames: f64) {
     let stream_bytes = per(STREAM_READ_BYTES) / 1024.0;
     tracing::info!(
         "renderer port 1: {} regions of the title's graphics memory in place ({} MB); per frame: {:.0} constant views read in place ({:.1} KB: \
-         nothing refreshed, filled or waited for), {:.0} small stream views in place ({:.1} KB), not in place: {:.0} not aligned for their raw view (4 root, 16 table), \
-         {:.0} on pages shaders write, {:.0} outside the regions; \
+         nothing refreshed, filled or waited for; {:.0} in tables' slots, {:.0} in title slots, the rest root views), {:.0} small stream views in place ({:.1} KB), \
+         not in place: off 4 bytes {:.0} root, {:.0} in tables' slots, {:.0} in title slots, {:.0} on pages shaders write, {:.0} outside the regions; \
          on the CPU {:.0} fills read out of them ({:.1} KB), {:.1} buffer copies touching them ({:.1} KB); since the start not opened: \
          {} not one stretch of a section, {} not committed, {} no view, {} by the host, {} no buffer; {} regions forgotten (other pages mapped there)",
         s[OPENED],
         s[OPENED_BYTES] >> 20,
         per(READ),
         per(READ_BYTES) / 1024.0,
+        per(READ_TABLE),
+        per(READ_MIRROR),
         stream_reads,
         stream_bytes,
         per(MISALIGNED),
+        per(MISALIGNED_TABLE),
+        per(MISALIGNED_MIRROR),
         per(SHADERS),
         per(OUTSIDE),
         per(FILLS),
@@ -537,10 +568,10 @@ mod tests {
     /// with bytes.
     #[test]
     fn only_memory_below_4_gib_is_read_in_place() {
-        assert!(constants(0xe1c80_0000, 256, TABLE_ALIGN).is_none());
-        assert!(constants(0xffff_ff00, 0x1000, TABLE_ALIGN).is_none());
-        assert!(constants(0x3431_0000, 0, TABLE_ALIGN).is_none());
-        assert!(constants(u64::MAX - 255, 16, ROOT_ALIGN).is_none());
+        assert!(constants(0xe1c80_0000, 256, Use::Table).is_none());
+        assert!(constants(0xffff_ff00, 0x1000, Use::Mirror).is_none());
+        assert!(constants(0x3431_0000, 0, Use::Table).is_none());
+        assert!(constants(u64::MAX - 255, 16, Use::Root).is_none());
         assert!(stream_bytes(0xe1c80_0000, 64).is_none());
         assert!(stream_bytes(0x3431_0000, 0).is_none());
         assert!(stream_bytes(0x3431_0000, CONSTANTS_MOST + 1).is_none());

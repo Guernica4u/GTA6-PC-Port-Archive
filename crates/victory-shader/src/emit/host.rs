@@ -1406,11 +1406,23 @@ impl Host {
                         uavs.push((t, Some((w, h)), 1, rb));
                     }
                     View::Cbv(data) => {
+                        // Translated shaders read a heap constant buffer as a
+                        // structured buffer of dwords, as the host makes it.
                         let b = upload(data)?;
-                        dev.CreateConstantBufferView(
-                            Some(&D3D12_CONSTANT_BUFFER_VIEW_DESC {
-                                BufferLocation: b.GetGPUVirtualAddress(),
-                                SizeInBytes: (data.len() * 4).next_multiple_of(256) as u32,
+                        dev.CreateShaderResourceView(
+                            &b,
+                            Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
+                                Format: DXGI_FORMAT_UNKNOWN,
+                                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                    Buffer: D3D12_BUFFER_SRV {
+                                        FirstElement: 0,
+                                        NumElements: data.len().max(1) as u32,
+                                        StructureByteStride: 4,
+                                        Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+                                    },
+                                },
                             }),
                             at,
                         );

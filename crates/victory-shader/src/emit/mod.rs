@@ -32,10 +32,13 @@
 //!   (changed 2026-11-27): a CBV's address must lie on 256 bytes on the host,
 //!   the console's on 16, and a raw view lets the host read the title's
 //!   constants where it wrote them. Root ones read zeros past
-//!   [`ROOT_CONSTANT_BYTES`]; ones in tables (and picked from the heap) are
-//!   read through the raw twin of their slot ([`raw_views`]), which the host
-//!   makes over the same bytes as the constant buffer view, so reads past
-//!   its size give zeros; without raw twins, through the CBV as before.
+//!   [`ROOT_CONSTANT_BYTES`]. Ones in the view heap are read as structured
+//!   buffers of dwords through their own slot: the host makes a constant
+//!   buffer's slot a structured view (`DXGI_FORMAT_UNKNOWN`, stride 4) of
+//!   the CBV's bytes (size rounded to 256, at most 64 KiB), which begins on
+//!   any 4 bytes and reads zeros past its end. Ones picked from the heap by
+//!   a computed index read the raw twin of their slot instead where the
+//!   host keeps twins ([`raw_views`]).
 //! * **Vertex fetch** (added 2026-11-23). The title's mesh and
 //!   vertex programs fetch vertices themselves with typed-format loads
 //!   (`tbuffer_load_format_*`): the format (8_8_8_8 unorm, 16_16 snorm,

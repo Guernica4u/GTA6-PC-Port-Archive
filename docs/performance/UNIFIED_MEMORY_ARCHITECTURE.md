@@ -76,11 +76,13 @@ SRV/UAV/root-SRV/vertex/index/indirect access uses, as today) and T (the port re
 pages use). The same title address resolves differently by access kind:
 
 - `draw.rs` `root_view` (root constant buffer, `srv == false`, a raw root SRV since `perf/raw-constants`):
-  `port::constants(address, 64 KiB, ROOT_ALIGN)` first; `Shadow::find`/`gpu` and the 64 KiB refresh only on
+  `port::constants(address, 64 KiB, Use::Root)` first; `Shadow::find`/`gpu` and the 64 KiB refresh only on
   fallback (any 4-byte address; scratch only off 4 bytes).
-- `draw.rs` table CBV (`View::Constant` in `tables`): `port::constants(address, size, HostHeap::constant_align())`
-  first; the slot's raw twin is made over the region buffer (`descriptor/host.rs` `constant_at`, which holds the
-  buffer; the CBV itself only on 256, else null); scratch + `defer_constants` only on fallback.
+- `draw.rs` table CBV (`View::Constant` in `tables`): `port::constants(address, size, Use::Table)` first; the slot
+  is made a structured view of dwords over the region buffer (`descriptor/host.rs` `constant_at` /
+  `constant_views`, which holds the buffer); scratch + `defer_constants` only on fallback.
+- Title slots holding a CBV (descriptor mirror, `make_twinned`): `port::constants(address, size, Use::Mirror)` first,
+  else the host copy (V); a structured view either way.
 - Everything else keeps `shadow::find` / `Shadow::gpu` (V).
 
 Why that is coherent: C1 pages are by definition pages no shader writes, so V's bytes for them can only be *older*
@@ -199,18 +201,28 @@ Structure after the change (no switch; constants in code):
 
 | Access | Shader reads (victory-shader `emit/lower.rs` `constant_view`) | Host binds | Needs |
 |---|---|---|---|
-| root constant buffer | `rawBufferLoad` through root SRV `t<slot>` (`ROOT_CBV_SPACE`), zeros past 64 KiB by the code | `Set*RootShaderResourceView` at T (`port::constants(.., ROOT_ALIGN)`) or the host copy | 4 bytes |
-| constant buffer in a table | `rawBufferLoad` through the raw twin of its slot (`raw_twin`) | twin = raw view of the bytes (sized like the CBV: zeros past it) over T or the scratch copy | 16 bytes |
-| constant buffer picked from the heap | the same twin (title slots: `make_twinned` now makes the twin raw) | mirror over V | 16 bytes |
-| any, without raw twins | `cbufferLoadLegacy` through the CBV (old path) | as before | 256 bytes |
+| root constant buffer | `rawBufferLoad` through root SRV `t<slot>` (`ROOT_CBV_SPACE`), zeros past 64 KiB by the code | `Set*RootShaderResourceView` at T (`port::constants(.., Use::Root)`) or the host copy | 4 bytes |
+| constant buffer in a table | structured load (props 12, stride 4) of element `byte / 4` through its own slot | structured view (`DXGI_FORMAT_UNKNOWN`, stride 4, sized like the CBV: zeros past it) over T or the scratch copy | 4 bytes |
+| title slot (mirror) holding a CBV | as in a table | structured view over T (`Use::Mirror`) or V | 4 bytes |
+| constant buffer picked from the heap by a computed index | with raw twins: `rawBufferLoad` through the twin (null raw view if off 16); without: as in a table | twin: raw view of the same bytes | 16 / 4 bytes |
+
+Revision (same day, log play-20261127-114321-28084): the first version read tables' constants through the slots' raw
+twins and used `port::constants(.., 16 or 256)`. On NVIDIA the view heap is capped at 1,000,000 descriptors and the
+twins (2 x 2^21) do not fit: `host view heaps hold 1000000 views ... raw_twins=false`, so every table constant asked
+for 256 bytes: ~108 views a frame in place, 2,841-4,075 "not aligned", 2,574-3,669 fills, 13.8 fps. Cause (b), not
+(a). Fix: a constant buffer's slot itself is a structured view of dwords, which begins on any 4 bytes and needs no
+twin and no residual offset (a residual table would cost a root SRV per shader and a dependent load per read; a
+structured view's first element is the title's own dword). Counts are split by binder: off 4 bytes as root, in
+tables' slots, in title slots; read in place in tables' slots and in title slots.
 
 Coherence is the port's (section 2, 5): only the view kind changed; which bytes are T is still decided per page by
 the oracle. Fallbacks (not in a region, pages shaders write, off alignment) keep the old copy paths, so correctness
 does not depend on the port opening. Pages shaders write keep V exactly as before.
 
-Not done: a residual offset for table constant buffers off 16 bytes (none expected; they take the fill path and are
-counted as "not aligned"); descriptor-mirror CBVs (title slots picked by index) still show V (section 7 item 3).
+Not done: a mirror slot made in place keeps the region buffer until the title rewrites the slot; a page that becomes
+the shaders' later is still read in place through it (the same window as the port's oracle, section 6).
 
-Log lines: `renderer port 1: ... per frame: N constant views read in place` in the thousands, `not aligned for
-their raw view (4 root, 16 table)` ~0, `fills read out of them` ~0. Must not appear: `host root signature refused`,
-`host pipeline refused`, `a constant buffer's raw twin could not be made`.
+Log lines: `renderer port 1: ... per frame: N constant views read in place (...; T in tables' slots, M in title
+slots, the rest root views)`: N in the thousands; `not in place: off 4 bytes R root, T' in tables' slots, M' in title
+slots` all ~0; `fills read out of them` ~0. Must not appear: `host root signature refused`, `host pipeline refused`,
+`constant buffer not on 4 bytes on the host`.
