@@ -10489,6 +10489,7 @@ pub(crate) static METER_FPS_TENTHS: std::sync::atomic::AtomicU32 = std::sync::at
 
 struct Meter {
     since: std::time::Instant,
+    previous_sample: Option<(std::time::Instant, u64)>,
     frames: u32,
     #[cfg(feature = "diagnostics")]
     copy_stats_frames: u64,
@@ -10501,12 +10502,14 @@ struct Meter {
 impl Meter {
     fn new() -> Self {
         let now = std::time::Instant::now();
+        let drawn = crate::draw::drawn();
         Meter {
             since: now,
+            previous_sample: crate::switch::on("VICTORY_FRAMETIME_SAMPLES").then_some((now, drawn)),
             frames: 0,
             #[cfg(feature = "diagnostics")]
             copy_stats_frames: 0,
-            drawn: crate::draw::drawn(),
+            drawn,
             logged: now,
             caption: None,
         }
@@ -10519,6 +10522,20 @@ impl Meter {
 
     /// Counts a presented frame.
     fn frame(&mut self, hwnd: HWND) {
+        if let Some((previous, previous_drawn)) = self.previous_sample {
+            let now = std::time::Instant::now();
+            let drawn = crate::draw::drawn();
+            self.previous_sample = Some((now, drawn));
+            // SAFETY: this queries the foreground window without changing focus.
+            let focused = unsafe { GetForegroundWindow() } == hwnd;
+            tracing::info!(
+                target: "victory_gpu::frametime",
+                elapsed_us = now.duration_since(previous).as_micros() as u64,
+                draws = drawn.saturating_sub(previous_drawn),
+                focused,
+                "rendered frame"
+            );
+        }
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
