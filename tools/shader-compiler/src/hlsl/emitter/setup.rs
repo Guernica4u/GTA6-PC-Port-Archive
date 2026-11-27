@@ -23,6 +23,8 @@ impl<'a> Emitter<'a> {
             packed: None,
             loop_depth: 0,
             accepted_swizzle_loops: BTreeSet::new(),
+            descriptor_copies: BTreeSet::new(),
+            descriptor_reads: BTreeSet::new(),
             in_accepted_swizzle_loop_stack: Vec::new(),
             ex,
             insns,

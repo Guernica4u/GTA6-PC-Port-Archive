@@ -24,6 +24,9 @@ impl<'a> Emitter<'a> {
             self.sampler_heap_base = Some(base);
             self.compute_heap = true;
         }
+        if self.compute_heap && !self.pixel_heap {
+            (self.descriptor_copies, self.descriptor_reads) = descriptor_broadcast::find(&self.insns);
+        }
         let off2idx: HashMap<usize, usize> = self.insns.iter().enumerate().map(|(i, x)| (x.offset, i)).collect();
         // Block leaders and per-instruction branch targets.
         let mut leaders: BTreeSet<usize> = BTreeSet::new();
