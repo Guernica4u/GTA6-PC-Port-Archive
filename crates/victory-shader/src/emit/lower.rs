@@ -21,6 +21,8 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+#[cfg(test)]
+mod wave_tests;
 
 type Why = &'static str;
 
@@ -406,14 +408,18 @@ fn wave_invariant_dpp(dpp: Dpp) -> bool {
             ctrl: 0..=0xFF,
             row_mask: 0xF,
             bank_mask: 0xF,
+            fi: false,
             ..
         }
     )
 }
 
 fn quad_swizzle(offset: u32) -> bool {
-    offset & 0x8000 != 0
-        || offset & 0x1C == 0x1C && offset & 0x380 == 0 && offset >> 10 & 0x1F < 4
+    match offset & 0xC000 {
+        0x8000 => true,
+        0xC000 => false,
+        _ => offset & 0x1C == 0x1C && offset & 0x380 == 0 && offset >> 10 & 0x1F < 4,
+    }
 }
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
@@ -588,17 +594,29 @@ impl<'a> Lower<'a> {
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
+            // Multidimensional groups use a different host quad layout, and
+            // a first-lane read makes the size of the surrounding wave visible.
+            let quad_layout_matches = cs.threads[1..] == [1, 1]
+                && !insts().any(|i| {
+                    i.name() == "v_readfirstlane_b32"
+                        && i.writes
+                            .first()
+                            .is_some_and(|w| !x.res.waterfall.reads.contains(&w.1))
+                });
             console_lanes = insts().any(|i| {
                 let n = i.name();
                 matches!(
                     &i.fields,
                     Fields::Ds { offset0, offset1, .. }
                         if n == "ds_swizzle_b32"
-                            && !quad_swizzle(u32::from(*offset0) | u32::from(*offset1) << 8)
+                            && !(quad_layout_matches
+                                && quad_swizzle(u32::from(*offset0) | u32::from(*offset1) << 8))
                 ) || n.contains("permute")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
-                    || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some_and(|d| !wave_invariant_dpp(d)))
+                    || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some_and(|d| {
+                        !(quad_layout_matches && wave_invariant_dpp(d))
+                    }))
                     || reads_mask_as_data(x.st, i)
             }) || {
                 // Masks held as numbers or constant lane sets: the lane
@@ -3219,8 +3237,9 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         if name == "ds_swizzle_b32" {
-            // Bit 15 set: each lane of a quad picks a lane of it; else lanes
-            // of each group of 32 combine their index with and/or/xor masks.
+            if offset >= 0xC000 {
+                return Err("a rotate or FFT DS swizzle");
+            }
             let quad = quad_swizzle(offset);
             // Mesh: host quads are threads 4n..4n+3 of a 1D group, as the
             // console's, so quad-local swizzles read through quad operations.
@@ -5952,10 +5971,13 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl, fi)
             }
         };
-        let src_active = if fi {
-            None
-        } else {
+        let src_active = if !fi {
             self.src_lane_active(src, guard, mesh_quad)
+        } else if quad && self.s.threads.is_some() && !mesh_quad {
+            // FI ignores guest EXEC, but a host wave read still needs a live lane.
+            self.src_lane_active(src, None, false)
+        } else {
+            None
         };
         let valid = match (inside, src_active) {
             (Some(in_b), Some(act)) => Some(self.s.m.bin(c, Bin::And, in_b, act)),
@@ -12238,88 +12260,5 @@ mod tests {
             lowers(&words, 0),
             Err(crate::ShaderError::Unsupported { what: "GDS", .. })
         ));
-    }
-
-    fn lower_cs_wave64(words: &[u32]) -> Lowered {
-        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let native = NativeProgram {
-            stage: HwStage::Cs,
-            wave64: true,
-            vgprs: 256,
-            layout: vec![],
-            used: vec![],
-            io: StageIo::Cs(ComputeIo {
-                rsrc2: 0,
-                threads: [64, 1, 1],
-            }),
-            code,
-        };
-        let p = ir::build(&native.code, true, 256).unwrap();
-        let st = structure::structure(&p).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
-        let io = io::raise(&p, &native).unwrap();
-        lower(&Parts {
-            native: &native,
-            p: &p,
-            st: &st,
-            io: &io,
-            res: &res,
-            inputs: vec![],
-            outputs: vec![],
-            prims: vec![],
-            mesh_stride: 0,
-            view_marks: false,
-        })
-        .unwrap()
-    }
-
-    #[test]
-    fn wave64_ds_swizzle_with_thread_id_omits_wave_size() {
-        let words = [
-            0xD8D4_80B1, // ds_swizzle_b32 v2, v0 offset:0x80b1
-            0x0200_0000,
-            S_ENDPGM,
-        ];
-        let lowered = lower_cs_wave64(&words);
-        assert_eq!(lowered.wave_size, None);
-        assert!(lowered.wave_ops);
-    }
-
-    #[test]
-    fn wave64_ds_swizzle_across_quad_keeps_wave_size() {
-        let lowered = lower_cs_wave64(&[
-            0xD8D4_401F, // ds_swizzle_b32 v2, v0 xor 16
-            0x0200_0000,
-            S_ENDPGM,
-        ]);
-        assert_eq!(lowered.wave_size, Some(64));
-        assert!(lowered.wave_ops);
-    }
-
-    #[test]
-    fn wave64_dpp_omits_wave_size_only_for_unmasked_quad_ops() {
-        for (control, wave_size) in [
-            (0xFF00_B100, None),     // quad_perm, all rows and banks
-            (0xCF00_B100, Some(64)), // quad_perm, upper rows only
-            (0xF500_B100, Some(64)), // quad_perm, selected banks
-            (0xFF01_0100, Some(64)), // row_shl:1
-            (0x5F01_4000, Some(64)), // row_mirror, repeating row mask
-        ] {
-            let lowered = lower_cs_wave64(&[0x7E04_02FA, control, S_ENDPGM]);
-            assert_eq!(lowered.wave_size, wave_size, "DPP control {control:#x}");
-            assert!(lowered.wave_ops);
-        }
-    }
-
-    #[test]
-    fn wave64_dpp_wave_shl1_keeps_wave_size_64() {
-        let words = [
-            0x7E04_02FA, // v_mov_b32_dpp v2, v0 wave_shl:1
-            0xFF01_3000,
-            S_ENDPGM,
-        ];
-        let lowered = lower_cs_wave64(&words);
-        assert_eq!(lowered.wave_size, Some(64));
-        assert!(lowered.wave_ops);
     }
 }

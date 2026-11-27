@@ -1090,3 +1090,75 @@ fn wave64_dpp_row_mask_preserves_both_halves_on_warp() {
         assert_eq!(out[0][..64], want, "row mask {row_mask:#x}");
     }
 }
+
+#[test]
+fn wave64_first_lane_with_quad_swizzle_is_uniform_on_warp() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(true) else {
+        eprintln!("no SM 6.6 WARP device; skipped");
+        return;
+    };
+    let mut caps = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: this query writes into the supplied structure of the given size.
+    unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut caps).cast(),
+            size_of_val(&caps) as u32,
+        )
+    }
+    .unwrap();
+    if !caps.WaveOps.as_bool() || !(caps.WaveLaneCountMin..=caps.WaveLaneCountMax).contains(&64) {
+        eprintln!("WARP has no 64-lane waves; skipped");
+        return;
+    }
+
+    let mut w = vec![s_mov_b32(1, 0x80)];
+    w.extend(s_load_dwordx4(4, 0));
+    w.extend([
+        0xD8D4_804E,
+        0x0200_0000, // v2 = quad swizzle of v0, lane 0 reads lane 2
+        0x7E04_0502, // v_readfirstlane_b32 s2, v2
+        0x7E04_0202, // v_mov_b32 v2, s2
+        v_lshlrev_b32_imm(5, 2, 0),
+    ]);
+    w.extend(buffer_store_dword_offen(2, 5, 4));
+    w.push(S_ENDPGM);
+    let shader = build_crosslane_cs(&w, true);
+    let (root, pso) = host.compute_pipeline(&shader).expect("D3D12 pipeline");
+    let ud = vec![0; shader.user_data_dwords().max(1) as usize];
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(64)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("D3D12 readback");
+    assert_eq!(&out[0][..64], &[2; 64]);
+    eprintln!("WARP: quad swizzle plus first-lane read matched all 64 words");
+}
+
+#[test]
+fn dpp_quad_fi_preserves_the_destination_when_a_host_lane_is_absent() {
+    let dpp = Dpp::Row {
+        ctrl: 0xB1,
+        row_mask: 0xF,
+        bank_mask: 0xF,
+        bound_ctrl: false,
+        fi: true,
+    };
+    let words = encode_dpp16(2, 1, None, dpp);
+    let shader = build_wave32_cs(MaskPattern::Even, Divergence::Branched, &words);
+    let expected = std::array::from_fn(|lane| lane_v2_old(lane as u32));
+    check_cases(
+        "DPP FI under divergence",
+        &[("odd source lanes absent", shader, expected)],
+    );
+}
