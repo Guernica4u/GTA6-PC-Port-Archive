@@ -405,6 +405,11 @@ impl<'a> Emitter<'a> {
                         written.insert(d + k as u16);
                     }
                 }
+                // Only the loads read a descriptor. Scratch loads, cache controls,
+                // timers and probes share the encoding.
+                Enc::Smem if !(8..=12).contains(&ins.op) => {
+                    return Err(format!("unsupported scalar memory instruction at {:#x}", ins.offset));
+                }
                 Enc::Smem => {
                     let n = 1u32 << (ins.op - 8);
                     let b = ins.src.first().and_then(sg).ok_or("s_buffer_load: bad base")?;

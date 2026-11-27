@@ -38,6 +38,9 @@ mod scalar_values;
 mod code_offset;
 mod scalar_bits;
 #[cfg(test)]
+#[path = "tests/hlsl/instruction_inventory.rs"]
+mod instruction_inventory;
+#[cfg(test)]
 #[path = "tests/hlsl/raw_width.rs"]
 mod raw_width;
 #[cfg(test)]
