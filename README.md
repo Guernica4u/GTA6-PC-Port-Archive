@@ -1,14 +1,14 @@
 # hyphenn GitHub export
 
-Issues, pull requests and comments from `fxceless/victory-fork` (called `victory-gta6` until 24 Nov 2026; archived here as hyphenn), exported from the GitHub REST API on 2026-11-26.
+Issues, pull requests and comments from `fxceless/victory-fork` (called `victory-gta6` until 24 Nov 2026; archived here as hyphenn), exported from the GitHub REST API on 2026-11-27.
 
 Each file in `data/` is gzipped JSON Lines: one API object per line, unchanged.
 
 | File | Contents | Items |
 |---|---|---|
-| `issues_and_prs.jsonl.gz` | every issue and PR (title, body, labels, state, author) | 313 |
-| `pulls.jsonl.gz` | PR details (head and base branch, merge state) | 1,104 |
-| `issue_comments.jsonl.gz` | conversation comments on issues and PRs | 2,953 |
+| `issues_and_prs.jsonl.gz` | every issue and PR (title, body, labels, state, author) | 314 |
+| `pulls.jsonl.gz` | PR details (head and base branch, merge state) | 1,114 |
+| `issue_comments.jsonl.gz` | conversation comments on issues and PRs | 2,993 |
 | `review_comments.jsonl.gz` | inline code-review comments | 68 |
 | `labels.jsonl.gz` | labels | 10 |
 
