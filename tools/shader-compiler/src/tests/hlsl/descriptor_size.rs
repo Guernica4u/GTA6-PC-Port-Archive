@@ -46,7 +46,8 @@ fn sequence(after_level: &[u32]) -> ShaderExtract {
 fn the_load_fills_the_size_fields_from_the_texture() {
     let hlsl = translate(&sequence(&[])).unwrap().hlsl;
     let fill = hlsl.find("tex1.GetDimensions(0u, w0, h0, n0);").expect(&hlsl);
-    for line in ["s9 = ((w0 - 1u) & 3u) << 30;", "s10 = ((w0 - 1u) >> 2) | ((h0 - 1u) << 14);", "s11 = 0u;"] {
+    for line in ["s9 = ((max(w0, 1u) - 1u) & 3u) << 30;",
+                 "s10 = ((max(w0, 1u) - 1u) >> 2) | ((max(h0, 1u) - 1u) << 14);", "s11 = 0u;"] {
         let at = hlsl[fill..].find(line).unwrap_or_else(|| panic!("{line}: {hlsl}"));
         // Before the program's first read of the words.
         assert!(fill + at < hlsl.find("s_lshl_b32").unwrap(), "{hlsl}");

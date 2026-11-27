@@ -8,7 +8,8 @@ Save the text between BEGIN_HLSL and END_HLSL as the --hlsl file.
 The program loads an image descriptor, extracts its width, height and base
 level fields and computes (field + 1) >> level. Each case binds a texture of
 known size through a view that starts at a known mip, and the two results must
-be that mip's size. Only the output is instrumented. No game data is needed.
+be that mip's size. A null view stands for an empty console descriptor, whose
+zero fields give one texel each way. Only the output is instrumented. No game data is needed.
 """
 from pathlib import Path
 import argparse
@@ -21,9 +22,10 @@ from build import find_dxc
 from frosty_gpu_guest import run_gpu_guest
 
 # Width, height, mip levels of the texture and the view's first mip. The widths
-# cover both halves of the field (two bits in word 1, the rest in word 2).
+# cover both halves of the field (two bits in word 1, the rest in word 2). A
+# width of zero binds a null view.
 CASES = [(256, 128, 1, 0), (640, 360, 4, 0), (640, 360, 4, 2), (4096, 2048, 6, 3), (1, 1, 1, 0),
-         (16384, 8, 1, 0), (8, 16384, 1, 0), (1023, 513, 3, 1), (6, 7, 1, 0)]
+         (16384, 8, 1, 0), (8, 16384, 1, 0), (1023, 513, 3, 1), (6, 7, 1, 0), (0, 0, 1, 0)]
 WORDS = 384
 FIRST_WORD = 96  # the output view starts 384 bytes into the buffer
 
@@ -69,9 +71,11 @@ guest = replace(guest, "    D3D12_COMMAND_QUEUE_DESC qd{};", """    UINT texture
     texture_desc.Format = DXGI_FORMAT_R8_UNORM;
     texture_desc.SampleDesc = {1, 0};
     ComPtr<ID3D12Resource> texture;
-    check(device->CreateCommittedResource(&texture_heap, D3D12_HEAP_FLAG_NONE, &texture_desc,
-                                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
-                                          IID_PPV_ARGS(&texture)), "create sized texture");
+    if (texture_width) {
+        check(device->CreateCommittedResource(&texture_heap, D3D12_HEAP_FLAG_NONE, &texture_desc,
+                                              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+                                              IID_PPV_ARGS(&texture)), "create sized texture");
+    }
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
     srv.Format = DXGI_FORMAT_R8_UNORM;
     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;

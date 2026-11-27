@@ -194,8 +194,11 @@ impl<'a> Emitter<'a> {
         let names: Vec<String> = outputs.split(", ").map(|name| if name == "0u" { name.to_string() } else { format!("{name}{t}") }).collect();
         let declared: Vec<&str> = names.iter().map(String::as_str).filter(|name| *name != "0u").collect();
         self.line(&format!("uint {}; {texture}.GetDimensions({});", declared.join(", "), names.join(", ")));
-        self.ws(&Opnd::Sgpr(first + 1), &format!("((w{t} - 1u) & 3u) << 30"))?;
-        self.ws(&Opnd::Sgpr(first + 2), &format!("((w{t} - 1u) >> 2) | ((h{t} - 1u) << 14)"))?;
+        // A null view reports no texels. The console's empty descriptor holds zero
+        // in these fields, which reads as one texel each way.
+        let [width, height] = ["w", "h"].map(|name| format!("(max({name}{t}, 1u) - 1u)"));
+        self.ws(&Opnd::Sgpr(first + 1), &format!("({width} & 3u) << 30"))?;
+        self.ws(&Opnd::Sgpr(first + 2), &format!("({width} >> 2) | ({height} << 14)"))?;
         self.ws(&Opnd::Sgpr(first + 3), "0u")
     }
 }
