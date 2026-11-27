@@ -5,9 +5,37 @@
 use super::*;
 use std::sync::atomic::AtomicU64;
 
+/// The switch is a size gate, in MiB. Unset or `0` keeps every upload on the
+/// original path; `1` sends every non-empty upload through the copy queue (the
+/// behaviour of the first version); `N` above one only sends uploads of at least
+/// `N` MiB, so small handoffs keep their original position and the queue is only
+/// used where there is enough work to hide.
+fn threshold() -> Option<u64> {
+    static THRESHOLD: OnceLock<Option<u64>> = OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        let asked = std::env::var("VICTORY_UPLOAD_QUEUE").ok()?;
+        match asked.trim().parse::<u64>().ok()? {
+            0 => None,
+            1 => Some(0),
+            mebibytes => Some(mebibytes << 20),
+        }
+    })
+}
+
 pub(super) fn on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_UPLOAD_QUEUE").is_some_and(|v| v == "1"))
+    threshold().is_some()
+}
+
+/// Whether an upload of `total` bytes belongs on the copy queue at this gate.
+pub(super) fn wants(total: u64) -> bool {
+    gate(threshold(), total)
+}
+
+fn gate(threshold: Option<u64>, total: u64) -> bool {
+    match threshold {
+        Some(threshold) => total != 0 && total <= 512 << 20 && total >= threshold,
+        None => false,
+    }
 }
 
 pub(super) struct Slot {
@@ -151,18 +179,41 @@ pub(super) fn fallback() {
 }
 
 pub(super) fn line(frames: f64) {
-    if on() {
+    if let Some(threshold) = threshold() {
         let [sent, bytes, fallback] = [0, 1, 2].map(|i| STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
-        tracing::info!(
-            "VICTORY_UPLOAD_QUEUE: {sent:.1} uploads/frame, {:.1} MB/frame, {fallback:.1} fallbacks/frame",
-            bytes / 1048576.0
-        );
+        if threshold == 0 {
+            tracing::info!(
+                "VICTORY_UPLOAD_QUEUE: {sent:.1} uploads/frame, {:.1} MB/frame, {fallback:.1} fallbacks/frame",
+                bytes / 1048576.0
+            );
+        } else {
+            tracing::info!(
+                "VICTORY_UPLOAD_QUEUE at {} MiB: {sent:.1} uploads/frame, {:.1} MB/frame, {fallback:.1} fallbacks/frame",
+                threshold >> 20,
+                bytes / 1048576.0
+            );
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_gate_sends_only_what_clears_it() {
+        // Unset and 0 keep every upload on the original path.
+        assert!(!gate(None, 4096));
+        // 1 means every non-empty upload, which is what the first version did.
+        assert!(!gate(Some(0), 0));
+        assert!(gate(Some(0), 1));
+        assert!(gate(Some(0), 4096));
+        // A size gate sends only the large handoffs, and still refuses absurd ones.
+        assert!(!gate(Some(4 << 20), 4096));
+        assert!(gate(Some(4 << 20), 4 << 20));
+        assert!(gate(Some(4 << 20), 8 << 20));
+        assert!(!gate(Some(4 << 20), (512 << 20) + 1));
+    }
 
     #[test]
     fn uploads_preserve_bytes_and_reuse_only_after_drawing() {
