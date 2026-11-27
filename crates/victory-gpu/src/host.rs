@@ -598,6 +598,50 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn reaping_a_removed_device_keeps_the_pending_submission() {
+        let Some(host) = host() else {
+            eprintln!("skipped: no host D3D12 device");
+            return;
+        };
+        let submitted = host.submitted.lock().unwrap();
+        assert!(host.drain_in_flight_locked().is_ok());
+        assert!(!host.has_in_flight());
+        let finished = FINISHED_FENCE.load(Ordering::Acquire);
+        let target = (*submitted).max(finished) + 1;
+        let written = std::cell::Cell::new(0u64);
+        let list = std::sync::Arc::new(host.new_list().unwrap());
+        list.defer_write(written.as_ptr().cast(), crate::queue::Written::Value(23), 8);
+        list.close();
+        let held_list = std::sync::Arc::downgrade(&list);
+        host.in_flight.lock().unwrap().push_back(InFlight {
+            fence: target,
+            submission: 0,
+            _early_copies: Vec::new(),
+            _plans: Vec::new(),
+            finish: Some(Finish { lists: vec![list], back: Vec::new() }),
+        });
+
+        let result = host.reap_completed(u64::MAX);
+        let still_held = held_list.strong_count();
+        // Remove the synthetic submission while its deferred write is still valid.
+        let pending = {
+            let mut in_flight = host.in_flight.lock().unwrap();
+            if in_flight.back().is_some_and(|entry| entry.fence == target) {
+                in_flight.pop_back()
+            } else {
+                None
+            }
+        };
+        let finished_after = FINISHED_FENCE.load(Ordering::Acquire);
+        drop(submitted);
+        assert!(matches!(result, Err(DeviceRemoved)));
+        assert_eq!(pending.as_ref().map(|entry| entry.fence), Some(target));
+        assert_eq!(still_held, 1);
+        assert_eq!(written.get(), 0);
+        assert_eq!(finished_after, finished);
+    }
+
     /// A list with no work before its waits, as the title's queues meet one
     /// another halfway: each write goes as soon as the waits before it are
     /// met, and work holds the later ones back.
@@ -1144,9 +1188,8 @@ impl Host {
     /// Finishes the unwaited submissions that have run, oldest first, and
     /// buries objects retired before them. The caller holds `submitted`:
     /// finishing puts back what shaders wrote, as a submission does.
-    fn reap_completed(&self) -> Result<(), DeviceRemoved> {
-        // SAFETY: a plain fence query.
-        let completed = completed_fence_value(unsafe { self.fence.GetCompletedValue() })?;
+    fn reap_completed(&self, value: u64) -> Result<(), DeviceRemoved> {
+        let completed = completed_fence_value(value)?;
         let mut last_sub = 0u64;
         loop {
             let done = {
@@ -1219,7 +1262,8 @@ impl Host {
                 }
             }
         }
-        if self.reap_completed().is_err() {
+        // SAFETY: a plain fence query.
+        if self.reap_completed(unsafe { self.fence.GetCompletedValue() }).is_err() {
             drop(submitted);
             self.fail_in_flight();
         }
@@ -1263,7 +1307,8 @@ impl Host {
                 SUBMISSION_US[1].fetch_add(waited.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
         }
-        self.reap_completed()
+        // SAFETY: a plain fence query.
+        self.reap_completed(unsafe { self.fence.GetCompletedValue() })
     }
 
     /// Runs closed lists; waits synchronously when CPU copy-back, readbacks, or
