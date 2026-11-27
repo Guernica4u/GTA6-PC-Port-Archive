@@ -6,9 +6,9 @@ Each file in `data/` is gzipped JSON Lines: one API object per line, unchanged.
 
 | File | Contents | Items |
 |---|---|---|
-| `issues_and_prs.jsonl.gz` | every issue and PR (title, body, labels, state, author) | 1,196 |
-| `pulls.jsonl.gz` | PR details (head and base branch, merge state) | 2,452 |
-| `issue_comments.jsonl.gz` | conversation comments on issues and PRs | 16,694 |
+| `issues_and_prs.jsonl.gz` | every issue and PR (title, body, labels, state, author) | 1,198 |
+| `pulls.jsonl.gz` | PR details (head and base branch, merge state) | 2,462 |
+| `issue_comments.jsonl.gz` | conversation comments on issues and PRs | 16,751 |
 | `review_comments.jsonl.gz` | inline code-review comments | 97 |
 | `labels.jsonl.gz` | labels | 15 |
 
