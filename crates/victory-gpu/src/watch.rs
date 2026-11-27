@@ -772,15 +772,45 @@ pub(crate) fn write_beside(at: usize, bytes: &[u8]) -> bool {
 }
 
 /// [`write_beside`] through `writer`, which calls its argument with the
-/// address to write `bytes` at, or returns false.
+/// address to write `bytes` at, or returns false. While the write is under
+/// way its pages, and those showing them elsewhere, are busy as in a
+/// [`writing`]: a tracker taking them meanwhile leaves them changed and
+/// keeps the bytes it saved before the write.
 fn write_through(at: usize, bytes: &[u8], writer: impl FnOnce(&mut dyn FnMut(*mut u8)) -> bool) -> bool {
-    let (first, last) = (at / PAGE, (at + bytes.len()).div_ceil(PAGE));
-    writer(&mut |to| {
-        mark_with_aliases(&mut guards(), first, last, true);
+    write_through_with(at, bytes.len(), writer, |to| {
         // SAFETY: the writer's address of `bytes.len()` committed, writable
         // bytes, whose mapping holds until it returns.
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), to, bytes.len()) };
-        mark_with_aliases(&mut guards(), first, last, false);
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), to, bytes.len()) }
+    })
+}
+
+/// [`write_through`] with the copy itself given (tests pause in it).
+fn write_through_with(
+    at: usize,
+    len: usize,
+    writer: impl FnOnce(&mut dyn FnMut(*mut u8)) -> bool,
+    copy: impl FnOnce(*mut u8),
+) -> bool {
+    let (first, last) = (at / PAGE, (at + len).div_ceil(PAGE));
+    let mut copy = Some(copy);
+    writer(&mut |to| {
+        let busy: Vec<(usize, usize)> = {
+            let mut g = guards();
+            let others = mark_with_aliases(&mut g, first, last, true);
+            let busy: Vec<_> = std::iter::once((first, last)).chain(others.into_iter().map(|p| (p, p + 1))).collect();
+            g.busy.extend(&busy);
+            busy
+        };
+        if let Some(copy) = copy.take() {
+            copy(to);
+        }
+        let mut g = guards();
+        for r in busy {
+            if let Some(i) = g.busy.iter().position(|&b| b == r) {
+                g.busy.swap_remove(i);
+            }
+        }
+        mark_with_aliases(&mut g, first, last, false);
     })
 }
 
@@ -1425,6 +1455,49 @@ pub(crate) mod tests {
         assert!(t.changed(a / PAGE) && u.changed(b / PAGE));
         let saved = t.saved(a / PAGE).expect("armed: saved before the write");
         assert_eq!(saved[32..48], [0; 16]);
+    }
+
+    /// A tracker taking pages halfway through a write beside the guards
+    /// (both the written mapping and its alias) leaves them changed, keeps
+    /// the bytes it saved before the write and does not guard them again.
+    #[test]
+    fn a_take_during_a_write_beside_leaves_the_pages_changed() {
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile};
+        // SAFETY: a pagefile section of one block mapped three times (two
+        // title mappings and the writer's); the test keeps the views.
+        let [a, b, w] = unsafe {
+            let section =
+                CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, PAGE as u32, std::ptr::null());
+            assert!(!section.is_null());
+            [0; 3].map(|_| MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE).Value as usize)
+        };
+        assert!(a != 0 && b != 0 && w != 0);
+        title_memory_aliased(b, &[a]);
+        let t = track(a, PAGE, true).expect("views are tracked");
+        let u = track(b, PAGE, true).expect("views are tracked");
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        assert_eq!(u.take(b, b + PAGE), [(b, b + PAGE)]);
+        t.arm(a, a + PAGE);
+        u.arm(b, b + PAGE);
+        assert!(write_through_with(
+            a + 32,
+            16,
+            |write| {
+                write((w + 32) as *mut u8);
+                true
+            },
+            |to| {
+                // Half written: eight new bytes, then both trackers take.
+                // SAFETY: the writer's view, unguarded and writable.
+                unsafe { std::ptr::write_bytes(to, 5, 8) };
+                let _ = t.take_split(a, a + PAGE);
+                let _ = u.take_split(b, b + PAGE);
+                assert!(t.changed(a / PAGE) && u.changed(b / PAGE), "busy pages stay changed");
+            },
+        ));
+        assert!(t.changed(a / PAGE) && u.changed(b / PAGE));
+        assert_eq!(t.saved(a / PAGE).expect("saved before the write")[32..48], [0; 16]);
+        assert_eq!(u.saved(b / PAGE).expect("saved before the write")[32..48], [0; 16]);
     }
 
     /// A tracker of one mapping going away leaves the guard its page shares
