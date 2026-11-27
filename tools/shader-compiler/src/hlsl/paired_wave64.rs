@@ -46,9 +46,6 @@ fn paired_once(ex: &ShaderExtract) -> Result<Translated, String> {
     em.paired = true;
     em.required_wave_size = Some(32);
     em.vreg_array = false;
-    if em.insns.iter().any(|i| i.mnemonic.starts_with("v_movrel")) {
-        return Err("paired wave64: relative vector registers".into());
-    }
     if !em.resolve_packed(None)? {
         em.resolve_resources()?;
     }
@@ -131,10 +128,15 @@ pub(super) fn prologue(em: &Emitter<'_>, header: &mut String, group_register: us
     let _ = writeln!(header, "void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
     let _ = writeln!(header, "    uint exec_lo = 0xffffffffu, exec_hi = {upper}, vcc_lo = 0u, vcc_hi = 0u, scc = 0u, m0 = 0u, nul = 0u;");
     em.heap_sampler_locals(header);
+    // A register-relative move picks its register at run time, so such a program
+    // keeps every vector register in one table.
+    let table = em.insns.iter().any(relative_move);
     let mut names = Vec::new();
     for register in &em.regs {
         if is_vector_register(register) {
-            names.push(format!("{register}__[2] = {{0u, 0u}}"));
+            if !table {
+                names.push(format!("{register}__[2] = {{0u, 0u}}"));
+            }
         } else if register == "tb_fp_mode" {
             names.push(format!("{register} = 0xc0u"));
         } else {
@@ -142,6 +144,12 @@ pub(super) fn prologue(em: &Emitter<'_>, header: &mut String, group_register: us
         }
     }
     let _ = writeln!(header, "    uint {};", names.join(", "));
+    if table {
+        let _ = writeln!(header, "    uint tb_v[256][2] = (uint[256][2])0;");
+        for n in 0..256 {
+            let _ = writeln!(header, "#define v{n}__ tb_v[{n}]");
+        }
+    }
     // Full subgroups follow the thread index, so each run of 32 threads is one wave.
     let _ = writeln!(header, "    uint tb_pair = WaveGetLaneIndex(), tb_first = (gtid.x / 32u) * 64u;");
     for lane in 0..2 {
@@ -170,6 +178,31 @@ fn lane_registers(code: &str) -> String {
         out.push('\n');
     }
     out
+}
+
+fn relative_move(ins: &Insn) -> bool {
+    matches!(ins.mnemonic.as_str(), "v_movrels_b32" | "v_movreld_b32" | "v_movrelsd_b32")
+}
+
+/// A move whose source, destination or both are the named register plus M0.
+fn move_relative(em: &mut Emitter<'_>, ins: &Insn) -> Result<(), String> {
+    let (Some(Opnd::Vgpr(to)), Some(Opnd::Vgpr(from))) = (ins.dst.first(), ins.src.first()) else {
+        return Err("paired wave64: register-relative move with a non-VGPR operand".into());
+    };
+    let register = |n: u8, relative: bool| if relative { format!("tb_v[({n}u + m0) & 255u]") } else { format!("v{n}__") };
+    let source = register(*from, ins.mnemonic != "v_movreld_b32");
+    let destination = register(*to, ins.mnemonic != "v_movrels_b32");
+    em.line("{");
+    // Both lanes are read before either is written.
+    for lane in 0..2u32 {
+        em.line(&format!("uint tbr_{lane} = {source}[{lane}];"));
+    }
+    for lane in 0..2u32 {
+        let active = lane_bit("exec_lo", "exec_hi", lane);
+        em.line(&format!("if ({active} != 0u) {destination}[{lane}] = tbr_{lane};"));
+    }
+    em.line("}");
+    Ok(())
 }
 
 fn is_vector_register(name: &str) -> bool {
@@ -468,6 +501,9 @@ pub(super) fn emit(em: &mut Emitter<'_>, idx: usize, ins: &Insn, is_ps: bool, br
     }
     if m == "ds_swizzle_b32" {
         return ds_swizzle(em, ins);
+    }
+    if relative_move(ins) {
+        return move_relative(em, ins);
     }
     // A DPP8 first source reads a neighbour within the lane's group of eight.
     let (mut moved, mut gated) = (None, false);

@@ -141,3 +141,19 @@ fn a_row_permute_treats_an_inactive_source_as_its_modifiers_say() {
     assert!(hlsl(3).unwrap().contains("if (((exec_lo >> tb_pair) & 1u) != 0u) v4__[0] = tbp_0;"));
     assert_eq!(hlsl(4).unwrap_err(), "paired wave64: permlane modifiers [v_permlanex16_b32 @ 0x14]");
 }
+
+/// s_mov_b32 m0, s20; v_movrels_b32 v10, v20; v_movreld_b32 v24, v0; v_movrelsd_b32 v30, v20.
+#[test]
+fn register_relative_moves_index_one_table_of_lane_pairs() {
+    let hlsl = translate_paired_wave64(&program(64, &[0xbefc0314, 0x7e148714, 0x7e308500, 0x7e3c8914, 0xbf810000])).unwrap().hlsl;
+    assert!(hlsl.contains("uint tb_v[256][2] = (uint[256][2])0;") && hlsl.contains("#define v10__ tb_v[10]"), "{hlsl}");
+    // Source plus M0, destination plus M0, and both.
+    assert!(hlsl.contains("uint tbr_1 = tb_v[(20u + m0) & 255u][1];"), "{hlsl}");
+    assert!(hlsl.contains("if (((exec_lo >> tb_pair) & 1u) != 0u) v10__[0] = tbr_0;"), "{hlsl}");
+    assert!(hlsl.contains("uint tbr_0 = v0__[0];"), "{hlsl}");
+    assert!(hlsl.contains("if (((exec_hi >> tb_pair) & 1u) != 0u) tb_v[(24u + m0) & 255u][1] = tbr_1;"), "{hlsl}");
+    assert!(hlsl.contains("tb_v[(30u + m0) & 255u][0] = tbr_0;"), "{hlsl}");
+    // A program without such a move keeps separate registers.
+    let plain = translate_paired_wave64(&program(64, &[0x7e140300, 0xbf810000])).unwrap().hlsl;
+    assert!(!plain.contains("tb_v"), "{plain}");
+}

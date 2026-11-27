@@ -103,6 +103,16 @@ PROGRAMS = {
     'permlane_inactive': ['v_mov_b32_e32 v10, 11', 'v_mov_b32_e32 v11, 22', 's_mov_b32 s30, 0x76543210',
                           's_mov_b32 s31, 0xfedcba98', 'v_permlanex16_b32 v10, v0, s30, s31 op_sel:[0,1]',
                           'v_permlane16_b32 v11, v0, s31, s30 op_sel:[1,1]'],
+    # A small array kept in registers v20 to v27: each lane reads and writes the element
+    # its index names, one index value at a time through M0.
+    'relative': ['v_and_b32_e32 v4, 3, v0', 'v_mov_b32_e32 v20, v1', 'v_add_nc_u32_e32 v21, 0x64, v1',
+                 'v_lshlrev_b32_e32 v22, 8, v1', 'v_xor_b32_e32 v23, v0, v1', 's_mov_b64 s[10:11], exec',
+                 ('label', 'again'), 'v_readfirstlane_b32 s20, v4', 'v_cmp_eq_u32_e32 vcc, s20, v4',
+                 's_and_saveexec_b64 s[12:13], vcc', 's_mov_b32 m0, s20', 'v_movrels_b32 v10, v20',
+                 'v_movreld_b32 v24, v0', 's_andn2_b64 exec, s[12:13], exec', ('branch', 's_cbranch_execnz', 'again'),
+                 's_mov_b64 exec, s[10:11]', 's_mov_b32 m0, 1', 'v_movrelsd_b32 v5, v24',
+                 'v_xor_b32_e32 v11, v24, v25', 'v_add_nc_u32_e32 v5, v26, v27', 'v_add_nc_u32_e32 v11, v11, v5',
+                 'v_add_nc_u32_e32 v11, v11, v6', 's_mov_b32 s21, m0'],
     # A texture taken at a run-time heap index: the descriptor is copied to vector
     # registers and a waterfall reads it back to load from it. The check stands a
     # function of the heap index and the coordinate in for the heap (see `instrument`).
@@ -172,7 +182,7 @@ class Wave:
     def __init__(self, inputs, group, started=64):
         self.s = [0] * 128
         # Lanes past the group's threads hold registers but never start.
-        self.vcc, self.exec, self.scc = 0, (1 << started) - 1, 0
+        self.vcc, self.exec, self.scc, self.m0 = 0, (1 << started) - 1, 0, 0
         self.lds = {}
         self.v = [[0] * 64 for _ in range(64)]
         self.v[0], self.v[1], self.v[2] = list(inputs), list(range(64)), [group] * 64
@@ -180,6 +190,7 @@ class Wave:
     def scalar(self, token, wide=False):
         if token == 'exec': return self.exec
         if token == 'vcc': return self.vcc
+        if token == 'm0': return self.m0
         if token == 'exec_lo': return self.exec & M32
         if token == 'exec_hi': return self.exec >> 32
         if m := re.fullmatch(r's\[(\d+):(\d+)\]', token): return self.s[int(m[1])] | self.s[int(m[2])] << 32
@@ -193,6 +204,7 @@ class Wave:
         elif token == 'exec_lo': self.exec = self.exec & ~M32 | value & M32
         elif token == 'exec_hi': self.exec = self.exec & M32 | (value & M32) << 32
         elif token == 'vcc': self.vcc = value & M64
+        elif token == 'm0': self.m0 = value & M32
         elif m := re.fullmatch(r's\[(\d+):(\d+)\]', token):
             self.s[int(m[1])], self.s[int(m[2])] = value & M32, (value >> 32) & M32
         else: self.s[int(token[1:])] = value & M32
@@ -288,6 +300,14 @@ def step(w, text):
         test = {'lt': lambda x, y: x < y, 'eq': lambda x, y: x == y, 'ne': lambda x, y: x != y}[base.split('_')[2]]
         mask = sum(1 << l for l in range(64) if w.active(l) and test(w.value(a, l), w.value(b, l)))
         w.store(dst, mask); return
+    if base in ('v_movrels_b32', 'v_movreld_b32', 'v_movrelsd_b32'):
+        to, source = int(ops[0][1:]), int(ops[1][1:])
+        if base != 'v_movrels_b32': to = (to + w.m0) & 255
+        if base != 'v_movreld_b32': source = (source + w.m0) & 255
+        old = list(w.v[source])
+        for l in range(64):
+            if w.active(l): w.v[to][l] = old[l]
+        return
     if base in ('v_permlane16_b32', 'v_permlanex16_b32'):
         modifiers = re.search(r' op_sel:\[(\d),(\d)\]', ops[3])
         fetch_inactive, zero_inactive = (int(n) for n in modifiers.groups()) if modifiers else (0, 0)
