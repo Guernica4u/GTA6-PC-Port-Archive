@@ -90,8 +90,17 @@ fn to_console(file: &[u8]) -> Option<Vec<i16>> {
     let u16_at = |k: usize| fmt.get(k..k + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
     let (tag, channels, bits) = (u16_at(0)?, usize::from(u16_at(2)?), u16_at(14)?);
     let rate = u32::from_le_bytes(fmt.get(4..8)?.try_into().ok()?);
-    // PCM, or WAVE_FORMAT_EXTENSIBLE around it.
-    if !matches!(tag, 1 | 0xFFFE) || bits != 16 || channels == 0 || rate == 0 {
+    // PCM, or WAVE_FORMAT_EXTENSIBLE whose SubFormat is PCM
+    // (KSDATAFORMAT_SUBTYPE_PCM, 00000001-0000-0010-8000-00aa00389b71).
+    const PCM: [u8; 16] = [
+        1, 0, 0, 0, 0, 0, 0x10, 0, 0x80, 0, 0, 0xaa, 0, 0x38, 0x9b, 0x71,
+    ];
+    let pcm = match tag {
+        1 => true,
+        0xFFFE => fmt.get(24..40) == Some(&PCM[..]),
+        _ => false,
+    };
+    if !pcm || bits != 16 || channels == 0 || rate == 0 {
         return None;
     }
     let mono: Vec<f32> = data?
@@ -446,13 +455,51 @@ mod tests {
     }
 
     #[test]
+    fn extensible_wave_files_count_only_with_a_pcm_sub_format() {
+        // WAVE_FORMAT_EXTENSIBLE, 16,000 Hz mono 16-bit, 160 samples of 500.
+        let extensible = |sub_format: [u8; 16]| {
+            let mut file = b"RIFF\0\0\0\0WAVEfmt ".to_vec();
+            file.extend_from_slice(&40u32.to_le_bytes());
+            for v in [0xFFFEu16, 1] {
+                file.extend_from_slice(&v.to_le_bytes());
+            }
+            for v in [16_000u32, 16_000 * 2] {
+                file.extend_from_slice(&v.to_le_bytes());
+            }
+            for v in [2u16, 16, 22, 16] {
+                file.extend_from_slice(&v.to_le_bytes());
+            }
+            file.extend_from_slice(&4u32.to_le_bytes()); // channel mask
+            file.extend_from_slice(&sub_format);
+            file.extend_from_slice(b"data");
+            file.extend_from_slice(&320u32.to_le_bytes());
+            for _ in 0..160 {
+                file.extend_from_slice(&500i16.to_le_bytes());
+            }
+            file
+        };
+        let pcm = [
+            1, 0, 0, 0, 0, 0, 0x10, 0, 0x80, 0, 0, 0xaa, 0, 0x38, 0x9b, 0x71,
+        ];
+        let out = to_console(&extensible(pcm)).unwrap();
+        assert_eq!(out.len(), 160);
+        assert!(out.iter().all(|&s| s == 500));
+        // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: not PCM.
+        let mut float = pcm;
+        float[0] = 3;
+        assert_eq!(to_console(&extensible(float)), None);
+    }
+
+    #[test]
     fn ssml_text_without_markup() {
         let words = plain("<speak>Press <emphasis>A</emphasis></speak>");
         assert_eq!(words.split_whitespace().collect::<Vec<_>>(), ["Press", "A"]);
     }
 
-    /// Lines spoken on several title threads at once: each `speak` makes,
-    /// uses and drops a synthesizer on a thread of its own.
+    /// Lines spoken on several title threads at once all come back: they
+    /// queue for the one speech thread, which owns the only synthesizer
+    /// (one synthesizer per caller, made and dropped concurrently, crashed
+    /// the process).
     #[test]
     fn lines_spoken_on_many_threads_at_once_all_come_back() {
         let threads: Vec<_> = (0..8)
