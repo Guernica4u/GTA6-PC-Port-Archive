@@ -1550,7 +1550,10 @@ fn conversion_probes() -> Vec<Probe> {
             }
         }
     }
-    signed.extend([0x7FFF_FFBF, 0x7FFF_FFC0, 0x8000_0040, 0x8000_0041]);
+    let midpoint = 0x7FFF_FFC0u32;
+    for x in [midpoint - 1, midpoint, midpoint + 1] {
+        signed.extend([x, x.wrapping_neg()]);
+    }
     let mut p = vec![
         probe([vop1(0x08, 5, v(1))], xs.clone(), INT, |i| {
             vec![to_i32(i[0])]
