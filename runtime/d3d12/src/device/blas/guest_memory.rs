@@ -151,6 +151,15 @@ pub(super) fn target(
             }
         };
         extents.insert(address, extent);
+        // Publish the storage now rather than at submission. A scene can be
+        // submitted before the list that builds one of its structures, when
+        // that list waits for a title fence; its instances must still reach
+        // this storage, never the guest address.
+        let native = unsafe { resource.GetGPUVirtualAddress() };
+        let mut mappings = lock(&pool.mappings);
+        if mappings.addresses.insert(address, native) != Some(native) {
+            mappings.dirty();
+        }
         resource
     };
     if !evicted.is_empty() {
