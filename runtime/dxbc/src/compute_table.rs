@@ -353,8 +353,9 @@ const UNCOVERED_SPACE: u32 = 32_700;
 
 /// FSSM descriptor slots missing from an embedded root. Each returned binding
 /// is one range to append: the slot is uncovered and the register is free.
-pub fn missing_root_descriptors(bytes: &[u8], root: &crate::rootsig::RootSig) -> Vec<Binding> {
-    let Some((program, resources)) = stage_program(bytes, 5) else {
+/// `stage` is the DXIL program kind: 0 pixel, 1 vertex, 5 compute.
+pub fn missing_root_descriptors(bytes: &[u8], root: &crate::rootsig::RootSig, stage: u32) -> Vec<Binding> {
+    let Some((program, resources)) = stage_program(bytes, stage) else {
         return Vec::new();
     };
     let Some(users) = user_data_records(&program) else {
@@ -368,11 +369,11 @@ pub fn missing_root_descriptors(bytes: &[u8], root: &crate::rootsig::RootSig) ->
         let Ok(sgpr) = u8::try_from(location & 0xff) else { continue };
         let Some(byte_offset) = offset.checked_mul(4) else { continue };
         let Some((kind, register, space)) =
-            uncovered_descriptor(&program, &resources, 5, sgpr, byte_offset, root)
+            uncovered_descriptor(&program, &resources, stage, sgpr, byte_offset, root)
         else {
             continue;
         };
-        let Some(table) = table_parameter(5, sgpr) else { continue };
+        let Some(table) = table_parameter(stage, sgpr) else { continue };
         let binding = Binding { table, kind, register, space, slot: offset / 8 };
         if found.iter().any(|seen: &Binding| {
             (seen.table, seen.slot) == (binding.table, binding.slot)
