@@ -276,6 +276,12 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
             i.enc = Encoding::Vop1;
             i.op -= 0x180;
         }
+        if (direct && !graphics && i.enc == Encoding::Vop3 && (i.op == 0x377 || i.op == 0x378)) {
+            // The shared extent decoder already counts the trailing literal word.
+            // S1 and S2 may both reference that word.
+            if (i.src[0] == 255)
+                refuse(pc, "permlane S0 cannot be a literal");
+        }
         lit = std::find(i.src.begin(), i.src.end(), 255) != i.src.end();
     } else
         refuse(pc, "unsupported instruction " + string(encoded.name) + " " + hexword(a));
@@ -1093,8 +1099,8 @@ struct Emit {
             }
     }
     void require_numeric(const Inst &i, unsigned reg, unsigned limit = 106) const {
-        if (reg < limit && !program.before[program.at.at(i.pc)][reg].numeric())
-            refuse(i.pc, "unbound numeric SGPR s" + to_string(reg));
+        if ((reg < limit || reg == 124) && !program.before[program.at.at(i.pc)][reg].numeric())
+            refuse(i.pc, reg == 124 ? "unbound numeric M0" : "unbound numeric SGPR s" + to_string(reg));
     }
     void scalar(const Inst &i) {
         auto n = i.name;
@@ -1619,6 +1625,7 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
     State initial{};
     for (unsigned k = 0; k <= 105; ++k)
         initial[k].type = Symbol::Type::unbound;
+    initial[124].type = Symbol::Type::unbound; // RDNA2 M0 is a separate 32-bit register.
     std::vector<ComputeConstants> constants;
     if (stage) {
         std::array<bool,32> assigned{};

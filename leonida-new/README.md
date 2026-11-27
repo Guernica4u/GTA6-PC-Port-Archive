@@ -283,6 +283,13 @@ These commands use the package in `game_path.txt`, the port's `overlay` for writ
 When the Vulkan backend is selected with `LEONIDA_D3D12=vulkan`, the packaged runtime finds the translated shaders
 in `<work>/shaders/spirv` using `shader_path.txt` beside `gta6rt.exe`. Set `LEONIDA_SHADERS` to use another directory.
 
+### Starting the game: the launcher
+
+Double-click **`Launcher.bat`** (Linux: `python3 tools/leonida_launcher.py`) for the Leonida Launcher: a window with a
+PLAY button, the game and data folders, the runtime's options (DLSS, ray tracing, Smooth Motion, and so on), the mod
+list and a few tools. PLAY runs `scripts\play-d3d12.ps1` for you. It needs only Python and Tkinter, and is described in
+[docs/launcher.md](docs/launcher.md).
+
 ## How it works
 
 | Piece | What it does | Where |
@@ -335,6 +342,12 @@ pull requests.
 - [LLVM](https://llvm.org/): AMDGPU disassembler.
 - Logo: ["Grand Theft Auto VI" icon by SlyDevil](https://www.steamgriddb.com/icon/122618) on SteamGridDB.
 - [SPIRV-Tools](https://github.com/KhronosGroup/SPIRV-Tools): assembly and validation.
+- Aki-Developer: `aki-gta6/aki-runtime` (GPL-3.0), a sister port shared with the project. Taken from it into the Rust
+  D3D12 runtime: the count of dropped draws by reason in the frame line, descriptor slots given back as soon as the
+  card has run a submission, pixel colours held to the console's HDR range, the composer's clamp that keeps a NaN from
+  coming out black, two planes composed into 10 bits under frame generation, the paired form of wave64 programs tried
+  before the approximate ones (`LEONIDA_PAIRED_LANES=exact`), a pipeline's kept skip answer, and four small fixes it
+  carried from fxceless/victory-fork. Each commit names the `aki-runtime` commit it is from.
 
 Grand Theft Auto and all related names are trademarks of their owners. This project is not affiliated with or
 endorsed by them.

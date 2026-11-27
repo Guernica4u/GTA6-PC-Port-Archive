@@ -21,6 +21,7 @@ from tempfile import TemporaryDirectory
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 from check_packed_integer_gpu import assemble, digest, instrument, translate, INIT, STRIDE, GROUPS  # noqa: E402
+from check_half_exact_gpu import EDGE_F16, encode_half, f32_value, half_value  # noqa: E402
 from frosty_gpu_guest import run_gpu_guest  # noqa: E402
 
 M = 0xffffffff
@@ -137,6 +138,7 @@ OPERATIONS = {
     "v_bcnt_u32_b32": (2, lambda a, b, c: (bin(a).count("1") + b) & M),
     "v_bfm_b32": (2, lambda a, b, c: (((1 << (a & 31)) - 1) << (b & 31)) & M),
     "v_perm_b32": (3, lambda a, b, c: byte_permute(a, b, c)),
+    "v_pack_b32_f16": (2, lambda a, b, c: (a & 0xffff) | (b & 0xffff) << 16),
     **{f"v_cvt_f32_ubyte{n}": (1, lambda a, b, c, n=n: float_bits((a >> (8 * n)) & 0xff)) for n in range(4)},
 }
 
@@ -206,11 +208,16 @@ SCALAR = {
     "s_sext_i32_i8": (1, lambda a: (((a & 0xff) - (0x100 if a & 0x80 else 0)) & M, None)),
     "s_sext_i32_i16": (1, lambda a: (((a & 0xffff) - (0x10000 if a & 0x8000 else 0)) & M, None)),
     "s_abs_i32": (1, lambda a: nonzero(abs(s32(a)) & M)),
+    "s_wqm_b32": (1, lambda a: nonzero(quads(a))),
     # SCC is 1 before each instruction, so these two carry or borrow one in.
     "s_addc_u32": (2, lambda a, b: ((a + b + 1) & M, int(a + b + 1 > M))),
     "s_subb_u32": (2, lambda a, b: ((a - b - 1) & M, int(b + 1 > a))),
 }
 M64 = (1 << 64) - 1
+
+
+def halves64(value):
+    return value & M, value >> 32 & M
 
 
 def s64(value):
@@ -238,6 +245,81 @@ PAIRS = {
     "s_cselect_b64": lambda x, y, scc: (x if scc else y, None),
     "s_cmp_eq_u64": lambda x, y, scc: int(x == y),
     "s_cmp_lg_u64": lambda x, y, scc: int(x != y),
+}
+# Group memory, in one thread: v20 is an address from the first input, and the
+# second and third inputs are data. `{0}` and `{1}` are the result registers.
+# name: (instructions, model of the results)
+WRITE, READ = "ds_write_b32 v20, v5", "ds_read_b32 {0}, v20"
+GROUP_MEMORY = {
+    "ds_or_b32": ([WRITE, "ds_or_b32 v20, v6", READ], lambda b, c: [b | c]),
+    "ds_and_b32": ([WRITE, "ds_and_b32 v20, v6", READ], lambda b, c: [b & c]),
+    "ds_xor_b32": ([WRITE, "ds_xor_b32 v20, v6", READ], lambda b, c: [b ^ c]),
+    "ds_add_u32": ([WRITE, "ds_add_u32 v20, v6", READ], lambda b, c: [(b + c) & M]),
+    "ds_min_u32": ([WRITE, "ds_min_u32 v20, v6", READ], lambda b, c: [min(b, c)]),
+    "ds_max_u32": ([WRITE, "ds_max_u32 v20, v6", READ], lambda b, c: [max(b, c)]),
+    # The returning form also gives the word as it was.
+    "ds_add_rtn_u32": ([WRITE, "ds_add_rtn_u32 {1}, v20, v6", READ], lambda b, c: [(b + c) & M, b]),
+    "ds_write2_b32": (["ds_write2_b32 v20, v5, v6 offset1:1", READ, "ds_read_b32 {1}, v20 offset:4"],
+                      lambda b, c: [b, c]),
+    "ds_read2_b32": ([WRITE, "ds_write_b32 v20, v6 offset:4", "ds_read2_b32 v[{0n}:{1n}], v20 offset1:1"],
+                     lambda b, c: [b, c]),
+    # The second offset counts in units of 64 words.
+    "ds_write2st64_b32": (["ds_write2st64_b32 v20, v5, v6 offset1:1", READ, "ds_read_b32 {1}, v20 offset:256"],
+                          lambda b, c: [b, c]),
+    "ds_read2st64_b32": ([WRITE, "ds_write_b32 v20, v6 offset:256", "ds_read2st64_b32 v[{0n}:{1n}], v20 offset1:1"],
+                         lambda b, c: [b, c]),
+    "ds_write_b16": ([WRITE, "ds_write_b16 v20, v6", READ], lambda b, c: [(b & 0xffff0000) | (c & 0xffff)]),
+    "ds_write_b8": ([WRITE, "ds_write_b8 v20, v6", READ], lambda b, c: [(b & 0xffffff00) | (c & 0xff)]),
+    "ds_read_u16": ([WRITE, "ds_read_u16 {0}, v20"], lambda b, c: [b & 0xffff]),
+    "ds_read_u8": ([WRITE, "ds_read_u8 {0}, v20"], lambda b, c: [b & 0xff]),
+    "ds_read_i16": ([WRITE, "ds_read_i16 {0}, v20"], lambda b, c: [((b & 0xffff) - (0x10000 if b & 0x8000 else 0)) & M]),
+    "ds_read_i8": ([WRITE, "ds_read_i8 {0}, v20"], lambda b, c: [((b & 0xff) - (0x100 if b & 0x80 else 0)) & M]),
+    # The D16_HI forms use the high half of the register and leave its low half.
+    "ds_read_u16_d16_hi": ([WRITE, "v_mov_b32_e32 {0}, v6", "ds_read_u16_d16_hi {0}, v20"],
+                           lambda b, c: [(b & 0xffff) << 16 | (c & 0xffff)]),
+    "ds_write_b16_d16_hi": ([WRITE, "ds_write_b16_d16_hi v20, v6", READ], lambda b, c: [(b & 0xffff0000) | c >> 16]),
+}
+def quads(a):
+    """`s_wqm`: every bit of a group of four is set where any of them is."""
+    return sum(0xf << shift for shift in range(0, 32, 4) if a >> shift & 0xf)
+
+
+def borrow(minuend, subtrahend, carry):
+    return [(minuend - subtrahend - carry) & M, int(subtrahend + carry > minuend)]
+
+
+# Vector forms that need more than one instruction to set up or to read.
+# name: (instructions with `{0}` and `{1}` the result registers, model of the three inputs)
+CARRY = "v_cmp_lt_u32_e32 vcc_lo, v4, v6"
+CARRY_OUT = "v_cndmask_b32_e64 {1}, 0, 1, vcc_lo"
+SEQUENCES = {
+    # The count is the first source; the value is the pair in the next two.
+    "v_lshlrev_b64": (["v_lshlrev_b64 v[{0n}:{1n}], v4, v[5:6]"],
+                      lambda a, b, c: list(halves64((b | c << 32) << (a & 63)))),
+    "v_lshrrev_b64": (["v_lshrrev_b64 v[{0n}:{1n}], v4, v[5:6]"],
+                      lambda a, b, c: list(halves64((b | c << 32) >> (a & 63)))),
+    "v_ashrrev_i64": (["v_ashrrev_i64 v[{0n}:{1n}], v4, v[5:6]"],
+                      lambda a, b, c: list(halves64(s64(b | c << 32) >> (a & 63)))),
+    # VCC holds a carry of 1 where the first input is below the third.
+    "v_add_co_ci_u32": ([CARRY, "v_add_co_ci_u32_e32 {0}, vcc_lo, v4, v5, vcc_lo", CARRY_OUT],
+                        lambda a, b, c: [(a + b + (a < c)) & M, int(a + b + (a < c) > M)]),
+    "v_sub_co_ci_u32": ([CARRY, "v_sub_co_ci_u32_e32 {0}, vcc_lo, v4, v5, vcc_lo", CARRY_OUT],
+                        lambda a, b, c: borrow(a, b, int(a < c))),
+    "v_subrev_co_ci_u32": ([CARRY, "v_subrev_co_ci_u32_e32 {0}, vcc_lo, v4, v5, vcc_lo", CARRY_OUT],
+                           lambda a, b, c: borrow(b, a, int(a < c))),
+    "v_swap_b32": (["v_mov_b32_e32 {0}, v4", "v_mov_b32_e32 {1}, v5", "v_swap_b32 {0}, {1}"], lambda a, b, c: [b, a]),
+    # The pairs are {second, third} and {first, third}, equal where the first two inputs are.
+    **{f"v_cmp_{name}_u64": (["v_mov_b32_e32 v21, v4", "v_mov_b32_e32 v22, v6", f"v_cmp_{name}_u64_e32 vcc_lo, v[5:6], v[21:22]",
+                              "v_cndmask_b32_e64 {0}, 0, 1, vcc_lo"],
+                             lambda a, b, c, name=name: [int(RELATIONS[name](b | c << 32, a | c << 32))])
+       for name in ("eq", "ne", "lt", "gt", "le", "ge")},
+    **{f"v_cmpx_{name}_u64": (["v_mov_b32_e32 v21, v4", "v_mov_b32_e32 v22, v6", "v_mov_b32_e32 {0}, 0", "s_mov_b32 s26, exec_lo",
+                               f"v_cmpx_{name}_u64_e32 v[5:6], v[21:22]", "v_mov_b32_e32 {0}, 1", "s_mov_b32 exec_lo, s26"],
+                              lambda a, b, c, name=name: [int(RELATIONS[name](b | c << 32, a | c << 32))])
+       for name in ("eq", "ne", "lt", "gt", "le", "ge")},
+    # M0 is added to the register number: v4 + 1 is v5, and v7 + 1 the second result.
+    "v_movrels_b32": (["s_mov_b32 m0, 1", "v_movrels_b32 {0}, v4"], lambda a, b, c: [b]),
+    "v_movreld_b32": (["s_mov_b32 m0, 1", "v_mov_b32_e32 {0}, v6", "v_movreld_b32 {0}, v4"], lambda a, b, c: [c, a]),
 }
 OUTPUTS = 8
 
@@ -305,7 +387,7 @@ def distance(got, want):
 
 
 def matches(got, want):
-    return want.matches(got) if isinstance(want, Float) else got == want
+    return got == want if isinstance(want, int) else want.matches(got)
 
 
 def fused(a, b, c):
@@ -551,6 +633,227 @@ COMPARES = {
 FLOAT_COMPARES = {f"v_cmp_{name}_f32": (2, float_relation(name))
                   for name in ("eq", "lt", "gt", "le", "ge", "lg", "o", "u", "neq", "nlt", "ngt", "nle", "nge")}
 FLOAT_COMPARES["v_cmp_class_f32"] = (2, lambda a, b, c: int(bool(number_class(a) & b)))
+# ----- Half precision -----
+# The exact rounding is `check_half_exact_gpu`'s, which was compared with an RDNA 2 card.
+NEAREST, TOWARD_ZERO = 0xc0, 0xcc
+HALF_NAN = 0x7e00
+
+
+def half_float(bits):
+    return struct.unpack("<e", struct.pack("<H", bits & 0xffff))[0]
+
+
+def half_is_nan(bits):
+    return bits & 0x7fff > 0x7c00
+
+
+class Half:
+    """An expected f16 in the low 16 bits of a word whose high bits are zero.
+    Any NaN matches a NaN, and a zero of either sign where `any_zero`."""
+
+    def __init__(self, bits, ulps=0, any_zero=False, absolute=0.0):
+        self.bits, self.ulps, self.any_zero, self.absolute = bits & 0xffff, ulps, any_zero, absolute
+
+    def matches(self, got):
+        want = self.bits
+        if got >> 16:
+            return False
+        if half_is_nan(want):
+            return half_is_nan(got)
+        if got == want or (self.any_zero and not want & 0x7fff and not got & 0x7fff):
+            return True
+        if half_is_nan(got):
+            return False
+        if self.absolute and got & 0x7fff < 0x7c00 and want & 0x7fff < 0x7c00 \
+                and abs(half_float(got) - half_float(want)) <= self.absolute:
+            return True
+        return not (got ^ want) & 0x8000 and abs((got & 0x7fff) - (want & 0x7fff)) <= self.ulps
+
+    def __repr__(self):
+        return f"{self.bits:#06x}" + (f"~{self.ulps}ulp" if self.ulps else "")
+
+
+class Halves:
+    """Two expected f16 values packed in one word, low first."""
+
+    def __init__(self, low, high):
+        self.low, self.high = low, high
+
+    def matches(self, got):
+        return self.low.matches(got & 0xffff) and self.high.matches(got >> 16)
+
+    def __repr__(self):
+        return f"[{self.low!r}, {self.high!r}]"
+
+
+def round_half(value, mode=NEAREST):
+    """The f16 nearest an exact or a Python float value."""
+    if isinstance(value, float):
+        if math.isnan(value):
+            return Half(HALF_NAN)
+        if math.isinf(value):
+            return Half(0xfc00 if value < 0 else 0x7c00)
+        value = Fraction(value)
+    if not value:
+        return Half(0, any_zero=True)
+    return Half(encode_half(abs(value), int(value < 0), mode))
+
+
+def half_arithmetic(function, ulps=0, absolute=0.0, count=3):
+    """A model over f16 sources. Infinities and NaN go through Python's floats;
+    finite sources are exact fractions, so the result is rounded once."""
+    def model(a, b, c):
+        floats = [half_float(x) for x in (a, b, c)]
+        try:
+            # Sources the instruction doesn't read hold anything.
+            if all(math.isfinite(v) for v in floats[:count]) and not ulps and not absolute:
+                result = round_half(function(*(half_value(x & 0xffff) for x in (a, b, c))))
+            else:
+                result = round_half(float(function(*floats)))
+        except (ValueError, ZeroDivisionError, OverflowError):
+            result = Half(HALF_NAN)
+        result.ulps, result.absolute = ulps, absolute
+        return result
+    return model
+
+
+def half_extreme(pick, count):
+    def model(a, b, c):
+        numbers = [x & 0xffff for x in (a, b, c)[:count] if not half_is_nan(x)]
+        return Half(pick(numbers, key=half_float) if numbers else HALF_NAN, any_zero=True)
+    return model
+
+
+def half_median(a, b, c):
+    if any(half_is_nan(x) for x in (a, b, c)):
+        return half_extreme(min, 3)(a, b, c)
+    return Half(sorted((x & 0xffff for x in (a, b, c)), key=half_float)[1], any_zero=True)
+
+
+def divide(a, b):
+    return a / b if b else math.copysign(INFINITY, a) * math.copysign(1.0, b)
+
+
+def half_turns(function, at_zero):
+    def model(a, b, c):
+        value = half_float(a)
+        if not math.isfinite(value):
+            return Half(HALF_NAN)
+        part = Fraction(value) - math.floor(value)
+        result = round_half(function(2 * math.pi * float(part)) if part else at_zero)
+        result.any_zero, result.absolute = True, 2.0 ** -9
+        return result
+    return model
+
+
+def halves_of(word):
+    return word & 0xffff, word >> 16
+
+
+def packed(model):
+    """An f16 model applied to the low halves and to the high halves."""
+    def both(a, b, c):
+        low, high = zip(*(halves_of(x) for x in (a, b, c)))
+        return Halves(model(*low), model(*high))
+    return both
+
+
+# name: (source count, model of the low 16 bits)
+HALF = {
+    "v_add_f16": (2, half_arithmetic(lambda a, b, c: a + b, count=2)),
+    "v_sub_f16": (2, half_arithmetic(lambda a, b, c: a - b, count=2)),
+    "v_subrev_f16": (2, half_arithmetic(lambda a, b, c: b - a, count=2)),
+    "v_mul_f16": (2, half_arithmetic(lambda a, b, c: a * b, count=2)),
+    "v_fma_f16": (3, half_arithmetic(lambda a, b, c: a * b + c)),
+    # The destination is the third source.
+    "v_fmac_f16": (3, half_arithmetic(lambda a, b, c: a * b + c)),
+    "v_min_f16": (2, half_extreme(min, 2)),
+    "v_max_f16": (2, half_extreme(max, 2)),
+    "v_med3_f16": (3, half_median),
+    "v_trunc_f16": (1, half_arithmetic(lambda a, b, c: Fraction(math.trunc(a)) if isinstance(a, Fraction) else a,
+                                       count=1)),
+    "v_rcp_f16": (1, half_arithmetic(lambda a, b, c: divide(1.0, a), ulps=1)),
+    "v_sqrt_f16": (1, half_arithmetic(lambda a, b, c: math.sqrt(a) if a >= 0 else float("nan"), ulps=1)),
+    "v_rsq_f16": (1, half_arithmetic(lambda a, b, c: divide(1.0, math.sqrt(a)) if a >= 0 else float("nan"), ulps=1)),
+    "v_exp_f16": (1, half_arithmetic(lambda a, b, c: power_of_two(a), ulps=1)),
+    "v_sin_f16": (1, half_turns(math.sin, 0.0)),
+    "v_cos_f16": (1, half_turns(math.cos, 1.0)),
+}
+PACKED = {
+    "v_pk_add_f16": (2, packed(HALF["v_add_f16"][1])),
+    "v_pk_mul_f16": (2, packed(HALF["v_mul_f16"][1])),
+    "v_pk_fma_f16": (3, packed(HALF["v_fma_f16"][1])),
+    "v_pk_min_f16": (2, packed(HALF["v_min_f16"][1])),
+    "v_pk_max_f16": (2, packed(HALF["v_max_f16"][1])),
+}
+
+
+def half_relation(name):
+    """`float_relation` over the f16 in each source's low half."""
+    relation = float_relation(name)
+    return lambda a, b, c: relation(to_bits(half_float(a)), to_bits(half_float(b)), 0)
+
+
+HALF_NAMES = ("eq", "lt", "gt", "le", "ge", "lg", "o", "u", "neq", "nlt", "ngt", "nle", "nge")
+HALF_COMPARES = {
+    **{f"v_cmp_{name}_f16": (2, half_relation(name)) for name in HALF_NAMES},
+    **{f"v_cmp_{name}_u16": (2, lambda a, b, c, name=name: int(RELATIONS[name](a & 0xffff, b & 0xffff)))
+       for name in ("eq", "ne", "lt", "gt", "le", "ge")},
+}
+HALF_EXEC_COMPARES = {
+    **{f"v_cmpx_{name}_f16": (2, half_relation(name)) for name in HALF_NAMES},
+    **{f"v_cmpx_{name}_u16": (2, lambda a, b, c, name=name: int(RELATIONS[name](a & 0xffff, b & 0xffff)))
+       for name in ("eq", "ne", "lt", "gt", "le", "ge")},
+}
+
+
+def rounded_toward_zero(bits):
+    """An f32 as an f16, toward zero: `v_cvt_pkrtz_f16_f32` ignores the rounding mode."""
+    if is_nan(bits):
+        return Half(HALF_NAN)
+    if bits & 0x7fffffff == 0x7f800000:
+        return Half(0x7c00 | bits >> 16 & 0x8000)
+    value = f32_value(bits)
+    return Half(encode_half(abs(value), bits >> 31, TOWARD_ZERO)) if value else Half(bits >> 16 & 0x8000)
+
+
+def mixed(selection):
+    """The sources of a MIX instruction as f32 bit patterns: `f` takes the word
+    as an f32, `l` and `h` its low or high half as an f16, which an f32 holds exactly."""
+    def sources(a, b, c):
+        return [word if pick == "f" else to_bits(half_float(word >> (16 if pick == "h" else 0)))
+                for pick, word in zip(selection, (a, b, c))]
+    return sources
+
+
+def mix_to_half(selection):
+    def model(a, b, c):
+        values = [to_float(x) for x in mixed(selection)(a, b, c)]
+        if not all(math.isfinite(v) for v in values):
+            return round_half(values[0] * values[1] + values[2])
+        return round_half(Fraction(values[0]) * Fraction(values[1]) + Fraction(values[2]))
+    return model
+
+
+# name@sources: the instruction with each source taken as `mixed` describes.
+MIX = {
+    **{f"v_fma_mix_f32@{sel}": (3, lambda a, b, c, sel=sel: multiply_add(*mixed(sel)(a, b, c)))
+       for sel in ("fff", "lll", "hlf", "fhl")},
+    **{f"v_fma_mixlo_f16@{sel}": (3, mix_to_half(sel)) for sel in ("lll", "hhh", "fff", "lhf")},
+    **{f"v_fma_mixhi_f16@{sel}": (3, mix_to_half(sel)) for sel in ("lll", "hhh", "fff")},
+}
+CONVERSIONS = {
+    "v_cvt_pkrtz_f16_f32": (2, lambda a, b, c: Halves(rounded_toward_zero(a), rounded_toward_zero(b))),
+}
+FLOATS.update(CONVERSIONS)
+FLOATS.update(MIX)
+HALF_TABLES = (HALF, PACKED, HALF_COMPARES, HALF_EXEC_COMPARES)
+
+
+def is_half(name):
+    return any(name in table for table in HALF_TABLES)
+
+
 # Comparisons into EXEC: 1 where the lane stays active.
 EXEC_COMPARES = {
     **{f"v_cmpx_{name}_u32": (2, lambda a, b, c, name=name: int(RELATIONS[name](a, b)))
@@ -593,6 +896,10 @@ def is_float(name):
 
 def count(name):
     """Result words one instruction produces: scalar ones also report SCC."""
+    if name in GROUP_MEMORY:
+        return len(GROUP_MEMORY[name][1](1, 1))
+    if name in SEQUENCES:
+        return len(SEQUENCES[name][1](1, 1, 1))
     if name in PAIRS:
         result = PAIRS[name](1, 1, 1)
         return 1 if isinstance(result, int) else 2 if result[1] is None else 3
@@ -627,7 +934,36 @@ def lines_for(name, destination):
         if count(name) == 3:
             program += ["s_cselect_b32 s26, 1, 0", f"v_mov_b32_e32 v{destination + 2}, s26"]
         return program + [f"v_mov_b32_e32 v{destination}, s24", f"v_mov_b32_e32 v{destination + 1}, s25"]
-    if name in EXEC_COMPARES or name in FLOAT_EXEC_COMPARES:
+    if name in GROUP_MEMORY or name in SEQUENCES:
+        # Group memory gets a word-aligned address within the first 64 bytes.
+        lines, start = (GROUP_MEMORY[name][0], ["v_and_b32_e32 v20, 0x3c, v4"]) if name in GROUP_MEMORY \
+            else (SEQUENCES[name][0], [])
+        return start + [
+            line.format(f"v{destination}", f"v{destination + 1}") if "{0n}" not in line
+            else line.replace("{0n}", str(destination)).replace("{1n}", str(destination + 1))
+            for line in lines]
+    if name in MIX:
+        instruction, selection = name.split("@")
+        low = ",".join(str(int(pick == "h")) for pick in selection)
+        high = ",".join(str(int(pick != "f")) for pick in selection)
+        # Only one half of the destination is written, so the other is shifted or masked away.
+        keep = {"v_fma_mixlo_f16": [f"v_and_b32_e32 v{destination}, 0xffff, v{destination}"],
+                "v_fma_mixhi_f16": [f"v_lshrrev_b32_e32 v{destination}, 16, v{destination}"]}.get(instruction, [])
+        return [f"v_mov_b32_e32 v{destination}, 0",
+                f"{instruction} v{destination}, v4, v5, v6 op_sel:[{low}] op_sel_hi:[{high}]"] + keep
+    if name in HALF:
+        sources = ", ".join(f"v{4 + j}" for j in range(HALF[name][0]))
+        if name == "v_fmac_f16":
+            return [f"v_mov_b32_e32 v{destination}, v6", f"{name} v{destination}, v4, v5",
+                    f"v_and_b32_e32 v{destination}, 0xffff, v{destination}"]
+        # The manual defines the low 16 bits of the result only.
+        return [f"{name} v{destination}, {sources}", f"v_and_b32_e32 v{destination}, 0xffff, v{destination}"]
+    if name in PACKED:
+        sources = ", ".join(f"v{4 + j}" for j in range(PACKED[name][0]))
+        return [f"{name} v{destination}, {sources}"]
+    if name in HALF_COMPARES:
+        return [f"{name} vcc_lo, v4, v5", f"v_cndmask_b32_e64 v{destination}, 0, 1, vcc_lo"]
+    if name in EXEC_COMPARES or name in FLOAT_EXEC_COMPARES or name in HALF_EXEC_COMPARES:
         # The write of 1 runs only where the comparison leaves the lane active.
         return [f"v_mov_b32_e32 v{destination}, 0", "s_mov_b32 s26, exec_lo", f"{name}_e32 v4, v5",
                 f"v_mov_b32_e32 v{destination}, 1", "s_mov_b32 exec_lo, s26"]
@@ -662,7 +998,7 @@ def lines_for(name, destination):
 
 
 def results(name, values):
-    for table in (OPERATIONS, FLOATS, COMPARES, FLOAT_COMPARES, EXEC_COMPARES, FLOAT_EXEC_COMPARES):
+    for table in (OPERATIONS, FLOATS, COMPARES, FLOAT_COMPARES, EXEC_COMPARES, FLOAT_EXEC_COMPARES, *HALF_TABLES):
         if name in table:
             return [table[name][1](*values)]
     if name in SCALAR_COMPARES:
@@ -676,6 +1012,10 @@ def results(name, values):
             return [result]
         value, flag = result
         return [value & M, value >> 32] + ([] if flag is None else [flag])
+    if name in GROUP_MEMORY:
+        return GROUP_MEMORY[name][1](values[1], values[2])
+    if name in SEQUENCES:
+        return SEQUENCES[name][1](*values)
     if name in CONSTANT_COMPARES:
         return [CONSTANT_COMPARES[name][1](values[0])]
     if name in CONSTANT or name in IN_PLACE:
@@ -697,7 +1037,7 @@ def program(chunk):
 def kind(name):
     """Float and integer instructions need different inputs, and RDNA 1 ones
     another assembler target, so a shader holds one kind."""
-    return is_float(name), name in LEGACY
+    return is_float(name), name in LEGACY, is_half(name)
 
 
 def target(names):
@@ -750,8 +1090,8 @@ def main():
         ap.error("choose a fresh receipt")
     a.work.mkdir(parents=True, exist_ok=False)
     rng = random.Random(0x414c5531)
-    every = [*OPERATIONS, *SCALAR, *PAIRS, *IN_PLACE, *CONSTANT, *CONSTANT_COMPARES, *COMPARES, *SCALAR_COMPARES,
-             *EXEC_COMPARES, *FLOATS, *FLOAT_COMPARES,
+    every = [*OPERATIONS, *SCALAR, *GROUP_MEMORY, *SEQUENCES, *PAIRS, *IN_PLACE, *CONSTANT, *CONSTANT_COMPARES, *COMPARES, *SCALAR_COMPARES,
+             *EXEC_COMPARES, *HALF, *PACKED, *HALF_COMPARES, *HALF_EXEC_COMPARES, *FLOATS, *FLOAT_COMPARES,
              *FLOAT_EXEC_COMPARES]
     supported, refused = probe(every, a.emitter, a.llvm_mc)
     expected, chunks = {}, {}
@@ -782,6 +1122,12 @@ def main():
                     # Edge values first, rotated so each source sees each of them.
                     if index < len(edges):
                         values = [edges[(index + 7 * j) % len(edges)] for j in range(3)]
+                    elif is_half(chunk[0]):
+                        # Edge halves in both halves of the word, or any bits.
+                        values = [rng.choice(EDGE_F16) * 0x10001 if rng.random() < 0.3 else rng.getrandbits(32)
+                                  for _ in range(3)]
+                        if rng.random() < 0.15:
+                            values[1] = values[0]
                     elif is_float(chunk[0]):
                         # Ordinary magnitudes of both signs, so results stay finite
                         # and rounding matters. Some pairs are equal.
@@ -824,7 +1170,7 @@ def main():
                                         "got": got_word, "wanted": repr(want_word)})
     receipt = {"schema": 1, "adapter": a.adapter, "tools_sha256": {n: digest(getattr(a, n))
                                                                    for n in ("emitter", "dxc", "provider")},
-               "checked": supported, "refused": refused, "wrong": wrong, "inputs": a.rounds * GROUPS,
+               "checked": sorted({name.split("@")[0] for name in supported}), "forms": len(supported), "refused": refused, "wrong": wrong, "inputs": a.rounds * GROUPS,
                # The largest error seen from each approximate instruction, in units in the last place.
                "worst_ulps": dict(sorted(worst.items())),
                # Instructions that gave a documented alternative to the console's result.

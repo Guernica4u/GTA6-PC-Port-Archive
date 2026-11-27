@@ -131,7 +131,9 @@ struct DirectCompute {
     string operand32(const Inst &i, unsigned n, unsigned sgpr_limit = 106) {
         if (graphics_input && n == 106)
             refuse(i.pc, "graphics instruction consumes a full wave mask");
-        if (n <= 106 || n == 126 || n == 127 || (!graphics_input && n == 107) || (n >= 256 && n < 512)) {
+        // M0 holds ordinary numeric ALU bits here, not an implicit memory/indexing operand.
+        const bool numeric_m0 = !graphics_input && n == 124 && i.enc != Encoding::Mubuf && i.enc != Encoding::Smem;
+        if (n <= 106 || n == 126 || n == 127 || (!graphics_input && n == 107) || numeric_m0 || (n >= 256 && n < 512)) {
             analysis.require_numeric(i, n, sgpr_limit);
             return read(n);
         }
@@ -376,7 +378,7 @@ struct DirectCompute {
         return ir.invoke("%dx.types.ResRet.i32", raw ? "rawBufferLoad.i32" : "bufferLoad.i32", raw ? 139 : 68, args,
                          "nounwind readonly");
     }
-    void buffer_atomic(const Inst &i, const State &s) {
+    void buffer_atomic(const Inst &i, const State &s, const string &pixel_predicate = {}) {
         // The operation set and VGPR ordering follow gfx2hlsl.MUBUF_ATOMIC_OPS.
         static const std::map<Name, unsigned> operations{
             {"buffer_atomic_add", 0},  {"buffer_atomic_sub", 0},  {"buffer_atomic_and", 1},  {"buffer_atomic_or", 2},
@@ -422,6 +424,30 @@ struct DirectCompute {
             args.emplace_back("i32", read(data + 1));
         args.emplace_back("i32", value);
         auto tag = to_string(label_number++), pred = active();
+        if (!pixel_predicate.empty()) {
+            // Graphics uses SSA rather than the compute VGPR allocas. The caller
+            // proves a single guest block and supplies exact coverage and EXEC.
+            // Keep the original VGPR for inactive lanes, including helpers.
+            const auto size = ir.invoke("%dx.types.Dimensions", "getDimensions", 72,
+                {{"%dx.types.Handle", h}, {"i32", "undef"}}, "nounwind readonly");
+            const auto bytes = ir.value("extractvalue %dx.types.Dimensions " + size + ", 0");
+            const auto in_view = cmp("ult", address, bytes); // aligned DWORD, raw view length is a multiple of 4
+            const auto fallback = (i.a & 0x4000) ? select(pixel_predicate, "0", value) : "";
+            const auto execute = ir.value("and i1 " + pixel_predicate + ", " + in_view);
+            ir.body << "  br i1 " << execute << ", label %atomic" << tag << ", label %atomicSkip" << tag
+                    << "\natomic" << tag << ":\n";
+            const auto previous = ir.invoke("i32", "atomicBinOp.i32", 78, args, "nounwind");
+            ir.body << "  br label %atomicEnd" << tag << "\natomicSkip" << tag
+                    << ":\n  br label %atomicEnd" << tag << "\natomicEnd" << tag << ":\n";
+            if (i.a & 0x4000) {
+                auto returned = ir.value("phi i32 [ " + previous + ", %atomic" + tag + " ], [ " +
+                                         fallback + ", %atomicSkip" + tag + " ]");
+                // Contention makes the old value varying even with uniform operands.
+                ir.dependencies[returned].set(128);
+                write(data, returned);
+            }
+            return;
+        }
         if (indexed) {
             if (i.a & 0x4000) {
                 auto out_of_range = ir.value("and i1 " + pred + ", " + ir.value("xor i1 " + in_range + ", true"));
@@ -1595,6 +1621,58 @@ struct DirectCompute {
                                                       ir.binary("and", rounded, "65535")));
             return true;
         }
+        if (n == "v_fma_f16" || n == "v_fmac_f16" || n == "v_fmamk_f16" || n == "v_fmaak_f16") {
+            if (graphics_input)
+                return false;
+            if (i.dpp_control || permuted)
+                refuse(i.pc, "unsupported " + string(n) + " DPP form");
+            if (i.subword)
+                refuse(i.pc, "unsupported " + string(n) + " SDWA form");
+            if (i.scale)
+                refuse(i.pc, "unsupported " + string(n) + " omod");
+            if (i.wide && (i.a & 0x7800))
+                refuse(i.pc, "unsupported " + string(n) + " high-half op_sel");
+            if (n == "v_fmac_f16" && i.wide && (((i.abs | i.neg) & 4) || i.src[2]))
+                refuse(i.pc, "unsupported v_fmac_f16 third-source modifier");
+            if (!half_mode_known || ((mode_bits ^ 0xf0u) & 0x8000ccu))
+                refuse(i.pc, "unsupported binary16 rounding or denormal mode");
+            auto half_bits = [&](unsigned j) {
+                const unsigned r = i.src[j];
+                string bits;
+                if (r >= 240 && r <= 248) {
+                    constexpr unsigned halves[]{0x3800, 0xb800, 0x3c00, 0xbc00, 0x4000,
+                                                0xc000, 0x4400, 0xc400, 0x3118};
+                    bits = to_string(halves[r - 240]);
+                } else if (r == 255)
+                    bits = to_string(i.literal & 65535u);
+                else if (r >= 128 && r <= 192)
+                    bits = to_string((r - 128) & 65535u);
+                else if (r >= 193 && r <= 208)
+                    bits = to_string((192u - r) & 65535u);
+                else
+                    bits = ir.binary("and", operand32(i, r), "65535");
+                if (i.abs & (1u << j))
+                    bits = ir.binary("and", bits, "32767");
+                if (i.neg & (1u << j))
+                    bits = ir.binary("xor", bits, "32768");
+                return bits;
+            };
+            auto a = half_bits(0);
+            auto b = n == "v_fmamk_f16" ? to_string(i.literal & 65535u) : half_bits(1);
+            auto c = n == "v_fma_f16"   ? half_bits(2)
+                   : n == "v_fmac_f16"  ? ir.binary("and", read(i.dst), "65535")
+                   : n == "v_fmamk_f16" ? half_bits(1)
+                                        : to_string(i.literal & 65535u);
+            auto result = fused_half_rne(a, b, c);
+            if (i.clamp) {
+                auto nan = cmp("ugt", ir.binary("and", result, "32767"), "31744");
+                auto low = ir.value("or i1 " + nan + ", " + cmp("ne", ir.binary("and", result, "32768"), "0"));
+                result = select(low, "0", select(cmp("ugt", result, "15359"), "15360", result));
+            }
+            auto kept = ir.binary("and", read(i.dst), "4294901760");
+            vector_write(i.dst, ir.binary("or", kept, ir.binary("and", result, "65535")));
+            return true;
+        }
         const auto rule = alu_rules.find(n);
         const bool byte_to_float =
             n.size() == 16 && n.substr(0, 15) == "v_cvt_f32_ubyte" && n.back() >= '0' && n.back() <= '3';
@@ -2386,7 +2464,8 @@ struct DirectCompute {
         };
         if (n == "s_mov_b32" || n == "s_mov_b64") {
             const bool exec_hi = i.dst == 127 && (wave64 || (compute && n == "s_mov_b32"));
-            if (i.dst > 106 && i.dst != 126 && !(compute && i.dst == 107) && !exec_hi)
+            if (i.dst > 106 && i.dst != 126 && !(compute && i.dst == 107) && !exec_hi &&
+                !(compute && i.dst == 124 && n == "s_mov_b32"))
                 refuse(i.pc, "direct scalar move destination");
             if (i.src[0] <= 105 && !state[i.src[0]].numeric()) {
                 if (i.dst > 105)
@@ -3344,6 +3423,51 @@ struct DirectCompute {
         } else
             vector_write(i.dst, place_subword(i, z));
     }
+    void lower_permlane(const Inst &i, unsigned threads) {
+        const bool cross_row = i.name == "v_permlanex16_b32";
+        if (threads % (cross_row ? 32 : 16))
+            refuse(i.pc, string(i.name) + " needs a thread count divisible by " + (cross_row ? "32" : "16"));
+
+        // VOP3A retains op_sel in word 0 bits 11..14: bit 0 is FI and bit 1 is BOUND_CTRL.
+        const unsigned op_sel = (i.a >> 11) & 15;
+        if ((op_sel & ~3u) || i.neg || i.abs || i.clamp || i.scale)
+            refuse(i.pc, "unsupported permlane modifier or op_sel");
+        const bool fi = op_sel & 1;
+        const bool bound_zero = op_sel & 2;
+
+        // D and S0 are VGPRs. S1 and S2 are uniform SGPRs or constants.
+        if (i.src[0] < 256)
+            refuse(i.pc, "permlane S0 must be a VGPR");
+        for (unsigned reg : {i.src[1], i.src[2]})
+            if (reg > 105 && (wave64 || reg != 107) && !constant32(i, reg))
+                refuse(i.pc, "permlane selectors must be uniform SGPRs or constants");
+
+        // S1 packs the nibbles for row lanes 0..7 and S2 packs those for 8..15.
+        auto row_lane = ir.binary("and", lane, "15");
+        auto selectors = select(cmp("uge", row_lane, "8"), operand32(i, i.src[2]), operand32(i, i.src[1]));
+        auto shift = ir.binary("shl", ir.binary("and", row_lane, "7"), "2");
+        auto pick = ir.binary("and", ir.binary("lshr", selectors, shift), "15");
+
+        // Permlane16 uses the current row; permlanex16 toggles row bit 4.
+        // Both rows of the pair are in the same physical wave32, even for guest wave64.
+        auto row_base = ir.binary("and", lane, "4294967280");
+        if (cross_row)
+            row_base = ir.binary("xor", row_base, "16");
+        auto source_lane = ir.binary("or", row_base, pick);
+        auto src = operand32(i, i.src[0]);
+        auto value = ir.invoke("i32", "waveReadLaneAt.i32", 117, {{"i32",src},{"i32",source_lane}}, "nounwind");
+
+        // Assume DPP's inactive-source rule: FI bypasses the guest EXEC test.
+        // Otherwise an inactive source yields zero with BOUND_CTRL or preserves D.
+        if (!fi) {
+            auto exec = wave64 ? select(upper_half, read(127), read(126)) : read(126);
+            auto source_bit = ir.binary("shl", "1", source_lane);
+            auto source_usable = cmp("ne", ir.binary("and", exec, source_bit), "0");
+            value = select(source_usable, value, bound_zero ? "0" : read(i.dst));
+        }
+        // Guest EXEC still predicates the destination write.
+        vector_write(i.dst, value);
+    }
     void lower_dpp(const Inst &i, const State &state, unsigned threads) {
         // All lane selections stay in one physical wave32 for split guest wave64.
         // Shader control flow stays wave-uniform. Guest EXEC predicates VGPR
@@ -3480,7 +3604,11 @@ struct DirectCompute {
             op.name == "v_cvt_f16_u16" ||
             op.name == "v_cvt_f16_i16" ||
             op.name == "v_cvt_u16_f16" ||
-            op.name == "v_cvt_i16_f16")
+            op.name == "v_cvt_i16_f16" ||
+            op.name == "v_fma_f16" ||
+            op.name == "v_fmac_f16" ||
+            op.name == "v_fmamk_f16" ||
+            op.name == "v_fmaak_f16")
                 half_binary = true;
             if (op.name == "s_round_mode" || op.name == "s_denorm_mode" || op.name == "s_setreg_b32" ||
                 op.name == "s_setreg_imm32_b32")
@@ -3529,6 +3657,8 @@ struct DirectCompute {
                 }
             } else if (i.dpp_control)
                 lower_dpp(i, p.before[k], x*y*z);
+            else if (i.name == "v_permlane16_b32" || i.name == "v_permlanex16_b32")
+                lower_permlane(i, x*y*z);
             else if (i.name == "s_endpgm")
                 ir.body << "  ret void\n";
             // Hardware scheduling and register-dependency waits have no SGPR
