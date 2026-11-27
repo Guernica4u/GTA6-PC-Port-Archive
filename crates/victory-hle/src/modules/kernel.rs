@@ -368,12 +368,33 @@ pub extern "system" fn VirtualFree(
 ) -> i32 {
     const MEM_DECOMMIT: u32 = 0x4000;
     const MEM_RELEASE: u32 = 0x8000;
-    if !address.is_null() {
-        if free_type & MEM_RELEASE != 0 {
-            crate::modules::xmem::on_virtual_free_release(address as usize);
-        } else if free_type & MEM_DECOMMIT != 0 {
-            crate::modules::xmem::on_virtual_free_decommit(address as usize, size);
+    if address.is_null() {
+        return host::virtual_free(address, size, free_type);
+    }
+    let addr = address as usize;
+    if free_type & MEM_RELEASE != 0 {
+        let span = crate::modules::xmem::query_allocation_span(addr);
+        let ok = host::virtual_free(address, size, free_type);
+        if ok != 0 {
+            crate::modules::xmem::on_virtual_free_release(addr, span);
         }
+        return ok;
+    }
+    if free_type & MEM_DECOMMIT != 0 {
+        if size == 0 {
+            let span = crate::modules::xmem::query_allocation_span(addr);
+            let ok = host::virtual_free(address, size, free_type);
+            if ok != 0 {
+                crate::modules::xmem::on_virtual_free_decommit_all(addr, span);
+            }
+            return ok;
+        }
+        crate::modules::xmem::commit_partial_boundaries(addr, size);
+        let ok = host::virtual_free(address, size, free_type);
+        if ok != 0 {
+            crate::modules::xmem::on_virtual_free_decommit_interior(addr, size);
+        }
+        return ok;
     }
     host::virtual_free(address, size, free_type)
 }
