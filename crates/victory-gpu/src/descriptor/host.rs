@@ -697,30 +697,79 @@ impl HostHeap {
     /// at `start` + index × `step`: [`HostHeap::mirror`] of each slot whose
     /// record differs from what the slot holds.
     ///
-    /// Normalizes `ranges` once, reads each mapped 64 KiB page chunk into a
-    /// reusable buffer via [`crate::host::read_into`] **before** taking any
-    /// lock (so concurrently unmapped heap pages are skipped cleanly without
-    /// faulting), then holds `self.made` and `VIEWS` (in the same `made` ->
-    /// `VIEWS` order as [`HostHeap::mirror`]) across the in-memory diff pass,
-    /// skipping the `VIEWS` lookup for slots whose tag is not `VIEW_TAG`.
-    /// Returns the number of readable slots scanned.
+    /// Normalizes `ranges` once, reads each mapped 64 KiB page chunk (falling
+    /// back to 4 KiB OS pages if a 64 KiB block is only partially committed)
+    /// into a reusable buffer via [`crate::host::read_into`] **before** taking
+    /// any lock (so concurrently unmapped heap pages are skipped cleanly
+    /// without faulting), then holds `self.made` and `VIEWS` (in the same
+    /// `made` -> `VIEWS` order as [`HostHeap::mirror`]) across the in-memory
+    /// diff pass, skipping the `VIEWS` lookup for slots whose tag is not
+    /// `VIEW_TAG`. Returns the number of readable slots scanned.
     pub(crate) fn sync_ranges(&self, ranges: &[(u32, u32)], start: u64, step: u64) -> u64 {
         debug_assert!(step >= 12);
         let at = |i: u32| start + u64::from(i) * step;
         let (clamped, past_cap) = merge_ranges(ranges, self.count);
-        if let Some(highest) = past_cap
-            && crate::host::read_into(at(highest) as *const u8, &mut [0u8; 4])
-        {
-            self.mirror(highest, at(highest), false);
+        if let Some(highest) = past_cap {
+            let mut warn_slot =
+                crate::host::read_into(at(highest) as *const u8, &mut [0u8; 4]).then_some(highest);
+            if warn_slot.is_none() {
+                // If the highest past-cap slot sits on an uncommitted tail page,
+                // probe the start of each past-cap span so mapped overflow still warns.
+                warn_slot = ranges
+                    .iter()
+                    .filter(|&&(a, b)| a < b && b > self.count)
+                    .map(|&(a, _)| a.max(self.count))
+                    .find(|&slot| crate::host::read_into(at(slot) as *const u8, &mut [0u8; 4]));
+            }
+            if let Some(slot) = warn_slot {
+                self.mirror(slot, at(slot), false);
+            }
         }
         if clamped.is_empty() {
             return 0;
         }
         let total_slots: usize = clamped.iter().map(|&(a, b)| (b - a) as usize).sum();
         let page_size = crate::watch::PAGE as u64;
+        const OS_PAGE: u64 = 4096;
         let mut page_buf: Vec<u8> = Vec::new();
         let mut readable: Vec<(u32, u32)> = Vec::with_capacity(clamped.len());
         let mut records: Vec<[u32; 3]> = Vec::with_capacity(total_slots);
+        let mut read_span = |a: u32, b: u32| -> bool {
+            let addr = at(a);
+            let n = (b - a) as usize;
+            let bytes = (n - 1) * step as usize + 12;
+            if page_buf.len() < bytes {
+                page_buf.resize(bytes, 0);
+            }
+            if !crate::host::read_into(addr as *const u8, &mut page_buf[..bytes]) {
+                return false;
+            }
+            readable.push((a, b));
+            for k in 0..n {
+                let off = k * step as usize;
+                records.push([
+                    u32::from_ne_bytes([
+                        page_buf[off],
+                        page_buf[off + 1],
+                        page_buf[off + 2],
+                        page_buf[off + 3],
+                    ]),
+                    u32::from_ne_bytes([
+                        page_buf[off + 4],
+                        page_buf[off + 5],
+                        page_buf[off + 6],
+                        page_buf[off + 7],
+                    ]),
+                    u32::from_ne_bytes([
+                        page_buf[off + 8],
+                        page_buf[off + 9],
+                        page_buf[off + 10],
+                        page_buf[off + 11],
+                    ]),
+                ]);
+            }
+            true
+        };
         for &(first, last) in &clamped {
             let mut i = first;
             while i < last {
@@ -730,35 +779,17 @@ impl HostHeap {
                 // is not page-aligned and may straddle a page boundary).
                 let fit = ((next_page - addr) / step).max(1);
                 let j = last.min(i.saturating_add(fit as u32));
-                let n = (j - i) as usize;
-                let bytes = (n - 1) * step as usize + 12;
-                if page_buf.len() < bytes {
-                    page_buf.resize(bytes, 0);
-                }
-                if crate::host::read_into(addr as *const u8, &mut page_buf[..bytes]) {
-                    readable.push((i, j));
-                    for k in 0..n {
-                        let off = k * step as usize;
-                        records.push([
-                            u32::from_ne_bytes([
-                                page_buf[off],
-                                page_buf[off + 1],
-                                page_buf[off + 2],
-                                page_buf[off + 3],
-                            ]),
-                            u32::from_ne_bytes([
-                                page_buf[off + 4],
-                                page_buf[off + 5],
-                                page_buf[off + 6],
-                                page_buf[off + 7],
-                            ]),
-                            u32::from_ne_bytes([
-                                page_buf[off + 8],
-                                page_buf[off + 9],
-                                page_buf[off + 10],
-                                page_buf[off + 11],
-                            ]),
-                        ]);
+                if !read_span(i, j) {
+                    // A 64 KiB block may straddle committed and uncommitted 4 KiB
+                    // OS pages; retry per 4 KiB page so committed slots survive.
+                    let mut sub = i;
+                    while sub < j {
+                        let sub_addr = at(sub);
+                        let next_os = (sub_addr & !(OS_PAGE - 1)) + OS_PAGE;
+                        let sub_fit = ((next_os - sub_addr) / step).max(1);
+                        let sub_end = j.min(sub.saturating_add(sub_fit as u32));
+                        let _ = read_span(sub, sub_end);
+                        sub = sub_end;
                     }
                 }
                 i = j;
@@ -1918,7 +1949,7 @@ fn merge_ranges(ranges: &[(u32, u32)], cap: u32) -> (Vec<(u32, u32)>, Option<u32
     let mut past_cap: Option<u32> = None;
     let mut raw: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
     for &(first, last) in ranges {
-        if last > cap {
+        if first < last && last > cap {
             let high = last - 1;
             past_cap = Some(past_cap.map_or(high, |m| m.max(high)));
         }
@@ -2593,6 +2624,7 @@ mod tests {
             (vec![(0, 64)], Some(67))
         );
         assert_eq!(merge_ranges(&[(70, 80), (10, 10)], 64), (vec![], Some(79)));
+        assert_eq!(merge_ranges(&[(70, 70), (80, 75)], 64), (vec![], None));
     }
 
     /// `sync_ranges` merges overlapping, adjacent, and out-of-order ranges
@@ -2653,5 +2685,62 @@ mod tests {
 
         crate::shadow::unregister(pool, base);
         crate::watch::tests::free(pool);
+    }
+
+    /// When a 64 KiB heap block has a committed 4 KiB page followed by an
+    /// uncommitted 4 KiB page, `sync_ranges` must still mirror the descriptors
+    /// on the committed 4 KiB page instead of dropping the whole 64 KiB chunk.
+    #[test]
+    fn sync_ranges_mirrors_committed_4k_page_beside_uncommitted_page() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let Some(heap) = HostHeap::new(false, 256) else {
+            return;
+        };
+        assert!(heap.view_addresses().is_some());
+        let pool = crate::watch::tests::pool(1);
+        let base = pool as u64;
+        crate::shadow::register(pool, base, 64 << 10);
+
+        // SAFETY: reserve one 64 KiB page and commit only its first 4 KiB OS page.
+        let mem = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                crate::watch::PAGE,
+                MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!mem.is_null());
+        // SAFETY: committing the first 4 KiB page inside our reservation.
+        let committed = unsafe { VirtualAlloc(mem, 4096, MEM_COMMIT, PAGE_READWRITE) };
+        assert_eq!(committed, mem);
+
+        let step = 32u64;
+        let start = mem as u64;
+        let mut resource = [0u32; 14];
+        (resource[0], resource[4]) = (1, 64);
+        let mut view = [0u32; 16];
+        (view[1], view[2], view[6], view[7]) = (1, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, 16, 4);
+        (view[10], view[11]) = (base as u32, (base >> 32) as u32);
+        // Slot 2 lies in the committed first 4 KiB page; slots 128..256 lie in
+        // the uncommitted second 4 KiB page of the same 64 KiB watch::PAGE.
+        crate::descriptor::create_placed_srv(std::ptr::null(), &resource, &view, start + 2 * step);
+
+        let synced = heap.sync_ranges(&[(0, 256)], start, step);
+        let got = heap.address_at(2);
+
+        // SAFETY: releasing our reservation.
+        unsafe { VirtualFree(mem, 0, MEM_RELEASE) };
+        crate::shadow::unregister(pool, base);
+        crate::watch::tests::free(pool);
+
+        assert_eq!(synced, 128, "committed 4 KiB page slots should be scanned");
+        assert_eq!(
+            got,
+            Some(base),
+            "descriptor on committed 4 KiB page must be mirrored"
+        );
     }
 }
