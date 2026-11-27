@@ -11,27 +11,27 @@ Every instruction the decoder names, from [AMD's machine-readable instruction se
 ## Summary
 
 - 1,085 instructions in 1,398 encodings.
-- 372 are used by the recorded shaders; a GPU check runs 333 of those.
+- 372 are used by the recorded shaders; a GPU check runs 369 of those.
 - 210 encodings have no translation, and 186 are unproven: alone they need a bound resource or a stage, and no recorded shader uses them.
 
 | Family | Encodings | Translates | Seen translating | Nothing to emit | Unproven | Not translated | Used | Used without a GPU check |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | [Scalar, two operands (SOP2)](#scalar-two-operands-sop2) | 51 | 51 | 0 | 0 | 0 | 0 | 29 | 0 |
-| [Scalar with a constant (SOPK)](#scalar-with-a-constant-sopk) | 27 | 19 | 0 | 5 | 0 | 3 | 11 | 1 |
-| [Scalar, one operand (SOP1)](#scalar-one-operand-sop1) | 65 | 44 | 0 | 2 | 13 | 6 | 24 | 3 |
+| [Scalar with a constant (SOPK)](#scalar-with-a-constant-sopk) | 27 | 19 | 0 | 5 | 0 | 3 | 11 | 0 |
+| [Scalar, one operand (SOP1)](#scalar-one-operand-sop1) | 65 | 44 | 0 | 2 | 13 | 6 | 24 | 2 |
 | [Scalar compare (SOPC)](#scalar-compare-sopc) | 18 | 16 | 0 | 0 | 2 | 0 | 12 | 0 |
-| [Program control (SOPP)](#program-control-sopp) | 37 | 11 | 0 | 6 | 1 | 19 | 12 | 1 |
-| [Scalar memory (SMEM)](#scalar-memory-smem) | 20 | 0 | 5 | 5 | 0 | 10 | 9 | 1 |
+| [Program control (SOPP)](#program-control-sopp) | 37 | 11 | 0 | 6 | 1 | 19 | 12 | 0 |
+| [Scalar memory (SMEM)](#scalar-memory-smem) | 20 | 0 | 5 | 5 | 0 | 10 | 9 | 0 |
 | [Vector, two operands (VOP2)](#vector-two-operands-vop2) | 50 | 49 | 0 | 0 | 0 | 1 | 38 | 0 |
 | [Vector, one operand (VOP1)](#vector-one-operand-vop1) | 81 | 72 | 0 | 1 | 0 | 8 | 41 | 0 |
 | [Vector compare (VOPC)](#vector-compare-vopc) | 190 | 190 | 0 | 0 | 0 | 0 | 61 | 0 |
-| [Vector, three operands (VOP3 and VOP3P)](#vector-three-operands-vop3-and-vop3p) | 457 | 421 | 7 | 1 | 1 | 27 | 199 | 5 |
-| [Interpolation (VINTRP)](#interpolation-vintrp) | 3 | 0 | 3 | 0 | 0 | 0 | 3 | 3 |
+| [Vector, three operands (VOP3 and VOP3P)](#vector-three-operands-vop3-and-vop3p) | 457 | 421 | 7 | 1 | 1 | 27 | 199 | 0 |
+| [Interpolation (VINTRP)](#interpolation-vintrp) | 3 | 0 | 3 | 0 | 0 | 0 | 3 | 0 |
 | [Group memory (DS)](#group-memory-ds) | 123 | 36 | 0 | 0 | 0 | 87 | 17 | 0 |
-| [Flat, global and scratch memory (FLAT)](#flat-global-and-scratch-memory-flat) | 54 | 0 | 5 | 0 | 0 | 49 | 5 | 5 |
-| [Untyped buffers (MUBUF)](#untyped-buffers-mubuf) | 75 | 2 | 25 | 0 | 48 | 0 | 25 | 3 |
-| [Typed buffers (MTBUF)](#typed-buffers-mtbuf) | 16 | 0 | 4 | 0 | 12 | 0 | 4 | 4 |
-| [Images (MIMG)](#images-mimg) | 130 | 0 | 21 | 0 | 109 | 0 | 21 | 16 |
+| [Flat, global and scratch memory (FLAT)](#flat-global-and-scratch-memory-flat) | 54 | 0 | 5 | 0 | 0 | 49 | 5 | 1 |
+| [Untyped buffers (MUBUF)](#untyped-buffers-mubuf) | 75 | 2 | 25 | 0 | 48 | 0 | 25 | 0 |
+| [Typed buffers (MTBUF)](#typed-buffers-mtbuf) | 16 | 0 | 4 | 0 | 12 | 0 | 4 | 0 |
+| [Images (MIMG)](#images-mimg) | 130 | 0 | 21 | 0 | 109 | 0 | 21 | 0 |
 | [Export (EXP)](#export-exp) | 1 | 0 | 1 | 0 | 0 | 0 | 1 | 0 |
 
 ## Used without a GPU check
@@ -40,43 +40,7 @@ Most used first. Each needs a check before it can be trusted.
 
 | Instruction | Recorded shaders |
 | --- | ---: |
-| `s_inst_prefetch` | 44,348 |
-| `tbuffer_load_format_xy` | 18,506 |
-| `v_interp_p1_f32` | 13,513 |
-| `v_interp_p2_f32` | 13,513 |
-| `tbuffer_load_format_xyzw` | 12,152 |
-| `image_sample_l` | 12,138 |
-| `image_gather4_lz` | 8,973 |
-| `image_sample_c_lz` | 8,535 |
-| `v_interp_p2_f16` | 5,435 |
-| `tbuffer_load_format_xyz` | 5,231 |
-| `v_interp_mov_f32` | 4,326 |
-| `image_sample_d` | 3,149 |
-| `s_andn2_wrexec_b64` | 2,225 |
-| `image_atomic_or` | 1,094 |
-| `image_atomic_umin` | 1,066 |
-| `image_sample_b` | 1,034 |
-| `image_atomic_umax` | 1,014 |
-| `image_load_mip` | 770 |
-| `v_cvt_pk_u8_f32` | 686 |
 | `s_swappc_b64` | 679 |
-| `image_get_lod` | 672 |
-| `flat_load_dwordx2` | 537 |
-| `flat_load_dword` | 500 |
-| `image_get_resinfo` | 475 |
-| `tbuffer_load_format_x` | 316 |
-| `s_waitcnt_vscnt` | 180 |
-| `s_load_dwordx2` | 158 |
-| `buffer_store_format_d16_xyzw` | 132 |
-| `image_gather4_l` | 88 |
-| `image_gather4_l_o` | 88 |
-| `buffer_load_format_d16_xyzw` | 76 |
-| `buffer_load_format_d16_x` | 72 |
-| `image_sample_d_cl` | 48 |
-| `flat_load_dwordx3` | 26 |
-| `image_atomic_add` | 25 |
-| `flat_load_dwordx4` | 21 |
-| `image_gather4_lz_o` | 12 |
 | `s_setpc_b64` | 6 |
 | `flat_load_ushort` | 4 |
 
@@ -161,7 +125,7 @@ Most used first. Each needs a check before it can be trusted.
 | `s_setreg_b32` | 0x13 | Yes | — | — |
 | `s_setreg_imm32_b32` | 0x15 | Yes | AMD 1002:13c0, NVIDIA 10de:2705 | 28,099 |
 | `s_call_b64` | 0x16 | **No** | — | — |
-| `s_waitcnt_vscnt` | 0x17 | Nothing to emit | — | 180 |
+| `s_waitcnt_vscnt` | 0x17 | Nothing to emit | AMD 1002:13c0, NVIDIA 10de:2705 | 180 |
 | `s_waitcnt_vmcnt` | 0x18 | Nothing to emit | — | — |
 | `s_waitcnt_expcnt` | 0x19 | Nothing to emit | — | — |
 | `s_waitcnt_lgkmcnt` | 0x1a | Nothing to emit | — | — |
@@ -222,7 +186,7 @@ Most used first. Each needs a check before it can be trusted.
 | `s_andn1_saveexec_b64` | 0x37 | Yes | — | — |
 | `s_orn1_saveexec_b64` | 0x38 | Yes | AMD 1002:13c0, NVIDIA 10de:2705 | — |
 | `s_andn1_wrexec_b64` | 0x39 | Yes | — | — |
-| `s_andn2_wrexec_b64` | 0x3a | Yes | — | 2,225 |
+| `s_andn2_wrexec_b64` | 0x3a | Yes | AMD 1002:13c0, NVIDIA 10de:2705 | 2,225 |
 | `s_bitreplicate_b64_b32` | 0x3b | Unproven: s_bitreplicate_b64_b32 needs proven ordinary scalar operands (not a wave mask) | AMD 1002:13c0, NVIDIA 10de:2705 | — |
 | `s_and_saveexec_b32` | 0x3c | Yes | AMD 1002:13c0, NVIDIA 10de:2705 | 9,451 |
 | `s_or_saveexec_b32` | 0x3d | Yes | AMD 1002:13c0, NVIDIA 10de:2705 | 5,642 |
@@ -295,7 +259,7 @@ Most used first. Each needs a check before it can be trusted.
 | `s_endpgm_saved` | 0x1b | **No** | — | — |
 | `s_endpgm_ordered_ps_done` | 0x1e | **No** | — | — |
 | `s_code_end` | 0x1f | Nothing to emit | — | — |
-| `s_inst_prefetch` | 0x20 | Nothing to emit | — | 44,348 |
+| `s_inst_prefetch` | 0x20 | Nothing to emit | AMD 1002:13c0, NVIDIA 10de:2705 | 44,348 |
 | `s_clause` | 0x21 | Nothing to emit | — | — |
 | `s_wait_idle` | 0x22 | **No** | — | — |
 | `s_waitcnt_depctr` | 0x23 | Nothing to emit | — | — |
@@ -308,7 +272,7 @@ Most used first. Each needs a check before it can be trusted.
 | Instruction | Opcode | Translator | GPU check | Recorded shaders |
 | --- | --- | --- | --- | ---: |
 | `s_load_dword` | 0x0 | Nothing to emit | AMD 1002:13c0, NVIDIA 10de:2705 | 841 |
-| `s_load_dwordx2` | 0x1 | Nothing to emit | — | 158 |
+| `s_load_dwordx2` | 0x1 | Nothing to emit | AMD 1002:13c0, NVIDIA 10de:2705 | 158 |
 | `s_load_dwordx4` | 0x2 | Nothing to emit | AMD 1002:13c0, NVIDIA 10de:2705 | 43,821 |
 | `s_load_dwordx8` | 0x3 | Nothing to emit | AMD 1002:13c0, NVIDIA 10de:2705 | 30,350 |
 | `s_load_dwordx16` | 0x4 | Nothing to emit | — | — |
@@ -929,7 +893,7 @@ Most used first. Each needs a check before it can be trusted.
 | `v_sad_hi_u8` | 0x15b | Yes | AMD 1002:13c0, NVIDIA 10de:2705 | — |
 | `v_sad_u16` | 0x15c | Yes | AMD 1002:13c0, NVIDIA 10de:2705 | — |
 | `v_sad_u32` | 0x15d | Yes | AMD 1002:13c0, NVIDIA 10de:2705 | — |
-| `v_cvt_pk_u8_f32` | 0x15e | Yes | — | 686 |
+| `v_cvt_pk_u8_f32` | 0x15e | Yes | AMD 1002:13c0, NVIDIA 10de:2705 | 686 |
 | `v_div_fixup_f32` | 0x15f | **No** | — | — |
 | `v_div_fixup_f64` | 0x160 | **No** | — | — |
 | `v_add_f64` | 0x164 | **No** | — | — |
@@ -1031,9 +995,9 @@ Most used first. Each needs a check before it can be trusted.
 | `v_sat_pk_u8_i16` | 0x1e2 | Yes | AMD 1002:13c0, NVIDIA 10de:2705 | — |
 | `v_cvt_norm_i16_f16` | 0x1e3 | Yes | — | — |
 | `v_cvt_norm_u16_f16` | 0x1e4 | Yes | — | — |
-| `v_interp_p1_f32` | 0x200 | Yes, in recorded shaders | — | 13,513 |
-| `v_interp_p2_f32` | 0x201 | Yes, in recorded shaders | — | 13,513 |
-| `v_interp_mov_f32` | 0x202 | Yes, in recorded shaders | — | 4,326 |
+| `v_interp_p1_f32` | 0x200 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 13,513 |
+| `v_interp_p2_f32` | 0x201 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 13,513 |
+| `v_interp_mov_f32` | 0x202 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 4,326 |
 | `v_lshlrev_b64` | 0x2ff | Yes | AMD 1002:13c0, NVIDIA 10de:2705 | 602 |
 | `v_lshrrev_b64` | 0x300 | Yes | AMD 1002:13c0, NVIDIA 10de:2705 | — |
 | `v_ashrrev_i64` | 0x301 | Yes | AMD 1002:13c0, NVIDIA 10de:2705 | — |
@@ -1072,7 +1036,7 @@ Most used first. Each needs a check before it can be trusted.
 | `v_med3_f16` | 0x357 | Yes | AMD 1002:13c0, NVIDIA 10de:2705 | 22 |
 | `v_med3_i16` | 0x358 | Yes | AMD 1002:13c0, NVIDIA 10de:2705 | — |
 | `v_med3_u16` | 0x359 | Yes | AMD 1002:13c0, NVIDIA 10de:2705 | — |
-| `v_interp_p2_f16` | 0x35a | Yes, in recorded shaders | — | 5,435 |
+| `v_interp_p2_f16` | 0x35a | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 5,435 |
 | `v_mad_i16` | 0x35e | Yes | AMD 1002:13c0, NVIDIA 10de:2705 | — |
 | `v_div_fixup_f16` | 0x35f | **No** | — | — |
 | `v_readlane_b32` | 0x360 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 6,097 |
@@ -1130,9 +1094,9 @@ Most used first. Each needs a check before it can be trusted.
 
 | Instruction | Opcode | Translator | GPU check | Recorded shaders |
 | --- | --- | --- | --- | ---: |
-| `v_interp_p1_f32` | 0x0 | Yes, in recorded shaders | — | 13,513 |
-| `v_interp_p2_f32` | 0x1 | Yes, in recorded shaders | — | 13,513 |
-| `v_interp_mov_f32` | 0x2 | Yes, in recorded shaders | — | 4,326 |
+| `v_interp_p1_f32` | 0x0 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 13,513 |
+| `v_interp_p2_f32` | 0x1 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 13,513 |
+| `v_interp_mov_f32` | 0x2 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 4,326 |
 
 ## Group memory (DS)
 
@@ -1270,10 +1234,10 @@ Most used first. Each needs a check before it can be trusted.
 | `flat_load_sbyte` | 0x9 | **No** | — | — |
 | `flat_load_ushort` | 0xa | Yes, in recorded shaders | — | 4 |
 | `flat_load_sshort` | 0xb | **No** | — | — |
-| `flat_load_dword` | 0xc | Yes, in recorded shaders | — | 500 |
-| `flat_load_dwordx2` | 0xd | Yes, in recorded shaders | — | 537 |
-| `flat_load_dwordx4` | 0xe | Yes, in recorded shaders | — | 21 |
-| `flat_load_dwordx3` | 0xf | Yes, in recorded shaders | — | 26 |
+| `flat_load_dword` | 0xc | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 500 |
+| `flat_load_dwordx2` | 0xd | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 537 |
+| `flat_load_dwordx4` | 0xe | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 21 |
+| `flat_load_dwordx3` | 0xf | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 26 |
 | `flat_store_byte` | 0x18 | **No** | — | — |
 | `flat_store_byte_d16_hi` | 0x19 | **No** | — | — |
 | `flat_store_short` | 0x1a | **No** | — | — |
@@ -1392,23 +1356,23 @@ Most used first. Each needs a check before it can be trusted.
 | `buffer_atomic_fmax_x2` | 0x60 | Unproven: mubuf: s8 not a buffer descriptor (None) | — | — |
 | `buffer_gl0_inv` | 0x71 | Yes | — | — |
 | `buffer_gl1_inv` | 0x72 | Yes | — | — |
-| `buffer_load_format_d16_x` | 0x80 | Yes, in recorded shaders | — | 72 |
+| `buffer_load_format_d16_x` | 0x80 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 72 |
 | `buffer_load_format_d16_xy` | 0x81 | Unproven: mubuf: s8 not a buffer descriptor (None) | — | — |
 | `buffer_load_format_d16_xyz` | 0x82 | Unproven: mubuf: s8 not a buffer descriptor (None) | — | — |
-| `buffer_load_format_d16_xyzw` | 0x83 | Yes, in recorded shaders | — | 76 |
+| `buffer_load_format_d16_xyzw` | 0x83 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 76 |
 | `buffer_store_format_d16_x` | 0x84 | Unproven: mubuf: s8 not a buffer descriptor (None) | — | — |
 | `buffer_store_format_d16_xy` | 0x85 | Unproven: mubuf: s8 not a buffer descriptor (None) | — | — |
 | `buffer_store_format_d16_xyz` | 0x86 | Unproven: mubuf: s8 not a buffer descriptor (None) | — | — |
-| `buffer_store_format_d16_xyzw` | 0x87 | Yes, in recorded shaders | — | 132 |
+| `buffer_store_format_d16_xyzw` | 0x87 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 132 |
 
 ## Typed buffers (MTBUF)
 
 | Instruction | Opcode | Translator | GPU check | Recorded shaders |
 | --- | --- | --- | --- | ---: |
-| `tbuffer_load_format_x` | 0x0 | Yes, in recorded shaders | — | 316 |
-| `tbuffer_load_format_xy` | 0x1 | Yes, in recorded shaders | — | 18,506 |
-| `tbuffer_load_format_xyz` | 0x2 | Yes, in recorded shaders | — | 5,231 |
-| `tbuffer_load_format_xyzw` | 0x3 | Yes, in recorded shaders | — | 12,152 |
+| `tbuffer_load_format_x` | 0x0 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 316 |
+| `tbuffer_load_format_xy` | 0x1 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 18,506 |
+| `tbuffer_load_format_xyz` | 0x2 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 5,231 |
+| `tbuffer_load_format_xyzw` | 0x3 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 12,152 |
 | `tbuffer_store_format_x` | 0x4 | Unproven: typed buffer load requires a verified linear root SRV | — | — |
 | `tbuffer_store_format_xy` | 0x5 | Unproven: typed buffer load requires a verified linear root SRV | — | — |
 | `tbuffer_store_format_xyz` | 0x6 | Unproven: typed buffer load requires a verified linear root SRV | — | — |
@@ -1427,7 +1391,7 @@ Most used first. Each needs a check before it can be trusted.
 | Instruction | Opcode | Translator | GPU check | Recorded shaders |
 | --- | --- | --- | --- | ---: |
 | `image_load` | 0x0 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 18,145 |
-| `image_load_mip` | 0x1 | Yes, in recorded shaders | — | 770 |
+| `image_load_mip` | 0x1 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 770 |
 | `image_load_pck` | 0x2 | Unproven: mimg: s8 not an image descriptor (None) | — | — |
 | `image_load_pck_sgn` | 0x3 | Unproven: mimg: s8 not an image descriptor (None) | — | — |
 | `image_load_mip_pck` | 0x4 | Unproven: mimg: s8 not an image descriptor (None) | — | — |
@@ -1436,17 +1400,17 @@ Most used first. Each needs a check before it can be trusted.
 | `image_store_mip` | 0x9 | Unproven: mimg: s8 not an image descriptor (None) | — | — |
 | `image_store_pck` | 0xa | Unproven: mimg: s8 not an image descriptor (None) | — | — |
 | `image_store_mip_pck` | 0xb | Unproven: mimg: s8 not an image descriptor (None) | — | — |
-| `image_get_resinfo` | 0xe | Yes, in recorded shaders | — | 475 |
+| `image_get_resinfo` | 0xe | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 475 |
 | `image_atomic_swap` | 0xf | Unproven: mimg: s8 not an image descriptor (None) | — | — |
 | `image_atomic_cmpswap` | 0x10 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 4 |
-| `image_atomic_add` | 0x11 | Yes, in recorded shaders | — | 25 |
+| `image_atomic_add` | 0x11 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 25 |
 | `image_atomic_sub` | 0x12 | Unproven: mimg: s8 not an image descriptor (None) | — | — |
 | `image_atomic_smin` | 0x14 | Unproven: mimg: s8 not an image descriptor (None) | — | — |
-| `image_atomic_umin` | 0x15 | Yes, in recorded shaders | — | 1,066 |
+| `image_atomic_umin` | 0x15 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 1,066 |
 | `image_atomic_smax` | 0x16 | Unproven: mimg: s8 not an image descriptor (None) | — | — |
-| `image_atomic_umax` | 0x17 | Yes, in recorded shaders | — | 1,014 |
+| `image_atomic_umax` | 0x17 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 1,014 |
 | `image_atomic_and` | 0x18 | Unproven: mimg: s8 not an image descriptor (None) | — | — |
-| `image_atomic_or` | 0x19 | Yes, in recorded shaders | — | 1,094 |
+| `image_atomic_or` | 0x19 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 1,094 |
 | `image_atomic_xor` | 0x1a | Unproven: mimg: s8 not an image descriptor (None) | — | — |
 | `image_atomic_inc` | 0x1b | Unproven: mimg: s8 not an image descriptor (None) | — | — |
 | `image_atomic_dec` | 0x1c | Unproven: mimg: s8 not an image descriptor (None) | — | — |
@@ -1455,10 +1419,10 @@ Most used first. Each needs a check before it can be trusted.
 | `image_atomic_fmax` | 0x1f | Unproven: mimg: s8 not an image descriptor (None) | — | — |
 | `image_sample` | 0x20 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 15,441 |
 | `image_sample_cl` | 0x21 | Unproven: mimg: s8 not an image descriptor (None) | — | — |
-| `image_sample_d` | 0x22 | Yes, in recorded shaders | — | 3,149 |
-| `image_sample_d_cl` | 0x23 | Yes, in recorded shaders | — | 48 |
-| `image_sample_l` | 0x24 | Yes, in recorded shaders | — | 12,138 |
-| `image_sample_b` | 0x25 | Yes, in recorded shaders | — | 1,034 |
+| `image_sample_d` | 0x22 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 3,149 |
+| `image_sample_d_cl` | 0x23 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 48 |
+| `image_sample_l` | 0x24 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 12,138 |
+| `image_sample_b` | 0x25 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 1,034 |
 | `image_sample_b_cl` | 0x26 | Unproven: mimg: s8 not an image descriptor (None) | — | — |
 | `image_sample_lz` | 0x27 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 19,654 |
 | `image_sample_c` | 0x28 | Unproven: mimg: s8 not an image descriptor (None) | — | — |
@@ -1468,7 +1432,7 @@ Most used first. Each needs a check before it can be trusted.
 | `image_sample_c_l` | 0x2c | Unproven: mimg: s8 not an image descriptor (None) | — | — |
 | `image_sample_c_b` | 0x2d | Unproven: mimg: s8 not an image descriptor (None) | — | — |
 | `image_sample_c_b_cl` | 0x2e | Unproven: mimg: s8 not an image descriptor (None) | — | — |
-| `image_sample_c_lz` | 0x2f | Yes, in recorded shaders | — | 8,535 |
+| `image_sample_c_lz` | 0x2f | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 8,535 |
 | `image_sample_o` | 0x30 | Unproven: mimg: s8 not an image descriptor (None) | — | — |
 | `image_sample_cl_o` | 0x31 | Unproven: mimg: s8 not an image descriptor (None) | — | — |
 | `image_sample_d_o` | 0x32 | Unproven: mimg: s8 not an image descriptor (None) | — | — |
@@ -1489,10 +1453,10 @@ Most used first. Each needs a check before it can be trusted.
 | `image_gather4_cl` | 0x41 | Unproven: mimg: s8 not an image descriptor (None) | — | — |
 | `image_load_by2` | 0x42 | Unproven: mimg: s8 not an image descriptor (None) | — | — |
 | `image_load_by4` | 0x43 | Unproven: mimg: s8 not an image descriptor (None) | — | — |
-| `image_gather4_l` | 0x44 | Yes, in recorded shaders | — | 88 |
+| `image_gather4_l` | 0x44 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 88 |
 | `image_gather4_b` | 0x45 | Unproven: mimg: s8 not an image descriptor (None) | — | — |
 | `image_gather4_b_cl` | 0x46 | Unproven: mimg: s8 not an image descriptor (None) | — | — |
-| `image_gather4_lz` | 0x47 | Yes, in recorded shaders | — | 8,973 |
+| `image_gather4_lz` | 0x47 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 8,973 |
 | `image_gather4_c` | 0x48 | Unproven: mimg: s8 not an image descriptor (None) | — | — |
 | `image_gather4_c_cl` | 0x49 | Unproven: mimg: s8 not an image descriptor (None) | — | — |
 | `image_load_mip_by2` | 0x4a | Unproven: mimg: s8 not an image descriptor (None) | — | — |
@@ -1505,10 +1469,10 @@ Most used first. Each needs a check before it can be trusted.
 | `image_gather4_cl_o` | 0x51 | Unproven: mimg: s8 not an image descriptor (None) | — | — |
 | `image_store_by2` | 0x52 | Unproven: mimg: s8 not an image descriptor (None) | — | — |
 | `image_store_by4` | 0x53 | Unproven: mimg: s8 not an image descriptor (None) | — | — |
-| `image_gather4_l_o` | 0x54 | Yes, in recorded shaders | — | 88 |
+| `image_gather4_l_o` | 0x54 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 88 |
 | `image_gather4_b_o` | 0x55 | Unproven: mimg: s8 not an image descriptor (None) | — | — |
 | `image_gather4_b_cl_o` | 0x56 | Unproven: mimg: s8 not an image descriptor (None) | — | — |
-| `image_gather4_lz_o` | 0x57 | Yes, in recorded shaders | — | 12 |
+| `image_gather4_lz_o` | 0x57 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 12 |
 | `image_gather4_c_o` | 0x58 | Unproven: mimg: s8 not an image descriptor (None) | — | — |
 | `image_gather4_c_cl_o` | 0x59 | Unproven: mimg: s8 not an image descriptor (None) | — | — |
 | `image_store_mip_by2` | 0x5a | Unproven: mimg: s8 not an image descriptor (None) | — | — |
@@ -1517,7 +1481,7 @@ Most used first. Each needs a check before it can be trusted.
 | `image_gather4_c_b_o` | 0x5d | Unproven: mimg: s8 not an image descriptor (None) | — | — |
 | `image_gather4_c_b_cl_o` | 0x5e | Unproven: mimg: s8 not an image descriptor (None) | — | — |
 | `image_gather4_c_lz_o` | 0x5f | Unproven: mimg: s8 not an image descriptor (None) | — | — |
-| `image_get_lod` | 0x60 | Yes, in recorded shaders | — | 672 |
+| `image_get_lod` | 0x60 | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 672 |
 | `image_gather4h` | 0x61 | Unproven: mimg: s8 not an image descriptor (None) | — | — |
 | `image_gather4h_pck` | 0x62 | Unproven: mimg: s8 not an image descriptor (None) | — | — |
 | `image_gather8h_pck` | 0x63 | Unproven: mimg: s8 not an image descriptor (None) | — | — |
