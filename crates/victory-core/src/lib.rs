@@ -6,6 +6,7 @@
 //! * [`logging`]: one tracing setup for all binaries.
 
 pub mod config;
+pub mod input;
 pub mod logging;
 pub mod policy;
 

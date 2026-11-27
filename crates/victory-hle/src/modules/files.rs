@@ -107,6 +107,31 @@ const VERBATIM: [u16; 4] = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u1
 /// host's MAX_PATH limit (248 characters for a directory, 260 for a file).
 const LONG: usize = 248;
 
+/// The title opens the same package on G: and sometimes on its other mount.
+/// Match only its top-level UI archive. Save drives and nested archives keep
+/// their normal paths even when their filenames happen to be the same.
+fn is_ui_archive(tail: &[u16]) -> bool {
+    let mut parts = tail.split(|c| SEPARATORS.contains(c))
+        .filter(|p| !p.is_empty() && *p != [u16::from(b'.')]);
+    let Some(name) = parts.next() else { return false };
+    let expected = b"data.rpf";
+    parts.next().is_none() && name.len() == expected.len()
+        && name.iter().zip(expected).all(|(&a, &b)| u8::try_from(a).is_ok_and(|c| c.eq_ignore_ascii_case(&b)))
+}
+
+fn keyboard_hud_archive() -> Option<&'static [u16]> {
+    static ARCHIVE: std::sync::OnceLock<Option<Vec<u16>>> = std::sync::OnceLock::new();
+    ARCHIVE.get_or_init(|| {
+        let path = std::path::PathBuf::from(std::env::var_os("VICTORY_KEYBOARD_HUD_ARCHIVE")?);
+        if !path.is_absolute() || !path.is_file() {
+            tracing::warn!(?path, "keyboard HUD archive unavailable");
+            return None;
+        }
+        tracing::info!(?path, "using the keyboard button movie from the local UI archive");
+        Some(path.as_os_str().encode_wide().chain([0]).collect())
+    }).as_deref()
+}
+
 /// `root` and the title's `tail` as a `\\?\` path. That form turns off the
 /// host's own clean-up, so `/` becomes `\` and `.` and `..` are resolved
 /// here (`..` stops at the root).
@@ -160,6 +185,13 @@ pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
     let drives = drives();
     let (_, root) = drives.iter().find(|(l, _)| *l == letter)?;
     let tail = &rest[2..];
+    if is_ui_archive(tail)
+        && drives.iter().any(|(l, r)| *l == u16::from(b'G') && r == root)
+        && victory_loader::input::active_input() != victory_loader::input::ActiveInput::Controller
+        && let Some(archive) = keyboard_hud_archive()
+    {
+        return Some(archive.to_vec());
+    }
     if prefix.is_empty() && root.len() + tail.len() >= LONG {
         let mut out = verbatim(root, tail);
         out.push(0);
@@ -821,6 +853,16 @@ mod tests {
 
     fn text(v: &[u16]) -> String {
         String::from_utf16_lossy(&v[..v.len() - 1])
+    }
+
+    #[test]
+    fn keyboard_hud_matches_only_the_package_archive() {
+        for path in [r"\data.rpf", "./DATA.RPF", "data.rpf"] {
+            assert!(is_ui_archive(&path.encode_utf16().collect::<Vec<_>>()));
+        }
+        for path in ["", "../data.rpf", "packs/data.rpf", "data.rpf.bak", "data.rpf/sub"] {
+            assert!(!is_ui_archive(&path.encode_utf16().collect::<Vec<_>>()));
+        }
     }
 
     #[test]

@@ -261,12 +261,43 @@ fork has always had; its options:
 | `-Res 1080to1440` / `4k` | scene at 1080p upscaled by the title / the stock 3840x2160 output |
 | `-NoFrameGenReady` | frame generation only with `-FrameGen` (it is otherwise made ready at every start, so the menu can switch it) |
 | `-Build diag` | the diagnostics build (slower; captures, timelines, recording time in the F3 panel) |
+| `-KeyboardMouse` | opt into the Windows keyboard and mouse preset described below |
 | `-More @{VICTORY_X='1'}` | add or override any switch |
 
 What the F1 menu saved (`victory-settings.txt`) goes over these at every start;
 delete that file to go back to them. Full screen: start the game, then run
 `.\scripts\fullscreen.ps1` in another window. Logs go to
 `%LOCALAPPDATA%\victory\logs`, saves to `%LOCALAPPDATA%\victory\data`.
+
+### Keyboard and mouse
+
+Run `scripts\play-foxhound.ps1 -Exe <path> -KeyboardMouse` for the F interact
+and pickup bindings, right mouse to aim, left mouse to fire or punch, and
+mouse-wheel zoom and weapon changes while the weapon wheel is open. The boat
+uses W and S for its throttle and brake/reverse, and Space for the handbrake.
+
+Pass `-KeyboardBindings <path>` alongside `-KeyboardMouse` to load a local
+UTF-8 text profile. Each line assigns one action or setting. Unspecified
+actions retain the preset defaults. For example:
+
+```ini
+interact = F
+pickup = F
+aim = MouseRight
+fire = MouseLeft
+punch = MouseLeft
+zoom_in = WheelUp
+zoom_out = WheelDown
+wheel_next = WheelUp
+wheel_previous = WheelDown
+mouse_sensitivity = 1.25
+```
+
+Sensitivity accepts values from 0.05 to 10. F1 shows the active bindings and
+lets you adjust mouse settings in-game. If you already generated a matching
+keyboard HUD archive from your own local files, pass it through
+`-KeyboardHudArchive <path>` alongside `-KeyboardMouse` to use its button
+glyphs. Keep that archive outside the repository.
 
 ## How it works, and the findings
 

@@ -7,6 +7,25 @@ use crate::{Console, Unimplemented};
 #[path = "native_1440p.rs"]
 mod native_1440p;
 
+#[cfg(windows)]
+mod boat_controls;
+#[cfg(windows)]
+mod digital_actions;
+#[cfg(windows)]
+mod lockon;
+#[cfg(windows)]
+mod lockon_prompt;
+#[cfg(windows)]
+mod mouse_controls;
+#[cfg(windows)]
+mod mouse_timing;
+#[cfg(windows)]
+mod scope_zoom;
+#[cfg(windows)]
+mod weapon_wheel;
+#[cfg(windows)]
+use lockon::{keyboard_lockon_active, lockon_image_base, trace_lockon};
+
 #[cfg(any(windows, test))]
 const SKIP_CPU_CHECK_ENV: &str = "VICTORY_SKIP_CPU_CHECK";
 
@@ -271,6 +290,12 @@ pub fn run(
             None => println!("frame rate: our clock {ms} ms; the title's own rate (30) left as it is"),
         }
     }
+    // SAFETY: all action sites are checked while the mapped title is still stopped.
+    unsafe { lockon::install(&image, hash.as_str()) }?;
+    unsafe { mouse_controls::install(&image) }?;
+    unsafe { digital_actions::install(&image) }?;
+    unsafe { mouse_timing::install(&image) }?;
+    unsafe { boat_controls::install(&image, hash.as_str()) }?;
     if !execute {
         println!("not executing (pass --execute to start the title)");
         return Ok(());

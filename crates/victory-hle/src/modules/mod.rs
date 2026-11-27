@@ -28,6 +28,8 @@ pub mod lifecycle;
 #[cfg(windows)]
 pub mod media;
 #[cfg(windows)]
+pub(crate) mod mouse_capture;
+#[cfg(windows)]
 pub mod net;
 pub mod rpcrt4;
 pub mod speech;

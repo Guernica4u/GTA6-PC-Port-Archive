@@ -34,6 +34,9 @@ param(
     # Frames begin every 1/Fps s whatever the title asks (it asks 1/30). 1000, the default: no cap, a frame
     # begins as soon as the last is done. 30: the title's own rate.
     [ValidateRange(1, 1000)][int]$Fps = 1000,
+    [switch]$KeyboardMouse,
+    [string]$KeyboardBindings,
+    [string]$KeyboardHudArchive,
     [hashtable]$More = @{}
 )
 $repo = Split-Path $PSScriptRoot -Parent
@@ -105,6 +108,23 @@ if ($Dlss -ne 'off') {
     }
 }
 if ($fpsWanted -gt 0) { $settings.VICTORY_FRAME_INTERVAL_US = [string][int][math]::Round(1000000 / $fpsWanted) }
+$keyboardArgs = ''
+if ($KeyboardMouse) {
+    $keyboardArgs = ' -KeyboardMouse'
+    foreach ($flag in 'KEYBOARD_PAD', 'ONE_PAD', 'MOUSE_LOOK', 'MOUSE_ACTIONS', 'MOUSE_TIMED_ACTIONS',
+        'MOUSE_SCOPE_ZOOM', 'MOUSE_WEAPON_WHEEL', 'F_LOCKON', 'F_PICKUP', 'BOAT_CONTROLS', 'BOAT_HANDBRAKE') {
+        $settings["VICTORY_$flag"] = '1'
+    }
+    foreach ($option in 'KeyboardBindings', 'KeyboardHudArchive') {
+        $path = $PSBoundParameters[$option]
+        if (!$path) { continue }
+        $file = Get-Item -LiteralPath $path -ErrorAction Stop
+        if ($file.PSIsContainer) { throw "-$option requires a file." }
+        $key = if ($option -eq 'KeyboardBindings') { 'VICTORY_INPUT_BINDINGS' } else { 'VICTORY_KEYBOARD_HUD_ARCHIVE' }
+        $settings[$key] = $file.FullName
+        $keyboardArgs += " -$option '" + ($file.FullName -replace "'", "''") + "'"
+    }
+}
 foreach ($k in $menu.Keys) {
     if ($k -like 'VICTORY_MENU_*') { continue }
     if ($menu[$k]) { $settings[$k] = $menu[$k] } else { $settings.Remove($k) }
@@ -120,7 +140,7 @@ $settings.VICTORY_MENU_FRAMEGEN = if ($settings.VICTORY_FRAMEGEN -eq '1') { [str
 $settings.VICTORY_MENU_FPS = [string]$fpsWanted
 $settings.VICTORY_MENU_FILE = $menuFile
 $settings.VICTORY_MENU_PLAY = $MyInvocation.MyCommand.Path
-$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })"
+$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })$keyboardArgs"
 
 $victory = Join-Path $repo "target\$Build\victory.exe"
 if (-not (Test-Path $victory)) {

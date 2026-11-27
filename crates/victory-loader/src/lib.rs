@@ -33,6 +33,8 @@ mod profile;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod stacks;
 #[cfg(windows)]
+pub mod startup_calls;
+#[cfg(windows)]
 mod threads;
 #[cfg(windows)]
 mod thunks;
@@ -51,6 +53,7 @@ pub use crash::{
 pub use crash::save_on_crash;
 pub use prepare::{PrepareError, PreparedImage, prepare};
 pub use resolve::{ImportResolver, Provenance, Resolution};
+pub use victory_core::input;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use stacks::{dump_stacks, dump_stacks_on_schedule};
 #[cfg(all(windows, feature = "diagnostics"))]

@@ -1,5 +1,5 @@
-//! The F1 settings menu. F1 shows and hides it while our window has the
-//! focus; Up/Down pick a setting, Left/Right change it, Enter runs the line
+//! The F1 settings menu (Chinese). F1 shows and hides it while our window has
+//! the focus; Up/Down pick a setting, Left/Right change it, Enter runs the line
 //! picked (save, save and restart, reset, close), Esc closes. While it is
 //! shown the title sees no keyboard (`crate::SETTINGS_MENU_OPEN`, read by the
 //! input module); a pad still works.
@@ -13,32 +13,37 @@
 //! (DLSS mode, frame generation, frame rate, console, picture size), which it
 //! turns into the layer's switches; the others are the switches themselves.
 //!
-//! In every build, as the stats panel is. Drawn as
-//! that panel is: white text on a black box, copied onto the swap chain's
-//! buffer, in the middle of the picture.
+//! Text is drawn with Windows GDI in Microsoft YaHei so Chinese labels work;
+//! the picture is copied onto the swap chain's buffer, in the middle of the
+//! screen. The stats panel (F3) keeps the dot font of `font.rs`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{COLORREF, SIZE};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
+use windows::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_DOWN, VK_ESCAPE, VK_F1, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
-use super::font::{colours, glyph};
+use super::font::colours;
 use super::{Host, HostList, transition};
 
-const GLYPH: (u32, u32) = (5, 7);
-const CELL: (u32, u32) = (6, 9);
-const COLUMNS: u32 = 60;
+/// Box layout in base units, multiplied by the picture's scale.
+const MENU_W: u32 = 470;
+const ROW_H: u32 = 11;
 /// Lines of the box: a title, a help line, a blank, the settings shown, a
 /// blank and a note.
 const ROWS: usize = 20;
 const LINES: u32 = ROWS as u32 + 5;
 const RIM: u32 = 4;
+const LABEL_X: u32 = 14;
+const VALUE_X: u32 = 252;
 const UPLOADS: usize = 4;
 
 /// A setting: the variable, its name in the menu, the values it takes
@@ -50,44 +55,51 @@ struct Item {
     live: bool,
 }
 
-const ON_UNSET: &[(&str, &str)] = &[("1", "ON"), ("", "OFF")];
-const UNSET_ON: &[(&str, &str)] = &[("", "OFF"), ("1", "ON")];
-const STAGES: &[(&str, &str)] = &[("2", "2"), ("1", "1"), ("0", "0 OFF")];
+const ON_UNSET: &[(&str, &str)] = &[("1", "开"), ("", "关")];
+const UNSET_ON: &[(&str, &str)] = &[("", "关"), ("1", "开")];
+const STAGES: &[(&str, &str)] = &[("2", "2"), ("1", "1"), ("0", "0 关")];
 
 /// The first value of each is what the launcher starts with.
 #[rustfmt::skip]
 const ITEMS: &[Item] = &[
     // The launcher's own choices.
-    Item { var: "VICTORY_MENU_DLSS", label: "DLSS", values: &[("quality", "QUALITY"), ("balanced", "BALANCED"), ("performance", "PERFORMANCE"), ("dlaa", "DLAA (NATIVE)"), ("off", "OFF")], live: false },
-    Item { var: "VICTORY_MENU_FRAMEGEN", label: "FRAME GENERATION", values: &[("0", "OFF"), ("2", "2X"), ("3", "3X"), ("4", "4X"), ("5", "5X"), ("6", "6X (MOST)")], live: false },
-    Item { var: "VICTORY_MENU_FPS", label: "FRAME RATE CAP", values: &[("1000", "NONE"), ("120", "120"), ("60", "60"), ("30", "30 (THE GAME)")], live: false },
-    Item { var: "VICTORY_FPS_LINE", label: "FPS AT THE TOP", values: &[("1", "ON"), ("0", "OFF")], live: true },
-    Item { var: "VICTORY_PANEL", label: "STATS PANEL (F3)", values: &[("0", "OFF"), ("1", "ON")], live: true },
-    Item { var: "VICTORY_FULLSCREEN", label: "FULLSCREEN (NO BORDER)", values: UNSET_ON, live: false },
-    Item { var: "VICTORY_MOUSE_CAPTURE", label: "MOUSE CAPTURE", values: UNSET_ON, live: false },
-    Item { var: "VICTORY_IME_ENGLISH", label: "ENGLISH KEYBOARD", values: UNSET_ON, live: false },
-    Item { var: "VICTORY_MENU_CONSOLE", label: "CONSOLE", values: &[("series-x", "SERIES X"), ("series-s", "SERIES S (FASTER)")], live: false },
-    Item { var: "VICTORY_MENU_RES", label: "SERIES X PICTURE", values: &[("1440", "2560X1440"), ("1080to1440", "1080P TO 1440P"), ("4k", "3840X2160")], live: false },
+    Item { var: "VICTORY_MENU_DLSS", label: "DLSS 超分辨率", values: &[("quality", "质量"), ("balanced", "平衡"), ("performance", "性能"), ("dlaa", "DLAA（原生）"), ("off", "关闭")], live: false },
+    Item { var: "VICTORY_MENU_FRAMEGEN", label: "帧生成", values: &[("0", "关闭"), ("2", "2 倍"), ("3", "3 倍"), ("4", "4 倍"), ("5", "5 倍"), ("6", "6 倍（最高）")], live: false },
+    Item { var: "VICTORY_MENU_FPS", label: "帧率上限", values: &[("1000", "无限制"), ("120", "120"), ("60", "60"), ("30", "30（游戏原生）")], live: false },
+    Item { var: "VICTORY_FPS_LINE", label: "左上角帧率显示", values: &[("1", "开"), ("0", "关")], live: true },
+    Item { var: "VICTORY_PANEL", label: "性能面板（F3）", values: &[("0", "关"), ("1", "开")], live: true },
+    Item { var: "VICTORY_FULLSCREEN", label: "无边框全屏", values: UNSET_ON, live: false },
+    Item { var: "VICTORY_MOUSE_CAPTURE", label: "鼠标锁定", values: UNSET_ON, live: false },
+    Item { var: "VICTORY_IME_ENGLISH", label: "英文键盘布局", values: UNSET_ON, live: false },
+    Item { var: "VICTORY_MENU_CONSOLE", label: "主机配置", values: &[("series-x", "Series X"), ("series-s", "Series S（更快）")], live: false },
+    Item { var: "VICTORY_MENU_RES", label: "画面分辨率", values: &[("1440", "2560×1440"), ("1080to1440", "1080P → 1440P"), ("4k", "3840×2160")], live: false },
     // The layer's switches.
-    Item { var: "VICTORY_DLSS_PRESET", label: "DLSS MODEL", values: &[("", "DEFAULT"), ("k", "K"), ("j", "J"), ("m", "M"), ("l", "L")], live: false },
-    Item { var: "VICTORY_AMBIENT", label: "LIGHT ESTIMATE", values: &[("0.8", "0.8"), ("1", "1"), ("0.5", "0.5"), ("", "OFF")], live: false },
-    Item { var: "VICTORY_AMBIENT_SPECULAR", label: "REFLECTION ESTIMATE", values: ON_UNSET, live: false },
-    Item { var: "VICTORY_AMBIENT_AIR", label: "FOG CAP", values: &[("1.5", "1.5"), ("1", "1"), ("2", "2"), ("", "NONE")], live: false },
-    Item { var: "VICTORY_BVH_BUILDER", label: "RAY TRACING (SLOW, BROKEN)", values: UNSET_ON, live: false },
-    Item { var: "VICTORY_WATER_LIGHT", label: "WATER LIGHT", values: &[("", "OFF (NO DARK BLOCKS)"), ("1", "ON (GREEN, DARK BLOCKS)")], live: false },
-    Item { var: "VICTORY_LEAVE_OUT", label: "HEAT HAZE AND DECAL DEFRAG", values: &[("02384a60fda6f2d0,731a39171b568298", "LEFT OUT"), ("", "RUN (SLOWER, SMEARS)")], live: false },
-    Item { var: "VICTORY_EARLY_DEPTH", label: "EARLY DEPTH TEST", values: ON_UNSET, live: false },
-    Item { var: "VICTORY_WC_NO_BACK", label: "SKIP BIG COPY-BACKS", values: ON_UNSET, live: false },
-    Item { var: "VICTORY_SOFT_VIEWS", label: "SOFT VIEWS (NO CUT FREEZES)", values: &[("copies", "ON"), ("", "OFF")], live: false },
-    Item { var: "VICTORY_TEXTURE_NO_WAIT", label: "TEXTURE NO WAIT", values: ON_UNSET, live: false },
-    Item { var: "VICTORY_RELAY", label: "RELAY (SPEED, TRIANGLES)", values: STAGES, live: false },
-    Item { var: "VICTORY_CARD_STEPS", label: "CARD STEPS", values: STAGES, live: false },
-    Item { var: "VICTORY_INDIRECT_BATCH", label: "INDIRECT BATCH", values: STAGES, live: false },
-    Item { var: "VICTORY_CARD_BUFFERS_MIN_KB", label: "CARD COMPARES FROM (KB)", values: &[("64", "64"), ("1024", "1024")], live: false },
-    Item { var: "VICTORY_PORT_CONSTANTS", label: "CONSTANTS HEAP IN PLACE", values: UNSET_ON, live: false },
+    Item { var: "VICTORY_DLSS_PRESET", label: "DLSS 模型", values: &[("", "默认"), ("k", "K"), ("j", "J"), ("m", "M"), ("l", "L")], live: false },
+    Item { var: "VICTORY_AMBIENT", label: "间接光估算", values: &[("0.8", "0.8"), ("1", "1"), ("0.5", "0.5"), ("", "关闭")], live: false },
+    Item { var: "VICTORY_AMBIENT_SPECULAR", label: "反射估算", values: ON_UNSET, live: false },
+    Item { var: "VICTORY_AMBIENT_AIR", label: "雾效上限", values: &[("1.5", "1.5"), ("1", "1"), ("2", "2"), ("", "无")], live: false },
+    Item { var: "VICTORY_BVH_BUILDER", label: "光线追踪（慢且异常）", values: UNSET_ON, live: false },
+    Item { var: "VICTORY_WATER_LIGHT", label: "水面光照", values: &[("", "关闭（无黑块）"), ("1", "开启（偏绿、有黑块）")], live: false },
+    Item { var: "VICTORY_LEAVE_OUT", label: "热浪与贴花整理", values: &[("02384a60fda6f2d0,731a39171b568298", "跳过"), ("", "运行（慢、拖影）")], live: false },
+    Item { var: "VICTORY_EARLY_DEPTH", label: "早期深度测试", values: ON_UNSET, live: false },
+    Item { var: "VICTORY_WC_NO_BACK", label: "跳过大块回拷", values: ON_UNSET, live: false },
+    Item { var: "VICTORY_SOFT_VIEWS", label: "软视图（防切场景卡顿）", values: &[("copies", "开"), ("", "关")], live: false },
+    Item { var: "VICTORY_TEXTURE_NO_WAIT", label: "纹理不等待", values: ON_UNSET, live: false },
+    Item { var: "VICTORY_RELAY", label: "中继（速度/三角形）", values: STAGES, live: false },
+    Item { var: "VICTORY_CARD_STEPS", label: "显卡步数", values: STAGES, live: false },
+    Item { var: "VICTORY_INDIRECT_BATCH", label: "间接批处理", values: STAGES, live: false },
+    Item { var: "VICTORY_CARD_BUFFERS_MIN_KB", label: "显卡比较阈值（KB）", values: &[("64", "64"), ("1024", "1024")], live: false },
+    Item { var: "VICTORY_PORT_CONSTANTS", label: "常量堆原位", values: UNSET_ON, live: false },
 ];
 /// The lines after the settings.
-const ACTIONS: [&str; 4] = ["SAVE AND RESTART NOW", "SAVE FOR NEXT START", "RESET ALL TO PLAY DEFAULTS", "CLOSE"];
+const ACTIONS: [&str; 4] = ["立即保存并重启", "保存（下次启动生效）", "全部恢复为启动默认", "关闭"];
+
+/// One drawn line of the box.
+enum Row {
+    Text(String),
+    Item { sel: bool, label: String, value: String, mark: String },
+    Action { sel: bool, text: String },
+}
 
 fn get(var: &str) -> String {
     std::env::var(var).unwrap_or_default()
@@ -161,40 +173,170 @@ fn keys() -> &'static Mutex<Vec<u16>> {
 
 /// The box's size in pixels.
 const fn size(scale: u32) -> (u32, u32) {
-    ((COLUMNS * CELL.0 + 2 * RIM) * scale, (LINES * CELL.1 + 2 * RIM) * scale)
+    ((MENU_W + 2 * RIM) * scale, (LINES * ROW_H + 2 * RIM) * scale)
 }
 
-fn lit(lines: &[String], x: u32, y: u32) -> bool {
-    let (Some(x), Some(y)) = (x.checked_sub(RIM), y.checked_sub(RIM)) else {
-        return false;
-    };
-    if x % CELL.0 >= GLYPH.0 || y % CELL.1 >= GLYPH.1 || x / CELL.0 >= COLUMNS {
-        return false;
-    }
-    let Some(&c) = lines.get((y / CELL.1) as usize).and_then(|l| l.as_bytes().get((x / CELL.0) as usize)) else {
-        return false;
-    };
-    (glyph(c.to_ascii_uppercase())[(y % CELL.1) as usize] >> (GLYPH.0 - 1 - x % CELL.0)) & 1 != 0
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().collect()
 }
 
-fn painted(lines: &[String], scale: u32, colours: [&[u8]; 2], pitch: usize) -> Vec<u8> {
-    let (width, height) = size(scale);
-    let bytes = colours[0].len();
-    let mut out = vec![0; pitch * height as usize];
-    for y in 0..height / scale {
-        let top = pitch * (y * scale) as usize;
-        for x in 0..width / scale {
-            let colour = colours[usize::from(lit(lines, x, y))];
-            for i in 0..scale {
-                let at = top + (x * scale + i) as usize * bytes;
-                out[at..at + bytes].copy_from_slice(colour);
+/// 0..255 as IEEE halves, for the float swap-chain formats.
+fn half_table() -> &'static [u16; 256] {
+    static T: OnceLock<[u16; 256]> = OnceLock::new();
+    T.get_or_init(|| {
+        let mut t = [0u16; 256];
+        for (i, e) in t.iter_mut().enumerate() {
+            let v = i as f32 / 255.0;
+            let b = v.to_bits();
+            let sign = ((b >> 16) & 0x8000) as u16;
+            let exp = ((b >> 23) & 0xFF) as i32 - 127 + 15;
+            let man = (b >> 13) & 0x3FF;
+            *e = if exp >= 31 {
+                sign | 0x7C00
+            } else if exp <= 0 {
+                if exp < -10 { sign } else { sign | (((man | 0x400) >> (1 - exp)) as u16) }
+            } else {
+                sign | ((exp as u16) << 10) | man as u16
+            };
+        }
+        t
+    })
+}
+
+/// Draws the rows with GDI (Microsoft YaHei) into a 32-bit DIB and converts
+/// the pixels into the swap chain's format. White on black; the picked line
+/// is green.
+fn render_rows(rows: &[Row], scale: u32, format: DXGI_FORMAT, pitch: usize) -> Option<Vec<u8>> {
+    let bytes = colours(format)?[0].len();
+    let (w, h) = size(scale);
+    let mut out = vec![0u8; pitch * h as usize];
+    unsafe {
+        let hdc = CreateCompatibleDC(None);
+        if hdc.is_invalid() {
+            return None;
+        }
+        let mut bmi: BITMAPINFO = std::mem::zeroed();
+        bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        bmi.bmiHeader.biWidth = w as i32;
+        bmi.bmiHeader.biHeight = -(h as i32);
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB.0 as u32;
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let bmp = match CreateDIBSection(Some(hdc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) {
+            Ok(b) => b,
+            Err(_) => {
+                let _ = DeleteDC(hdc);
+                return None;
+            }
+        };
+        if bits.is_null() {
+            let _ = DeleteObject(bmp.into());
+            let _ = DeleteDC(hdc);
+            return None;
+        }
+        let old = SelectObject(hdc, bmp.into());
+        std::ptr::write_bytes(bits as *mut u8, 0, (w * h * 4) as usize);
+        let face = wide("Microsoft YaHei UI");
+        let font = CreateFontW(
+            -(9 * scale as i32), 0, 0, 0, 400, 0, 0, 0,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            ANTIALIASED_QUALITY, DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32, PCWSTR::from_raw(face.as_ptr()),
+        );
+        let font_bold = CreateFontW(
+            -(9 * scale as i32), 0, 0, 0, 700, 0, 0, 0,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            ANTIALIASED_QUALITY, DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32, PCWSTR::from_raw(face.as_ptr()),
+        );
+        let old_font = SelectObject(hdc, font.into());
+        SetBkMode(hdc, TRANSPARENT);
+        let white = COLORREF(0x00FFFFFF);
+        let green = COLORREF(0x0000B976);
+        let mut y = RIM * scale;
+        for (i, row) in rows.iter().enumerate() {
+            let x0 = (RIM + LABEL_X) * scale;
+            match row {
+                Row::Text(t) => {
+                    if t.is_empty() {
+                        y += ROW_H * scale;
+                        continue;
+                    }
+                    SelectObject(hdc, if i == 0 { font_bold.into() } else { font.into() });
+                    SetTextColor(hdc, white);
+                    let wt = wide(t);
+                    let _ = TextOutW(hdc, (RIM * scale) as i32, y as i32, &wt);
+                }
+                Row::Item { sel, label, value, mark } => {
+                    SelectObject(hdc, font.into());
+                    SetTextColor(hdc, if *sel { green } else { white });
+                    if *sel {
+                        let c = wide("▶");
+                        let _ = TextOutW(hdc, (RIM * scale) as i32, y as i32, &c);
+                    }
+                    let wl = wide(label);
+                    let _ = TextOutW(hdc, x0 as i32, y as i32, &wl);
+                    let shown = format!("< {value} >");
+                    let wv = wide(&shown);
+                    let vx = (RIM + VALUE_X) * scale;
+                    let _ = TextOutW(hdc, vx as i32, y as i32, &wv);
+                    if !mark.is_empty() {
+                        let mut sz = SIZE::default();
+                        let _ = GetTextExtentPoint32W(hdc, &wv, &mut sz);
+                        let wm = wide(mark);
+                        let _ = TextOutW(hdc, vx as i32 + sz.cx + 4 * scale as i32, y as i32, &wm);
+                    }
+                }
+                Row::Action { sel, text } => {
+                    SelectObject(hdc, font.into());
+                    SetTextColor(hdc, if *sel { green } else { white });
+                    if *sel {
+                        let c = wide("▶");
+                        let _ = TextOutW(hdc, (RIM * scale) as i32, y as i32, &c);
+                    }
+                    let wt = wide(text);
+                    let _ = TextOutW(hdc, x0 as i32, y as i32, &wt);
+                }
+            }
+            y += ROW_H * scale;
+        }
+        // DIB bits are BGRA; GDI leaves alpha 0. Convert into the chain's format.
+        let src = std::slice::from_raw_parts(bits as *const u8, (w * h * 4) as usize);
+        let halves = half_table();
+        for py in 0..h as usize {
+            for px in 0..w as usize {
+                let s = (py * w as usize + px) * 4;
+                let (b, g, r) = (src[s] as u32, src[s + 1] as u32, src[s + 2] as u32);
+                let at = py * pitch + px * bytes;
+                match format {
+                    DXGI_FORMAT_B8G8R8A8_UNORM => {
+                        out[at..at + 4].copy_from_slice(&[b as u8, g as u8, r as u8, 0xFF]);
+                    }
+                    DXGI_FORMAT_R8G8B8A8_UNORM => {
+                        out[at..at + 4].copy_from_slice(&[r as u8, g as u8, b as u8, 0xFF]);
+                    }
+                    DXGI_FORMAT_R10G10B10A2_UNORM => {
+                        let q = |v: u32| (v << 2) | (v >> 6);
+                        let packed = q(r) | (q(g) << 10) | (q(b) << 20) | (3 << 30);
+                        out[at..at + 4].copy_from_slice(&packed.to_le_bytes());
+                    }
+                    DXGI_FORMAT_R16G16B16A16_FLOAT => {
+                        out[at..at + 2].copy_from_slice(&halves[r as usize].to_le_bytes());
+                        out[at + 2..at + 4].copy_from_slice(&halves[g as usize].to_le_bytes());
+                        out[at + 4..at + 6].copy_from_slice(&halves[b as usize].to_le_bytes());
+                        out[at + 6..at + 8].copy_from_slice(&0x3C00u16.to_le_bytes());
+                    }
+                    _ => {}
+                }
             }
         }
-        for i in 1..scale as usize {
-            out.copy_within(top..top + pitch, top + i * pitch);
-        }
+        SelectObject(hdc, old_font);
+        let _ = DeleteObject(font.into());
+        let _ = DeleteObject(font_bold.into());
+        SelectObject(hdc, old);
+        let _ = DeleteObject(bmp.into());
+        let _ = DeleteDC(hdc);
     }
-    out
+    Some(out)
 }
 
 struct Buffers {
@@ -240,9 +382,8 @@ impl Buffers {
         Some(Buffers { format, scale, pitch, uploads, card: card?, turn: 0, fresh: false, used: false })
     }
 
-    fn write(&mut self, lines: &[String]) {
-        let Some(colours) = colours(self.format) else { return };
-        let picture = painted(lines, self.scale, colours, self.pitch as usize);
+    fn write(&mut self, rows: &[Row]) {
+        let Some(picture) = render_rows(rows, self.scale, self.format, self.pitch as usize) else { return };
         self.turn = (self.turn + 1) % UPLOADS;
         // SAFETY: a mapped upload buffer of the picture's size, which the card read frames ago.
         unsafe { std::ptr::copy_nonoverlapping(picture.as_ptr(), self.uploads[self.turn].1, picture.len()) };
@@ -282,31 +423,40 @@ impl Menu {
         crate::SETTINGS_MENU_OPEN.load(Ordering::Relaxed)
     }
 
-    fn lines(&self) -> Vec<String> {
+    fn rows(&self) -> Vec<Row> {
         let total = ITEMS.len() + ACTIONS.len();
         let first = self.at.saturating_sub(ROWS / 2).min(total.saturating_sub(ROWS));
         let mut out = vec![
-            "SETTINGS                       F1 OR ESC CLOSES".to_owned(),
-            "UP/DOWN PICK  LEFT/RIGHT CHANGE  ENTER DOES IT".to_owned(),
-            String::new(),
+            Row::Text("设置菜单　　　　　　　　　　F1 / Esc 关闭".to_owned()),
+            Row::Text("↑↓ 选择　←→ 修改　回车 执行".to_owned()),
+            Row::Text(String::new()),
         ];
         for row in first..(first + ROWS).min(total) {
-            let cursor = if row == self.at { '>' } else { ' ' };
-            let line = if let Some(item) = ITEMS.get(row) {
+            let sel = row == self.at;
+            if let Some(item) = ITEMS.get(row) {
                 let value = &self.values[row];
-                let shown = index_of(item, value).map_or(value.to_ascii_uppercase(), |i| item.values[i].1.to_owned());
-                let mark = if *value != self.started[row] { if live(item) { " *LIVE" } else { " *" } } else if live(item) { " LIVE" } else { "" };
-                format!("{cursor} {:<27} < {shown} >{mark}", item.label)
+                let shown = index_of(item, value).map_or(value.to_owned(), |i| item.values[i].1.to_owned());
+                let mark = if *value != self.started[row] {
+                    if live(item) { " *实时".to_owned() } else { " *".to_owned() }
+                } else if live(item) {
+                    " 实时".to_owned()
+                } else {
+                    String::new()
+                };
+                out.push(Row::Item { sel, label: item.label.to_owned(), value: shown, mark });
             } else {
-                format!("{cursor} {}", ACTIONS[row - ITEMS.len()])
-            };
-            out.push(line.chars().take(COLUMNS as usize).collect());
+                out.push(Row::Action { sel, text: ACTIONS[row - ITEMS.len()].to_owned() });
+            }
         }
         while out.len() < 3 + ROWS {
-            out.push(String::new());
+            out.push(Row::Text(String::new()));
         }
-        out.push(String::new());
-        out.push(if self.note.is_empty() { "* = CHANGED: APPLIES AT THE NEXT START UNLESS LIVE".to_owned() } else { self.note.clone() });
+        out.push(Row::Text(String::new()));
+        out.push(Row::Text(if self.note.is_empty() {
+            "* = 已修改：除标注“实时”外，下次启动生效".to_owned()
+        } else {
+            self.note.clone()
+        }));
         out
     }
 
@@ -348,7 +498,7 @@ impl Menu {
     /// Writes the changed values over those in the settings file.
     fn save(&mut self) -> bool {
         let Some(path) = std::env::var_os("VICTORY_MENU_FILE") else {
-            self.note = "NO SETTINGS FILE: START WITH VICTORY PLAY".to_owned();
+            self.note = "没有设置文件：请用启动器启动游戏".to_owned();
             return false;
         };
         let mut kept: Vec<(String, String)> = std::fs::read_to_string(&path)
@@ -372,12 +522,12 @@ impl Menu {
             Ok(()) => {
                 tracing::info!(path = %std::path::Path::new(&path).display(), "settings menu: saved");
                 self.started = self.values.clone();
-                self.note = "SAVED. APPLIES AT THE NEXT START".to_owned();
+                self.note = "已保存，下次启动生效".to_owned();
                 true
             }
             Err(e) => {
                 tracing::warn!(error = %e, "settings menu: not saved");
-                self.note = "COULD NOT SAVE THE SETTINGS FILE".to_owned();
+                self.note = "无法写入设置文件".to_owned();
                 false
             }
         }
@@ -387,7 +537,7 @@ impl Menu {
     fn restart(&mut self) {
         use std::os::windows::process::CommandExt;
         let Some(play) = std::env::var_os("VICTORY_MENU_PLAY") else {
-            self.note = "SAVED. START THE LAUNCHER AGAIN YOURSELF".to_owned();
+            self.note = "已保存，请自行重新启动启动器".to_owned();
             return;
         };
         let play = play.to_string_lossy().replace('\'', "''");
@@ -412,7 +562,7 @@ impl Menu {
             }
             Err(e) => {
                 tracing::warn!(error = %e, "settings menu: restart failed");
-                self.note = "SAVED, BUT THE RESTART FAILED".to_owned();
+                self.note = "已保存，但重启失败".to_owned();
             }
         }
     }
@@ -422,7 +572,7 @@ impl Menu {
         if let Some(path) = std::env::var_os("VICTORY_MENU_FILE") {
             let _ = std::fs::remove_file(path);
         }
-        self.note = "RESET. PLAY DEFAULTS AT THE NEXT START".to_owned();
+        self.note = "已重置，下次启动使用启动器默认".to_owned();
     }
 
     /// A frame was presented: the keys pressed since the last one.
@@ -492,15 +642,15 @@ impl Menu {
             self.painted = line.clone();
             self.changed = true;
         }
-        let lines = if self.changed { Some(line.as_ref().map_or_else(|| self.lines(), |l| vec![l.clone()])) } else { None };
+        let rows = if self.changed { Some(line.as_ref().map_or_else(|| self.rows(), |l| vec![Row::Text(l.clone())])) } else { None };
         let Some(buffers) = &mut self.buffers else { return };
-        if let Some(lines) = lines {
+        if let Some(rows) = rows {
             self.changed = false;
-            buffers.write(&lines);
+            buffers.write(&rows);
         }
         // The whole box in the middle, or of it the first line's part in the corner.
         let (w, h) = match &line {
-            Some(l) => ((l.len() as u32 * CELL.0 + 2 * RIM) * scale, (CELL.1 + 2 * RIM) * scale),
+            Some(l) => ((l.chars().count() as u32 * 6 + 2 * RIM) * scale, (ROW_H + 2 * RIM) * scale),
             None => size(scale),
         };
         let (w, h) = (w.min(width), h.min(height));
@@ -541,18 +691,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_line_fits_and_every_character_has_a_picture() {
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false };
-        menu.started = menu.values.clone();
-        for at in 0..ITEMS.len() + ACTIONS.len() {
-            menu.at = at;
-            for line in menu.lines() {
-                assert!(line.len() <= COLUMNS as usize, "{line}");
-                for c in line.bytes() {
-                    assert_ne!(glyph(c.to_ascii_uppercase()), glyph(b'#'), "{line}: {}", c as char);
-                }
+    fn labels_and_values_fit_their_columns() {
+        for item in ITEMS {
+            assert!(item.label.chars().count() <= 24, "{}", item.label);
+            for (_, shown) in item.values {
+                assert!(shown.chars().count() <= 22, "{shown}");
             }
         }
+        let menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false };
+        assert_eq!(menu.rows().len(), LINES as usize);
     }
 
     #[test]
@@ -566,5 +713,45 @@ mod tests {
         assert_eq!(menu.values[0], ITEMS[0].values[0].0);
         menu.change(0, -1);
         assert_eq!(menu.values[0], ITEMS[0].values[n - 1].0);
+    }
+
+    /// Renders the real menu through GDI and writes a BMP preview to the temp
+    /// folder, so the Chinese labels can be looked at without the game.
+    #[test]
+    fn render_preview_to_temp() {
+        use std::io::Write;
+        let values: Vec<String> = ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect();
+        let menu = Menu { started: values.clone(), values, at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false };
+        let rows = menu.rows();
+        let scale = 2;
+        let format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        let (w, h) = size(scale);
+        let pitch = (w * 4).next_multiple_of(256) as usize;
+        let px = render_rows(&rows, scale, format, pitch).expect("GDI render");
+        let path = std::env::temp_dir().join("victory-menu-preview.bmp");
+        let mut f = std::fs::File::create(&path).unwrap();
+        let data_size = w * h * 4;
+        let mut hdr = Vec::new();
+        hdr.extend_from_slice(b"BM");
+        hdr.extend_from_slice(&(14 + 40 + data_size).to_le_bytes());
+        hdr.extend_from_slice(&0u16.to_le_bytes());
+        hdr.extend_from_slice(&0u16.to_le_bytes());
+        hdr.extend_from_slice(&54u32.to_le_bytes());
+        hdr.extend_from_slice(&40u32.to_le_bytes());
+        hdr.extend_from_slice(&(w as i32).to_le_bytes());
+        hdr.extend_from_slice(&(h as i32).to_le_bytes());
+        hdr.extend_from_slice(&1u16.to_le_bytes());
+        hdr.extend_from_slice(&32u16.to_le_bytes());
+        hdr.extend_from_slice(&0u32.to_le_bytes());
+        hdr.extend_from_slice(&data_size.to_le_bytes());
+        hdr.extend_from_slice(&0i32.to_le_bytes());
+        hdr.extend_from_slice(&0i32.to_le_bytes());
+        hdr.extend_from_slice(&0u32.to_le_bytes());
+        hdr.extend_from_slice(&0u32.to_le_bytes());
+        f.write_all(&hdr).unwrap();
+        for y in (0..h).rev() {
+            f.write_all(&px[y as usize * pitch..y as usize * pitch + (w * 4) as usize]).unwrap();
+        }
+        println!("preview: {}", path.display());
     }
 }

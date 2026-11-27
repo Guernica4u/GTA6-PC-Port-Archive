@@ -151,7 +151,7 @@ static MOUSE_CAPTURE: std::sync::LazyLock<Mutex<MouseCapture>> =
     std::sync::LazyLock::new(|| Mutex::new(MouseCapture::default()));
 
 fn capture_mouse(hwnd: HWND, active: bool) {
-    if !enabled("VICTORY_MOUSE_CAPTURE") { return; }
+    if super::mouse_capture::uses_relative_look() || !enabled("VICTORY_MOUSE_CAPTURE") { return; }
     let mut state = MOUSE_CAPTURE.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: runs on the window thread; local geometry, balanced cursor count.
     unsafe {
@@ -353,6 +353,8 @@ fn hook(hwnd: HWND) {
             capture_mouse(hwnd, true);
         }
     }
+    super::gameinput::register_keyboard_window(hwnd);
+    super::mouse_capture::register(hwnd);
 }
 
 extern "system" fn window_proc(
@@ -361,6 +363,11 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    super::gameinput::keyboard_window_message(hwnd, message, wparam, lparam);
+    super::mouse_capture::message(hwnd, message, wparam, lparam);
+    if let Some(result) = super::mouse_capture::pointer_message(hwnd, message, wparam, lparam) {
+        return result;
+    }
     if message == wm::WM_SETFOCUS {
         english_input();
     }
