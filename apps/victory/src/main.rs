@@ -7,6 +7,7 @@ mod census;
 mod inspect;
 mod prebuild;
 mod run;
+mod sdkpath;
 mod shader;
 mod translate;
 
