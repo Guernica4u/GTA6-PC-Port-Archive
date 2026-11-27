@@ -117,6 +117,8 @@ const CASES: &[Case] = &[
      "s20 s21 s22 s23 s24 s25 s26 s27 s28 s29 s30 s31 s32 s33 s34 s35",
      "p4 p5 p6 p7 p8 p9 p10 p11 p12 p13 p14 p15 p16 p17 p18 p19", &[0xf430_0504, 0xfa00_0010]),
     ("raw-scalar-x4", "raw", 0, Some(4), "s20 s21 s22 s23", "p4 p5 p6 p7", &[0xf428_0504, 0xfa00_0010]),
+    // s_load_dwordx2 s[12:13], s[4:5], 0x0 first: a two-word fetch from the table changes nothing the load reads.
+    ("raw-after-fetch-x2", "raw", 0, Some(4), "v7", "p4", &[0xf404_0302, 0xfa00_0000, SIXTEEN, 0xe030_1000, 0x8002_0704]),
     // buffer_load_dword v7, off, s[8:11], 0 offset:8
     ("raw-vector-fixed", "raw", 0, Some(4), "v7", "p2", &[0xe030_0008, 0x8002_0700]),
     // buffer_load_dword* v7.., v4, s[8:11], 0 offen
