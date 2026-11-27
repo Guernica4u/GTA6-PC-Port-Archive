@@ -8,13 +8,22 @@ use crate::structure;
 const S_ENDPGM: u32 = 0xBF81_0000;
 
 fn lower_wave_cs(words: &[u32], threads: [u32; 3], lds_dwords: u32) -> Lowered {
+    lower_wave_cs_layout(words, threads, lds_dwords, vec![])
+}
+
+fn lower_wave_cs_layout(
+    words: &[u32],
+    threads: [u32; 3],
+    lds_dwords: u32,
+    layout: Vec<crate::native::RootParam>,
+) -> Lowered {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let lds_granules = lds_dwords.div_ceil(128).max(1);
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: true,
         vgprs: 256,
-        layout: vec![],
+        layout,
         used: vec![],
         io: StageIo::Cs(ComputeIo {
             // lds_size field in COMPUTE_PGM_RSRC2 is bits [15:23] in 128-dword granules.
@@ -149,7 +158,7 @@ fn wave64_lds_64_threads_scalar_mask_mod_keeps_wave_size_64() {
     let words = [
         0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
         0xBE94_046A, // s_mov_b64 s[20:21], vcc
-        0xBEB4_1D80, // s_bitset1_b32 s20, 0
+        0xBE94_1D80, // s_bitset1_b32 s20, 0
         0xBF06_8114, // s_cmp_eq_u32 s20, 1
         0xBF85_0002, // s_cbranch_scc1 +2
         0xD834_0000, // ds_write_b32 v0, v1
@@ -157,6 +166,69 @@ fn wave64_lds_64_threads_scalar_mask_mod_keeps_wave_size_64() {
         S_ENDPGM,
     ];
     let lowered = lower_wave_cs(&words, [64, 1, 1], 16);
+    assert_eq!(lowered.wave_size, Some(64));
+    assert!(!lowered.lds_wave32_sync);
+    assert_eq!(lowered.lds_barriers, 0);
+}
+
+#[test]
+fn wave64_lds_64_threads_high_mask_read_keeps_wave_size_64() {
+    // Reading the upper dword (x.st.highs) of a 64-bit lane mask must not allow Wave32 LDS sync.
+    let words = [
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE94_046A, // s_mov_b64 s[20:21], vcc
+        0xBE95_1D80, // s_bitset1_b32 s21, 0
+        0xBF06_8115, // s_cmp_eq_u32 s21, 1
+        0xBF85_0002, // s_cbranch_scc1 +2
+        0xD834_0000, // ds_write_b32 v0, v1
+        0x0000_0100,
+        S_ENDPGM,
+    ];
+    let lowered = lower_wave_cs(&words, [64, 1, 1], 16);
+    assert_eq!(lowered.wave_size, Some(64));
+    assert!(!lowered.lds_wave32_sync);
+    assert_eq!(lowered.lds_barriers, 0);
+}
+
+#[test]
+fn wave64_lds_64_threads_cndmask_data_keeps_wave_size_64() {
+    // Passing a tracked lane mask as a data operand to v_cndmask_b32 materializes a Wave32 ballot.
+    let words = [
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE94_046A, // s_mov_b64 s[20:21], vcc
+        0x0202_0314, // v_cndmask_b32 v1, s20, v1, vcc
+        0xD834_0000, // ds_write_b32 v0, v1
+        0x0000_0100,
+        S_ENDPGM,
+    ];
+    let lowered = lower_wave_cs(&words, [64, 1, 1], 16);
+    assert_eq!(lowered.wave_size, Some(64));
+    assert!(!lowered.lds_wave32_sync);
+    assert_eq!(lowered.lds_barriers, 0);
+}
+
+#[test]
+fn wave64_lds_64_threads_smem_mask_offset_keeps_wave_size_64() {
+    // Using a tracked lane mask SGPR as an SMEM soffset materializes a Wave32 ballot.
+    let layout = vec![crate::native::RootParam {
+        root: crate::native::RootType::Constants,
+        table_offset_dwords: 0,
+        sgprs: 4,
+        base_register: 0,
+        user_data: 0,
+        slot: 0,
+    }];
+    let words = [
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE94_046A, // s_mov_b64 s[20:21], vcc
+        0xF400_0100, // s_load_dword s4, s[0:1], s20
+        0x2800_0000,
+        0x7E02_0204, // v_mov_b32 v1, s4
+        0xD834_0000, // ds_write_b32 v0, v1
+        0x0000_0100,
+        S_ENDPGM,
+    ];
+    let lowered = lower_wave_cs_layout(&words, [64, 1, 1], 16, layout);
     assert_eq!(lowered.wave_size, Some(64));
     assert!(!lowered.lds_wave32_sync);
     assert_eq!(lowered.lds_barriers, 0);

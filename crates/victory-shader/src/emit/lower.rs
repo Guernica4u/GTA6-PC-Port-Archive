@@ -425,11 +425,18 @@ fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
             return false;
         }
         Fields::Sop { src, .. } => src.iter().collect(),
+        Fields::Smem {
+            data,
+            base,
+            soffset,
+            ..
+        } => data.iter().chain([base, soffset]).collect(),
         Fields::Valu(v)
-            if !matches!(i.name(), "v_cndmask_b32") && !i.name().contains("_co_ci_") =>
+            if matches!(i.name(), "v_cndmask_b32") || i.name().contains("_co_ci_") =>
         {
-            v.src.iter().collect()
+            v.src.iter().take(2).collect()
         }
+        Fields::Valu(v) => v.src.iter().collect(),
         _ => return false,
     };
     ops.into_iter().any(|op| match *op {
