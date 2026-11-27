@@ -182,7 +182,7 @@ pub(super) fn scalar_step(em: &Emitter<'_>, flow: &Flow, effects: &[Effect], i: 
                 Some([Res::Raw(_, false) | Res::Buf(_, false)]) => {
                     fixed_buffer(em, flow, effects, i, 0)
                 }
-                Some([Res::HeapLoad(0..=105) | Res::HeapBuffer(0..=105)]) => em.compute_heap,
+                Some([Res::HeapLoad(0..=107) | Res::HeapBuffer(0..=107)]) => em.compute_heap,
                 Some([Res::CodeTbl | Res::HeapSamplerLoad(_)]) => true,
                 None => op.op <= 4, // Descriptor-only load resolved before emission.
                 _ => false,

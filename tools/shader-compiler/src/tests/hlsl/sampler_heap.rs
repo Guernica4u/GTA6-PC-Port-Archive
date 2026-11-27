@@ -123,6 +123,25 @@ fn pixel_heap_refuses_what_it_cannot_prove() {
 }
 
 #[test]
+fn pixel_heap_allows_vcc_offsets() {
+    for (sdst, soff) in [(106u32, 106u32 << 25), (107u32, 107u32 << 25)] {
+        let mut vcc = SAMPLE;
+        vcc[0] = (0x8f00_850a & !(0x7f << 16)) | (sdst << 16); // vcc_{lo,hi} = s10 << 5
+        vcc[3] = soff; // s[4:11] = heap[s14:15][vcc_{lo,hi}]
+        let out = super::super::translate(&pixel(&vcc)).unwrap();
+        let name = if sdst == 106 { "vcc_lo" } else { "vcc_hi" };
+        assert!(out.hlsl.contains(&format!("s4 = tb_heap_index({name} >> 5)")), "{}", out.hlsl);
+        assert!(!out.hlsl.contains(&format!("uint {name} =")), "{}", out.hlsl);
+    }
+    // A vector comparison overwrites vcc_lo/vcc_hi and invalidates the offset proof.
+    let mut clobbered = SAMPLE.to_vec();
+    clobbered[0] = (0x8f00_850a & !(0x7f << 16)) | (106 << 16);
+    clobbered[3] = 106 << 25;
+    clobbered.insert(1, 0x7c94_0904); // v_cmp_eq_u32 vcc, v4, v4
+    assert!(refusal(&pixel(&clobbered)).contains("dynamic soffset unsupported"));
+}
+
+#[test]
 fn sampled_value_must_not_keep_sampler_offset_proof() {
     // v7 = v5 << 4; sample overwrites v7; readfirstlane s1,v7.
     // The second sampler fetch must not treat sample bits as an aligned offset.

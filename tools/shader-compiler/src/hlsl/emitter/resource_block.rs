@@ -38,9 +38,11 @@ impl<'a> Emitter<'a> {
             if self.pixel_heap {
                 lane_reads::step(ins, sym, self.one_word_vector_mask());
             }
-            // Dataflow key of a scalar location: SGPR number, or 1000+ for a lane-spill slot.
+            // Dataflow key of a scalar location: SGPR number (including vcc_lo/vcc_hi), or 1000+ for a lane-spill slot.
             let sg = |o: &Opnd| match o {
                 Opnd::Sgpr(n) => Some(*n as u16),
+                Opnd::VccLo => Some(106),
+                Opnd::VccHi => Some(107),
                 Opnd::Temp(n) if *n >= LANE_TEMP_BASE => Some(1000 + (*n - LANE_TEMP_BASE)),
                 _ => None,
             };
@@ -139,7 +141,7 @@ impl<'a> Emitter<'a> {
                     if let (Some(d), Some(source)) = (ins.dst.first().and_then(sg), ins.src.first().and_then(sg)) {
                         let entry = match sym.get(&source) {
                             Some(Sym::Table(t)) => Some(*t),
-                            None if !written.contains(&source) => u8::try_from(source).ok(),
+                            None if source < 106 && !written.contains(&source) => u8::try_from(source).ok(),
                             _ => None,
                         };
                         if let Some(index) = entry.and_then(|n| sampler_heap::index(self.ex, n)) {
@@ -172,7 +174,7 @@ impl<'a> Emitter<'a> {
                                 // A never-written user SGPR copied before use is still a table pointer.
                                 let s = ins.src.first().and_then(sg);
                                 match s {
-                                    Some(s) if !written.contains(&s) => {
+                                    Some(s) if s < 106 && !written.contains(&s) => {
                                         sym.insert(d, Sym::Table(s as u8));
                                     }
                                     _ => {
@@ -205,7 +207,7 @@ impl<'a> Emitter<'a> {
                                 None => match s {
                                     // A never-written user SGPR is a root table pointer (see
                                     // s_mov_b32); a 64-bit copy carries it in the low half.
-                                    Some(s) if k == 0 && !written.contains(&s) => {
+                                    Some(s) if k == 0 && s < 106 && !written.contains(&s) => {
                                         sym.insert(d, Sym::Table(s as u8));
                                     }
                                     _ => {
@@ -299,7 +301,7 @@ impl<'a> Emitter<'a> {
                     let d = ins.dst.first().and_then(sg).ok_or("s_load: bad dst")?;
                     let table = match sym.get(&b) {
                         Some(Sym::Table(t)) => *t,
-                        None if !written.contains(&b) => b as u8,
+                        None if b < 106 && !written.contains(&b) => b as u8,
                         other => {
                             return Err(format!(
                                 "s_load at {:#x}: base s{b} is not a root table pointer ({other:?})",
@@ -319,7 +321,7 @@ impl<'a> Emitter<'a> {
                             return Err(format!("s_load at {:#x}: heap buffer in a pixel shader", ins.offset));
                         }
                         let heap_offset = sym.get(&soff) == Some(&Sym::HeapOffset)
-                            || (self.compute_heap && !self.pixel_heap && soff < 106 && written.contains(&soff));
+                            || (self.compute_heap && !self.pixel_heap && soff <= 107 && written.contains(&soff));
                         if self.resource_heap_base == Some(table) && matches!(n, 4 | 8)
                             && (ins.aux.imm == 0 || (ins.aux.imm >= 0 && ins.aux.imm % 32 == 0 && sym.get(&soff) == Some(&Sym::HeapOffset)))
                             && heap_offset {
@@ -335,7 +337,7 @@ impl<'a> Emitter<'a> {
                         // heap (CS_RaytracingResolve: per-material index << 4, then a waterfall).
                         // Statically resolved sampler offsets keep their own path below.
                         if self.sampler_heap_base == Some(table) && n == 4 && ins.aux.imm == 0
-                            && soff < 106 && written.contains(&soff)
+                            && soff <= 107 && written.contains(&soff)
                             && (!self.pixel_heap || sym.get(&soff) == Some(&Sym::HeapSamplerOffset))
                             && !matches!(sym.get(&soff), Some(Sym::SamplerOffset(_)))
                         {

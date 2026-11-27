@@ -9,7 +9,7 @@ impl<'a> Emitter<'a> {
         if ins.op <= 4 {
             if let Some(Res::HeapLoad(offset)) = self.res.get(&idx).and_then(|v| v.first()).copied() {
                 let value = ssrc_name(u32::from(offset))?;
-                self.regs.insert(value.clone());
+                self.touch(&sreg_opnd(offset as u8));
                 let dst = d.ok_or("missing direct descriptor destination")?;
                 self.touch(&dst);
                 let byte_offset = if ins.aux.imm == 0 { value }
@@ -34,7 +34,7 @@ impl<'a> Emitter<'a> {
             }
             if let Some(Res::HeapSamplerLoad(offset)) = self.res.get(&idx).and_then(|v| v.first()).copied() {
                 let value = ssrc_name(u32::from(offset))?;
-                self.regs.insert(value.clone());
+                self.touch(&sreg_opnd(offset as u8));
                 let dst = d.ok_or("missing sampler descriptor destination")?;
                 self.touch(&dst);
                 // The guest sampler-heap pointer is the heap start (as for the static
