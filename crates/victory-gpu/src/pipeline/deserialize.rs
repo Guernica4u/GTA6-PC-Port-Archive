@@ -91,20 +91,102 @@ fn copied(pair: Pair) -> Result<Option<Vec<u8>>, ()> {
     ))
 }
 
+/// Logs one rejected deserialization with the shape every failure below shares.
+macro_rules! rejection {
+    ($pipeline:expr, $validator:expr, $reason:expr, $hresult:expr $(, $($fields:tt)*)?) => {
+        tracing::debug!(
+            pipeline = $pipeline,
+            validator = $validator,
+            reason = $reason,
+            hresult = format_args!("{:#010x}", $hresult as u32),
+            $($($fields)*)?
+            "pipeline state deserialization rejected"
+        );
+    };
+}
+
+fn bad_pair_reason(pair: Pair) -> &'static str {
+    match (pair.data.is_null(), pair.size > MAX_PAIR_SIZE) {
+        (true, true) => "null data pointer and size over cap",
+        (true, false) => "null data pointer",
+        (false, true) => "size over cap",
+        (false, false) => "size does not fit usize",
+    }
+}
+
+fn log_bad_pair(pipeline: &'static str, pair_name: &str, pair: Pair) {
+    rejection!(
+        pipeline,
+        "pair copy",
+        bad_pair_reason(pair),
+        E_INVALIDARG,
+        pair = pair_name,
+        size = pair.size,
+        max_size = MAX_PAIR_SIZE,
+        data_null = pair.data.is_null(),
+    );
+}
+
+fn copy_logged(pipeline: &'static str, pair_name: &str, pair: Pair) -> Result<Option<Vec<u8>>, ()> {
+    let copied = copied(pair);
+    if copied.is_err() {
+        log_bad_pair(pipeline, pair_name, pair);
+    }
+    copied
+}
+
+fn copy_stage_logged(
+    pipeline: &'static str,
+    index: usize,
+    pair_name: &str,
+    pair: Pair,
+) -> Result<Option<Vec<u8>>, ()> {
+    let copied = copied(pair);
+    if copied.is_err() {
+        log_bad_pair(pipeline, &format!("stage{index}.{pair_name}"), pair);
+    }
+    copied
+}
+
+fn required(pipeline: &'static str, pair_name: &str, copied: Option<Vec<u8>>) -> Option<Vec<u8>> {
+    if copied.is_none() {
+        rejection!(
+            pipeline,
+            "required pair",
+            "absent (size zero)",
+            E_INVALIDARG,
+            pair = pair_name,
+            size = 0,
+        );
+    }
+    copied
+}
+
 /// Validates the output argument and interface before reading a
 /// description. COM requires the output to be nulled on every failure that
 /// gets far enough to have an output at all.
-fn prepare_output(iid: *const Iid, out: *mut This) -> HRESULT {
+fn prepare_output(pipeline: &'static str, iid: *const Iid, out: *mut This) -> HRESULT {
     if out.is_null() {
+        rejection!(pipeline, "output", "null output pointer", E_POINTER);
         return E_POINTER;
     }
     // SAFETY: the caller passes a writable output location.
     unsafe { out.write(std::ptr::null()) };
     if iid.is_null() {
+        rejection!(pipeline, "interface", "null interface id", E_POINTER);
         E_POINTER
     } else if object::is(iid, &PIPELINE_IIDS) {
         S_OK
     } else {
+        // SAFETY: checked non-null above; the caller passes an interface id.
+        let iid = unsafe { &*iid };
+        rejection!(
+            pipeline,
+            "interface",
+            "unsupported interface",
+            E_NOINTERFACE,
+            iid = %object::guid_text(iid),
+        );
         E_NOINTERFACE
     }
 }
@@ -125,25 +207,78 @@ fn le32(bytes: &[u8], at: usize) -> u32 {
 /// remains lazy, just as it is for pipelines created the ordinary way.
 fn read_compute(desc: *const ComputeDesc) -> Option<ComputeParts> {
     // SAFETY: the caller passes the console description or null.
-    let desc = unsafe { desc.as_ref() }?;
-    let state = copied(desc.kind0).ok()??;
-    let opaque = copied(desc.kind1).ok()?;
-    let code = copied(desc.kind6).ok()??;
-    let records = copied(desc.kind7).ok()?;
+    let desc = match unsafe { desc.as_ref() } {
+        Some(desc) => desc,
+        None => {
+            rejection!("compute", "description", "null pointer", E_INVALIDARG);
+            return None;
+        }
+    };
+    let state = required(
+        "compute",
+        "kind0",
+        copy_logged("compute", "kind0", desc.kind0).ok()?,
+    )?;
+    let opaque = copy_logged("compute", "kind1", desc.kind1).ok()?;
+    let code = required(
+        "compute",
+        "kind6",
+        copy_logged("compute", "kind6", desc.kind6).ok()?,
+    )?;
+    let records = copy_logged("compute", "kind7", desc.kind7).ok()?;
     // The dispatch packet's seven words are the only part of kind 0 the
     // translator consumes. Machine code is dword machine code, and a record
     // blob has the 0x18-byte FSPX metadata header before its records.
-    if state.len() < 0x1c || code.len() % 4 != 0 {
+    if state.len() < 0x1c {
+        rejection!(
+            "compute",
+            "kind0 length",
+            "shorter than the seven-word dispatch packet",
+            E_INVALIDARG,
+            kind0_size = state.len(),
+            kind0_hash = %hash(&state),
+        );
+        return None;
+    }
+    if code.len() % 4 != 0 {
+        rejection!(
+            "compute",
+            "kind6 alignment",
+            "size is not dword-aligned",
+            E_INVALIDARG,
+            kind6_size = code.len(),
+            kind6_hash = %hash(&code),
+        );
         return None;
     }
     if let Some(records) = &records {
         if records.len() < 0x18 {
+            rejection!(
+                "compute",
+                "kind7 header",
+                "shorter than the FSPX metadata header",
+                E_INVALIDARG,
+                kind7_size = records.len(),
+                kind7_hash = %hash(records),
+            );
             return None;
         }
         // FSPX names the code length in dwords. A mismatch cannot become a
         // valid shader payload, so this is a corrupt description rather
         // than merely a shader the host may refuse later.
-        if le32(records, 8) as usize != code.len() / 4 {
+        let record_code_dwords = le32(records, 8) as usize;
+        if record_code_dwords != code.len() / 4 {
+            rejection!(
+                "compute",
+                "kind7 code length",
+                "record code length differs from kind6",
+                E_INVALIDARG,
+                record_code_dwords,
+                kind6_size = code.len(),
+                kind6_hash = %hash(&code),
+                kind7_size = records.len(),
+                kind7_hash = %hash(records),
+            );
             return None;
         }
     }
@@ -233,6 +368,30 @@ pub(crate) extern "system" fn serialize_denied(_: This, _: usize, _: usize, _: u
     E_ACCESSDENIED
 }
 
+fn trace_compute_entry(desc: *const ComputeDesc) {
+    if !tracing::enabled!(tracing::Level::TRACE) {
+        return;
+    }
+    // SAFETY: null is checked by `as_ref`; a non-null description names
+    // readable memory under the console ABI. Only scalar pair sizes are read.
+    match unsafe { desc.as_ref() } {
+        Some(desc) => tracing::trace!(
+            pipeline = "compute",
+            desc_null = false,
+            kind0_size = desc.kind0.size,
+            kind1_size = desc.kind1.size,
+            kind6_size = desc.kind6.size,
+            kind7_size = desc.kind7.size,
+            "pipeline state deserialization entry"
+        ),
+        None => tracing::trace!(
+            pipeline = "compute",
+            desc_null = true,
+            "pipeline state deserialization entry"
+        ),
+    }
+}
+
 /// Device method 0x218: deserializes a compute pipeline.
 pub(crate) extern "system" fn compute(
     _: This,
@@ -240,7 +399,8 @@ pub(crate) extern "system" fn compute(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    let valid = prepare_output(iid, out);
+    trace_compute_entry(desc);
+    let valid = prepare_output("compute", iid, out);
     if valid != S_OK {
         return valid;
     }
@@ -303,21 +463,72 @@ fn state_a_shape(blob: &[u8]) -> bool {
     measured && blob.len() >= 4 && (le32(blob, 0) & !0x18) == 0x4005_d800
 }
 
+fn stage_sizes(stages: &[StageDesc; 7]) -> String {
+    stages
+        .iter()
+        .enumerate()
+        .map(|(index, stage)| format!("{index}:{}:{}", stage.code.size, stage.records.size))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn read_graphics(desc: *const GraphicsDesc) -> Option<OfflineGraphics> {
     // SAFETY: the caller passes the console description or null.
-    let desc = unsafe { desc.as_ref() }?;
-    let state_a = copied(desc.state_a).ok()?;
-    let state_b = copied(desc.state_b).ok()??;
-    if state_a.as_ref().is_some_and(|blob| !state_a_shape(blob)) || state_b.len() < 0x50 {
+    let desc = match unsafe { desc.as_ref() } {
+        Some(desc) => desc,
+        None => {
+            rejection!("graphics", "description", "null pointer", E_INVALIDARG);
+            return None;
+        }
+    };
+    let state_a = copy_logged("graphics", "state_a", desc.state_a).ok()?;
+    let state_b = required(
+        "graphics",
+        "state_b",
+        copy_logged("graphics", "state_b", desc.state_b).ok()?,
+    )?;
+    if let Some(blob) = &state_a
+        && !state_a_shape(blob)
+    {
+        rejection!(
+            "graphics",
+            "state A shape",
+            "size or tag does not match measured state blobs",
+            E_INVALIDARG,
+            state_a_size = blob.len(),
+            state_a_hash = %hash(blob),
+        );
+        return None;
+    }
+    if state_b.len() < 0x50 {
+        rejection!(
+            "graphics",
+            "state B length",
+            "shorter than 0x50 bytes",
+            E_INVALIDARG,
+            state_b_size = state_b.len(),
+            state_b_hash = %hash(&state_b),
+        );
         return None;
     }
 
     let mut stages: [Option<OfflineStage>; 7] = std::array::from_fn(|_| None);
     let mut complete = 0;
     for (index, stage) in desc.stages.iter().enumerate() {
-        let code = copied(stage.code).ok()?;
-        let records = copied(stage.records).ok()?;
-        if code.as_ref().is_some_and(|code| code.len() % 4 != 0) {
+        let code = copy_stage_logged("graphics", index, "code", stage.code).ok()?;
+        let records = copy_stage_logged("graphics", index, "records", stage.records).ok()?;
+        if let Some(code) = &code
+            && code.len() % 4 != 0
+        {
+            rejection!(
+                "graphics",
+                "stage code alignment",
+                "size is not dword-aligned",
+                E_INVALIDARG,
+                stage = index,
+                code_size = code.len(),
+                code_hash = %hash(code),
+            );
             return None;
         }
         if code.is_some() || records.is_some() {
@@ -325,11 +536,44 @@ fn read_graphics(desc: *const GraphicsDesc) -> Option<OfflineGraphics> {
             complete += 1;
         }
     }
-    (complete != 0).then_some(OfflineGraphics {
+    if complete == 0 {
+        rejection!(
+            "graphics",
+            "stage coverage",
+            "no stage has code or records",
+            E_INVALIDARG,
+            stages = %stage_sizes(&desc.stages),
+        );
+        return None;
+    }
+    Some(OfflineGraphics {
         state_a,
         state_b,
         stages,
     })
+}
+
+fn trace_graphics_entry(desc: *const GraphicsDesc) {
+    if !tracing::enabled!(tracing::Level::TRACE) {
+        return;
+    }
+    // SAFETY: null is checked by `as_ref`; a non-null description names
+    // readable memory under the console ABI. Only scalar pair sizes are read.
+    match unsafe { desc.as_ref() } {
+        Some(desc) => tracing::trace!(
+            pipeline = "graphics",
+            desc_null = false,
+            state_a_size = desc.state_a.size,
+            state_b_size = desc.state_b.size,
+            stages = %stage_sizes(&desc.stages),
+            "pipeline state deserialization entry"
+        ),
+        None => tracing::trace!(
+            pipeline = "graphics",
+            desc_null = true,
+            "pipeline state deserialization entry"
+        ),
+    }
 }
 
 /// Device method 0x1c8: deserializes a graphics pipeline into a valid,
@@ -341,7 +585,8 @@ pub(crate) extern "system" fn graphics(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    let valid = prepare_output(iid, out);
+    trace_graphics_entry(desc);
+    let valid = prepare_output("graphics", iid, out);
     if valid != S_OK {
         return valid;
     }
@@ -672,26 +917,36 @@ mod tests {
     #[test]
     fn malformed_compute_descriptions_are_rejected() {
         let input = ComputeInput::new();
+        let rejected = |desc: &ComputeDesc| {
+            assert!(read_compute(desc).is_none());
+            let device = crate::device::device();
+            let mut out = device;
+            assert_eq!(
+                compute(device, desc, &PIPELINE_IIDS[0], &mut out),
+                E_INVALIDARG
+            );
+            assert!(out.is_null());
+        };
         let mut desc = input.desc();
         desc.kind0.size = 0;
-        assert!(read_compute(&desc).is_none());
+        rejected(&desc);
         let mut desc = input.desc();
         desc.kind6.size = 0;
-        assert!(read_compute(&desc).is_none());
+        rejected(&desc);
         let mut desc = input.desc();
         desc.kind0.size = 0x1b;
-        assert!(read_compute(&desc).is_none());
+        rejected(&desc);
         let mut desc = input.desc();
         desc.kind6.size = 3;
-        assert!(read_compute(&desc).is_none());
+        rejected(&desc);
         let mut desc = input.desc();
         desc.kind1.data = std::ptr::null();
-        assert!(read_compute(&desc).is_none());
+        rejected(&desc);
         let mut records = input.records.clone();
         records[8] = 2; // says two code dwords; kind 6 has one
         let mut desc = input.desc();
         desc.kind7 = pair(&records);
-        assert!(read_compute(&desc).is_none());
+        rejected(&desc);
     }
 
     #[test]
@@ -771,22 +1026,32 @@ mod tests {
     fn malformed_graphics_descriptions_are_rejected() {
         let input = GraphicsInput::new();
         assert!(read_graphics(&input.desc()).is_some());
+        let rejected = |desc: &GraphicsDesc| {
+            assert!(read_graphics(desc).is_none());
+            let device = crate::device::device();
+            let mut out = device;
+            assert_eq!(
+                graphics(device, desc, &PIPELINE_IIDS[0], &mut out),
+                E_INVALIDARG
+            );
+            assert!(out.is_null());
+        };
         let mut desc = input.desc();
         desc.state_b.size = 0;
-        assert!(read_graphics(&desc).is_none());
+        rejected(&desc);
         let mut desc = input.desc();
         desc.state_b.size = 0x4f;
-        assert!(read_graphics(&desc).is_none());
+        rejected(&desc);
         let mut desc = input.desc();
         desc.state_a.size = 421;
-        assert!(read_graphics(&desc).is_none());
+        rejected(&desc);
         let mut desc = input.desc();
         desc.stages[0].code.size = 3;
-        assert!(read_graphics(&desc).is_none());
+        rejected(&desc);
         let mut desc = input.desc();
         desc.stages[0].code.size = 0;
         desc.stages[0].records.size = 0;
-        assert!(read_graphics(&desc).is_none());
+        rejected(&desc);
     }
 
     #[test]
