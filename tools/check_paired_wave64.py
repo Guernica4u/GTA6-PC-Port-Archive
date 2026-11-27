@@ -89,6 +89,20 @@ PROGRAMS = {
                      'ds_swizzle_b32 v5, v0 offset:0x801b', 'v_add_nc_u32_e32 v10, v5, v10', 'v_mov_b32_e32 v11, v5',
                      's_add_u32 s21, s21, 1', 's_andn2_b64 exec, s[12:13], exec', ('branch', 's_cbranch_execnz', 'again'),
                      's_mov_b64 exec, s[10:11]'],
+    # An inclusive prefix sum over the wave: within each row, then each row hands its
+    # total to the next through a permute that reads lanes outside EXEC.
+    'row_scan': ['s_or_saveexec_b64 s[10:11], -1', 'v_cndmask_b32_e64 v10, 0, v0, s[10:11]',
+                 'v_add_nc_u32_dpp v10, v10, v10 row_shr:1 row_mask:0xf bank_mask:0xf bound_ctrl:1',
+                 'v_add_nc_u32_dpp v10, v10, v10 row_shr:2 row_mask:0xf bank_mask:0xf',
+                 'v_add_nc_u32_dpp v10, v10, v10 row_shr:4 row_mask:0xf bank_mask:0xf',
+                 'v_add_nc_u32_dpp v10, v10, v10 row_shr:8 row_mask:0xf bank_mask:0xf',
+                 's_mov_b32 exec_lo, 0xffff0000', 's_mov_b32 exec_hi, 0xffff0000',
+                 'v_permlanex16_b32 v11, v10, -1, -1 op_sel:[1,0]', 'v_add_nc_u32_e32 v10, v11, v10',
+                 'v_readlane_b32 s20, v10, 31', 's_mov_b64 exec, s[10:11]', 's_bcnt1_i32_b64 s21, exec'],
+    # The same permute where a lane outside EXEC supplies zero, and where it supplies nothing.
+    'permlane_inactive': ['v_mov_b32_e32 v10, 11', 'v_mov_b32_e32 v11, 22', 's_mov_b32 s30, 0x76543210',
+                          's_mov_b32 s31, 0xfedcba98', 'v_permlanex16_b32 v10, v0, s30, s31 op_sel:[0,1]',
+                          'v_permlane16_b32 v11, v0, s31, s30 op_sel:[1,1]'],
     # A texture taken at a run-time heap index: the descriptor is copied to vector
     # registers and a waterfall reads it back to load from it. The check stands a
     # function of the heap index and the coordinate in for the heap (see `instrument`).
@@ -176,6 +190,8 @@ class Wave:
 
     def store(self, token, value):
         if token == 'exec': self.exec = value & M64
+        elif token == 'exec_lo': self.exec = self.exec & ~M32 | value & M32
+        elif token == 'exec_hi': self.exec = self.exec & M32 | (value & M32) << 32
         elif token == 'vcc': self.vcc = value & M64
         elif m := re.fullmatch(r's\[(\d+):(\d+)\]', token):
             self.s[int(m[1])], self.s[int(m[2])] = value & M32, (value >> 32) & M32
@@ -272,12 +288,16 @@ def step(w, text):
         test = {'lt': lambda x, y: x < y, 'eq': lambda x, y: x == y, 'ne': lambda x, y: x != y}[base.split('_')[2]]
         mask = sum(1 << l for l in range(64) if w.active(l) and test(w.value(a, l), w.value(b, l)))
         w.store(dst, mask); return
-    if base == 'v_permlanex16_b32':
-        low, high = w.scalar(ops[2]), w.scalar(ops[3]); old = [w.value(ops[1], l) for l in range(64)]
+    if base in ('v_permlane16_b32', 'v_permlanex16_b32'):
+        modifiers = re.search(r' op_sel:\[(\d),(\d)\]', ops[3])
+        fetch_inactive, zero_inactive = (int(n) for n in modifiers.groups()) if modifiers else (0, 0)
+        low, high = w.scalar(ops[2]), w.scalar(ops[3].split()[0]); old = [w.value(ops[1], l) for l in range(64)]
         for l in range(64):
             i = l & 15; sel = ((low if i < 8 else high) >> (4 * (i & 7))) & 15
-            source = ((l & ~15) ^ 16) | sel
-            if w.active(l) and w.active(source): w.v[int(ops[0][1:])][l] = old[source]
+            source = ((l & ~15) ^ (16 if base == 'v_permlanex16_b32' else 0)) | sel
+            if not w.active(l): continue
+            if fetch_inactive or w.active(source): w.v[int(ops[0][1:])][l] = old[source]
+            elif zero_inactive: w.v[int(ops[0][1:])][l] = 0
         return
     dst = int(ops[0][1:])
     if base in ('v_add_co_u32', 'v_add_co_ci_u32'):

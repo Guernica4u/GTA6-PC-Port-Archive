@@ -337,9 +337,14 @@ fn dpp16(em: &mut Emitter<'_>, ins: &Insn) -> Result<Vec<String>, String> {
 
 /// Rows of sixteen lanes exchange values, within a row or with the neighbouring one.
 fn permlane(em: &mut Emitter<'_>, ins: &Insn) -> Result<(), String> {
-    if (ins.raw[0] >> 11) & 0xf != 0 || ins.aux.mask != 0 || ins.aux.imm != 0 || ins.aux.imm2 != 0 {
+    // OP_SEL[0] fetches from inactive lanes and OP_SEL[1] zeroes what an inactive lane
+    // would have supplied. OP_SEL[3] is set by the console compiler and selects nothing
+    // here; LLVM reads the same words as `op_sel:[1,0]`.
+    let flags = (ins.raw[0] >> 11) & 0xf;
+    if flags & 4 != 0 || ins.aux.mask != 0 || ins.aux.imm != 0 || ins.aux.imm2 != 0 {
         return Err("paired wave64: permlane modifiers".into());
     }
+    let (fetch_inactive, zero_inactive) = (flags & 1 != 0, flags & 2 != 0);
     let (Some(Opnd::Vgpr(to)), Some(Opnd::Vgpr(from))) = (ins.dst.first(), ins.src.first()) else {
         return Err("paired wave64: permlane operands".into());
     };
@@ -354,10 +359,18 @@ fn permlane(em: &mut Emitter<'_>, ins: &Insn) -> Result<(), String> {
             em.line(&line);
         }
     }
-    // Both lanes are read before either is written. An inactive source keeps the destination.
+    // Both lanes are read before either is written. An inactive source supplies its
+    // value, zero, or nothing, in which case the destination keeps what it had.
     for lane in 0..2u32 {
         let active = lane_bit("exec_lo", "exec_hi", lane);
-        em.line(&format!("if ({active} != 0u && {}) v{to}__[{lane}] = tbp_{lane};", source_active(lane)));
+        let source = source_active(lane);
+        em.line(&if fetch_inactive {
+            format!("if ({active} != 0u) v{to}__[{lane}] = tbp_{lane};")
+        } else if zero_inactive {
+            format!("if ({active} != 0u) v{to}__[{lane}] = {source} ? tbp_{lane} : 0u;")
+        } else {
+            format!("if ({active} != 0u && {source}) v{to}__[{lane}] = tbp_{lane};")
+        });
     }
     em.line("}");
     Ok(())
