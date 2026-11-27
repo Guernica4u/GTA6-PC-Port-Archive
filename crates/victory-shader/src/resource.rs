@@ -1601,7 +1601,8 @@ impl<'a> Tracer<'a> {
                     .iter()
                     .find(|phi| phi.reg == reg)
                     .map(|phi| phi.value)
-            })?;
+            })
+            .or_else(|| inst.read(reg))?;
         let mut active = known.clone();
         active.extend([(lanes.reach[site.0], true), (guard, true)]);
         if !self.consistent(&active) || self.same_under(Term::Value(prior), next, &active, depth) {
@@ -1725,6 +1726,8 @@ impl<'a> Tracer<'a> {
             && let Fields::Valu(f) = &inst.fields
             && f.abs == 0
             && f.neg == 0
+            && !f.clamp
+            && f.omod == 0
             && f.sdwa.is_none()
             && f.dpp.is_none()
             && let Some(t) = f.src.first().and_then(|s| self.raw(inst, s))
