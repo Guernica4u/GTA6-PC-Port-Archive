@@ -26,6 +26,20 @@ from .shader_prep import SOURCE_CACHE, ToolFailure, compiler_tools, run_tool
 XSHADER_UNSUPPORTED_HLSL = 65
 # The emitter's one-line refusal reason kept beside an .unsupported marker.
 REASON_BYTES = 512
+# Each runtime cache is named after the compiler fingerprint, so every branch
+# build gets its own and switching back is a warm hit. Request keys carry no
+# translator version, so one build's output must never answer another's
+# request: the caches stay apart on purpose rather than being merged.
+#
+# Nothing removed a cache whose build was gone, so they accumulated (two branch
+# builds held 2.1 GB). Keep the running build's cache plus the two most
+# recently used others, and record in `last-used` when each one ran, because a
+# directory's own time also moves when a file inside it is rewritten.
+USED_FILE = "last-used"
+# Held open with an flock by the launcher using that cache, so retention cannot
+# remove a directory that is still compiling on another branch.
+IN_USE_FILE = "in-use"
+RUNTIME_CACHES_KEPT = 3
 SOURCE_KEY = r"[a-f0-9]{64}"
 STENCIL_KEY = SOURCE_KEY + r"_rt[0-7]"
 LINK_KEY = "_".join([SOURCE_KEY] * 3)
@@ -566,6 +580,104 @@ def request_notifications(directory, stop):
         os.close(fd)
 
 
+# Claims this process holds, by cache path; the handles stay open until it exits.
+_IN_USE = {}
+
+
+def mark_in_use(cache):
+    """Hold `cache` against retention until this process closes the handle.
+
+    Returns the handle. The launcher keeps it for the life of the worker, so a
+    second branch cannot evict a cache that is still compiling. Prelaunch
+    preparation and the live worker run in one process and ask twice: a process
+    cannot take the same flock through two descriptors, so reuse the claim.
+    """
+    import fcntl
+    directory = Path(cache)
+    key = str(directory.resolve())
+    if key in _IN_USE:
+        return _IN_USE[key]
+    handle = os.open(directory / IN_USE_FILE,
+                     os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(handle)
+        raise
+    _IN_USE[key] = handle
+    return handle
+
+
+def locked_by_another_launcher(cache):
+    """Whether another process holds `cache` open, or it cannot be told apart.
+
+    Probing with an flock rather than a marker file means a launcher that
+    crashed or was killed releases its claim when the kernel closes the file;
+    no stale claim outlives the process. This process's own claim also reads as
+    held, which is what retention wants: never remove a cache in use.
+    """
+    import fcntl
+    try:
+        handle = os.open(Path(cache) / IN_USE_FILE,
+                         os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError:
+        return True
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    finally:
+        os.close(handle)
+    return False
+
+
+def runtime_caches(runtime_root):
+    """The fingerprint directories under `runtime_root`, most recently used first.
+
+    A cache without a `last-used` marker is ordered by its directory time, so
+    caches written before the marker existed still sort sensibly. `last-used`
+    wins where it exists because rewriting files inside a directory moves that
+    directory's own timestamp whether the build ran or not.
+    """
+    def used(folder):
+        for path in (folder / USED_FILE, folder):
+            try:
+                return path.stat().st_mtime_ns
+            except OSError:
+                continue
+        return 0
+    folders = [path for path in Path(runtime_root).iterdir() if path.is_dir()]
+    return sorted(folders, key=used, reverse=True)
+
+
+def retain_runtime_caches(runtime_root, current, *, keep=RUNTIME_CACHES_KEPT):
+    """Keep `current` and the `keep - 1` most recently used sibling caches.
+
+    `current` is kept even when it is the oldest, so a long session never loses
+    the cache it is writing to. Returns the names of the directories removed. A
+    cache another launcher holds is skipped rather than evicted, so this can
+    keep more than `keep` while two branches compile at the same time; the next
+    launch with nothing running trims the remainder.
+    """
+    if keep < 1:
+        raise ValueError("keep must be at least 1")
+    current = Path(current)
+    # Record this build as the one that just ran. Its in-use claim is already
+    # held by the caller, so evicting the rest cannot touch it either way.
+    (current / USED_FILE).touch()
+    ordered = [path for path in runtime_caches(runtime_root) if path.name != current.name]
+    removed = []
+    for folder in ordered[keep - 1:]:
+        if locked_by_another_launcher(folder):
+            continue
+        try:
+            shutil.rmtree(folder)
+        except OSError:
+            continue  # A cache this run cannot remove is not worth a failed launch.
+        removed.append(folder.name)
+    return removed
+
+
 def snapshot_compiler_cache(xshader, cache_root, *, dxc_helper=None):
     """Pin the executable used for all requests under this toolchain fingerprint."""
     compiler, dxc, dxv = compiler_tools()
@@ -582,6 +694,11 @@ def snapshot_compiler_cache(xshader, cache_root, *, dxc_helper=None):
     cache = cache_root / "runtime" / fingerprint.hexdigest()
     cache.mkdir(parents=True, exist_ok=True)
     write_identity(cache, version, dxc, dxv)
+    # Claim this build's cache before evicting, so a concurrent launch on
+    # another branch cannot remove it while it compiles. Both steps also run
+    # during prelaunch preparation; the claim is shared with the live worker.
+    mark_in_use(cache)
+    retain_runtime_caches(cache.parent, cache)
     return tools, cache
 
 
