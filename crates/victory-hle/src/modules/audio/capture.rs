@@ -186,7 +186,7 @@ fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         const MAX_FRAMES: u64 = (u32::MAX as u64 - 36) / FRAME_BYTES as u64;
         const SILENCE_CHUNK: [u8; 4096] = [0u8; 4096];
 
-        let mut write_silence = |file: &mut File, frames: u64| -> std::io::Result<()> {
+        let write_silence = |file: &mut File, frames: u64| -> std::io::Result<()> {
             let mut bytes = frames * FRAME_BYTES as u64;
             while bytes > 0 {
                 let n = bytes.min(SILENCE_CHUNK.len() as u64) as usize;
@@ -198,25 +198,33 @@ fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
         let (mut written, mut first) = (0u64, None);
         let mut patched = Instant::now();
-        let res = 'capture: loop {
+        let res: Result<(), Box<dyn std::error::Error>> = 'capture: loop {
             std::thread::sleep(Duration::from_millis(10));
             let ended = WaitForSingleObject(target, 0) == WAIT_OBJECT_0;
-            while capture.GetNextPacketSize()? > 0 {
+            loop {
+                let next_packet_size = match capture.GetNextPacketSize() {
+                    Ok(size) => size,
+                    Err(e) => break 'capture Err(e.into()),
+                };
+                if next_packet_size == 0 {
+                    break;
+                }
+
                 let (mut data, mut frames, mut flags, mut qpc) = (std::ptr::null_mut(), 0, 0, 0);
                 if let Err(e) =
                     capture.GetBuffer(&mut data, &mut frames, &mut flags, None, Some(&mut qpc))
-                {
-                    break 'capture Err(e.into());
-                }
-                // Where this packet belongs, from its time stamp (100 ns).
-                let qpc_delta = u128::from(qpc.saturating_sub(*first.get_or_insert(qpc)));
+                    {
+                        break 'capture Err(e.into());
+                    }
+                    // Where this packet belongs, from its time stamp (100 ns).
+                    let qpc_delta = u128::from(qpc.saturating_sub(*first.get_or_insert(qpc)));
                 let at = ((qpc_delta * u128::from(RATE)) / 10_000_000) as u64;
                 let at = at.min(MAX_FRAMES);
 
                 if at > written + u64::from(RATE / 500) {
                     tracing::debug!(
                         ms = (at - written) * 1000 / u64::from(RATE),
-                        "audio capture: nothing played"
+                                    "audio capture: nothing played"
                     );
                     if let Err(e) = write_silence(&mut file, at - written) {
                         let _ = capture.ReleaseBuffer(frames);
@@ -243,7 +251,9 @@ fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 if flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0 && written > 0 {
                     tracing::debug!("audio capture: discontinuity");
                 }
-                capture.ReleaseBuffer(frames)?;
+                if let Err(e) = capture.ReleaseBuffer(frames) {
+                    break 'capture Err(e.into());
+                }
 
                 if written >= MAX_FRAMES {
                     tracing::warn!("audio capture: reached 4 GiB WAV limit, stopping");
@@ -252,9 +262,13 @@ fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
             }
             if ended || patched.elapsed() >= Duration::from_secs(1) {
                 // Valid sizes at any time: runs end by being killed.
-                file.seek(SeekFrom::Start(0))?;
-                file.write_all(&header(written))?;
-                file.seek(SeekFrom::End(0))?;
+                let patch_res = file
+                .seek(SeekFrom::Start(0))
+                .and_then(|_| file.write_all(&header(written)))
+                .and_then(|_| file.seek(SeekFrom::End(0)));
+                if let Err(e) = patch_res {
+                    break 'capture Err(e.into());
+                }
                 patched = Instant::now();
             }
             if ended {
@@ -264,8 +278,14 @@ fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
         let _ = client.Stop();
         let _ = windows::Win32::Foundation::CloseHandle(target);
-        file.seek(SeekFrom::Start(0))?;
-        file.write_all(&header(written))?;
-        res
+        if let Err(e) = file
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| file.write_all(&header(written)))
+            && res.is_ok()
+            {
+                return Err(e.into());
+            }
+            res
     }
 }
+
