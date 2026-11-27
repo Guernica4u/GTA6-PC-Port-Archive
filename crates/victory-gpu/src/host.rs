@@ -1256,26 +1256,31 @@ impl Host {
         let groups = [&lists[..]];
         let mut removed_in = None;
         for (i, group) in groups.iter().enumerate() {
-            *submitted += 1;
             let started = std::time::Instant::now();
-            #[cfg(feature = "diagnostics")]
-            crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
-            // SAFETY: closed lists; the fence and event are ours.
-            unsafe {
-                self.queue.ExecuteCommandLists(group);
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
+            // D3D12 forbids naming the same command list twice in one
+            // `ExecuteCommandLists` call, while a submission may name a list
+            // twice; split only when a handle repeats.
+            for chunk in unique_runs(group, |l| l.as_ref().map(|c| c.as_raw() as usize)) {
+                *submitted += 1;
+                #[cfg(feature = "diagnostics")]
+                crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
+                // SAFETY: closed lists; the fence and event are ours.
+                unsafe {
+                    self.queue.ExecuteCommandLists(chunk);
+                    let waited = self
+                        .queue
+                        .Signal(&self.fence, *submitted)
+                        .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                    match waited {
+                        Ok(()) => {
+                            WaitForSingleObject(self.event, INFINITE);
+                        }
+                        Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                     }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
+                #[cfg(feature = "diagnostics")]
+                crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
             }
-            #[cfg(feature = "diagnostics")]
-            crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
             #[cfg(feature = "diagnostics")]
             if groups.len() > 1 {
                 // SAFETY: a plain query.
@@ -3942,9 +3947,51 @@ fn pump() {
     }
 }
 
+/// Splits `items` into contiguous slices where no non-`None` key repeats,
+/// because D3D12 forbids naming the same command list twice in one
+/// `ExecuteCommandLists` call.
+fn unique_runs<T>(items: &[T], mut key: impl FnMut(&T) -> Option<usize>) -> Vec<&[T]> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut seen = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        if let Some(k) = key(item) {
+            if seen.contains(&k) {
+                out.push(&items[start..i]);
+                start = i;
+                seen.clear();
+            }
+            seen.push(k);
+        }
+    }
+    if start < items.len() {
+        out.push(&items[start..]);
+    }
+    out
+}
+
 #[cfg(test)]
 mod batch {   // `mod tests` is already taken at the top of this file
-    use super::Batch;
+    use super::{unique_runs, Batch};
+
+    #[test]
+    fn unique_runs_splits_only_on_repeated_handles() {
+        let empty: [Option<usize>; 0] = [];
+        assert!(unique_runs(&empty, |&x| x).is_empty());
+        assert_eq!(unique_runs(&[Some(1), Some(2)], |&x| x), vec![&[Some(1), Some(2)][..]]);
+        assert_eq!(
+            unique_runs(&[Some(1), Some(1)], |&x| x),
+            vec![&[Some(1)][..], &[Some(1)][..]]
+        );
+        assert_eq!(
+            unique_runs(&[Some(10), Some(1), Some(10), Some(1)], |&x| x),
+            vec![&[Some(10), Some(1)][..], &[Some(10), Some(1)][..]]
+        );
+        assert_eq!(
+            unique_runs(&[Some(1), None, Some(2), Some(2), Some(3)], |&x| x),
+            vec![&[Some(1), None, Some(2)][..], &[Some(2), Some(3)][..]]
+        );
+    }
 
     /// A host copy of tracked title memory: a submission whose lists all ask
     /// for it whole copies the one page the title wrote, once, and again
