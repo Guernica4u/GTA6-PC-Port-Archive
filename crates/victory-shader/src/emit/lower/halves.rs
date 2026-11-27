@@ -807,7 +807,7 @@ pub(super) const FIRST_ACROSS: Why = "a first-lane read of a value that may diff
 
 /// Every per-lane branch (by its block) with its region: the blocks
 /// reachable from it that do not post-dominate it, which only some lanes
-/// run. Branches on uniform conditions too with `uniform`. None with an
+/// run, and the branch's block itself where they lead back to it. Branches on uniform conditions too with `uniform`. None with an
 /// indirect exit.
 fn branch_regions(st: &Structured, uniform: bool) -> Option<Vec<(usize, Vec<bool>)>> {
     let n = st.exits.len();
@@ -876,11 +876,17 @@ fn branch_regions(st: &Structured, uniform: bool) -> Option<Vec<(usize, Vec<bool
         let mut seen = vec![false; n];
         let mut stack: Vec<usize> = succ[d].clone();
         while let Some(b) = stack.pop() {
-            if seen[b] || pdom[d][b / 64] >> (b % 64) & 1 == 1 {
+            // The branch's own block post-dominates itself, but where its
+            // edges lead back to it (a loop's latch, a loop of one block)
+            // each lane gets there once a round, as many times as it goes
+            // round: it is in the region.
+            if seen[b] || b != d && pdom[d][b / 64] >> (b % 64) & 1 == 1 {
                 continue;
             }
             seen[b] = true;
-            stack.extend(succ[b].iter().copied());
+            if b != d {
+                stack.extend(succ[b].iter().copied());
+            }
         }
         regions.push((d, seen));
     }
@@ -918,13 +924,24 @@ fn wave_tid(x: &Parts) -> Option<Value> {
 ///
 /// A phi counts where every predecessor is a block every lane of the wave
 /// reaches together: no branch on a lane-dependent condition can have split
-/// them (a branch on alike values does not). The analysis runs to a fixed
-/// point from nothing, so a loop-carried value that needs itself to be
-/// alike never is.
+/// them (a branch on alike values does not). A value written inside a loop
+/// whose exit is lane-dependent and read after it is not alike, nor what is
+/// computed from it there: lanes leave in rounds of their own, each holding
+/// what its last round wrote (scalars too, in the per-lane form). The
+/// analysis runs to a fixed point
+/// from nothing, so a loop-carried value that needs itself to be alike
+/// never is.
 pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
     let (p, st) = (x.p, x.st);
     let wave_tid = wave_tid(x);
     let regions = branch_regions(st, false);
+    let mut def: HashMap<Value, usize> = HashMap::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        def.extend(block.phis.iter().map(|phi| (phi.value, b)));
+        for inst in &block.insts {
+            def.extend(inst.writes.iter().map(|w| (w.1, b)));
+        }
+    }
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let per_lane = |v: Value| x.res.waterfall.reads.contains(&v);
     let mut same: HashSet<Value> = HashSet::new();
@@ -958,6 +975,34 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
             }
             None => vec![false; st.exits.len()],
         };
+        // Loops whose exit is lane-dependent: the blocks of a branch's region
+        // that lead back to the branch, where the region holds it.
+        let loops: Vec<Vec<bool>> = regions
+            .iter()
+            .flatten()
+            .filter(|(d, region)| {
+                region[*d]
+                    && matches!(st.exits[*d], LaneExit::Branch { when, .. } if !alike_bool(&same, when))
+            })
+            .map(|(d, region)| {
+                let mut body = vec![false; region.len()];
+                let mut stack = vec![*d];
+                while let Some(b) = stack.pop() {
+                    if body[b] {
+                        continue;
+                    }
+                    body[b] = true;
+                    stack.extend(p.blocks[b].preds.iter().copied().filter(|&q| region[q]));
+                }
+                body
+            })
+            .collect();
+        // Whether `v`, read in block `b`, was written in such a loop `b` is
+        // not in.
+        let escapes = |v: &Value, b: usize| {
+            def.get(v)
+                .is_some_and(|&d| loops.iter().any(|body| body[d] && !body[b]))
+        };
         let mut next: HashSet<Value> = HashSet::new();
         for b in crate::ir::reverse_postorder(&p.blocks) {
             let block = &p.blocks[b];
@@ -976,7 +1021,9 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
                     next.insert(phi.value);
                 }
             }
-            let known = |next: &HashSet<Value>, v: &Value| next.contains(v) || same.contains(v);
+            let known = |next: &HashSet<Value>, v: &Value| {
+                (next.contains(v) || same.contains(v)) && !escapes(v, b)
+            };
             for (i, inst) in block.insts.iter().enumerate() {
                 let name = inst.name();
                 // Under a condition: only one every lane holds alike, and
@@ -1088,9 +1135,11 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
                     }
                     // A scalar is one value; a lane mask is not, unless a
                     // compare of alike values made it.
-                    Operand::Scalar { code, .. } if code != NULL => inst
-                        .read(Reg::S(code))
-                        .is_none_or(|x| !is_mask(x) && !per_lane(x) || known(&next, &x)),
+                    Operand::Scalar { code, .. } if code != NULL => {
+                        inst.read(Reg::S(code)).is_none_or(|x| {
+                            !is_mask(x) && !per_lane(x) && !escapes(&x, b) || known(&next, &x)
+                        })
+                    }
                     _ => true,
                 });
                 if alike {
@@ -1099,6 +1148,17 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
             }
         }
         if next.is_subset(&same) {
+            // A value read outside its loop is not alike where it is read
+            // inside either: the alike are values, not reads.
+            for (b, block) in p.blocks.iter().enumerate() {
+                for inst in &block.insts {
+                    for r in &inst.reads {
+                        if escapes(&r.1, b) {
+                            same.remove(&r.1);
+                        }
+                    }
+                }
+            }
             return same;
         }
         same.extend(next);

@@ -175,7 +175,38 @@ fn refusal(words: &[u32], threads: u32, lds_bytes: u32) -> String {
 /// The hand-encoded words are the instructions their comments name.
 #[test]
 fn the_test_programs_are_what_their_comments_say() {
-    let programs: [(Vec<u32>, &[&str]); 26] = [
+    let programs: [(Vec<u32>, &[&str]); 28] = [
+        (
+            wide_loop(true),
+            &[
+                "v_lshrrev_b32 v12, 4, v1",
+                "v_and_b32 v13, 1, v1",
+                "v_and_b32 v12, 3, v12",
+                "ds_write_b32 v6, v8",
+                "s_mov_b64 s[26:27], exec",
+                "v_readfirstlane_b32 s12, v1",
+                "v_cmp_le_u32 vcc, 32, v1",
+                "s_bcnt1_i32_b64 s13, vcc",
+                "ds_write_b32 v6, v11",
+                "ds_read_b32 v9, v7",
+                "v_cmp_lt_u32 vcc, v11, v12",
+                "s_and_b64 exec, exec, vcc",
+                "s_cbranch_execnz",
+                "s_mov_b64 exec, s[26:27]",
+            ],
+        ),
+        (
+            first_lane_after_a_loop(),
+            &[
+                "s_mov_b32 s20, 0",
+                "s_add_u32 s20, s20, 1",
+                "v_mov_b32 v2, s20",
+                "v_cmp_lt_u32 vcc, v11, v12",
+                "s_and_b64 exec, exec, vcc",
+                "s_cbranch_execnz",
+                "v_readfirstlane_b32 s12, v2",
+            ],
+        ),
         (
             lds_tree_step(true),
             &[
@@ -1811,6 +1842,159 @@ fn wave_wide_regions_translate_in_halves() {
     }
 }
 
+/// A loop each console lane runs [`wide_loop_rounds`] rounds of (the exit a
+/// compare of the round with that count, EXEC narrowed by it): each round
+/// adds the first lane's console lane (`v2`) and the number of lanes from
+/// 32 still in the loop (`v3`); with `lds`, each lane also writes the round
+/// at its LDS dword and adds what lane `lane ^ 33` wrote there (`v5`), which
+/// that lane left at its last round once it is out of the loop. After the
+/// loop: the rounds (`v11`).
+fn wide_loop(lds: bool) -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0xD766_0001,
+        0x0002_02C1,                  // v_mbcnt_hi_u32_b32 v1, -1, v1
+        vop2(12, 0x16, 128 + 4, 1),   // v_lshrrev_b32 v12, 4, v1
+        vop2(13, 0x1B, 128 + 1, 1),   // v_and_b32 v13, 1, v1
+        vop2(12, 0x25, 256 + 13, 12), // v_add_nc_u32 v12, v13, v12
+        vop2(12, 0x1B, 128 + 3, 12),  // v_and_b32 v12, 3, v12
+        vop2(12, 0x25, 128 + 1, 12),  // v_add_nc_u32 v12, 1, v12
+    ]);
+    for d in [2, 3, 5, 11] {
+        w.push(vop1(d, 0x01, 128)); // v_mov_b32 vd, 0
+    }
+    if lds {
+        w.extend([
+            vop2(6, 0x1A, 128 + 2, 1),  // v_lshlrev_b32 v6, 2, v1
+            vop2(7, 0x1D, 128 + 33, 1), // v_xor_b32 v7, 33, v1
+            vop2(7, 0x1A, 128 + 2, 7),  // v_lshlrev_b32 v7, 2, v7
+            vop1(8, 0x01, 255),         // v_mov_b32 v8, 100
+            100,
+            0xD834_0000,
+            0x0000_0806, // ds_write_b32 v6, v8
+            S_WAITCNT_LGKM,
+        ]);
+    }
+    w.push(0xBE9A_047E); // s_mov_b64 s[26:27], exec
+    let mut body = vec![
+        vop1(12, 0x02, 256 + 1),                 // v_readfirstlane_b32 s12, v1
+        vop2(2, 0x25, 12, 2),                    // v_add_nc_u32 v2, s12, v2
+        0x7C00_0000 | 0xC3 << 17 | 1 << 9 | 160, // v_cmp_le_u32 vcc, 32, v1
+        sop1(13, 0x10, 106),                     // s_bcnt1_i32_b64 s13, vcc
+        vop2(3, 0x25, 13, 3),                    // v_add_nc_u32 v3, s13, v3
+    ];
+    if lds {
+        body.extend([
+            0xD834_0000,
+            0x0000_0B06, // ds_write_b32 v6, v11
+            0xD8D8_0000,
+            0x0900_0007, // ds_read_b32 v9, v7
+            S_WAITCNT_LGKM,
+            vop2(5, 0x25, 256 + 9, 5), // v_add_nc_u32 v5, v9, v5
+        ]);
+    }
+    body.extend([
+        vop2(11, 0x25, 128 + 1, 11), // v_add_nc_u32 v11, 1, v11
+        0x7C00_0000 | 0xC1 << 17 | 12 << 9 | (256 + 11), // v_cmp_lt_u32 vcc, v11, v12
+        0x87FE_6A7E,                 // s_and_b64 exec, exec, vcc
+    ]);
+    // s_cbranch_execnz back to the loop's first instruction.
+    let back = -(body.len() as i32 + 1);
+    body.push(0xBF89_0000 | (back as u32 & 0xFFFF));
+    w.extend(body);
+    w.push(0xBEFE_041A); // s_mov_b64 exec, s[26:27]
+    for (slot, d) in [2, 3, 5, 11].into_iter().enumerate() {
+        w.extend(store(d, 4 * slot as u32));
+    }
+    w.push(S_ENDPGM);
+    w
+}
+
+/// The rounds console lane `l` runs of [`wide_loop`]: `((l >> 4) + (l & 1))
+/// & 3` plus one, so the low half goes round at most 3 times and the high
+/// half 4.
+fn wide_loop_rounds(l: u32) -> u32 {
+    (((l >> 4) + (l & 1)) & 3) + 1
+}
+
+/// A loop each console lane goes round [`wide_loop_rounds`] times, writing
+/// its count of rounds so far (a scalar) to `v2` each round; after the loop,
+/// in every lane, the first lane's `v2` (`v3`): what console lane 0 wrote in
+/// its last round, which lanes that went round more times do not hold.
+fn first_lane_after_a_loop() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0xD766_0001,
+        0x0002_02C1,                  // v_mbcnt_hi_u32_b32 v1, -1, v1
+        vop2(12, 0x16, 128 + 4, 1),   // v_lshrrev_b32 v12, 4, v1
+        vop2(13, 0x1B, 128 + 1, 1),   // v_and_b32 v13, 1, v1
+        vop2(12, 0x25, 256 + 13, 12), // v_add_nc_u32 v12, v13, v12
+        vop2(12, 0x1B, 128 + 3, 12),  // v_and_b32 v12, 3, v12
+        vop2(12, 0x25, 128 + 1, 12),  // v_add_nc_u32 v12, 1, v12
+        vop1(11, 0x01, 128),          // v_mov_b32 v11, 0
+        sop1(20, 0x03, 128),          // s_mov_b32 s20, 0
+        0xBE9A_047E,                  // s_mov_b64 s[26:27], exec
+    ]);
+    let body = [
+        0x8014_8114,                                     // s_add_u32 s20, s20, 1
+        vop1(2, 0x01, 20),                               // v_mov_b32 v2, s20
+        vop2(11, 0x25, 128 + 1, 11),                     // v_add_nc_u32 v11, 1, v11
+        0x7C00_0000 | 0xC1 << 17 | 12 << 9 | (256 + 11), // v_cmp_lt_u32 vcc, v11, v12
+        0x87FE_6A7E,                                     // s_and_b64 exec, exec, vcc
+    ];
+    w.extend(body);
+    let back = -(body.len() as i32 + 1);
+    w.push(0xBF89_0000 | (back as u32 & 0xFFFF)); // s_cbranch_execnz back
+    w.extend([
+        0xBEFE_041A,             // s_mov_b64 exec, s[26:27]
+        vop1(12, 0x02, 256 + 2), // v_readfirstlane_b32 s12, v2
+        vop1(3, 0x01, 12),       // v_mov_b32 v3, s12
+    ]);
+    w.extend(store(2, 0));
+    w.extend(store(3, 4));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// [`first_lane_after_a_loop`] on every hardware adapter, in halves and as
+/// one wave64 where the adapter runs those, in groups of 48, 64 and 128:
+/// every lane reads console lane 0's `v2`, 1. Before, the value counted as
+/// one in every lane of the console wave (each round writes one scalar), and
+/// each half read its own first lane: 3, lane 32's, in the upper half.
+#[test]
+fn first_lane_after_a_loop_matches_the_console_on_every_gpu() {
+    let mut failed = Vec::new();
+    for threads in [48, 64, 128] {
+        let want: Vec<u32> = (0..threads)
+            .flat_map(|l| [wide_loop_rounds(l & 63), wide_loop_rounds(0)])
+            .collect();
+        failed.extend(differences(&first_lane_after_a_loop(), threads, 2, &want));
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// A loop whose exit is lane-dependent, with a first-lane read and a mask
+/// read as data inside: the halves cannot meet in it, so it is refused.
+/// Before, a loop of one block counted as a point where every thread meets
+/// (its block post-dominates itself), and each half reached its trades'
+/// barriers once a round: up to 3 times the low half, 4 the high one, which
+/// hangs a GPU whose barrier waits for every thread.
+#[test]
+fn trades_in_a_loop_lanes_leave_in_their_own_rounds_are_refused_in_halves() {
+    for threads in [64, 128] {
+        let why = refusal(&wide_loop(false), threads, 0);
+        assert!(
+            why.contains("where not every thread of the group meets"),
+            "{threads}: {why}"
+        );
+    }
+}
 /// Wave-wide regions on every hardware adapter, in halves and as one wave64
 /// where the adapter runs those, in groups of 64 and 128: [`wide_branch`]
 /// (with `outside` in halves only, as [`lane_read_in_a_branch`]: the
