@@ -25,24 +25,102 @@ use windows_sys::Win32::System::IO::OVERLAPPED;
 
 static NEXT_STAGING: AtomicU64 = AtomicU64::new(0);
 
-/// The digest sidecar published beside `path`: comparing it against the
-/// digest of the new bytes answers "already there" without reading the
-/// cached image back (a title image is ~100 MB; the read per boot per DLL
-/// was the point of the sidecar).
+/// Written at the front of the sidecar: a sidecar this build did not write
+/// (an older layout, a stray file) reads as absent, so the image is read
+/// back instead of trusted.
+const SIDECAR_MAGIC: [u8; 16] = *b"victory.loader.2";
+
+/// Magic, digest, length, last-write time.
+const SIDECAR_LEN: usize = 16 + 32 + 8 + 8;
+
+/// The sidecar published beside `path`: the digest of the published bytes,
+/// and the length and last-write time of the image they were written to.
+/// Comparing it against the image on disk answers "already there" without
+/// reading the cached image back (a title image is ~100 MB; the read per
+/// boot per DLL was the point of the sidecar).
 fn sidecar(path: &Path) -> std::path::PathBuf {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("image");
     path.with_file_name(format!(".{name}.blake3"))
+}
+
+/// What a sidecar records about the image beside it. The digest and the
+/// length alone would accept a stale image of the same size that another
+/// writer replaced, so the image's last-write time is recorded and compared
+/// too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Sidecar {
+    digest: [u8; 32],
+    len: u64,
+    written_nanos: u64,
+}
+
+impl Sidecar {
+    fn encode(&self) -> [u8; SIDECAR_LEN] {
+        let mut out = [0u8; SIDECAR_LEN];
+        out[..16].copy_from_slice(&SIDECAR_MAGIC);
+        out[16..48].copy_from_slice(&self.digest);
+        out[48..56].copy_from_slice(&self.len.to_le_bytes());
+        out[56..64].copy_from_slice(&self.written_nanos.to_le_bytes());
+        out
+    }
+
+    /// `None` for anything this layout does not describe: the image is then
+    /// read back, and the sidecar rewritten.
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        let bytes: [u8; SIDECAR_LEN] = bytes.try_into().ok()?;
+        if bytes[..16] != SIDECAR_MAGIC {
+            return None;
+        }
+        Some(Self {
+            digest: bytes[16..48].try_into().ok()?,
+            len: u64::from_le_bytes(bytes[48..56].try_into().ok()?),
+            written_nanos: u64::from_le_bytes(bytes[56..64].try_into().ok()?),
+        })
+    }
+}
+
+/// The identity the sidecar records for the image at `path`: its length and
+/// last-write time. `None` if it cannot be stat'ed with a time the sidecar
+/// can hold, which sends the caller down the read-back path.
+fn image_stamp(path: &Path) -> Option<(u64, u64)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let modified = metadata.modified().ok()?;
+    let since = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some((metadata.len(), u64::try_from(since.as_nanos()).ok()?))
+}
+
+/// The sidecar beside `path`, if this layout wrote it.
+fn read_sidecar(path: &Path) -> Option<Sidecar> {
+    let bytes = std::fs::read(sidecar(path)).ok()?;
+    Sidecar::decode(&bytes)
 }
 
 /// Writes the sidecar through its own staging file + rename, so a reader
 /// never sees a torn digest. Not fatal: without it the next boot falls back
 /// to reading the image.
 fn write_sidecar(path: &Path, digest: &blake3::Hash) {
-    let side = sidecar(path);
-    let name = side.file_name().and_then(|n| n.to_str()).unwrap_or("digest");
+    // Without the image's stamp the sidecar could not be trusted next boot,
+    // so none is written: the image is read back instead.
+    let Some((len, written_nanos)) = image_stamp(path) else {
+        return;
+    };
+    let side = Sidecar {
+        digest: *digest.as_bytes(),
+        len,
+        written_nanos,
+    };
+    let side_path = sidecar(path);
+    let name = side_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("digest");
     let sequence = NEXT_STAGING.fetch_add(1, Ordering::Relaxed);
-    let staging = side.with_file_name(format!(".{name}.{}.{sequence}.tmp", std::process::id()));
-    if std::fs::write(&staging, digest.as_bytes()).and_then(|_| std::fs::rename(&staging, &side)).is_err() {
+    let staging =
+        side_path.with_file_name(format!(".{name}.{}.{sequence}.tmp", std::process::id()));
+    if std::fs::write(&staging, side.encode())
+        .and_then(|_| std::fs::rename(&staging, &side_path))
+        .is_err()
+    {
         let _ = std::fs::remove_file(&staging);
     }
 }
@@ -109,14 +187,20 @@ fn publish_lock(path: &Path) -> std::io::Result<PublishLock> {
 
 /// Writes `bytes` to `path` unless it is already there, using a staging file
 /// unique to this process and call. "Already there" is answered from the
-/// digest sidecar when there is one, and by reading the file back otherwise
-/// (a cache from before sidecars).
+/// sidecar when it describes the image on disk — its digest, length and
+/// last-write time all match — and by reading the file back otherwise (a
+/// cache from before sidecars, or an image another writer replaced).
 pub fn write_if_changed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let digest = blake3::hash(bytes);
-    // Fast path: sidecar digest matches and the file is there with the
-    // right length — no read of the image.
-    if std::fs::read(sidecar(path)).is_ok_and(|d| d == *digest.as_bytes())
-        && std::fs::metadata(path).is_ok_and(|m| m.len() == bytes.len() as u64)
+    // Fast path: the sidecar was written for this image and still describes
+    // it, so the image holds the bytes asked for — no read of the image. A
+    // same-length replacement fails the time check here instead of passing
+    // as a hit.
+    if let Some((len, written_nanos)) = image_stamp(path)
+        && read_sidecar(path).is_some_and(|side| {
+            side.digest == *digest.as_bytes()
+                && (side.len, side.written_nanos) == (len, written_nanos)
+        })
     {
         return Ok(());
     }
@@ -211,8 +295,10 @@ mod tests {
         let bytes = vec![7u8; 1 << 20];
         write_if_changed(&path, &bytes).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
-        let digest = std::fs::read(sidecar(&path)).unwrap();
-        assert_eq!(digest.len(), 32);
+        let side = read_sidecar(&path).expect("the publish recorded a sidecar");
+        assert_eq!(side.digest, *blake3::hash(&bytes).as_bytes());
+        assert_eq!(side.len, bytes.len() as u64);
+        assert_eq!(side.written_nanos, image_stamp(&path).unwrap().1);
         // Same bytes again: a hit, nothing rewritten.
         let before = std::fs::metadata(&path).unwrap().modified().unwrap();
         write_if_changed(&path, &bytes).unwrap();
@@ -221,7 +307,7 @@ mod tests {
             before
         );
         // The image deleted under a matching sidecar: republished (the
-        // length check fails, the read fallback misses, the write happens).
+        // stamp misses, the read fallback misses, the write happens).
         std::fs::remove_file(&path).unwrap();
         write_if_changed(&path, &bytes).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
@@ -230,17 +316,18 @@ mod tests {
         write_if_changed(&path, &new).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), new);
         assert_eq!(
-            std::fs::read(sidecar(&path)).unwrap(),
-            blake3::hash(&new).as_bytes()
+            read_sidecar(&path).unwrap().digest,
+            *blake3::hash(&new).as_bytes()
         );
         // A legacy cache (no sidecar) falls back to reading, then publishes
         // the sidecar.
         std::fs::remove_file(sidecar(&path)).unwrap();
         write_if_changed(&path, &new).unwrap();
         assert_eq!(
-            std::fs::read(sidecar(&path)).unwrap(),
-            blake3::hash(&new).as_bytes()
+            read_sidecar(&path).unwrap().digest,
+            *blake3::hash(&new).as_bytes()
         );
+        assert_eq!(read_sidecar(&path).unwrap().len, new.len() as u64);
         // Boot cost: 64 MB image, cache hit — sidecar read + in-memory hash
         // vs the old full read + compare.
         let big = vec![3u8; 64 << 20];
@@ -258,6 +345,108 @@ mod tests {
         }
         let old = t0.elapsed() / 5;
         eprintln!("64 MB cache hit: sidecar path {hit:?}, old read+compare {old:?}");
+    }
+
+    /// The sidecar records the image's length and last-write time, so an
+    /// image another writer replaced with different bytes of the same length
+    /// is not a cache hit: it is read back, and republished.
+    #[test]
+    fn a_same_length_stale_image_is_not_a_cache_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.bin");
+        let published = vec![0x11u8; 1 << 16];
+        write_if_changed(&path, &published).unwrap();
+        let recorded = read_sidecar(&path).expect("the publish recorded a sidecar");
+        // Different bytes of the same length, the sidecar left in place:
+        // only the recorded last-write time can tell the two apart.
+        let stale = vec![0x22u8; 1 << 16];
+        std::fs::write(&path, &stale).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000))
+            .unwrap();
+        let (len, written_nanos) = image_stamp(&path).unwrap();
+        assert_eq!(len, recorded.len, "the stale image has the recorded length");
+        assert_ne!(
+            written_nanos, recorded.written_nanos,
+            "and a last-write time the sidecar does not describe"
+        );
+        write_if_changed(&path, &published).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            published,
+            "the stale image was read back and replaced, not taken for a hit"
+        );
+        let side = read_sidecar(&path).unwrap();
+        assert_eq!(side.digest, *blake3::hash(&published).as_bytes());
+        assert_eq!(side.len, published.len() as u64);
+        assert_eq!(side.written_nanos, image_stamp(&path).unwrap().1);
+    }
+
+    /// A sidecar in the older digest-only layout records no image stamp, so
+    /// it is not trusted: the image is read back, and a stale one replaced.
+    #[test]
+    fn a_digest_only_sidecar_is_not_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.bin");
+        let published = vec![0x33u8; 1 << 16];
+        write_if_changed(&path, &published).unwrap();
+        // The older layout: the 32 digest bytes and nothing else, beside a
+        // same-length image that is not the one they describe.
+        std::fs::write(sidecar(&path), blake3::hash(&published).as_bytes()).unwrap();
+        let stale = vec![0x44u8; 1 << 16];
+        std::fs::write(&path, &stale).unwrap();
+        assert!(
+            read_sidecar(&path).is_none(),
+            "a sidecar without an image stamp reads as absent"
+        );
+        write_if_changed(&path, &published).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), published);
+        assert_eq!(
+            read_sidecar(&path).map(|s| s.digest),
+            Some(*blake3::hash(&published).as_bytes())
+        );
+    }
+
+    /// A cache hit is answered from the sidecar and the image's metadata, not
+    /// by reading the image: held here with no sharing at all, the image
+    /// cannot be read, and the call still succeeds.
+    #[cfg(windows)]
+    #[test]
+    fn a_cache_hit_does_not_read_the_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.bin");
+        let bytes = vec![0x5au8; 1 << 16];
+        write_if_changed(&path, &bytes).unwrap();
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: a valid path; the handle is closed below.
+        let held = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ,
+                0,
+                std::ptr::null(),
+                windows_sys::Win32::Storage::FileSystem::OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(
+            held,
+            INVALID_HANDLE_VALUE,
+            "open the image: {}",
+            std::io::Error::last_os_error()
+        );
+        let hit = write_if_changed(&path, &bytes);
+        // SAFETY: our handle.
+        unsafe { CloseHandle(held) };
+        assert!(hit.is_ok(), "a cache hit must not read the image: {hit:?}");
     }
 
     /// A cache from before sidecars: its sidecar is backfilled under the
@@ -281,10 +470,9 @@ mod tests {
         );
         drop(held);
         published.join().unwrap().unwrap();
-        assert_eq!(
-            std::fs::read(sidecar(&path)).unwrap(),
-            blake3::hash(&bytes).as_bytes()
-        );
+        let side = read_sidecar(&path).expect("the backfill wrote a sidecar");
+        assert_eq!(side.digest, *blake3::hash(&bytes).as_bytes());
+        assert_eq!(side.written_nanos, image_stamp(&path).unwrap().1);
     }
 
     /// A sidecar another process holds without delete sharing cannot be
@@ -331,8 +519,8 @@ mod tests {
         );
         assert_eq!(std::fs::read(&path).unwrap(), a, "the image is untouched");
         assert_eq!(
-            std::fs::read(&side).unwrap(),
-            blake3::hash(&a).as_bytes(),
+            read_sidecar(&path).map(|s| s.digest),
+            Some(*blake3::hash(&a).as_bytes()),
             "the sidecar still describes the image"
         );
     }
@@ -357,13 +545,17 @@ mod tests {
                     // present at the same time must describe it.
                     // A rename by another publisher can make these reads
                     // fail transiently; only check when all three succeed.
-                    if let (Ok(before), Ok(d), Ok(after)) = (
+                    if let (Ok(before), Some(side), Ok(after)) = (
                         std::fs::read(&path),
-                        std::fs::read(sidecar(&path)),
+                        read_sidecar(&path),
                         std::fs::read(&path),
-                    ) && before == after && !d.is_empty()
+                    ) && before == after
                     {
-                        assert_eq!(d, blake3::hash(&before).as_bytes(), "sidecar matches the file");
+                        assert_eq!(
+                            side.digest,
+                            *blake3::hash(&before).as_bytes(),
+                            "sidecar matches the file"
+                        );
                     }
                 }
             }));
@@ -373,8 +565,8 @@ mod tests {
         }
         let on_disk = std::fs::read(&path).unwrap();
         assert_eq!(
-            std::fs::read(sidecar(&path)).unwrap(),
-            blake3::hash(&on_disk).as_bytes()
+            read_sidecar(&path).map(|s| s.digest),
+            Some(*blake3::hash(&on_disk).as_bytes())
         );
     }
 
