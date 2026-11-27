@@ -523,14 +523,71 @@ impl Module {
                 let name = self.funcs[*f as usize].name.as_str();
                 if name.starts_with("dx.op.createHandleFromHeap") {
                     // Arguments: opcode, index, sampler heap, non-uniform.
-                    let sampler = args.get(2).and_then(|&a| self.int_value(a)).is_some_and(|x| x != 0);
+                    let sampler = args
+                        .get(2)
+                        .and_then(|&a| self.int_value(a))
+                        .is_some_and(|x| x != 0);
                     u.heap |= !sampler;
                     u.sampler_heap |= sampler;
+                }
+                if name == "dx.op.annotateHandle" {
+                    let (props0, _) = self.handle_props(V::Inst(i));
+                    u.rovs |= props0 & 0x2000 != 0;
+                }
+                if (name.starts_with("dx.op.textureLoad.") || name.starts_with("dx.op.bufferLoad."))
+                    && let Some(&handle) = args.get(1)
+                {
+                    let (props0, _) = self.handle_props(handle);
+                    let kind = props0 & 0xFF;
+                    u.typed_uav_loads |= props0 & 0x1000 != 0 && (1..=10).contains(&kind);
+                }
+                if matches!(
+                    name,
+                    "dx.op.atomicBinOp.i64" | "dx.op.atomicCompareExchange.i64"
+                ) && let Some(&handle) = args.get(1)
+                {
+                    let (props0, from_heap) = self.handle_props(handle);
+                    u.atomic64_typed |= (1..=10).contains(&(props0 & 0xFF));
+                    u.atomic64_heap |= from_heap;
                 }
                 u.wave |= name.starts_with("dx.op.wave") || name.starts_with("dx.op.quad");
             }
         }
         u
+    }
+
+    /// Resource properties (`props0`, whether from the descriptor heap) of a
+    /// handle value, read from its `dx.op.annotateHandle` and underlying
+    /// handle-creation call.
+    fn handle_props(&self, handle: V) -> (u32, bool) {
+        let name = |v: V| match v {
+            V::Inst(i) => match &self.insts[i as usize].op {
+                Op::Call(f, _) => self.funcs[*f as usize].name.as_str(),
+                _ => "",
+            },
+            _ => "",
+        };
+        let (mut props0, mut source) = (0u32, handle);
+        if name(handle) == "dx.op.annotateHandle"
+            && let V::Inst(i) = handle
+            && let Op::Call(_, args) = &self.insts[i as usize].op
+        {
+            // Arguments: opcode, handle, properties.
+            if let Some(&V::Const(props)) = args.get(2)
+                && let Const::Aggregate(fields) = &self.consts[props as usize].1
+                && let Some(&first) = fields.first()
+                && let Some(p0) = self.int_value(V::Const(first))
+            {
+                props0 = p0 as u32;
+            }
+            if let Some(&raw) = args.get(1) {
+                source = raw;
+            }
+        }
+        (
+            props0,
+            name(source).starts_with("dx.op.createHandleFromHeap"),
+        )
     }
 
     /// Which instructions are written: those [`Module::rooted`] in reachable
@@ -1054,6 +1111,14 @@ pub struct Uses {
     pub wave: bool,
     /// 64-bit integers.
     pub int64: bool,
+    /// Typed UAV loads (`textureLoad` / `bufferLoad` on typed UAVs).
+    pub typed_uav_loads: bool,
+    /// Rasterizer ordered views.
+    pub rovs: bool,
+    /// 64-bit integer atomics on typed resources.
+    pub atomic64_typed: bool,
+    /// 64-bit integer atomics on resources from the descriptor heap.
+    pub atomic64_heap: bool,
 }
 
 /// What [`Module::write`] writes ([`Module::plan`]).
@@ -1683,11 +1748,19 @@ mod tests {
     #[test]
     fn dead_branch_users_do_not_keep_reachable_values_or_flags_alive() {
         let (mut m, b, sink) = module(3);
-        let [entry, live, dead] = b[..] else { unreachable!() };
+        let [entry, live, dead] = b[..] else {
+            unreachable!()
+        };
         let (i32t, i64t, handle_t, i1t) = (m.int(32), m.int(64), m.int(8), m.int(1));
         let heap_ty = m.func_ty(handle_t, vec![i32t, i32t, i1t, i1t]);
-        let heap = m.function("dx.op.createHandleFromHeap", heap_ty, Some(Attr::ReadNone), false);
-        let (op, zero, one, no, yes) = (m.i32(218), m.i32(0), m.i32(1), m.bool(false), m.bool(true));
+        let heap = m.function(
+            "dx.op.createHandleFromHeap",
+            heap_ty,
+            Some(Attr::ReadNone),
+            false,
+        );
+        let (op, zero, one, no, yes) =
+            (m.i32(218), m.i32(0), m.i32(1), m.bool(false), m.bool(true));
         let five = m.int_const(i64t, 5);
         let arr = m.array(2, i32t);
         let init = m.aggregate(arr, &[zero, one]);
@@ -1719,7 +1792,9 @@ mod tests {
         assert_eq!(plan.live, live_by_passes(&m));
         assert_eq!(m.uses(), Uses::default());
         let ((globals, g_n), _) = m.kept(&plan);
-        let V::Global(g) = dead_tbl else { unreachable!() };
+        let V::Global(g) = dead_tbl else {
+            unreachable!()
+        };
         assert_eq!((globals[g as usize], g_n), (u32::MAX, 0));
         let _ = m.write();
     }
@@ -1729,10 +1804,17 @@ mod tests {
     #[test]
     fn unreachable_phi_edge_does_not_keep_reachable_value_alive() {
         let (mut m, b, sink) = module(4);
-        let [entry, live, dead, join] = b[..] else { unreachable!() };
+        let [entry, live, dead, join] = b[..] else {
+            unreachable!()
+        };
         let (i32t, handle_t, i1t) = (m.int(32), m.int(8), m.int(1));
         let heap_ty = m.func_ty(handle_t, vec![i32t, i32t, i1t, i1t]);
-        let heap = m.function("dx.op.createHandleFromHeap", heap_ty, Some(Attr::ReadNone), false);
+        let heap = m.function(
+            "dx.op.createHandleFromHeap",
+            heap_ty,
+            Some(Attr::ReadNone),
+            false,
+        );
         let (op, zero, one, two, no, yes) = (
             m.i32(218),
             m.i32(0),
@@ -1778,12 +1860,25 @@ mod tests {
     fn dropped_direct_phi_edge_from_reachable_pred_does_not_keep_value_alive() {
         for folded in [false, true] {
             let (mut m, b, sink) = module(3);
-            let [entry, mid, join] = b[..] else { unreachable!() };
+            let [entry, mid, join] = b[..] else {
+                unreachable!()
+            };
             let (i32t, handle_t, i1t) = (m.int(32), m.int(8), m.int(1));
             let heap_ty = m.func_ty(handle_t, vec![i32t, i32t, i1t, i1t]);
-            let heap = m.function("dx.op.createHandleFromHeap", heap_ty, Some(Attr::ReadNone), false);
-            let (op, zero, one, two, no, yes) =
-                (m.i32(218), m.i32(0), m.i32(1), m.i32(2), m.bool(false), m.bool(true));
+            let heap = m.function(
+                "dx.op.createHandleFromHeap",
+                heap_ty,
+                Some(Attr::ReadNone),
+                false,
+            );
+            let (op, zero, one, two, no, yes) = (
+                m.i32(218),
+                m.i32(0),
+                m.i32(1),
+                m.i32(2),
+                m.bool(false),
+                m.bool(true),
+            );
 
             // Pure values defined in the reachable entry block, read only by
             // the phi entry along the removed direct edge entry -> join.
@@ -1813,9 +1908,15 @@ mod tests {
             if folded {
                 assert_eq!(plan.fold[mid], Some((entry, join)));
             }
-            assert!(!at(dead_sum) && !at(dead_h) && !at(dead_h32), "folded={folded}");
+            assert!(
+                !at(dead_sum) && !at(dead_h) && !at(dead_h32),
+                "folded={folded}"
+            );
             assert!(at(p_val) && at(p_h) && at(out), "folded={folded}");
-            assert!(!plan.edge(&m, entry, join), "the removed direct edge, folded={folded}");
+            assert!(
+                !plan.edge(&m, entry, join),
+                "the removed direct edge, folded={folded}"
+            );
             assert!(plan.edge(&m, mid, join), "the taken edge, folded={folded}");
             assert_eq!(plan.live, live_by_passes(&m), "folded={folded}");
             assert_eq!(m.uses(), Uses::default(), "folded={folded}");
@@ -1828,7 +1929,9 @@ mod tests {
     #[test]
     fn block_emptied_by_dropping_dead_branch_uses_folds() {
         let (mut m, b, sink) = module(4);
-        let [entry, mid, live, dead] = b[..] else { unreachable!() };
+        let [entry, mid, live, dead] = b[..] else {
+            unreachable!()
+        };
         let (one, two, yes) = (m.i32(1), m.i32(2), m.bool(true));
 
         m.terminate(entry, Term::Br(mid));
@@ -1840,12 +1943,87 @@ mod tests {
         m.terminate(dead, Term::Ret);
 
         let plan = m.plan();
-        let V::Inst(i) = only_for_dead else { unreachable!() };
+        let V::Inst(i) = only_for_dead else {
+            unreachable!()
+        };
         assert!(!plan.live[i as usize]);
         assert_eq!(plan.fold[mid], Some((entry, live)));
         assert!(!plan.layout.contains(&mid));
         assert_eq!(plan.live, live_by_passes(&m));
         let _ = m.write();
+    }
+
+    /// Pruned `ReadOnly` typed UAV loads and unreachable ROV / 64-bit atomic
+    /// uses do not leak into [`Module::uses`], while live uses set them.
+    #[test]
+    fn uses_tracks_typed_uav_loads_rovs_and_atomic64() {
+        const HEAP: &str = "dx.op.createHandleFromHeap";
+        const BINDING: &str = "dx.op.createHandleFromBinding";
+        let build = |props0: u32, source: &str, op_name: &str, live_use: bool| {
+            let (mut m, b, sink) = module(3);
+            let [entry, live, dead] = b[..] else {
+                unreachable!()
+            };
+            let (i32t, i64t, handle_t, i1t) = (m.int(32), m.int(64), m.int(8), m.int(1));
+            let props_ty = m.named_struct("props", vec![i32t, i32t]);
+            let ann_ty = m.func_ty(handle_t, vec![i32t, handle_t, props_ty]);
+            let ann = m.function("dx.op.annotateHandle", ann_ty, Some(Attr::ReadNone), false);
+            let make_ty = m.func_ty(handle_t, vec![i32t, i32t, i1t, i1t]);
+            let make = m.function(source, make_ty, Some(Attr::ReadNone), false);
+            let res_ty = m.named_struct("res_ret", vec![i32t, i32t, i32t, i32t, i32t]);
+            let load_ty = m.func_ty(res_ty, vec![i32t, handle_t, i32t, i32t]);
+            let atomic_ty = m.func_ty(i64t, vec![i32t, handle_t, i32t, i32t, i32t, i32t, i64t]);
+            let (zero, one, two, yes, no) =
+                (m.i32(0), m.i32(1), m.i32(2), m.bool(true), m.bool(false));
+            let iu = m.undef(i32t);
+            let make_op = m.i32(if source == HEAP { 218 } else { 217 });
+            let raw = m.call(entry, make, vec![make_op, zero, no, no]);
+            let p0 = m.i32(props0);
+            let p = m.aggregate(props_ty, &[p0, zero]);
+            let ann_op = m.i32(216);
+            let h = m.call(entry, ann, vec![ann_op, raw, p]);
+            let val = if op_name.starts_with("dx.op.bufferLoad.")
+                || op_name.starts_with("dx.op.textureLoad.")
+            {
+                let f = m.function(op_name, load_ty, Some(Attr::ReadOnly), false);
+                let ld_op = m.i32(68);
+                let r = m.call(entry, f, vec![ld_op, h, zero, iu]);
+                m.extract(entry, r, 0)
+            } else {
+                let f = m.function(op_name, atomic_ty, Some(Attr::NoUnwind), false);
+                let blk = if live_use { live } else { dead };
+                let at_op = m.i32(78);
+                let one64 = m.int_const(i64t, 1);
+                let r = m.call(blk, f, vec![at_op, h, two, zero, iu, iu, one64]);
+                let r32 = m.cast(blk, Cast::Trunc, r, i32t);
+                let _ = m.call(blk, sink, vec![r32]);
+                m.terminate(entry, Term::CondBr(yes, live, dead));
+                if !live_use {
+                    let _ = m.call(live, sink, vec![one]);
+                }
+                m.terminate(live, Term::Ret);
+                m.terminate(dead, Term::Ret);
+                return m.uses();
+            };
+            m.terminate(entry, Term::CondBr(yes, live, dead));
+            let dst = if live_use { live } else { dead };
+            let other = if live_use { dead } else { live };
+            let _ = m.call(dst, sink, vec![val]);
+            let _ = m.call(other, sink, vec![one]);
+            m.terminate(live, Term::Ret);
+            m.terminate(dead, Term::Ret);
+            m.uses()
+        };
+        let pruned_load = build(10 | 0x1000, BINDING, "dx.op.bufferLoad.f32", false);
+        assert!(!pruned_load.typed_uav_loads);
+        let live_load = build(10 | 0x1000 | 0x2000, HEAP, "dx.op.textureLoad.f32", true);
+        assert!(live_load.typed_uav_loads && live_load.rovs && live_load.heap);
+        let srv_load = build(10, BINDING, "dx.op.bufferLoad.f32", true);
+        assert!(!srv_load.typed_uav_loads && !srv_load.rovs);
+        let pruned_a64 = build(2 | 0x1000 | 0x2000, HEAP, "dx.op.atomicBinOp.i64", false);
+        assert!(!pruned_a64.atomic64_typed && !pruned_a64.atomic64_heap && !pruned_a64.rovs);
+        let live_a64 = build(2 | 0x1000, HEAP, "dx.op.atomicCompareExchange.i64", true);
+        assert!(live_a64.atomic64_typed && live_a64.atomic64_heap);
     }
 
     #[test]
