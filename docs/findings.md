@@ -84,9 +84,11 @@ in that order of size:
 1. The preparing thread: split what one submission does over two threads in a row; ask
    for the next submission while this one is sent; view the card's own buffers where fills
    copy them now.
-2. The card: small buffers' copies in its own memory (`VICTORY_CARD_BUFFERS_MIN_KB=64`,
-   after fxceless c36971b2; not measured here yet), and the passes that run for nothing
-   without rays.
+2. The card: small buffers' copies in its own memory now default to a 64 KiB minimum on
+   16 GB cards (`VICTORY_CARD_BUFFERS_MIN_KB=64` still overrides it elsewhere; after
+   fxceless c36971b2). This avoids shader accesses to these buffers crossing PCIe, within
+   the existing 2 GiB copy cap and live VRAM-budget checks; the frame-time gain has not
+   yet been measured. Also, the passes that run for nothing without rays.
 3. Stalls: 270-660 s of a session were full of frames over 200 ms, almost all while new
    pipelines were made. `victory warm`, and a quarter of the workers for the slow ones.
 4. Outdoor flicker: suspected to be one bad indirect record that uses up its list's
