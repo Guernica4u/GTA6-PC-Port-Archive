@@ -27,6 +27,8 @@ pub(super) mod intersect;
 
 #[path = "paired.rs"]
 mod paired;
+#[path = "paired_fp32.rs"]
+mod paired_fp32;
 pub(super) use paired::{accesses_lds, supports_paired_lds};
 
 type Why = &'static str;
@@ -406,6 +408,9 @@ struct Lower<'a> {
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
     section_out: HashSet<Value>,
+    /// The paired form: FP32 adds, mins and maxes of a reduction section replayed in the
+    /// console's order ([`paired_fp32`], fork pull request #1419).
+    paired_fp32: bool,
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
@@ -2121,6 +2126,7 @@ impl<'a> Lower<'a> {
             cur_ir: 0,
             sections: HashMap::new(),
             section_out: HashSet::new(),
+            paired_fp32: false,
             code_table: None,
             counters: HashMap::new(),
             abort: None,
@@ -2813,6 +2819,10 @@ impl<'a> Lower<'a> {
                     self.inst(b, i)?;
                 }
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
+                    if self.twin.is_some() && self.replay_paired_fp32(b, i, end)? {
+                        i = end;
+                        continue;
+                    }
                     for j in i + 1..end {
                         if self.twin.is_some() {
                             self.paired_section_inst(b, j, i);
@@ -8910,6 +8920,11 @@ impl<'a> Lower<'a> {
             }
             "v_add_f32" | "v_sub_f32" | "v_subrev_f32" | "v_mul_f32" | "v_mul_legacy_f32"
             | "v_max_f32" | "v_min_f32" => {
+                if self.paired_fp32 && matches!(name, "v_add_f32" | "v_min_f32" | "v_max_f32") {
+                    let (a, b) = (s(self, 0)?, s(self, 1)?);
+                    let r = self.paired_fp32_op(name, a, b);
+                    return int(self, r);
+                }
                 let (a, bb) = (f(self, 0)?, f(self, 1)?);
                 let r = match name {
                     "v_add_f32" => self.s.m.bin(c, Bin::Add, a, bb),
