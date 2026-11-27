@@ -715,6 +715,17 @@ fn translate_outputs_once_impl(ex: &ShaderExtract, feeds_ps: Option<&InputInterp
     if material_classify { hlsl.insert_str(0, ps09_classify::DECLARATIONS); }
     hlsl.insert_str(0, &format!("// entry-live registers (read before written): {}
 ", live_in.join(" ")));
+    // A host lays a derivative-taking group out two by two, so a wave of a group wider
+    // than 16 threads holds two runs of thread numbers and need not start on a wave
+    // boundary. No recorded program is one; refuse instead of trusting the wave to be
+    // the console's.
+    if ex.stage == Stage::Compute && em.compute_derivatives {
+        let [x, y, z] = compute_group(ex);
+        let threads = x.saturating_mul(y).saturating_mul(z);
+        if x > 16 && (y > 1 || z > 1) && em.required_wave_size.is_some_and(|width| threads > width) {
+            return Err("derivatives in a group wider than 16 threads that spans several waves".into());
+        }
+    }
     // ps_5_0 forces UAV slots to start after the render-target outputs (FXC X4509);
     // SM5.1 has no such rule, and D3D12 accepts SM5.1 bytecode.
     let profile = if em.compute_derivatives || em.resolve_wave32 {
