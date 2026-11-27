@@ -141,13 +141,32 @@ struct Decl {
     at: Instant,
 }
 
-#[derive(Default)]
-struct State {
-    keys: HashMap<(usize, u32), Foot>,
-    decls: HashMap<u64, Vec<Decl>>,
+/// Footprints by key, in [`SHARDS`] parts by key, and noted declarations by
+/// copy, in as many parts by copy: one lock for all was taken by every
+/// draw or dispatch with a root UAV it writes, on every thread that
+/// translates list calls. A declaration takes its key's part, then (when it
+/// is a full one) its copy's; a landing takes its copy's part, then the
+/// parts of the keys it found, never two at once.
+const SHARDS: usize = 16;
+
+type Keys = HashMap<(usize, u32), Foot>;
+type Decls = HashMap<u64, Vec<Decl>>;
+
+static KEYS: [Mutex<Option<Keys>>; SHARDS] = [const { Mutex::new(None) }; SHARDS];
+static DECLS: [Mutex<Option<Decls>>; SHARDS] = [const { Mutex::new(None) }; SHARDS];
+
+fn spread(x: u64) -> usize {
+    (x.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 60) as usize % SHARDS
 }
 
-static STATE: Mutex<Option<State>> = Mutex::new(None);
+fn keys_of(key: (usize, u32)) -> std::sync::MutexGuard<'static, Option<Keys>> {
+    let at = spread(key.0 as u64 ^ u64::from(key.1).rotate_left(32));
+    KEYS[at].lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn decls_of(id: u64) -> std::sync::MutexGuard<'static, Option<Decls>> {
+    DECLS[spread(id)].lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// What `Draw::root_uav` declares of a root UAV at `address` in copy `id`
 /// (title memory from `start`), whose range is `len` bytes: the offset from
@@ -157,14 +176,16 @@ pub(crate) fn declare(pipeline: usize, param: u32, id: u64, start: u64, address:
         return (0, len);
     }
     let key = (pipeline, param);
-    let mut all = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    let state = all.get_or_insert_with(Default::default);
-    let foot = state.keys.entry(key).or_insert_with(Foot::new);
-    let (from, n, full) = foot.declare(len, verify_every());
+    let (from, n, full) = keys_of(key)
+        .get_or_insert_with(Default::default)
+        .entry(key)
+        .or_insert_with(Foot::new)
+        .declare(len, verify_every());
     if full {
         let base = address.saturating_sub(start);
-        let list = state.decls.entry(id).or_default();
         let now = Instant::now();
+        let mut decls = decls_of(id);
+        let list = decls.get_or_insert_with(Default::default).entry(id).or_default();
         let same = list.iter().rev().take(8).position(|d| d.key == key && d.from == base && d.to == base + len);
         match same {
             Some(i) => {
@@ -188,27 +209,26 @@ pub(crate) fn landed(id: u64, from: usize, to: usize) {
         return;
     }
     let (from, to) = (from as u64, to as u64);
-    let mut all = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(state) = all.as_mut() else {
-        return;
+    // The noted declarations it lands in, in their order: the key and the
+    // range relative to the declaration.
+    let hits: Vec<((usize, u32), u64, u64)> = {
+        let mut decls = decls_of(id);
+        let Some(list) = decls.as_mut().and_then(|d| d.get_mut(&id)) else {
+            return;
+        };
+        let now = Instant::now();
+        list.retain(|d| now.duration_since(d.at) < EXPIRE);
+        list.iter()
+            .filter(|d| from < d.to && to > d.from)
+            .map(|d| (d.key, from.max(d.from) - d.from, to.min(d.to) - d.from))
+            .collect()
     };
-    let State { keys, decls } = state;
-    let Some(list) = decls.get_mut(&id) else {
-        return;
-    };
-    let now = Instant::now();
-    list.retain(|d| now.duration_since(d.at) < EXPIRE);
-    for d in list.iter() {
-        if from >= d.to || to <= d.from {
-            continue;
-        }
-        let (a, b) = (from.max(d.from) - d.from, to.min(d.to) - d.from);
-        if let Some(foot) = keys.get_mut(&d.key)
-            && foot.landed(a, b)
-        {
+    for (key, a, b) in hits {
+        let widened = keys_of(key).as_mut().and_then(|k| k.get_mut(&key)).is_some_and(|foot| foot.landed(a, b));
+        if widened {
             tracing::warn!(
-                pipeline = format_args!("{:#x}", d.key.0),
-                param = d.key.1,
+                pipeline = format_args!("{:#x}", key.0),
+                param = key.1,
                 from = format_args!("{a:#x}"),
                 to = format_args!("{b:#x}"),
                 "a shader wrote outside its learned footprint: its root UAV is declared whole again (VICTORY_TIGHT_WRITES)"

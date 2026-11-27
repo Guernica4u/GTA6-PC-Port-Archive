@@ -273,3 +273,60 @@ Expected (unmeasured): the chase's 10,977 known-nothing spans from ~3 us to well
 Risks: a wrong part stamp is a stale host copy (old geometry/constants). The notes only ever claim a part current when it was held whole by a refresh or a merge at that asking, the same rule pages had. Lock order: `copied` -> `parts_taken` (-> journal read); `ranged` never held while `parts_taken` is taken.
 
 What to check in the log: the new `refreshes that looked at title memory` line; frame line "copies ms/MB"; `preparing per frame` "refreshes X in N flushes" and "asking the write watch"; "title bytes put in under flights' shader writes: pages looked at"; `settled for: title memory changed under shader writes` must not rise. With `VICTORY_REFRESH_CHECK=1` no "stale after its refresh, three times in a row" warnings.
+## perf/thin-contention: per-call shared writes in list translation (NOT COMPILED, UNMEASURED; no switch)
+
+Measured before (log play-20261127-104020-14256, chase 10:49, Ryzen 7 5700X 8C/16T, card 25 % busy): 70,418 list
+calls in 812.9 ms of thread time a frame = 11.5 us a call, against 5.3 us in plain gameplay and 3.5 us in the
+`list/thin.rs` header. The cost per call doubles under load: what grows with the threads is what they share. Read
+from code (line numbers before the change): every call or draw wrote lines that every translating thread writes.
+
+Removed (each was an atomic RMW or lock on one line for the whole process, per call/draw/lookup):
+1. `list.rs:1934` `DRAWS.fetch_add` (`count_draw`, every draw, mesh dispatch and indirect execution) and
+   `list.rs:2013` `DISPATCHES.fetch_add`: now `crate::sharded::Counter` (one 128-byte place per thread, summed by
+   `take_counts` for the frame line). Same totals.
+2. `draw.rs:653/1112/1124` `DRAWN`, `DROPPED`, `DISPATCHED` (`fetch_add` at draw.rs 3749-3781, 3816, 4361, 4367,
+   4851, 4854, 5034, 5037, 5423, 5425: every draw/dispatch): `sharded::Counter`; `drawn()`, `dropped_now()`,
+   `take_dropped()`, `dispatched()` sum the places. Same totals.
+3. `descriptor.rs:1173` `VIEWS: RwLock<Views>`: a read lock (an RMW on the lock word) per view look-up, i.e. per
+   `view_at` (descriptor.rs:1584), reached from `HostHeap::mirror`'s quick path (descriptor/host.rs:3903, every table
+   entry of every draw, `draw.rs:4460`), `make_listed` (descriptor/host.rs:3480) and `descriptor::view` in
+   `State::tables` (draw.rs:4584, 4593, 4699): tens a draw. Report 03 measured 410 ms / 5 s waiting for it. Now
+   `sharded::ReadMostly`: a reader takes only its own thread's lock (no shared line), a writer takes all 32 in order.
+   Same exclusion as the `RwLock`; lock waits still counted in `LOCK_WAITS[2..4]`.
+4. `descriptor.rs:1562` `forget`: took the writer's lock (stopping every reader) for every released resource; now
+   looks first (reader's lock) and returns if the resource has no entry, as the old code did after the lock.
+5. `host.rs:7900` `next_epoch` (one process-wide `fetch_add` per `HostList::changed_something`: state transitions
+   `host.rs:6741/6747`, `twins_written` 6977, `defer_copy` 7245, `defer` 7680, i.e. per draw that moves a texture):
+   each thread takes numbers from its own block of 1024 (`sharded::Numbers`). Epochs are only compared for equality
+   (draw.rs 4573/4606/4664, indirect/merge.rs, descriptor/host.rs:2882, host.rs:6597); they stay unique and never 0.
+6. `pipeline.rs:442` `bound`: `p.bound.swap(true)` on every `SetPipelineState` (list.rs:1618) wrote the pipeline
+   object's line, which `host_pipeline` reads on every draw on every thread; now a load first, swap only the first
+   time.
+7. `tight.rs:149` one `Mutex<State>` taken by `declare` for every root UAV a draw/dispatch writes (draw.rs:2232) on
+   every translating thread, and by `landed`: now 16 mutexes by key and 16 by copy; a declaration takes its key's,
+   then (full ones) its copy's; a landing takes its copy's, collects the hits, then each key's. Never two at once.
+   Same footprint state machine and order per key.
+
+Not changed (hot, but out of this branch's files or not exactly behaviour-preserving), in likely order of cost:
+- `resource.rs:1656` `hosted()`: a per-resource `Mutex` and an `Arc` clone/drop per call, 2-4 calls per texture
+  per draw (`ensure_state` -> `HostList::transition` -> `host_copy`, `twin_use` -> `twin` + `host_copy`, and
+  `readable`'s `host_copy`, draw.rs 1861, 1865, 5668, 5681, 5691). Render targets, depth and shared textures are the
+  same objects on all threads: the same lines bounce. Fix: one `hosted` per texture per draw passed through
+  (needs `HostList::transition_made`/`twin_use_made`), or a lock-free snapshot of `made` (it is replaced by
+  `want_level`/`let_go_idle`, so needs an arc-swap or epoch scheme). Touches the texture let-go logic.
+- `shadow.rs:5155/5175` `find`/`find_any` return `Arc<Shadow>`: a refcount RMW pair per vertex/index slot, root view
+  and buffer view per draw on buffers every list uses (shadow.rs is another agent's).
+- `descriptor/host.rs:2249` `HostHeap::dynamic`: the heap's `Mutex` per fresh table (draw.rs:4616), one heap for all.
+- `pipeline/make.rs:849` `note_draw`: `DRAW_COUNT.fetch_add` per `host_pipeline` call (2-4 a draw) while loading.
+  Not cached per draw: the count decides when loading ends, and calling it fewer times would move that.
+- `host.rs:7228` `COPIES_JOINED` per deferred copy; `copystat::recorded` per call in diagnostics builds.
+- `list/thin.rs` itself is fine: its shared counters and queues are touched per 1024-word chunk, not per call.
+
+Expected: unmeasured. Items 1-6 take 3-5 shared RMWs per draw and tens per draw from VIEWS off shared lines; at
+7k draws and 70k calls a frame and 100-300 ns per contended RMW that is roughly 15-40 ms of the 813 ms thread time
+(a few percent), more where the VIEWS lock was waited for (report 03: 6 ms a frame in waits alone). The larger
+remaining shares are `hosted()` and the shadow `Arc`s above. Check: the thin line's us per call
+(`list calls translated by threads of ours per frame`) in the same chase, and `LOCK_WAITS` views share in the
+descriptor line. Risks: `ReadMostly` writers now take 32 locks (a new view, or the release of a resource with
+entries): fine at hundreds a second, slower than before at a burst of tens of thousands; epochs are no longer in
+order across threads (nothing orders them).

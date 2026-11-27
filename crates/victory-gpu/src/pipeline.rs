@@ -439,7 +439,10 @@ pub(crate) fn bound(this: This) {
         return;
     }
     let p = pipeline(this);
-    if p.bound.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    // Looked at first: a swap writes the pipeline's line on every bind, on
+    // every thread that binds it, and the lookups of its host pipeline
+    // (`host_pipeline`) read that line.
+    if p.bound.load(std::sync::atomic::Ordering::Relaxed) || p.bound.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return;
     }
     let frame = crate::frame::current();

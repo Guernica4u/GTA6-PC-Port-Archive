@@ -1169,8 +1169,12 @@ struct Views {
 /// Read far more often than written: every slot a draw reads through a
 /// table is looked up here, on several recording threads at once in the
 /// world. Readers share it; only a view not seen before (a new table entry
-/// or shape) and a released resource take it alone.
-static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
+/// or shape) and a released resource with views take it alone.
+/// A reader takes the lock of its own thread only (`crate::sharded`): one
+/// read lock for all, taken some 100,000 times a frame by eight threads
+/// translating list calls and the title's, moved its line between their
+/// cores at every look-up.
+static VIEWS: crate::sharded::ReadMostly<Views> = crate::sharded::ReadMostly::new(Views {
     list: Vec::new(),
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
@@ -1364,26 +1368,24 @@ fn words_for(view: View) -> [u32; 2] {
     views_write().entry(view)
 }
 
-fn views_read() -> std::sync::RwLockReadGuard<'static, Views> {
+fn views_read() -> crate::sharded::ReadGuard<'static, Views> {
     match VIEWS.try_read() {
-        Ok(views) => views,
-        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => {
+        Some(views) => views,
+        None => {
             let started = std::time::Instant::now();
-            let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+            let views = VIEWS.read();
             waited(1, started);
             views
         }
     }
 }
 
-fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
+fn views_write() -> crate::sharded::WriteGuard<'static, Views> {
     match VIEWS.try_write() {
-        Ok(views) => views,
-        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => {
+        Some(views) => views,
+        None => {
             let started = std::time::Instant::now();
-            let views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
+            let views = VIEWS.write();
             waited(1, started);
             views
         }
@@ -1559,6 +1561,13 @@ pub(crate) fn forget(resource: usize) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&resource);
+    // Most released resources have no entry (buffers, textures whose views
+    // are named whole): those take no writer's lock, which stops every
+    // reader. (A view of a resource made while it is released is a title's
+    // fault; as before, such an entry stays if it comes after.)
+    if !views_read().by_resource.contains_key(&resource) {
+        return;
+    }
     let mut views = views_write();
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
@@ -2073,8 +2082,8 @@ mod tests {
             View::Placed(_, r, _) => *r == resource,
             _ => false,
         };
-        let entries = || VIEWS.read().unwrap().list.iter().filter(|(v, _)| mine(v)).count();
-        let shapes = || VIEWS.read().unwrap().shapes.iter().filter(|s| s.1 == resource).count();
+        let entries = || views_read().list.iter().filter(|(v, _)| mine(v)).count();
+        let shapes = || views_read().shapes.iter().filter(|s| s.1 == resource).count();
         for n in 0..20_000u64 {
             let address = 0x6_0000_0000 + n * 0x100;
             create_cbv(null, &[address as u32, (address >> 32) as u32, 512, 0], at);
