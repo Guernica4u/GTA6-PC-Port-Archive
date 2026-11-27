@@ -396,11 +396,11 @@ fn generation_file(n: u64) -> String {
     format!("{GENERATION_PREFIX}{n}.bin")
 }
 
-/// Deletes the generations but `keep` (best effort: where Windows refuses to
-/// delete the one a process has mapped, a sharing violation, it stays for
-/// the next start).
-fn remove_other_generations(dir: &Path, keep: u64) {
-    for (n, path) in generations(dir).into_iter().filter(|&(n, _)| n != keep) {
+/// Deletes the generations matching `remove` (best effort: where Windows
+/// refuses to delete the one a process has mapped, a sharing violation, it
+/// stays for the next start).
+fn remove_generations_where(dir: &Path, mut remove: impl FnMut(u64) -> bool) {
+    for (n, path) in generations(dir).into_iter().filter(|&(n, _)| remove(n)) {
         match std::fs::remove_file(&path) {
             Ok(()) => {
                 let _ = std::fs::remove_file(sidecar(&path));
@@ -408,6 +408,18 @@ fn remove_other_generations(dir: &Path, keep: u64) {
             Err(e) => tracing::debug!(generation = n, error = %e, "old host pipeline library kept"),
         }
     }
+}
+
+/// Deletes every generation other than `keep` (used on open after falling
+/// back past damaged newer generations).
+fn remove_other_generations(dir: &Path, keep: u64) {
+    remove_generations_where(dir, |n| n != keep);
+}
+
+/// Deletes generations strictly older than `keep` (used on save so a save
+/// never deletes a newer generation).
+fn remove_older_generations(dir: &Path, keep: u64) {
+    remove_generations_where(dir, |n| n < keep);
 }
 
 /// Serialises `library` into the file of generation `generation` in `dir`
@@ -573,6 +585,10 @@ thread_local! {
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    // Serialises the full save sequence (generation write, metadata files,
+    // old-generation cleanup) without holding `library.state` during post-
+    // serialisation file updates.
+    static SAVING: Mutex<()> = Mutex::new(());
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     {
@@ -582,6 +598,7 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
+    let _saving = SAVING.lock().unwrap_or_else(|e| e.into_inner());
     let mmap = mmap_enabled();
     let (generation, bytes, prebuilt) = {
         let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -615,8 +632,9 @@ pub(crate) fn save(now: bool) {
         }
     });
     // The generation this process maps may stay (if Windows refuses to
-    // delete it); the next start removes it.
-    remove_other_generations(dir, generation);
+    // delete it); the next start removes it. Only strictly older generations
+    // are removed so a save can never delete a newer generation.
+    remove_older_generations(dir, generation);
     let (created, distinct) = created();
     let (shaders_cached, shaders_translated) = crate::shader_cache::counts();
     match written {
@@ -1303,5 +1321,21 @@ mod tests {
         let final_bytes = std::fs::read(&target).unwrap();
         assert_eq!(final_bytes.len(), 4096);
         assert!(final_bytes.iter().all(|&b| b == final_bytes[0]));
+    }
+
+    #[test]
+    fn remove_older_generations_never_deletes_newer_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in [1u64, 2, 3] {
+            let bin = dir.path().join(generation_file(n));
+            std::fs::write(&bin, b"blob").unwrap();
+            std::fs::write(sidecar(&bin), b"4 deadbeef").unwrap();
+        }
+        remove_older_generations(dir.path(), 2);
+        assert!(!dir.path().join(generation_file(1)).exists());
+        assert!(!sidecar(&dir.path().join(generation_file(1))).exists());
+        assert!(dir.path().join(generation_file(2)).exists());
+        assert!(dir.path().join(generation_file(3)).exists());
+        assert!(sidecar(&dir.path().join(generation_file(3))).exists());
     }
 }
