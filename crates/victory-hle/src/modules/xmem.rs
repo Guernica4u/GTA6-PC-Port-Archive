@@ -84,6 +84,15 @@ fn address_range(flags: u64) -> (usize, usize) {
     (1 << 32, (1 << bits) - 1)
 }
 
+/// Whether the host hands this request a write-watched reservation: it does
+/// for the reservations it places itself (`constrained`), except placeholders,
+/// whose physical-page views the GPU side copies whole. Reads the decision,
+/// not the flags: they travel in `kind` today and in `alloc_kind` once lazy
+/// commit lands (#3438), so keying off the bits would stop tracking silently.
+fn host_write_watches(constrained: bool, placeholder: bool) -> bool {
+    constrained && !placeholder
+}
+
 pub extern "system" fn XMemVirtualAlloc(
     base: *mut c_void,
     size: usize,
@@ -173,7 +182,7 @@ pub extern "system" fn XMemVirtualAlloc(
             );
         }
     }
-    if !at.is_null() && kind & MEM_RESERVE != 0 && kind & MEM_WRITE_WATCH != 0 {
+    if !at.is_null() && host_write_watches(constrained, placeholder) {
         touch_diag::track(at as usize, size);
     }
     if base.is_null() {
@@ -1164,6 +1173,34 @@ mod tests {
         assert!((p as usize) + (16 << 30) <= 1 << 40, "{p:p}");
         // SAFETY: our own reservation.
         assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
+    }
+
+    #[test]
+    fn touch_diag_keys_off_the_hosts_decision_not_the_flags() {
+        // The host makes a request a write-watched reservation when it picks
+        // the address itself (`constrained`), unless it is a placeholder.
+        // Recompute the bits the host sets today (`kind`) and check the
+        // diagnostic's guard agrees, so moving them (to `alloc_kind`, #3438)
+        // cannot silently stop the tracking.
+        for constrained in [false, true] {
+            for placeholder in [false, true] {
+                let mut kind = 0u32;
+                if placeholder {
+                    kind |= MEM_RESERVE | MEM_RESERVE_PLACEHOLDER;
+                }
+                if constrained {
+                    kind |= MEM_RESERVE;
+                    if kind & MEM_RESERVE_PLACEHOLDER == 0 {
+                        kind |= MEM_WRITE_WATCH;
+                    }
+                }
+                assert_eq!(
+                    host_write_watches(constrained, placeholder),
+                    kind & MEM_RESERVE != 0 && kind & MEM_WRITE_WATCH != 0,
+                    "constrained {constrained}, placeholder {placeholder}"
+                );
+            }
+        }
     }
 
     #[test]
