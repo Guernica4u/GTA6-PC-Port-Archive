@@ -1546,6 +1546,57 @@ const NEVER: u64 = u64::MAX;
 const BUDGET_HIGH: f64 = 0.90;
 #[cfg(windows)]
 const BUDGET_LOW: f64 = 0.85;
+/// Past this share of Windows system commit limit, evict LRU title-backed
+/// textures until commit is back under [`COMMIT_LOW`]: on 16 GB RAM hosts
+/// with large VRAM GPUs, WDDM commit backing can exhaust system commit
+/// before VRAM hits [`BUDGET_HIGH`].
+#[cfg(windows)]
+const COMMIT_HIGH: f64 = 0.85;
+#[cfg(windows)]
+const COMMIT_LOW: f64 = 0.80;
+
+#[cfg(windows)]
+fn commit_over_bytes_for(commit_total: usize, commit_limit: usize, page_size: usize) -> u64 {
+    if commit_limit == 0 || page_size == 0 {
+        return 0;
+    }
+    let total = commit_total as f64;
+    let limit = commit_limit as f64;
+    if total > COMMIT_HIGH * limit {
+        ((total - COMMIT_LOW * limit) * page_size as f64).max(0.0) as u64
+    } else {
+        0
+    }
+}
+
+#[cfg(windows)]
+fn system_commit_over() -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetPerformanceInfo, PERFORMANCE_INFORMATION};
+    let mut info = PERFORMANCE_INFORMATION {
+        cb: size_of::<PERFORMANCE_INFORMATION>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `info` is a valid writable PERFORMANCE_INFORMATION of size `info.cb`.
+    if unsafe { K32GetPerformanceInfo(&mut info, info.cb) } == 0 {
+        return 0;
+    }
+    commit_over_bytes_for(info.CommitTotal, info.CommitLimit, info.PageSize)
+}
+
+#[cfg(windows)]
+fn texture_budget_bytes_for(val: Option<&str>) -> Option<u64> {
+    val.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&mb| mb > 0)
+        .map(|mb| mb.saturating_mul(1 << 20))
+}
+
+#[cfg(windows)]
+fn texture_budget_bytes() -> Option<u64> {
+    static CAP: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        texture_budget_bytes_for(std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok().as_deref())
+    })
+}
 /// A texture made again within this many frames of being given up counts
 /// as remade soon ([`EVICTIONS`]): too eager an [`IDLE_MS`].
 #[cfg(windows)]
@@ -1593,12 +1644,18 @@ pub(crate) fn evict_unused() {
     if LAST.swap(frame, Relaxed) == frame {
         return;
     }
-    let over = crate::host::video_memory().map_or(0, |[(used, budget), _]| {
+    let vram_over = crate::host::video_memory().map_or(0, |[(used, budget), _]| {
         // Free space in the heaps of textures takes the card's memory but
         // is not in use: new textures go there first.
         let used = used - crate::placement::free_bytes() as f64 / 1e6;
         if used > BUDGET_HIGH * budget { ((used - BUDGET_LOW * budget) * 1e6) as u64 } else { 0 }
     });
+    let commit_over = system_commit_over();
+    let cap_over = texture_budget_bytes().map_or(0, |cap| {
+        let live: u64 = candidates().iter().map(|(t, _)| t.bytes).sum();
+        live.saturating_sub(cap)
+    });
+    let over = vram_over.max(commit_over).max(cap_over);
     evict(frame, now_ms(), over);
 }
 
@@ -3178,5 +3235,17 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn commit_pressure_and_texture_budget_compute_eviction_targets() {
+        assert_eq!(commit_over_bytes_for(0, 0, 4096), 0);
+        assert_eq!(commit_over_bytes_for(800, 1000, 4096), 0);
+        assert_eq!(commit_over_bytes_for(850, 1000, 4096), 0);
+        assert_eq!(commit_over_bytes_for(900, 1000, 4096), 100 * 4096);
+        assert_eq!(texture_budget_bytes_for(None), None);
+        assert_eq!(texture_budget_bytes_for(Some("0")), None);
+        assert_eq!(texture_budget_bytes_for(Some("2048")), Some(2048 << 20));
     }
 }
