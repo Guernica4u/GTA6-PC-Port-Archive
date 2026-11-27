@@ -28,7 +28,7 @@
 
 use std::collections::HashMap;
 use std::sync::Once;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, LocalFree};
@@ -59,22 +59,24 @@ fn hz() -> u64 {
     std::env::var("VICTORY_CPU_STAGES_HZ").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250u64).clamp(10, 2000)
 }
 
-/// The frames of the frame-rate line just written (f64 bits), for the next report.
-static FRAMES: AtomicU64 = AtomicU64::new(0);
-static ASKED: AtomicBool = AtomicBool::new(false);
+/// Presented frames since the sampler's last report request was taken.
+static PENDING_FRAMES: AtomicU64 = AtomicU64::new(0);
 
-/// Called beside the frame-rate line: a report of the time since the last one goes out (from
-/// the sampling thread, soon after). Starts that thread the first time.
-pub(crate) fn frame_line(frames: f64) {
-    if !on() || frames <= 0.0 {
+/// Called beside the frame-rate line with all frames since the previous call.
+/// The first call starts sampling. Later calls request a report.
+pub(crate) fn frame_line(frames: u64) {
+    if !on() || frames == 0 {
         return;
     }
     static START: Once = Once::new();
+    let mut starting = false;
     START.call_once(|| {
+        starting = true;
         let _ = std::thread::Builder::new().name("victory-stages".into()).spawn(run);
     });
-    FRAMES.store(frames.to_bits(), Ordering::Relaxed);
-    ASKED.store(true, Ordering::Release);
+    if !starting {
+        PENDING_FRAMES.fetch_add(frames, Ordering::Relaxed);
+    }
 }
 
 /// `.pdata` of a module, as the image has it.
@@ -617,6 +619,7 @@ fn run() {
     let mut names = Names::new();
     let mut sums = Sums::default();
     let mut last = Instant::now();
+    let mut window_started = last;
     let mut handles: Vec<(u32, HANDLE, (usize, usize), bool, usize)> = Vec::new();
     let mut round: Vec<(u32, bool, usize, Sample)> = Vec::new();
     // (the submitting thread's group, once named)
@@ -682,11 +685,14 @@ fn run() {
                 sums.stacks.entry((submit_group, kind, 0, at)).or_insert(s);
             }
         }
-        if ASKED.swap(false, Ordering::Acquire) {
-            let frames = f64::from_bits(FRAMES.load(Ordering::Relaxed)).max(1.0);
+        if PENDING_FRAMES.load(Ordering::Relaxed) != 0 {
+            let frames = PENDING_FRAMES.swap(0, Ordering::Relaxed);
             refresh_threads(pid, me, &modules, &mut threads, &mut groups);
-            report(&mut sums, &mut threads, &groups, &mut names, frames, submit_group);
+            let seconds = now.duration_since(window_started).as_secs_f64();
+            tracing::info!("cpu stages, report window: {frames} presented frames in {seconds:.2} s");
+            report(&mut sums, &mut threads, &groups, &mut names, frames as f64, submit_group);
             sums = Sums::default();
+            window_started = now;
             refresh = true;
         }
         let spent = now.elapsed();

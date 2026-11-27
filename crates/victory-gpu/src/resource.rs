@@ -11,6 +11,8 @@ use std::ptr::NonNull;
 
 use victory_formats::texture;
 
+#[cfg(windows)]
+use crate::host::memory_samples::{Allocation, Kind};
 use crate::object::{
     self, E_INVALIDARG, E_OUTOFMEMORY, HEAP, HRESULT, Iid, Object, RESOURCE, S_OK, Table, This,
     guid,
@@ -509,7 +511,8 @@ fn twin_texture(
         TWINS[1].fetch_add(1, Relaxed);
         return None;
     };
-    let _ = crate::host::resident(&host.device, &texture);
+    let allocation = Allocation::texture(Kind::DepthTwin, &host.device, &texture);
+    let _ = crate::host::resident(&host.device, &texture, allocation);
     crate::host::name(&texture, || {
         format!("depth twin {}x{} f{}", d.width, d.height, d.format)
     });
@@ -570,7 +573,8 @@ fn twin_texture(
             tracing::warn!(error = %e, desc = ?d, "no twin for a depth plane");
         }
         texture.map(|texture| {
-            let _ = crate::host::resident(&host.device, &texture);
+            let allocation = Allocation::texture(Kind::DepthTwin, &host.device, &texture);
+            let _ = crate::host::resident(&host.device, &texture, allocation);
             crate::host::name(&texture, || {
                 format!("depth plane twin {}x{} f{}", d.width, d.height, d.format)
             });
@@ -1792,26 +1796,30 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
     }
 }
 
-/// Whether more host copies of textures the title fills may be made for
-/// shaders that pick textures by index (`draw.rs` `heap_textures`): always
-/// up to [`texture_floor_bytes`] bytes of them, beyond that while the card's
-/// memory in use by this process is under nine tenths of the budget the system
-/// gives it ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB`
-/// sets a limit on those copies' bytes instead). Past the budget the system moves the card's memory into the PC's,
-/// which ended runs 20 and 24.
 #[cfg(windows)]
-pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
-    use std::sync::atomic::Ordering::Relaxed;
-    const WITHOUT_BUDGET: u64 = 4 << 30;
+fn texture_budget_limit() -> Option<u64> {
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    let limit = *LIMIT.get_or_init(|| {
+    *LIMIT.get_or_init(|| {
         let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
         mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
-    });
+    })
+}
+
+#[cfg(windows)]
+fn filled_texture_bytes() -> u64 {
     // (With the tiles of the copies made level by level, whose own bytes
     // count as none: `crate::tiles`.)
-    let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
-    if let Some(limit) = limit {
+    KINDS[1].load(std::sync::atomic::Ordering::Relaxed) + crate::tiles::given_total()
+}
+
+/// Admission for copies of textures picked by index. An explicit
+/// `VICTORY_TEXTURE_BUDGET_MB` limits their bytes directly. Otherwise,
+/// the texture floor and the DXGI budget determine admission.
+#[cfg(windows)]
+pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
+    const WITHOUT_BUDGET: u64 = 4 << 30;
+    let filled = filled_texture_bytes();
+    if let Some(limit) = texture_budget_limit() {
         return filled < limit;
     }
     let floor = texture_floor_bytes(memory.map(|[budget, ..]| budget));
@@ -1819,18 +1827,9 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         return true;
     }
     match memory {
-        // What is kept for card copies of title buffers not made yet
-        // (`crate::shadow::card_room_kept`) and for the render targets a
-        // world makes in its first frame ([`targets_room_kept`]) counts as
-        // used.
         Some([budget, used, ..]) => {
-            // Only count a small fraction of free pool blocks as headroom: DXGI
-            // already counts the whole 64 MiB blocks against `budget`, and
-            // subtracting up to ~1.8 GiB of fragmented pool space hid real
-            // VRAM exhaustion (DLSS `out of VRAM` + device loss).
-            let usable_pool = crate::pool::texture_room().min(budget / 32);
-            used.saturating_sub(usable_pool) + crate::shadow::card_room_kept() + targets_room_kept()
-                < room_line(budget)
+            let weights = RoomWeights::new(budget, used);
+            weights.weighed() < weights.line
         }
         None => filled < WITHOUT_BUDGET,
     }
@@ -1950,28 +1949,65 @@ fn targets_kept_from_peak(most: u64, targets: u64, peak: u64) -> u64 {
     peak.saturating_add(peak / 2).max(LEAST).min(most).saturating_sub(targets)
 }
 
-/// What [`room`] weighs now, in MB, for the log: the card's budget, its
-/// use, the free part of the texture blocks, what is kept for card copies
-/// of title buffers and for render targets, and the line. `None` without
-/// the system's numbers, or under `VICTORY_TEXTURE_BUDGET_MB` (which
-/// weighs the textures' own bytes instead).
+/// Shared by the texture admission check and its log. All values are bytes.
 #[cfg(windows)]
-pub(crate) fn room_terms(memory: Option<[u64; 4]>) -> Option<[u64; 6]> {
-    if std::env::var_os("VICTORY_TEXTURE_BUDGET_MB").is_some() {
-        return None;
-    }
-    let [budget, used, ..] = memory?;
-    Some(
-        [
-            budget,
+struct RoomWeights {
+    used: u64,
+    free_in_blocks: u64,
+    credit: u64,
+    buffers: u64,
+    targets: u64,
+    line: u64,
+}
+
+#[cfg(windows)]
+impl RoomWeights {
+    fn new(budget: u64, used: u64) -> Self {
+        let free_in_blocks = crate::pool::texture_room();
+        // DXGI charges entire heaps. Crediting the full internal free space
+        // hid exhaustion when it was fragmented across live heaps.
+        let credit = free_in_blocks.min(budget / 32);
+        Self {
             used,
-            crate::pool::texture_room(),
-            crate::shadow::card_room_kept(),
-            targets_room_kept(),
-            room_line(budget),
-        ]
-        .map(|bytes| bytes >> 20),
-    )
+            free_in_blocks,
+            credit,
+            buffers: crate::shadow::card_room_kept(),
+            targets: targets_room_kept(),
+            line: room_line(budget),
+        }
+    }
+
+    fn weighed(&self) -> u64 {
+        self.used.saturating_sub(self.credit) + self.buffers + self.targets
+    }
+}
+
+/// The exact texture admission verdict for a sample with a DXGI budget.
+#[cfg(windows)]
+pub(crate) fn log_room(memory: Option<[u64; 4]>) {
+    let Some([budget, used, ..]) = memory else { return };
+    if texture_budget_limit().is_some() {
+        return;
+    }
+    let weights = RoomWeights::new(budget, used);
+    let weighed = weights.weighed();
+    let below_floor = filled_texture_bytes() < texture_floor_bytes(Some(budget));
+    let verdict = match (below_floor, weighed < weights.line) {
+        (true, _) => "room (below the texture floor)",
+        (false, true) => "room",
+        (false, false) => "no room, new textures wait",
+    };
+    let [budget, used, free, credit, buffers, targets, weighed, line] = [
+        budget, used, weights.free_in_blocks, weights.credit, weights.buffers, weights.targets, weighed, weights.line,
+    ]
+    .map(|bytes| bytes >> 20);
+    tracing::info!(
+        target: "victory_gpu::host",
+        "the texture queue's room: {used} MB in use - {credit} MB texture block credit (of {free} MB free) + \
+         {buffers} MB kept for card copies of title buffers + {targets} MB kept for render targets = {weighed} MB \
+         against a line of {line} MB ({:.1} % of a budget of {budget} MB): {verdict}",
+        line as f64 * 100.0 / budget.max(1) as f64
+    );
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question
@@ -2328,11 +2364,8 @@ pub(crate) fn let_go_idle() {
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
     let (idle_ms, most) = match memory {
         Some([budget, used, ..]) if keep => {
-            let usable_pool = crate::pool::texture_room().min(budget / 32);
-            let used = used.saturating_sub(usable_pool)
-                + crate::shadow::card_room_kept()
-                + targets_room_kept();
-            crate::host::vram_keep_below(budget, used, room_line(budget))
+            let weights = RoomWeights::new(budget, used);
+            crate::host::vram_keep_below(budget, weights.weighed(), weights.line)
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
@@ -2831,10 +2864,13 @@ fn host_texture_as(
     if !reserved
         && made.is_ok()
         && let Some(t) = &texture
-        && let Err(e) = crate::host::resident(&host.device, t).and_then(|()| crate::host::mapped(&host.device))
     {
-        tracing::warn!(error = %e, desc = ?d, "a host texture is not resident");
-        texture = None;
+        let kind = if fills(desc) { Kind::SampledTexture } else { Kind::WritableTexture };
+        let allocation = Allocation::texture(kind, &host.device, t);
+        if let Err(e) = crate::host::resident_and_mapped(&host.device, t, allocation) {
+            tracing::warn!(error = %e, desc = ?d, "a host texture is not resident");
+            texture = None;
+        }
     }
     if let Some(t) = &texture {
         crate::host::name(t, || {
