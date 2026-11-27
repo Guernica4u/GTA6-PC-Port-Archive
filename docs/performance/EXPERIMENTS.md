@@ -128,3 +128,20 @@ Change 1 (counters): the frame line now names two more sources inside "title mem
 Change 2 (fix for the first): `place::read_by` asked whether ANY step of the submission reads the destination of a copy at its place whose flights are in the air, wherever the step stands. Submission runs steps in list order (`run_deferred`), and a copy at its place is not put into title memory when flights may write it (`Placed::prepare(free=false)`). A step that stands before the copy reads the old bytes with or without the wait, so waiting for it changes nothing. `blocked_by` now checks each step against the destinations of the copies at their place ahead of it only (`place::reads`). Invariants kept: a reader behind the copy still waits; the readers' own source checks against `written` are unchanged.
 
 Not changed: `copied_read`. A refresh of another host copy over a card-copy destination really needs the landed bytes (the draw reads that host copy), so the wait is correct until the copy also writes that other host copy or the refresh is given a card-side order; that needs the landing to be ordered on the queue and is a larger change. If the next log shows counter 19 dominating, that is the next work item.
+## perf/tight-writes: learned footprint for root UAV declarations (UNCOMPILED, UNMEASURED; default OFF)
+
+`VICTORY_TIGHT_WRITES=1` enables `tight.rs`. Root UAVs (`Draw::root_uav`) have no size; they declared the rest of the
+title's buffer as shader-written. Now, per (pipeline, root parameter), the footprint relative to the root address is
+learned from what lands (hook in `copystat_footprint::gpu_wrote`, which `land_card`/`land_back` already call). Learn:
+full declaration, noted per copy for 400 ms, landings inside widen the footprint. After 8 landings and 32
+declarations: tight, footprint +-256 KiB in 64 KiB blocks. Tight keys declare the footprint only, except every 16th
+declaration (`VICTORY_TIGHT_VERIFY`) which is full and noted; a landing outside the footprint in a noted full
+declaration makes the key wide for good (warn log). Keys that never saw a landing never tighten.
+Not done: table UAV views in `readable` (sized, no pipeline identity there), persistence across runs, static shader
+analysis. The view and `refresh` stay wide; only `gpu_writes` is narrowed.
+Why default OFF: a write outside the footprint between two verifications is not declared, so it stays on the card
+until the next declared write of its 64 KiB or verification; that violates "must reach title memory before the title
+is told" for that frame. An exact fallback needs a card-side whole-range compare declared as compare-and-land (host.rs
+card steps, not touched here) or a shader-side bounds flag. Attribution is a superset (any noted declaration of the
+copy overlapping a landing), so errors widen, never narrow. Measure: log of `footprint of 64 KiB blocks`, and
+shadow/flight lines with the switch on vs off. Code was not compiled or tested (instruction); unit tests in tight.rs.

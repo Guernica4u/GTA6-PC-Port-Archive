@@ -114,6 +114,7 @@ fn with(id: u64, start: u64, len: u64, f: impl FnOnce(&mut Foot)) {
 /// Shaders wrote bytes that landed in offsets `[from, to)` of copy `id`
 /// (title memory `[start, start + len)`).
 pub(crate) fn gpu_wrote(id: u64, start: u64, len: u64, from: usize, to: usize) {
+    crate::tight::landed(id, from, to);
     with(id, start, len, |f| f.gpu_wrote(from, to));
 }
 
