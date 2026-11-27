@@ -1385,6 +1385,8 @@ impl<'a> Lower<'a> {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
         }
+        // A region run wave-wide is lowered in its own order.
+        let order = self.wide.lowered_in(&order);
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
             self.cur_ir = b;
@@ -1916,6 +1918,7 @@ impl<'a> Lower<'a> {
                 self.s.flags |= flags::WAVE_OPS;
                 let xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
                 let xy = self.mask_halves(lo, at, xy)?;
+                let xy = self.wide_keep_ballot(lo, xy, at);
                 self.ballots.insert(lo, xy);
                 xy
             }

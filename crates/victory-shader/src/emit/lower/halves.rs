@@ -275,7 +275,7 @@ impl Lower<'_> {
     /// a half without threads (in a group that ends inside a console wave's
     /// low half) gives the identity. A barrier one half skips hangs the GPU
     /// (D3D12 leaves it undefined; NVIDIA waits for every thread).
-    fn trade(&mut self, at: usize, words: &[(V, u32)]) -> Result<Vec<(V, V)>, Why> {
+    pub(super) fn trade(&mut self, at: usize, words: &[(V, u32)]) -> Result<Vec<(V, V)>, Why> {
         debug_assert!(words.len() <= WORDS as usize);
         let slots = self.slots()?;
         let f = self.relabelled_flat();

@@ -177,6 +177,18 @@ fn refusal(words: &[u32], threads: u32, lds_bytes: u32) -> String {
 fn the_test_programs_are_what_their_comments_say() {
     let programs: [(Vec<u32>, &[&str]); 28] = [
         (
+            first_lane_after_a_loop(),
+            &[
+                "s_mov_b32 s20, 0",
+                "s_add_u32 s20, s20, 1",
+                "v_mov_b32 v2, s20",
+                "v_cmp_lt_u32 vcc, v11, v12",
+                "s_and_b64 exec, exec, vcc",
+                "s_cbranch_execnz",
+                "v_readfirstlane_b32 s12, v2",
+            ],
+        ),
+        (
             wide_loop(true),
             &[
                 "v_lshrrev_b32 v12, 4, v1",
@@ -193,18 +205,6 @@ fn the_test_programs_are_what_their_comments_say() {
                 "s_and_b64 exec, exec, vcc",
                 "s_cbranch_execnz",
                 "s_mov_b64 exec, s[26:27]",
-            ],
-        ),
-        (
-            first_lane_after_a_loop(),
-            &[
-                "s_mov_b32 s20, 0",
-                "s_add_u32 s20, s20, 1",
-                "v_mov_b32 v2, s20",
-                "v_cmp_lt_u32 vcc, v11, v12",
-                "s_and_b64 exec, exec, vcc",
-                "s_cbranch_execnz",
-                "v_readfirstlane_b32 s12, v2",
             ],
         ),
         (
@@ -1920,6 +1920,25 @@ fn wide_loop_rounds(l: u32) -> u32 {
     (((l >> 4) + (l & 1)) & 3) + 1
 }
 
+/// What the console stores for [`wide_loop`]'s thread `l` in a group of
+/// `threads` (one console wave), round by round as its wave runs the loop.
+fn wide_loop_want(lds: bool, threads: u32, l: u32) -> [u32; 4] {
+    let k = wide_loop_rounds(l);
+    let running = |r: u32| (0..threads).filter(move |&m| wide_loop_rounds(m) > r);
+    let first: u32 = (0..k).map(|r| running(r).min().unwrap_or(0)).sum();
+    let high: u32 = (0..k)
+        .map(|r| running(r).filter(|&m| m >= 32).count() as u32)
+        .sum();
+    // What lane `l ^ 33` last wrote at its dword: this round, or its last.
+    let other = wide_loop_rounds(l ^ 33);
+    let read: u32 = if lds {
+        (0..k).map(|r| r.min(other - 1)).sum()
+    } else {
+        0
+    };
+    [first, high, read, k]
+}
+
 /// A loop each console lane goes round [`wide_loop_rounds`] times, writing
 /// its count of rounds so far (a scalar) to `v2` each round; after the loop,
 /// in every lane, the first lane's `v2` (`v3`): what console lane 0 wrote in
@@ -1979,21 +1998,48 @@ fn first_lane_after_a_loop_matches_the_console_on_every_gpu() {
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
-/// A loop whose exit is lane-dependent, with a first-lane read and a mask
-/// read as data inside: the halves cannot meet in it, so it is refused.
-/// Before, a loop of one block counted as a point where every thread meets
-/// (its block post-dominates itself), and each half reached its trades'
-/// barriers once a round: up to 3 times the low half, 4 the high one, which
-/// hangs a GPU whose barrier waits for every thread.
+/// A loop whose exit is lane-dependent, with a first-lane read, a mask read
+/// as data and one-wave LDS written and read inside, runs wave-wide in
+/// halves in a group of one console wave: every thread goes round while any
+/// lane does (before, the loop of one block counted as a point where every
+/// thread meets, and its trades' barriers were reached once a round by each
+/// half: up to 3 times by the low half, 4 by the high one). In a group of
+/// two console waves, whose waves would each go round their own number of
+/// times, it is refused.
 #[test]
-fn trades_in_a_loop_lanes_leave_in_their_own_rounds_are_refused_in_halves() {
-    for threads in [64, 128] {
-        let why = refusal(&wide_loop(false), threads, 0);
-        assert!(
-            why.contains("where not every thread of the group meets"),
-            "{threads}: {why}"
+fn wave_wide_loops_translate_in_halves() {
+    for threads in [48, 64] {
+        assert_eq!(
+            refusal(&wide_loop(false), threads, 0),
+            "translated",
+            "{threads}"
         );
     }
+    assert_eq!(refusal(&wide_loop(true), 64, 256), "translated");
+    // A first lane and a mask traded each round, and whether to go round.
+    assert_eq!(barriers(&wide_loop(false), 64, 0), 6);
+    let why = refusal(&wide_loop(false), 128, 0);
+    assert!(
+        why.contains("where not every thread of the group meets"),
+        "{why}"
+    );
+}
+
+/// [`wide_loop`] on every hardware adapter, in halves and as one wave64
+/// where the adapter runs those: in groups of 48 and 64, and with LDS in a
+/// group of 64, every lane stores what the console does.
+#[test]
+fn wave_wide_loops_match_the_console_on_every_gpu() {
+    let mut failed = Vec::new();
+    for threads in [48, 64] {
+        let want: Vec<u32> = (0..threads)
+            .flat_map(|l| wide_loop_want(false, threads, l))
+            .collect();
+        failed.extend(differences(&wide_loop(false), threads, 4, &want));
+    }
+    let want: Vec<u32> = (0..64).flat_map(|l| wide_loop_want(true, 64, l)).collect();
+    failed.extend(differences_with_lds(&wide_loop(true), 64, 256, 4, &want));
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 /// Wave-wide regions on every hardware adapter, in halves and as one wave64
 /// where the adapter runs those, in groups of 64 and 128: [`wide_branch`]

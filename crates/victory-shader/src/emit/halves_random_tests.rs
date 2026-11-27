@@ -10,7 +10,8 @@
 //! `v_readfirstlane_b32`, lane masks read as data, a whole-wave prefix sum,
 //! LDS), compute lane by lane in branches only some lanes take (where they
 //! may also read across lanes and write LDS, one inside another or not),
-//! and take branches on a scalar compare. They are integer only, set every
+//! go round loops each lane leaves after its own number of rounds (reading
+//! across lanes inside), and take branches on a scalar compare. They are integer only, set every
 //! register before reading it, read only LDS that is written, read only
 //! lanes that run (the one-wave64 form reads another as the host does,
 //! which D3D leaves undefined), and run in whole console waves of 1-D
@@ -91,6 +92,7 @@ fn program(seed: u64) -> Program {
         lds_written: false,
         same: [false; 9],
         lanes: [0, 64],
+        in_loop: false,
     };
     g.w.push(0x3420_0085); // v_lshlrev_b32 v16, 5, v0
     g.init(&STATE);
@@ -131,6 +133,10 @@ struct Gen {
     /// The console lanes that take the branches around the steps being
     /// written (`low..high`).
     lanes: [u32; 2],
+    /// Steps are being written inside a loop, where a lane may have left
+    /// (so no lane reads: the one-wave64 form reads a lane that left as the
+    /// host does, which D3D leaves undefined).
+    in_loop: bool,
 }
 
 impl Gen {
@@ -177,7 +183,7 @@ impl Gen {
     }
 
     fn step(&mut self) {
-        match self.r.below(17) {
+        match self.r.below(18) {
             0 | 1 => self.alu(),
             2 | 3 => self.dpp(),
             4 => self.swizzle(),
@@ -190,6 +196,7 @@ impl Gen {
             13 => self.uniform(),
             14 | 15 if self.lds => self.lds_step(),
             14 | 15 => self.alu(),
+            16 => self.lane_loop(),
             _ => self.section(),
         }
     }
@@ -359,20 +366,62 @@ impl Gen {
             [around[0], around[1].min(lanes)]
         };
         for _ in 0..1 + self.r.below(3) {
-            match self.r.below(9) {
+            match self.r.below(10) {
                 0 if self.lds_written => self.lds_write(),
                 1 => self.ballot(),
                 2 => self.first_lane(),
                 3 if self.lds_written && self.threads == 64 => self.lds_read(),
-                4 => self.read_lane(),
+                4 if !self.in_loop => self.read_lane(),
                 5 => self.dpp(),
                 6 if depth == 0 => self.branch(1),
+                7 if depth == 0 => self.lane_loop(),
                 _ => self.alu(),
             }
         }
         self.lanes = around;
         self.w[at] = 0xBF88_0000 | (self.w.len() - at - 1) as u32; // s_cbranch_execz past it
         self.w.push(0xBEFE_0400 | saved); // s_mov_b64 exec, s[saved:]
+    }
+
+    /// A loop each console lane goes round a number of times of its own (1
+    /// to 4, two bits of the lane, in `v13`; the round in `v14`, which no
+    /// other step writes), each round's exit narrowing EXEC: inside,
+    /// a lane's own arithmetic, DPP, lane masks, first lanes, LDS writes and
+    /// (in a group of one wave) reads, and a branch where the loop is not in
+    /// one.
+    fn lane_loop(&mut self) {
+        let shift = self.r.below(5);
+        self.w.extend([
+            vop2(10, 0x1B, k(63), 0),     // v_and_b32 v10, 63, v0
+            vop2(13, 0x16, k(shift), 10), // v_lshrrev_b32 v13, shift, v10
+            vop2(13, 0x1B, k(3), 13),     // v_and_b32 v13, 3, v13
+            vop2(13, 0x25, k(1), 13),     // v_add_nc_u32 v13, 1, v13
+            vop1(14, 0x01, k(0)),         // v_mov_b32 v14, 0
+            0xBE9A_047E,                  // s_mov_b64 s[26:27], exec
+        ]);
+        let top = self.w.len();
+        let outside = self.lanes == [0, 64];
+        self.in_loop = true;
+        for _ in 0..1 + self.r.below(3) {
+            match self.r.below(8) {
+                0 => self.ballot(),
+                1 => self.first_lane(),
+                2 => self.dpp(),
+                3 if self.lds_written => self.lds_write(),
+                4 if self.lds_written && self.threads == 64 => self.lds_read(),
+                5 if outside => self.branch(1),
+                _ => self.alu(),
+            }
+        }
+        self.in_loop = false;
+        self.w.extend([
+            vop2(14, 0x25, k(1), 14), // v_add_nc_u32 v14, 1, v14
+            0x7C00_0000 | 0xC1 << 17 | 13 << 9 | v(14) as u32, // v_cmp_lt_u32 vcc, v14, v13
+            0x87FE_6A7E,              // s_and_b64 exec, exec, vcc
+        ]);
+        let back = top as i32 - (self.w.len() as i32 + 1);
+        self.w.push(0xBF89_0000 | (back as u32 & 0xFFFF)); // s_cbranch_execnz to the top
+        self.w.push(0xBEFE_041A); // s_mov_b64 exec, s[26:27]
     }
 
     /// A read of the LDS dword of another thread of the console wave.

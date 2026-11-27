@@ -32,10 +32,11 @@ is.
 
 Level 1: exact within a half, nothing exchanged. Level 2: the halves
 exchange values at a point every thread of the group reaches (below).
-Level 3: an exchange inside a branch only some lanes take: where only one
-half's lanes take it, that half runs it alone and nothing crosses
-(`lower::confine`); elsewhere the branch's region runs wave-wide, every
-thread running every block of it (`lower::wide`), so the halves meet there.
+Level 3: an exchange inside a branch or a loop only some lanes run: where
+only one half's lanes run it, that half runs it alone and nothing crosses
+(`lower::confine`); elsewhere the region runs wave-wide, every thread
+running every block of it, and a loop going round while any lane of the
+group does (`lower::wide`), so the halves meet there.
 
 | Operation | On the console (RDNA2, wave64) | In halves | Level |
 |---|---|---|---|
@@ -82,7 +83,8 @@ the same number of times:
   if no branch on a lane-dependent condition has it in its region (the
   blocks reachable from the branch that do not post-dominate it, the
   program's ends joined). A loop whose exit is lane-dependent is such a
-  region, and so is everything after a lane-dependent early end.
+  region, its latch included (each lane gets there once a round), and so
+  is everything after a lane-dependent early end.
 - In a group of one console wave, branches on uniform conditions are
   taken alike by both halves (their scalars are alike), so they are
   allowed. In a group of several console waves the other waves may take
@@ -116,22 +118,39 @@ regions. Two cases are lowered, tried in this order after Level 2:
   console's (a first lane under a guard that may leave EXEC empty is still
   refused), and LDS the region both writes and reads needs no barrier
   inside.
-- **Wave-wide** (`lower::wide`). Otherwise a branch where every thread
-  meets runs its region wave-wide: every thread runs every block of it in
-  order (reverse postorder), and each block acts only in its own lanes,
-  those along its edges in. Each vector instruction's guard takes in the
-  block's lanes (a VGPR write keeps the old value elsewhere, memory is
-  accessed by those lanes only, ballots, first lanes and DPP source lanes
-  see only them), the phis of the region and of its join pick, lane by
-  lane, the value along the edge the lane came by, and every block of the
-  region is one where every thread meets, so the halves trade and order
-  LDS there. A lane read of a lane outside the block gives its old value,
-  as on the console. Only a region with no loop, one way out (its join,
-  entered from the region alone), no end and no scalar code with effects
-  beyond its values runs wave-wide. Regions run wave-wide only where an
+- **Wave-wide** (`lower::wide`). Otherwise the region runs wave-wide: the
+  blocks not every thread meets at, joined by their edges, entered from
+  one block and left to one (or, where such a set is not, the region of
+  one branch in it). Every thread runs every block of it in order, each
+  block after those its forward edges come from and a loop's blocks
+  together, and each block acts only in its own lanes, those along its
+  edges in. Each vector instruction's guard takes in the block's lanes (a
+  VGPR write keeps the old value elsewhere, memory is accessed by those
+  lanes only, ballots, first lanes and DPP source lanes see only them), the
+  phis of the region and of its join pick, lane by lane, the value along
+  the edge the lane came by, and every block of the region is one where
+  every thread meets, so the halves trade and order LDS there. A lane read
+  of a lane outside the block gives its old value, as on the console.
+- A loop of such a region runs as the console's wave runs it: every
+  thread goes round while any lane of the group does, which the halves
+  trade at the end of each round (two barriers). The header's lanes are
+  those entering, then those taking an edge back; a lane leaving along an
+  edge out of the loop is out of it from then on, and after the loop the
+  edge's lanes are all that left along it. What a lane holds stays as it
+  left it: VGPR writes are guarded, and every other value a block of the
+  loop defines (scalars, compare bits, what whole-wave sections leave,
+  ballots) is kept per lane from the last round the lane ran the block, as
+  each lane holds it in the per-lane form. A loop that reaches the
+  iteration limit (`LOOP_LIMIT`) ends the whole group, so no lane stores
+  past it.
+- Only a region with no end, no scalar code with effects beyond its values
+  and loops entered at their headers runs wave-wide, its loops only in a
+  group of one console wave (each console wave of a larger group would go
+  round its own number of times). Regions run wave-wide only where an
   attempt at lowering was refused for want of a meeting: a program that
   needs none is lowered as before, and one that does pays two barriers per
-  exchange inside its regions and a select per write there.
+  exchange inside its regions (and per round of a loop) and a select per
+  write there.
 
 ## Two console lanes per host lane
 
@@ -148,10 +167,7 @@ LDS of a one-wave group needs no barrier at all. It is not used here:
   per-lane form no longer fits: control flow would follow EXEC (the console
   flow) for the whole program, a second lowering beside the per-lane one;
 - what it gains over the halves, cross-lane reads inside loops with
-  lane-dependent exits, is what the remaining refusals below need; a
-  wave-wide loop (run while any lane of the group is in it, its test traded
-  at the latch, values leaving it kept per lane) would reach them within
-  the per-lane form.
+  lane-dependent exits, wave-wide loops give within the per-lane form.
 
 Running the two halves one after the other (lanes 0-31 to the end, then
 32-63) is not exact for any program that reads across halves before its
@@ -163,7 +179,7 @@ end, and it reorders memory effects between them.
 executable, `XboxBvhBuilder.dll` and the FidelityFX upscaler DLL: wave64
 compute programs that need console lanes run in halves. Compute programs
 emitted, as each step was added (of 2,763; none lost on the way, every
-program gained validates but for 2 in an existing validator failure class
+program gained validates but for 6 in an existing validator failure class
 that 735 compute programs share):
 
 | Step | Compute programs emitted |
@@ -175,11 +191,12 @@ that 735 compute programs share):
 | first lanes, masks and reductions traded | 2,463 |
 | regions only one half runs | 2,485 |
 | wave-wide regions | 2,542 |
+| wave-wide loops | 2,650 |
 
-Still refused in halves: 93 one-wave LDS regions, 59 masks, 19 first
-lanes and 16 reductions, nearly all in groups of one console wave, in a
-region that holds a loop whose exit is lane-dependent (some also an early
-end); 6 tiled group shapes and 2 16-bit sums.
+Still refused in halves: 33 masks, 21 one-wave LDS regions, 13 first lanes
+and 3 reductions, in a region that holds an early end, a loop in a group of
+several console waves, or two ways in; 6 tiled group shapes and 2 16-bit
+sums.
 
 Before Levels 2 and 3, a local build that recorded every cross-half site
 (and went on past each refusal, so every block was seen) classified the
@@ -212,10 +229,13 @@ in halves and as one wave64 where the adapter runs 64-lane waves, against
 the console's results: lane reads, first lanes, masks and sums at meeting
 points, in one-half regions and wave-wide, LDS of one-wave groups
 (including a race that only barriers prevent), group shapes, and the
-group-shared slots' cost in barriers. `emit::halves_random_tests` runs
-random wave64 programs (cross-lane steps at the top level and in branches
-one inside another, LDS, scalar branches) in halves and as one wave64 on an
-adapter that runs 64-lane waves, lane by lane.
+group-shared slots' cost in barriers; loops each lane leaves in its own
+round (the halves going round different numbers of times) with first
+lanes, masks and LDS inside, and a first lane read after such a loop.
+`emit::halves_random_tests` runs random wave64 programs (cross-lane steps
+at the top level, in branches one inside another and in loops each lane
+leaves in its own round, LDS, scalar branches) in halves and as one wave64
+on an adapter that runs 64-lane waves, lane by lane.
 
 ## Open pull requests in this area
 
