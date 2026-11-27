@@ -271,7 +271,7 @@ static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 #[cfg(all(feature = "diagnostics", any(windows, test)))]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
-        .split(',')
+        .split([',', '\n', '\r', ' ', '\t'])
         .map(str::trim)
         .filter(|hash| !hash.is_empty())
         .filter_map(|hash| {
@@ -288,12 +288,29 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// Loads `VICTORY_SKIP_PIPELINES` from an inline list or `@<path>` file.
+#[cfg(all(feature = "diagnostics", any(windows, test)))]
+fn load_skip_hashes(value: &str) -> Vec<String> {
+    let trimmed = value.trim();
+    if let Some(path) = trimmed.strip_prefix('@') {
+        match std::fs::read_to_string(path.trim()) {
+            Ok(contents) => parse_skip_hashes(&contents),
+            Err(error) => {
+                tracing::warn!(path = path.trim(), %error, "failed to read VICTORY_SKIP_PIPELINES file");
+                Vec::new()
+            }
+        }
+    } else {
+        parse_skip_hashes(trimmed)
+    }
+}
+
 #[cfg(all(windows, feature = "diagnostics"))]
 fn skip_hashes() -> &'static [String] {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        parse_skip_hashes(&value)
+        load_skip_hashes(&value)
     })
 }
 
@@ -715,6 +732,31 @@ mod tests {
             super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
             ["0123456789abcdef", "0011223344556677"]
         );
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn skip_hashes_reads_at_file_with_commas_and_lines() {
+        let path = std::env::temp_dir().join(format!("victory_skip_{}.txt", std::process::id()));
+        std::fs::write(
+            &path,
+            "0123456789ABCDEF\n  0011223344556677, invalid\nAABBCCDDEEFF0011\n",
+        )
+        .unwrap();
+        let arg = format!("@{}", path.display());
+        let hashes = super::load_skip_hashes(&arg);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            hashes,
+            ["0123456789abcdef", "0011223344556677", "aabbccddeeff0011"]
+        );
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn skip_hashes_missing_at_file_returns_empty() {
+        let path = std::env::temp_dir().join("victory_skip_nonexistent_file.txt");
+        assert!(super::load_skip_hashes(&format!("@{}", path.display())).is_empty());
     }
 
     use super::*;
