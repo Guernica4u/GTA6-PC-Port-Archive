@@ -10,7 +10,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let threads: u32 = args.next().expect("thread count").parse().expect("integer");
     let words: Vec<u32> = args.map(|s| u32::from_str_radix(&s, 16).expect("hex native word")).collect();
-    assert!(threads % 64 == 0 && !words.is_empty() && words.last() == Some(&0xbf810000));
+    assert!((threads % 64 == 0 || threads == 32) && !words.is_empty() && words.last() == Some(&0xbf810000));
     let (mut shader, _, _): (ShaderExtract, _, _) = fixture::shader(64);
     shader.isa = words.iter().flat_map(|word| word.to_le_bytes()).collect();
     shader.isa_data = shader.isa.clone();

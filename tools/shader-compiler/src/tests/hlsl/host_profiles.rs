@@ -90,3 +90,27 @@ fn group_shared_accesses_are_checked_against_the_declared_size() {
     }
     assert!(checked > 0, "no host profile translated the shared-memory program");
 }
+
+/// A group of 32 threads fills lanes 0..32 of one console wave. A sum over the
+/// whole wave reads the lanes that never start, so each host thread keeps one.
+#[test]
+fn a_group_of_32_threads_runs_as_the_lower_half_of_a_console_wave() {
+    let &(_, _, words) = programs::PROGRAMS.iter().find(|program| program.0 == "lane-sum-half-wave").unwrap();
+    for translated in [translate(&program(32, words)), translate_for_wave32_host(&program(32, words))] {
+        let translated = translated.unwrap();
+        assert_eq!(translated.required_wave_size, Some(32));
+        let hlsl = &translated.hlsl;
+        assert!(hlsl.contains("[WaveSize(32)]\n[numthreads(32, 1, 1)]"), "{hlsl}");
+        // The upper lanes start outside EXEC and are read as lanes of their own.
+        assert!(hlsl.contains("exec_lo = 0xffffffffu, exec_hi = 0u,"), "{hlsl}");
+        assert!(hlsl.contains("WaveReadLaneAt(v2__1, tb_leader - 32u)"), "{hlsl}");
+    }
+    // Other incomplete waves have no host wave that holds exactly their lanes.
+    for threads in [16, 48, 96] {
+        assert_eq!(translate(&program(threads, words)).map(|t| t.hlsl).unwrap_err(),
+            "wave operation requires complete 64-lane compute waves");
+    }
+    // A whole wave keeps its two-lane form: every lane starts active.
+    let whole = translate_paired_wave64(&program(64, words)).unwrap().hlsl;
+    assert!(whole.contains("[numthreads(32, 1, 1)]") && whole.contains("exec_hi = 0xffffffffu,"), "{whole}");
+}
