@@ -9704,9 +9704,11 @@ impl Meter {
         }
         let Some(caption) = &self.caption else { return };
         // With frame generation showing more frames than are rendered, both rates.
-        let text = match crate::streamline::shown_per_frame() {
-            1 => format!(" | VIctory-NVIDIA {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame"),
-            per => format!(" | VIctory-NVIDIA {fps:.0} fps (frame gen {:.0} fps) {ms:.1} ms/frame {draws:.0} draws/frame", fps * f64::from(per)),
+        let text = match (menu::is_chinese(), crate::streamline::shown_per_frame()) {
+            (false, 1) => format!(" | VIctory-NVIDIA {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame"),
+            (false, per) => format!(" | VIctory-NVIDIA {fps:.0} fps (frame gen {:.0} fps) {ms:.1} ms/frame {draws:.0} draws/frame", fps * f64::from(per)),
+            (true, 1) => format!(" | VIctory-NVIDIA {fps:.0} 帧/秒，{ms:.1} 毫秒/帧，{draws:.0} 次绘制/帧"),
+            (true, per) => format!(" | VIctory-NVIDIA {fps:.0} 帧/秒（显示 {:.0} 帧/秒），{ms:.1} 毫秒/帧，{draws:.0} 次绘制/帧", fps * f64::from(per)),
         };
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);

@@ -31,11 +31,9 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
-use super::font::{colours, glyph};
+use super::font::{ASCII_WIDTH, TextBox, colours, supports_chinese, width as text_width};
 use super::{Host, HostList, transition};
 
-const GLYPH: (u32, u32) = (5, 7);
-const CELL: (u32, u32) = (6, 9);
 const COLUMNS: u32 = 60;
 /// Lines of the box: a title, a help line, a blank, the settings shown, a
 /// blank, what the line picked does (`ABOUT`, else blank), a note and the
@@ -44,68 +42,98 @@ const ROWS: usize = 20;
 const LINES: u32 = ROWS as u32 + 9;
 /// The action that preloads shaders, and what is said of it while it is picked.
 const PRELOAD: usize = 2;
-const ABOUT_PRELOAD: [&str; 3] = [
-    "MAKES EVERY SHADER AHEAD, THEN STARTS THE GAME AGAIN.",
-    "TAKES A WHILE: MAYBE A LONG TIME, DEPENDING ON HARDWARE.",
-    "A LATER UPDATE OF THIS BUILD MAY NEED A NEW PRELOAD.",
+const ABOUT_PRELOAD: [Labels; 3] = [
+    ("MAKES EVERY SHADER AHEAD, THEN STARTS THE GAME AGAIN.", "提前编译全部着色器，然后重新启动游戏。"),
+    ("TAKES A WHILE: MAYBE A LONG TIME, DEPENDING ON HARDWARE.", "处理时间取决于硬件，可能需要等很久。"),
+    ("A LATER UPDATE OF THIS BUILD MAY NEED A NEW PRELOAD.", "兼容层更新后可能需要重新预加载。"),
 ];
 /// The note after the first Enter on it: the second one does it.
-const CONFIRM_PRELOAD: &str = "ENTER AGAIN: SAVE, CLOSE THE GAME AND PRELOAD";
+const CONFIRM_PRELOAD: Labels = ("ENTER AGAIN: SAVE, CLOSE THE GAME AND PRELOAD", "再次按回车：保存设置、退出游戏并预加载");
 /// The last line of the box: where this build comes from.
 const REPO: &str = "GITHUB.COM/TRUSTNO1-CODER/VICTORY-NVIDIA";
-const RIM: u32 = 4;
+const BOX: TextBox = TextBox { columns: COLUMNS, lines: LINES, rim: 4 };
+const FPS_BOX: TextBox = TextBox { columns: 38, lines: 1, rim: 4 };
 const UPLOADS: usize = 4;
+
+const LANGUAGE: &str = "VICTORY_MENU_LANGUAGE";
+type Labels = (&'static str, &'static str);
+
+fn label((english, chinese): Labels, use_chinese: bool) -> &'static str {
+    if use_chinese { chinese } else { english }
+}
+
+const fn same(value: &'static str) -> Labels {
+    (value, value)
+}
+
+fn chinese_requested() -> &'static AtomicBool {
+    static CHINESE: OnceLock<AtomicBool> = OnceLock::new();
+    CHINESE.get_or_init(|| AtomicBool::new(get(LANGUAGE).eq_ignore_ascii_case("zh-CN")))
+}
+
+pub(super) fn is_chinese() -> bool {
+    chinese_requested().load(Ordering::Relaxed) && supports_chinese()
+}
 
 /// A setting: the variable, its name in the menu, the values it takes
 /// (`""`: not set, the build's own default), and whether a change applies at once.
 struct Item {
     var: &'static str,
-    label: &'static str,
-    values: &'static [(&'static str, &'static str)],
+    label: Labels,
+    values: &'static [(&'static str, Labels)],
     live: bool,
 }
 
-const ON_UNSET: &[(&str, &str)] = &[("1", "ON"), ("", "OFF")];
-const UNSET_ON: &[(&str, &str)] = &[("", "OFF"), ("1", "ON")];
-const STAGES: &[(&str, &str)] = &[("2", "2"), ("1", "1"), ("0", "0 OFF")];
+const ON: Labels = ("ON", "开启");
+const OFF: Labels = ("OFF", "关闭");
+const NONE: Labels = ("NONE", "无限制");
+const ON_UNSET: &[(&str, Labels)] = &[("1", ON), ("", OFF)];
+const UNSET_ON: &[(&str, Labels)] = &[("", OFF), ("1", ON)];
+const STAGES: &[(&str, Labels)] = &[("2", same("2")), ("1", same("1")), ("0", ("0 OFF", "0 关闭"))];
 
 /// The first value of each is what the launcher starts with.
 #[rustfmt::skip]
 const ITEMS: &[Item] = &[
+    Item { var: LANGUAGE, label: ("LANGUAGE", "界面语言"), values: &[("en", same("ENGLISH")), ("zh-CN", ("SIMPLIFIED CHINESE", "简体中文"))], live: true },
     // The launcher's own choices.
-    Item { var: "VICTORY_MENU_DLSS", label: "DLSS", values: &[("quality", "QUALITY"), ("balanced", "BALANCED"), ("performance", "PERFORMANCE"), ("dlaa", "DLAA (NATIVE)"), ("off", "OFF")], live: false },
-    Item { var: "VICTORY_MENU_FRAMEGEN", label: "FRAME GENERATION", values: &[("0", "OFF"), ("2", "2X"), ("3", "3X"), ("4", "4X"), ("5", "5X"), ("6", "6X (MOST)")], live: false },
+    Item { var: "VICTORY_MENU_DLSS", label: same("DLSS"), values: &[("quality", ("QUALITY", "质量")), ("balanced", ("BALANCED", "平衡")), ("performance", ("PERFORMANCE", "性能")), ("dlaa", ("DLAA (NATIVE)", "DLAA (原生分辨率)")), ("off", OFF)], live: false },
+    Item { var: "VICTORY_MENU_FRAMEGEN", label: ("FRAME GENERATION", "帧生成"), values: &[("0", OFF), ("2", same("2X")), ("3", same("3X")), ("4", same("4X")), ("5", same("5X")), ("6", ("6X (MOST)", "6X (最高)"))], live: false },
     // DLSS Frame Generation where it runs (RTX 40 and later), else AMD's FSR 3 (2X only).
-    Item { var: "VICTORY_MENU_FG_TYPE", label: "FRAME GEN TYPE", values: &[("auto", "AUTO"), ("dlss", "DLSS"), ("fsr", "FSR 3 (OLDER CARDS)")], live: false },
-    Item { var: "VICTORY_MENU_FPS", label: "FRAME RATE CAP", values: &[("1000", "NONE"), ("120", "120"), ("60", "60"), ("30", "30 (THE GAME)")], live: false },
-    Item { var: "VICTORY_FPS_LINE", label: "FPS AT THE TOP", values: &[("1", "ON"), ("0", "OFF")], live: true },
-    Item { var: "VICTORY_PANEL", label: "STATS PANEL (F3)", values: &[("0", "OFF"), ("1", "ON")], live: true },
-    Item { var: "VICTORY_FULLSCREEN", label: "FULLSCREEN (NO BORDER)", values: UNSET_ON, live: false },
-    Item { var: "VICTORY_MOUSE_CAPTURE", label: "MOUSE CAPTURE", values: UNSET_ON, live: false },
-    Item { var: "VICTORY_IME_ENGLISH", label: "ENGLISH KEYBOARD", values: UNSET_ON, live: false },
-    Item { var: "VICTORY_MENU_CONSOLE", label: "CONSOLE", values: &[("series-x", "SERIES X"), ("series-s", "SERIES S (FASTER)")], live: false },
-    Item { var: "VICTORY_MENU_RES", label: "SERIES X PICTURE", values: &[("1440", "2560X1440"), ("1080to1440", "1080P TO 1440P"), ("4k", "3840X2160")], live: false },
+    Item { var: "VICTORY_MENU_FG_TYPE", label: ("FRAME GEN TYPE", "帧生成类型"), values: &[("auto", ("AUTO", "自动")), ("dlss", same("DLSS")), ("fsr", ("FSR 3 (OLDER CARDS)", "FSR 3 (旧显卡)"))], live: false },
+    Item { var: "VICTORY_MENU_FPS", label: ("FRAME RATE CAP", "帧率上限"), values: &[("1000", NONE), ("120", same("120")), ("60", same("60")), ("30", ("30 (THE GAME)", "30 (游戏默认)"))], live: false },
+    Item { var: "VICTORY_FPS_LINE", label: ("FPS AT THE TOP", "顶部帧率"), values: &[("1", ON), ("0", OFF)], live: true },
+    Item { var: "VICTORY_PANEL", label: ("STATS PANEL (F3)", "性能统计 (F3)"), values: &[("0", OFF), ("1", ON)], live: true },
+    Item { var: "VICTORY_FULLSCREEN", label: ("FULLSCREEN (NO BORDER)", "无边框全屏"), values: UNSET_ON, live: false },
+    Item { var: "VICTORY_MOUSE_CAPTURE", label: ("MOUSE CAPTURE", "锁定鼠标"), values: UNSET_ON, live: false },
+    Item { var: "VICTORY_IME_ENGLISH", label: ("ENGLISH KEYBOARD", "使用英文键盘"), values: UNSET_ON, live: false },
+    Item { var: "VICTORY_MENU_CONSOLE", label: ("CONSOLE", "主机型号"), values: &[("series-x", same("SERIES X")), ("series-s", ("SERIES S (FASTER)", "SERIES S (更快)"))], live: false },
+    Item { var: "VICTORY_MENU_RES", label: ("SERIES X PICTURE", "SERIES X 分辨率"), values: &[("1440", same("2560X1440")), ("1080to1440", ("1080P TO 1440P", "1080P 升至 1440P")), ("4k", same("3840X2160"))], live: false },
     // The layer's switches.
-    Item { var: "VICTORY_DLSS_PRESET", label: "DLSS MODEL", values: &[("", "DEFAULT"), ("k", "K"), ("j", "J"), ("m", "M"), ("l", "L")], live: false },
-    Item { var: "VICTORY_AMBIENT", label: "LIGHT ESTIMATE", values: &[("0.8", "0.8"), ("1", "1"), ("0.5", "0.5"), ("", "OFF")], live: false },
-    Item { var: "VICTORY_AMBIENT_SPECULAR", label: "REFLECTION ESTIMATE", values: ON_UNSET, live: false },
-    Item { var: "VICTORY_AMBIENT_AIR", label: "FOG CAP", values: &[("1.5", "1.5"), ("1", "1"), ("2", "2"), ("", "NONE")], live: false },
-    Item { var: "VICTORY_BVH_BUILDER", label: "RAY TRACING (SLOW, BROKEN)", values: UNSET_ON, live: false },
-    Item { var: "VICTORY_WATER_LIGHT", label: "WATER LIGHT", values: &[("", "OFF (NO DARK BLOCKS)"), ("1", "ON (GREEN, DARK BLOCKS)")], live: false },
-    Item { var: "VICTORY_LEAVE_OUT", label: "HEAT HAZE AND DECAL DEFRAG", values: &[("02384a60fda6f2d0,731a39171b568298", "LEFT OUT"), ("", "RUN (SLOWER, SMEARS)")], live: false },
-    Item { var: "VICTORY_EARLY_DEPTH", label: "EARLY DEPTH TEST", values: ON_UNSET, live: false },
-    Item { var: "VICTORY_WC_NO_BACK", label: "SKIP BIG COPY-BACKS", values: ON_UNSET, live: false },
-    Item { var: "VICTORY_SOFT_VIEWS", label: "SOFT VIEWS (NO CUT FREEZES)", values: &[("copies", "ON"), ("", "OFF")], live: false },
-    Item { var: "VICTORY_TEXTURE_NO_WAIT", label: "TEXTURE NO WAIT", values: ON_UNSET, live: false },
-    Item { var: "VICTORY_RELAY", label: "RELAY (SPEED, TRIANGLES)", values: STAGES, live: false },
-    Item { var: "VICTORY_CARD_STEPS", label: "CARD STEPS", values: STAGES, live: false },
-    Item { var: "VICTORY_INDIRECT_BATCH", label: "INDIRECT BATCH", values: STAGES, live: false },
-    Item { var: "VICTORY_CARD_BUFFERS_MIN_KB", label: "CARD COMPARES FROM (KB)", values: &[("64", "64"), ("1024", "1024")], live: false },
-    Item { var: "VICTORY_PORT_CONSTANTS", label: "CONSTANTS HEAP IN PLACE", values: UNSET_ON, live: false },
+    Item { var: "VICTORY_DLSS_PRESET", label: ("DLSS MODEL", "DLSS 模型"), values: &[("", ("DEFAULT", "默认")), ("k", same("K")), ("j", same("J")), ("m", same("M")), ("l", same("L"))], live: false },
+    Item { var: "VICTORY_AMBIENT", label: ("LIGHT ESTIMATE", "环境光估算"), values: &[("0.8", same("0.8")), ("1", same("1")), ("0.5", same("0.5")), ("", OFF)], live: false },
+    Item { var: "VICTORY_AMBIENT_SPECULAR", label: ("REFLECTION ESTIMATE", "反射估算"), values: ON_UNSET, live: false },
+    Item { var: "VICTORY_AMBIENT_AIR", label: ("FOG CAP", "雾效强度上限"), values: &[("1.5", same("1.5")), ("1", same("1")), ("2", same("2")), ("", NONE)], live: false },
+    Item { var: "VICTORY_BVH_BUILDER", label: ("RAY TRACING (SLOW, BROKEN)", "光线追踪 (慢且有故障)"), values: UNSET_ON, live: false },
+    Item { var: "VICTORY_WATER_LIGHT", label: ("WATER LIGHT", "水面光照"), values: &[("", ("OFF (NO DARK BLOCKS)", "关闭 (无黑块)")), ("1", ("ON (GREEN, DARK BLOCKS)", "开启 (偏绿和黑块)"))], live: false },
+    Item { var: "VICTORY_LEAVE_OUT", label: ("HEAT HAZE AND DECAL DEFRAG", "热浪和贴花整理"), values: &[("02384a60fda6f2d0,731a39171b568298", ("LEFT OUT", "跳过")), ("", ("RUN (SLOWER, SMEARS)", "开启 (慢且有拖影)"))], live: false },
+    Item { var: "VICTORY_EARLY_DEPTH", label: ("EARLY DEPTH TEST", "提前深度测试"), values: ON_UNSET, live: false },
+    Item { var: "VICTORY_WC_NO_BACK", label: ("SKIP BIG COPY-BACKS", "跳过大块数据回拷"), values: ON_UNSET, live: false },
+    Item { var: "VICTORY_SOFT_VIEWS", label: ("SOFT VIEWS (NO CUT FREEZES)", "软视图 (减少转场卡顿)"), values: &[("copies", ON), ("", OFF)], live: false },
+    Item { var: "VICTORY_TEXTURE_NO_WAIT", label: ("TEXTURE NO WAIT", "纹理异步加载"), values: ON_UNSET, live: false },
+    Item { var: "VICTORY_RELAY", label: ("RELAY (SPEED, TRIANGLES)", "GPU 中继 (速度、三角面)"), values: STAGES, live: false },
+    Item { var: "VICTORY_CARD_STEPS", label: ("CARD STEPS", "GPU 处理阶段"), values: STAGES, live: false },
+    Item { var: "VICTORY_INDIRECT_BATCH", label: ("INDIRECT BATCH", "间接绘制批处理"), values: STAGES, live: false },
+    Item { var: "VICTORY_CARD_BUFFERS_MIN_KB", label: ("CARD COMPARES FROM (KB)", "GPU 缓冲区比较阈值 (KB)"), values: &[("64", same("64")), ("1024", same("1024"))], live: false },
+    Item { var: "VICTORY_PORT_CONSTANTS", label: ("CONSTANTS HEAP IN PLACE", "原地更新常量缓冲区"), values: UNSET_ON, live: false },
 ];
 /// The lines after the settings.
-const ACTIONS: [&str; 5] =
-    ["SAVE AND RESTART NOW", "SAVE FOR NEXT START", "PRELOAD SHADERS (RESTARTS THE GAME)", "RESET ALL TO PLAY DEFAULTS", "CLOSE"];
+const ACTIONS: [Labels; 5] = [
+    ("SAVE AND RESTART NOW", "保存并立即重启"),
+    ("SAVE FOR NEXT START", "保存设置"),
+    ("PRELOAD SHADERS (RESTARTS THE GAME)", "预加载着色器 (重启游戏)"),
+    ("RESET ALL TO PLAY DEFAULTS", "恢复启动默认设置"),
+    ("CLOSE", "关闭"),
+];
 
 fn get(var: &str) -> String {
     std::env::var(var).unwrap_or_default()
@@ -164,7 +192,7 @@ fn fps_line_on() -> &'static AtomicBool {
 }
 
 /// That line: the frames rendered a second and, while frame generation shows more, those shown.
-fn fps_line() -> Option<String> {
+fn fps_line(chinese: bool) -> Option<String> {
     if !fps_line_on().load(Ordering::Relaxed) {
         return None;
     }
@@ -176,9 +204,13 @@ fn fps_line() -> Option<String> {
     if fps <= 0.0 {
         return None;
     }
-    Some(match crate::streamline::shown_per_frame() {
-        1 => format!("FPS: {fps:.1}"),
-        per => format!("FPS: {fps:.1}  FG: {:.1}", fps * f64::from(per)),
+    let rate = label(("FPS", "帧率"), chinese);
+    let per = crate::streamline::shown_per_frame();
+    Some(if per == 1 {
+        format!("{rate}: {fps:.1}")
+    } else {
+        let displayed = label(("FG", "显示帧率"), chinese);
+        format!("{rate}: {fps:.1}  {displayed}: {:.1}", fps * f64::from(per))
     })
 }
 
@@ -191,10 +223,10 @@ fn index_of(item: &Item, value: &str) -> Option<usize> {
 /// What the menu shows for `value`: its label, an unknown value as itself,
 /// and a value the launcher did not set (a start without play.ps1) as
 /// "NOT SET" rather than a blank.
-fn shown_value(item: &Item, value: &str) -> String {
+fn shown_value(item: &Item, value: &str, chinese: bool) -> String {
     match index_of(item, value) {
-        Some(i) => item.values[i].1.to_owned(),
-        None if value.is_empty() => "NOT SET".to_owned(),
+        Some(i) => label(item.values[i].1, chinese).to_owned(),
+        None if value.is_empty() => label(("NOT SET", "未设置"), chinese).to_owned(),
         None => value.to_ascii_uppercase(),
     }
 }
@@ -227,45 +259,8 @@ fn keys() -> &'static Mutex<Vec<u16>> {
     })
 }
 
-/// The box's size in pixels.
-const fn size(scale: u32) -> (u32, u32) {
-    ((COLUMNS * CELL.0 + 2 * RIM) * scale, (LINES * CELL.1 + 2 * RIM) * scale)
-}
-
-fn lit(lines: &[String], x: u32, y: u32) -> bool {
-    let (Some(x), Some(y)) = (x.checked_sub(RIM), y.checked_sub(RIM)) else {
-        return false;
-    };
-    if x % CELL.0 >= GLYPH.0 || y % CELL.1 >= GLYPH.1 || x / CELL.0 >= COLUMNS {
-        return false;
-    }
-    let Some(&c) = lines.get((y / CELL.1) as usize).and_then(|l| l.as_bytes().get((x / CELL.0) as usize)) else {
-        return false;
-    };
-    (glyph(c.to_ascii_uppercase())[(y % CELL.1) as usize] >> (GLYPH.0 - 1 - x % CELL.0)) & 1 != 0
-}
-
-fn painted(lines: &[String], scale: u32, colours: [&[u8]; 2], pitch: usize) -> Vec<u8> {
-    let (width, height) = size(scale);
-    let bytes = colours[0].len();
-    let mut out = vec![0; pitch * height as usize];
-    for y in 0..height / scale {
-        let top = pitch * (y * scale) as usize;
-        for x in 0..width / scale {
-            let colour = colours[usize::from(lit(lines, x, y))];
-            for i in 0..scale {
-                let at = top + (x * scale + i) as usize * bytes;
-                out[at..at + bytes].copy_from_slice(colour);
-            }
-        }
-        for i in 1..scale as usize {
-            out.copy_within(top..top + pitch, top + i * pitch);
-        }
-    }
-    out
-}
-
 struct Buffers {
+    shape: TextBox,
     format: DXGI_FORMAT,
     scale: u32,
     pitch: u32,
@@ -282,8 +277,8 @@ struct Buffers {
 unsafe impl Send for Buffers {}
 
 impl Buffers {
-    fn new(host: &Host, format: DXGI_FORMAT, scale: u32) -> Option<Buffers> {
-        let (width, height) = size(scale);
+    fn new(host: &Host, shape: TextBox, format: DXGI_FORMAT, chinese: bool, scale: u32) -> Option<Buffers> {
+        let (width, height) = shape.size(chinese, scale);
         let pitch = (width * colours(format)?[0].len() as u32).next_multiple_of(256);
         let bytes = u64::from(pitch) * u64::from(height);
         let uploads = (0..UPLOADS).map(|_| host.upload_buffer(bytes)).collect::<Option<Vec<_>>>()?;
@@ -305,12 +300,12 @@ impl Buffers {
                 .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut card)
                 .ok()?;
         }
-        Some(Buffers { format, scale, pitch, uploads, card: card?, turn: 0, fresh: false, used: false })
+        Some(Buffers { shape, format, scale, pitch, uploads, card: card?, turn: 0, fresh: false, used: false })
     }
 
-    fn write(&mut self, lines: &[String]) {
+    fn write(&mut self, lines: &[String], chinese: bool) {
         let Some(colours) = colours(self.format) else { return };
-        let picture = painted(lines, self.scale, colours, self.pitch as usize);
+        let picture = self.shape.paint(lines, chinese, self.scale, colours, self.pitch as usize);
         self.turn = (self.turn + 1) % UPLOADS;
         // SAFETY: a mapped upload buffer of the picture's size, which the card read frames ago.
         unsafe { std::ptr::copy_nonoverlapping(picture.as_ptr(), self.uploads[self.turn].1, picture.len()) };
@@ -326,11 +321,12 @@ pub(super) struct Menu {
     started: Vec<String>,
     /// The line picked: an item, or an action after them.
     at: usize,
-    note: String,
+    note: Option<Labels>,
     changed: bool,
     /// What the buffer holds: the frame-rate line, or (none) the menu's lines.
     painted: Option<String>,
-    buffers: Option<Buffers>,
+    buffers: [Option<Buffers>; 2],
+    fps_buffers: [Option<Buffers>; 2],
     failed: bool,
 }
 
@@ -342,41 +338,61 @@ impl Menu {
         if std::env::var_os("VICTORY_MENU_OPEN").is_some_and(|v| v == "1") {
             crate::SETTINGS_MENU_OPEN.store(true, Ordering::Relaxed);
         }
-        let values: Vec<String> = ITEMS.iter().map(|i| get(i.var)).collect();
-        Menu { started: values.clone(), values, at: 0, note: String::new(), changed: true, painted: None, buffers: None, failed: false }
+        let values: Vec<String> = ITEMS.iter().map(|i| {
+            if i.var == LANGUAGE {
+                label(("en", "zh-CN"), chinese_requested().load(Ordering::Relaxed)).to_owned()
+            } else {
+                get(i.var)
+            }
+        }).collect();
+        Menu { started: values.clone(), values, at: 0, note: None, changed: true, painted: None, buffers: [None, None], fps_buffers: [None, None], failed: false }
     }
 
     fn open() -> bool {
         crate::SETTINGS_MENU_OPEN.load(Ordering::Relaxed)
     }
 
-    fn lines(&self) -> Vec<String> {
+    fn lines(&self, chinese: bool) -> Vec<String> {
+        let tr = |labels| label(labels, chinese);
         let total = ITEMS.len() + ACTIONS.len();
         let first = self.at.saturating_sub(ROWS / 2).min(total.saturating_sub(ROWS));
         let mut out = vec![
-            "SETTINGS                       F1 OR ESC CLOSES".to_owned(),
-            "UP/DOWN PICK  LEFT/RIGHT CHANGE  ENTER DOES IT".to_owned(),
+            tr(("SETTINGS                       F1 OR ESC CLOSES", "设置                     F1 / ESC 关闭")).to_owned(),
+            tr(("UP/DOWN PICK  LEFT/RIGHT CHANGE  ENTER DOES IT", "上下选择    左右修改    回车确认")).to_owned(),
             String::new(),
         ];
         for row in first..(first + ROWS).min(total) {
             let cursor = if row == self.at { '>' } else { ' ' };
             let line = if let Some(item) = ITEMS.get(row) {
                 let value = &self.values[row];
-                let shown = shown_value(item, value);
-                let mark = if *value != self.started[row] { if live(item) { " *LIVE" } else { " *" } } else if live(item) { " LIVE" } else { "" };
-                format!("{cursor} {:<27} < {shown} >{mark}", item.label)
+                let shown = shown_value(item, value, chinese);
+                let mark = match (*value != self.started[row], live(item)) {
+                    (true, true) => tr((" *LIVE", " *即时")),
+                    (true, false) => " *",
+                    (false, true) => tr((" LIVE", " 即时")),
+                    (false, false) => "",
+                };
+                let name = tr(item.label);
+                let padding = (27 * ASCII_WIDTH).saturating_sub(text_width(name)) / ASCII_WIDTH;
+                format!("{cursor} {name}{:width$} < {shown} >{mark}", "", width = padding as usize)
             } else {
-                format!("{cursor} {}", ACTIONS[row - ITEMS.len()])
+                format!("{cursor} {}", tr(ACTIONS[row - ITEMS.len()]))
             };
-            out.push(line.chars().take(COLUMNS as usize).collect());
+            out.push(line);
         }
         while out.len() < 3 + ROWS {
             out.push(String::new());
         }
         out.push(String::new());
-        let about = if self.at == ITEMS.len() + PRELOAD { ABOUT_PRELOAD } else { [""; 3] };
-        out.extend(about.iter().map(|l| (*l).to_owned()));
-        out.push(if self.note.is_empty() { "* = CHANGED: APPLIES AT THE NEXT START UNLESS LIVE".to_owned() } else { self.note.clone() });
+        let about = if self.at == ITEMS.len() + PRELOAD { ABOUT_PRELOAD } else { [same(""); 3] };
+        out.extend(about.map(|line| tr(line).to_owned()));
+        let note = self.note.or_else(|| {
+            (!chinese && chinese_requested().load(Ordering::Relaxed)).then_some(same("CHINESE FONTS NOT FOUND IN WINDOWS"))
+        });
+        out.push(tr(note.unwrap_or((
+            "* = CHANGED: APPLIES AT THE NEXT START UNLESS LIVE",
+            "* 已修改：即时项立即生效，其余下次启动生效",
+        ))).to_owned());
         out.push(REPO.to_owned());
         out
     }
@@ -391,12 +407,16 @@ impl Menu {
         if live(item) {
             self.apply_live(i);
         }
-        self.note.clear();
+        self.note = None;
     }
 
     /// A setting the build reads at each use: changed in this run's environment at once.
     fn apply_live(&self, i: usize) {
         let (var, value) = (ITEMS[i].var, &self.values[i]);
+        if var == LANGUAGE {
+            chinese_requested().store(value == "zh-CN", Ordering::Relaxed);
+            return;
+        }
         // SAFETY: the variables changed here are read by this build with
         // std::env::var at each use; Windows' environment block is locked by
         // the process heap's routines, and std holds its own lock.
@@ -419,7 +439,7 @@ impl Menu {
     /// Writes the changed values over those in the settings file.
     fn save(&mut self) -> bool {
         let Some(path) = std::env::var_os("VICTORY_MENU_FILE") else {
-            self.note = "NO SETTINGS FILE: START WITH VICTORY PLAY".to_owned();
+            self.note = Some(("NO SETTINGS FILE: START WITH VICTORY PLAY", "找不到设置文件，请通过 VICTORY PLAY 启动"));
             return false;
         };
         let mut kept: Vec<(String, String)> = std::fs::read_to_string(&path)
@@ -429,7 +449,8 @@ impl Menu {
             .filter(|(k, _)| k.starts_with("VICTORY_"))
             .collect();
         for (i, item) in ITEMS.iter().enumerate() {
-            if self.values[i] == self.started[i] {
+            // The live language can outlast a presenter recreated before Save.
+            if self.values[i] == self.started[i] && item.var != LANGUAGE {
                 continue;
             }
             kept.retain(|(k, _)| k != item.var);
@@ -443,12 +464,12 @@ impl Menu {
             Ok(()) => {
                 tracing::info!(path = %std::path::Path::new(&path).display(), "settings menu: saved");
                 self.started = self.values.clone();
-                self.note = "SAVED. APPLIES AT THE NEXT START".to_owned();
+                self.note = Some(("SAVED. APPLIES AT THE NEXT START", "已保存。其余设置在下次启动时生效"));
                 true
             }
             Err(e) => {
                 tracing::warn!(error = %e, "settings menu: not saved");
-                self.note = "COULD NOT SAVE THE SETTINGS FILE".to_owned();
+                self.note = Some(("COULD NOT SAVE THE SETTINGS FILE", "无法写入设置文件"));
                 false
             }
         }
@@ -458,7 +479,7 @@ impl Menu {
     /// `preload`: the launcher makes every shader first (its `-Preload`, for that start alone).
     fn restart(&mut self, preload: bool) {
         let Some(play) = std::env::var_os("VICTORY_MENU_PLAY") else {
-            self.note = "SAVED. START THE LAUNCHER AGAIN YOURSELF".to_owned();
+            self.note = Some(("SAVED. START THE LAUNCHER AGAIN YOURSELF", "已保存。请手动重新运行启动器"));
             return;
         };
         let play = play.to_string_lossy().replace('\'', "''");
@@ -478,7 +499,7 @@ impl Menu {
             }
             Err(e) => {
                 tracing::warn!(error = %e, "settings menu: restart failed");
-                self.note = "SAVED, BUT THE RESTART FAILED".to_owned();
+                self.note = Some(("SAVED, BUT THE RESTART FAILED", "已保存，重启失败"));
             }
         }
     }
@@ -488,7 +509,7 @@ impl Menu {
         if let Some(path) = std::env::var_os("VICTORY_MENU_FILE") {
             let _ = std::fs::remove_file(path);
         }
-        self.note = "RESET. PLAY DEFAULTS AT THE NEXT START".to_owned();
+        self.note = Some(("RESET. PLAY DEFAULTS AT THE NEXT START", "已重置。下次启动将使用默认设置"));
     }
 
     /// A frame was presented: the keys pressed since the last one.
@@ -502,7 +523,7 @@ impl Menu {
             let open = Self::open();
             if vk == VK_F1 || (open && vk == VK_ESCAPE) {
                 crate::SETTINGS_MENU_OPEN.store(!open && vk == VK_F1, Ordering::Relaxed);
-                self.note.clear();
+                self.note = None;
                 self.changed = true;
                 continue;
             }
@@ -510,9 +531,9 @@ impl Menu {
                 continue;
             }
             // Only an Enter right after the first one starts a preload.
-            let confirmed = self.note == CONFIRM_PRELOAD;
+            let confirmed = self.note == Some(CONFIRM_PRELOAD);
             if confirmed {
-                self.note.clear();
+                self.note = None;
             }
             match vk {
                 VK_UP => self.at = (self.at + total - 1) % total,
@@ -529,7 +550,7 @@ impl Menu {
                     1 => {
                         self.save();
                     }
-                    PRELOAD if !confirmed => self.note = CONFIRM_PRELOAD.to_owned(),
+                    PRELOAD if !confirmed => self.note = Some(CONFIRM_PRELOAD),
                     PRELOAD => {
                         if self.save() {
                             self.restart(true);
@@ -551,7 +572,8 @@ impl Menu {
         }
         // Closed: the frame-rate line in the top left corner, if it is wanted and there is a rate.
         let open = Self::open();
-        let line = if open { None } else { fps_line() };
+        let chinese = is_chinese();
+        let line = if open { None } else { fps_line(chinese) };
         if !open && line.is_none() {
             return;
         }
@@ -559,27 +581,32 @@ impl Menu {
         #[cfg(feature = "diagnostics")]
         let _ours = crate::replay::record::unrecorded();
         let scale = (height / 540).max(1);
-        if self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
-            std::mem::forget(self.buffers.take());
-            self.buffers = Buffers::new(host, format, scale);
-            self.failed = self.buffers.is_none();
+        let shape = if open { BOX } else { FPS_BOX };
+        let mode = usize::from(chinese);
+        let storage = if open { &mut self.buffers } else { &mut self.fps_buffers };
+        let buffers = &mut storage[mode];
+        if buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
+            std::mem::forget(buffers.take());
+            *buffers = Buffers::new(host, shape, format, chinese, scale);
+            self.failed = buffers.is_none();
             self.changed = true;
         }
         if self.painted != line {
             self.painted = line.clone();
             self.changed = true;
         }
-        let lines = if self.changed { Some(line.as_ref().map_or_else(|| self.lines(), |l| vec![l.clone()])) } else { None };
-        let Some(buffers) = &mut self.buffers else { return };
+        let lines = if self.changed { Some(line.as_ref().map_or_else(|| self.lines(chinese), |l| vec![l.clone()])) } else { None };
+        let storage = if open { &mut self.buffers } else { &mut self.fps_buffers };
+        let Some(buffers) = &mut storage[mode] else { return };
         if let Some(lines) = lines {
             self.changed = false;
-            buffers.write(&lines);
+            buffers.write(&lines, chinese);
         }
         // The whole box in the middle, or of it the first line's part in the corner.
-        let (w, h) = match &line {
-            Some(l) => ((l.len() as u32 * CELL.0 + 2 * RIM) * scale, (CELL.1 + 2 * RIM) * scale),
-            None => size(scale),
-        };
+        let (box_width, box_height) = shape.size(chinese, scale);
+        let (w, h) = line.as_ref().map_or((box_width, box_height), |l| {
+            shape.area(text_width(l).min(shape.columns * ASCII_WIDTH), 1, chinese, scale)
+        });
         let (w, h) = (w.min(width), h.min(height));
         let (x, y) = if line.is_some() { (0, 0) } else { ((width - w) / 2, (height - h) / 2) };
         let list = &list.list;
@@ -598,7 +625,7 @@ impl Menu {
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                     PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
                         Offset: 0,
-                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: format, Width: size(scale).0, Height: size(scale).1, Depth: 1, RowPitch: buffers.pitch },
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: format, Width: box_width, Height: box_height, Depth: 1, RowPitch: buffers.pitch },
                     },
                 },
             };
@@ -616,17 +643,23 @@ impl Menu {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::font::glyph;
 
     #[test]
     fn every_line_fits_and_every_character_has_a_picture() {
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: None, changed: false, painted: None, buffers: [None, None], fps_buffers: [None, None], failed: false };
         menu.started = menu.values.clone();
-        for at in 0..ITEMS.len() + ACTIONS.len() {
-            menu.at = at;
-            for line in menu.lines() {
-                assert!(line.len() <= COLUMNS as usize, "{line}");
-                for c in line.bytes() {
-                    assert_ne!(glyph(c.to_ascii_uppercase()), glyph(b'#'), "{line}: {}", c as char);
+        for chinese in [false, true] {
+            for (at, item) in ITEMS.iter().enumerate() {
+                menu.at = at;
+                for (value, _) in item.values {
+                    menu.values[at] = (*value).to_owned();
+                    for line in menu.lines(chinese) {
+                        assert!(text_width(&line) <= COLUMNS * ASCII_WIDTH, "{line}");
+                        for c in line.bytes().filter(u8::is_ascii) {
+                            assert_ne!(glyph(c.to_ascii_uppercase()), glyph(b'#'), "{line}: {}", c as char);
+                        }
+                    }
                 }
             }
         }
@@ -634,40 +667,42 @@ mod tests {
 
     #[test]
     fn the_link_is_always_right_under_the_note() {
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: None, changed: false, painted: None, buffers: [None, None], fps_buffers: [None, None], failed: false };
         menu.started = menu.values.clone();
-        for note in ["", "SAVED"] {
-            menu.note = note.to_owned();
+        for note in [None, Some(same("SAVED"))] {
+            menu.note = note;
             for at in 0..ITEMS.len() + ACTIONS.len() {
                 menu.at = at;
-                let lines = menu.lines();
+                let lines = menu.lines(false);
                 assert_eq!(lines.len(), LINES as usize);
                 let n = lines.len();
-                assert!(lines[n - 2].starts_with("* = CHANGED") || lines[n - 2] == note, "{}", lines[n - 2]);
+                assert!(lines[n - 2].starts_with("* = CHANGED") || note.is_some_and(|note| lines[n - 2] == note.0), "{}", lines[n - 2]);
                 assert_eq!(lines[n - 1], REPO);
                 // What a preload costs is said while it is picked, and only then.
                 let about = &lines[n - 5..n - 2];
                 if at == ITEMS.len() + PRELOAD {
-                    assert_eq!(about, ABOUT_PRELOAD);
+                    assert_eq!(about, ABOUT_PRELOAD.map(|line| line.0));
                 } else {
                     assert!(about.iter().all(String::is_empty), "{about:?}");
                 }
             }
         }
-        assert_eq!(ACTIONS[PRELOAD], "PRELOAD SHADERS (RESTARTS THE GAME)");
-        assert!(CONFIRM_PRELOAD.len() <= COLUMNS as usize);
+        assert_eq!(ACTIONS[PRELOAD].0, "PRELOAD SHADERS (RESTARTS THE GAME)");
+        assert!(text_width(CONFIRM_PRELOAD.0) <= COLUMNS * ASCII_WIDTH);
+        assert!(text_width(CONFIRM_PRELOAD.1) <= COLUMNS * ASCII_WIDTH);
     }
 
     #[test]
     fn values_cycle_both_ways() {
-        let mut menu = Menu { values: ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect(), started: Vec::new(), at: 0, note: None, changed: false, painted: None, buffers: [None, None], fps_buffers: [None, None], failed: false };
         menu.started = menu.values.clone();
-        let n = ITEMS[0].values.len();
+        let i = 1; // DLSS, a setting with more than two options.
+        let n = ITEMS[i].values.len();
         for _ in 0..n {
-            menu.change(0, 1);
+            menu.change(i, 1);
         }
-        assert_eq!(menu.values[0], ITEMS[0].values[0].0);
-        menu.change(0, -1);
-        assert_eq!(menu.values[0], ITEMS[0].values[n - 1].0);
+        assert_eq!(menu.values[i], ITEMS[i].values[0].0);
+        menu.change(i, -1);
+        assert_eq!(menu.values[i], ITEMS[i].values[n - 1].0);
     }
 }

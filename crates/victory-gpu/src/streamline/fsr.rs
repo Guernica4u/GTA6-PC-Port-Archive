@@ -901,7 +901,7 @@ mod tests {
             }
         };
         let lines = |f, dlss_live, fsr_live| {
-            let l = notice_of(&f, dlss_live, fsr_live).into_iter().map(|l| l.to_ascii_uppercase()).collect::<Vec<_>>();
+            let l = notice_of(&f, dlss_live, fsr_live, false).into_iter().map(|l| l.to_ascii_uppercase()).collect::<Vec<_>>();
             shown(&l);
             l.join("|")
         };
@@ -928,7 +928,7 @@ mod tests {
         // Nothing asked: nothing said.
         let mut quiet = facts(true, true, true, false);
         (quiet.dlss_fg_asked, quiet.fsr_asked) = (false, false);
-        assert!(notice_of(&quiet, false, false).is_empty());
+        assert!(notice_of(&quiet, false, false, false).is_empty());
     }
 
     #[test]

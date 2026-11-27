@@ -402,18 +402,23 @@ static FACTS: OnceLock<Facts> = OnceLock::new();
 /// characters: printed at the start and shown on the picture for its first
 /// seconds. Nothing if no frame generation was asked or made ready.
 pub fn notice() -> Vec<String> {
+    notice_in(false)
+}
+
+pub(crate) fn notice_in(chinese: bool) -> Vec<String> {
     let Some(f) = FACTS.get() else { return Vec::new() };
-    notice_of(f, FG_READY.load(Acquire) && SWAP_CHAIN_PROXIED.load(Acquire), fsr::live_swap_chain())
+    notice_of(f, FG_READY.load(Acquire) && SWAP_CHAIN_PROXIED.load(Acquire), fsr::live_swap_chain(), chinese)
 }
 
 /// [`notice`] as it is expected at the start, before the swap chain is made
 /// (DLSS Frame Generation where it is supported, else FSR 3 if loaded).
 pub fn notice_at_start() -> Vec<String> {
     let Some(f) = FACTS.get() else { return Vec::new() };
-    notice_of(f, f.dlss_fg_supported, f.fsr_loaded && !f.dlss_fg_supported)
+    notice_of(f, f.dlss_fg_supported, f.fsr_loaded && !f.dlss_fg_supported, false)
 }
 
-fn notice_of(f: &Facts, dlss_live: bool, fsr_live: bool) -> Vec<String> {
+fn notice_of(f: &Facts, dlss_live: bool, fsr_live: bool, chinese: bool) -> Vec<String> {
+    let tr = |english, chinese_text| if chinese { chinese_text } else { english };
     if !f.dlss_fg_asked && !f.fsr_asked {
         return Vec::new();
     }
@@ -429,44 +434,44 @@ fn notice_of(f: &Facts, dlss_live: bool, fsr_live: bool) -> Vec<String> {
     let no_dlss_fg = f.dlss_fg_asked && !f.dlss_fg_supported;
     if no_dlss_fg {
         lines.push(if f.files_missing {
-            "DLSS FRAME GEN: NVIDIA DLSS FILES NOT FOUND"
+            tr("DLSS FRAME GEN: NVIDIA DLSS FILES NOT FOUND", "DLSS 帧生成：找不到 NVIDIA DLSS 文件")
         } else {
-            "DLSS FRAME GEN: NOT ON THIS CARD (RTX 40 AND UP)"
+            tr("DLSS FRAME GEN: NOT ON THIS CARD (RTX 40 AND UP)", "DLSS 帧生成需要 RTX 40 或更新显卡")
         }.into());
     }
     if dlss_live {
-        lines.push("FRAME GEN: DLSS, SUPPORTED HERE (F1 MENU: 2X-6X)".into());
-        lines.push("MORE THAN 2X NEEDS AN RTX 50 CARD".into());
+        lines.push(tr("FRAME GEN: DLSS, SUPPORTED HERE (F1 MENU: 2X-6X)", "此显卡支持 DLSS 帧生成 (F1：2X-6X)").into());
+        lines.push(tr("MORE THAN 2X NEEDS AN RTX 50 CARD", "高于 2X 需要 RTX 50 显卡").into());
     } else if fsr_live {
         lines.push(if no_dlss_fg {
-            "USING AMD FSR 3 FRAME GEN INSTEAD: 2X AT MOST".into()
+            tr("USING AMD FSR 3 FRAME GEN INSTEAD: 2X AT MOST", "已改用 AMD FSR 3 帧生成，最高 2X").into()
         } else {
-            "FRAME GEN: AMD FSR 3 (CHOSEN IN F1), 2X AT MOST".into()
+            tr("FRAME GEN: AMD FSR 3 (CHOSEN IN F1), 2X AT MOST", "AMD FSR 3 帧生成 (F1 设置)，最高 2X").into()
         });
         if !f.series_s {
-            lines.push("SERIES X WITH FSR 3 NEEDS DLSS UPSCALING (ON)".into());
+            lines.push(tr("SERIES X WITH FSR 3 NEEDS DLSS UPSCALING (ON)", "SERIES X 的 FSR 3 需要开启 DLSS 超分").into());
         } else if f.no_dlss.is_some() {
-            lines.push("SERIES S MODE: FSR 3 RUNS WITHOUT DLSS".into());
+            lines.push(tr("SERIES S MODE: FSR 3 RUNS WITHOUT DLSS", "SERIES S 模式下 FSR 3 无需 DLSS").into());
         }
     } else if f.fsr_needs_series_s {
-        lines.push("FRAME GEN OFF: FSR 3 ON SERIES X NEEDS DLSS ON".into());
+        lines.push(tr("FRAME GEN OFF: FSR 3 ON SERIES X NEEDS DLSS ON", "帧生成关闭：SERIES X 的 FSR 3 需要 DLSS").into());
         lines.push(match f.no_dlss {
-            Some(NoDlss::FilesMissing) => "NVIDIA DLSS FILES NOT FOUND (VICTORY_STREAMLINE_DIR)",
-            Some(NoDlss::Card) => "THIS CARD HAS NO DLSS UPSCALING",
-            _ => "DLSS UPSCALING IS OFF: TURN IT ON IN F1 > DLSS",
+            Some(NoDlss::FilesMissing) => tr("NVIDIA DLSS FILES NOT FOUND (VICTORY_STREAMLINE_DIR)", "缺少 DLSS 文件 (VICTORY_STREAMLINE_DIR)"),
+            Some(NoDlss::Card) => tr("THIS CARD HAS NO DLSS UPSCALING", "此显卡不支持 DLSS 超分"),
+            _ => tr("DLSS UPSCALING IS OFF: TURN IT ON IN F1 > DLSS", "DLSS 超分已关闭，请在 F1 > DLSS 开启"),
         }.into());
         lines.push(if f.no_dlss == Some(NoDlss::Card) {
-            "USE F1 > CONSOLE > SERIES S (THE GAME RESTARTS)"
+            tr("USE F1 > CONSOLE > SERIES S (THE GAME RESTARTS)", "请选 F1 > 主机型号 > SERIES S (重启游戏)")
         } else {
-            "OR F1 > CONSOLE > SERIES S (THE GAME RESTARTS)"
+            tr("OR F1 > CONSOLE > SERIES S (THE GAME RESTARTS)", "或选 F1 > 主机型号 > SERIES S (重启游戏)")
         }.into());
     } else if f.fsr_asked && !f.fsr_loaded {
-        lines.push("FRAME GEN OFF: AMD FSR 3 FILES NOT FOUND".into());
-        lines.push("(AMD FIDELITYFX DLLS, VICTORY_FIDELITYFX_DIR)".into());
+        lines.push(tr("FRAME GEN OFF: AMD FSR 3 FILES NOT FOUND", "帧生成关闭：找不到 AMD FSR 3 文件").into());
+        lines.push(tr("(AMD FIDELITYFX DLLS, VICTORY_FIDELITYFX_DIR)", "(AMD FIDELITYFX DLL，VICTORY_FIDELITYFX_DIR)").into());
     } else if no_dlss_fg {
-        lines.push("F1 > FRAME GEN TYPE > FSR 3 GIVES 2X ON THIS CARD".into());
+        lines.push(tr("F1 > FRAME GEN TYPE > FSR 3 GIVES 2X ON THIS CARD", "此显卡可在 F1 > 帧生成类型 > FSR 3 用 2X").into());
     } else if f.dlss_fg_supported {
-        lines.push("FRAME GEN: DLSS DID NOT START (SEE THE LOG)".into());
+        lines.push(tr("FRAME GEN: DLSS DID NOT START (SEE THE LOG)", "DLSS 帧生成启动失败，请查看日志").into());
     } else {
         return Vec::new();
     }
