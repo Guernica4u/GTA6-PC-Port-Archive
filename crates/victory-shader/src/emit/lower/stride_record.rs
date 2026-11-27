@@ -88,7 +88,19 @@ fn a_zero_stride_field_loads_raw_by_element() {
         user_data: 0,
         slot: 0,
     }];
-    lower_with(&words, vec![root(RootType::Descriptor, 0, 0)], used).unwrap();
+    // The record names no stride, so the load lowers only if the
+    // descriptor's own field is what the index counts by: left as an element
+    // index, it would be refused as a structured buffer of unknown stride.
+    let zero = lower_with(&words, vec![root(RootType::Descriptor, 0, 0)], used.clone()).unwrap();
+    // The same load with the field at 4 counts four-byte elements: the bytes
+    // read come from the field, not from a scale the lowering chose.
+    let mut field = vec![0x8801_FF01, 4 << 16]; // s_or_b32 s1, s1, stride 4
+    field.extend_from_slice(&words);
+    let four = lower_with(&field, vec![root(RootType::Descriptor, 0, 0)], used).unwrap();
+    assert_ne!(
+        zero.dxil, four.dxil,
+        "the index counts by the descriptor's stride field"
+    );
 }
 
 /// The store of the same raw shape, written by element (the UAV).
@@ -102,7 +114,18 @@ fn a_zero_stride_field_stores_raw_by_element() {
         0x8000_0100, // buffer_store_dword v1, v0, s[0:3], 0 idxen
         S_ENDPGM,
     ];
-    lower_with(&words, vec![root(RootType::Descriptor, 0, 0)], vec![]).unwrap();
+    // As the load: the record names no stride (none is given at all), so the
+    // descriptor's own zero field is what leaves the index counting nothing.
+    let zero = lower_with(&words, vec![root(RootType::Descriptor, 0, 0)], vec![]).unwrap();
+    // The same store with the field at 4 writes four-byte elements: its bytes
+    // come from the field, not from a scale the lowering chose.
+    let mut field = vec![0x8801_FF01, 4 << 16]; // s_or_b32 s1, s1, stride 4
+    field.extend_from_slice(&words);
+    let four = lower_with(&field, vec![root(RootType::Descriptor, 0, 0)], vec![]).unwrap();
+    assert_ne!(
+        zero.dxil, four.dxil,
+        "the index counts by the descriptor's stride field"
+    );
 }
 
 /// The atomic of the same raw shape, its return read back.
@@ -119,7 +142,18 @@ fn a_zero_stride_field_atomics_raw_by_element() {
         0x0000_0500, // ds_write_b32 v0, v5
         S_ENDPGM,
     ];
-    lower_with(&words, vec![root(RootType::Descriptor, 0, 0)], vec![]).unwrap();
+    // As the load: the record names no stride (none is given), so the
+    // descriptor's own zero field is what addresses the atomic by offset.
+    let zero = lower_with(&words, vec![root(RootType::Descriptor, 0, 0)], vec![]).unwrap();
+    // The same atomic with the field at 4 addresses four-byte elements: its
+    // bytes come from the field, not from a scale the lowering chose.
+    let mut field = vec![0x8801_FF01, 4 << 16]; // s_or_b32 s1, s1, stride 4
+    field.extend_from_slice(&words);
+    let four = lower_with(&field, vec![root(RootType::Descriptor, 0, 0)], vec![]).unwrap();
+    assert_ne!(
+        zero.dxil, four.dxil,
+        "the index counts by the descriptor's stride field"
+    );
 }
 
 /// A built buffer descriptor's stride field, dword 1 bits 16-29, names
@@ -153,25 +187,31 @@ fn a_built_stride_field_counts_the_element_the_index_names() {
         slot: 0,
     }];
     // A zero field: a raw buffer, the index counts nothing.
-    lower_with(
+    let zero = lower_with(
         &words(0),
         vec![root(RootType::Descriptor, 0, 0)],
         used.clone(),
     )
     .unwrap();
-    // Two bytes and sixteen: the index counts elements of that size.
-    lower_with(
+    // Two bytes and sixteen: the index counts elements of that size, and each
+    // value the field names reaches the code the index is scaled in — a
+    // lowering that ignored the field would emit one code for all three.
+    let two = lower_with(
         &words(2),
         vec![root(RootType::Descriptor, 0, 0)],
         used.clone(),
     )
     .unwrap();
-    lower_with(
-        &words(16),
-        vec![root(RootType::Descriptor, 0, 0)],
-        used.clone(),
-    )
-    .unwrap();
+    let sixteen = lower_with(&words(16), vec![root(RootType::Descriptor, 0, 0)], used).unwrap();
+    assert_ne!(zero.dxil, two.dxil, "a field of 2 counts two-byte elements");
+    assert_ne!(
+        zero.dxil, sixteen.dxil,
+        "a field of 16 counts 16-byte elements"
+    );
+    assert_ne!(
+        two.dxil, sixteen.dxil,
+        "the code scales by the value the field names"
+    );
 }
 
 /// Swizzle bits above the stride field or a record limit keep a built
