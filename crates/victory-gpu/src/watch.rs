@@ -197,8 +197,11 @@ static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
     kept: false,
 });
 
-const WRITE_BLOCKS: usize = 1 << 16; // 4 GiB / 64 KiB
+// Reuse the same generation table across the address space. Aliases can
+// invalidate an unrelated memo, but every writer still advances its bucket.
+const WRITE_BLOCKS: usize = 1 << 16;
 static BLOCK_WRITE_GEN: [std::sync::atomic::AtomicU64; WRITE_BLOCKS] = [const { std::sync::atomic::AtomicU64::new(1) }; WRITE_BLOCKS];
+static ALL_WRITE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ASK_END_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 static KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -206,17 +209,35 @@ pub(crate) fn kept() -> bool {
     KEPT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether the submission actually asked the kernel about this range.
+pub(crate) fn kept_covers(from: usize, to: usize) -> bool {
+    if !KEPT.load(std::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
+    let j = journal();
+    j.kept && covers(&j.ahead, from / PAGE, to.div_ceil(PAGE))
+}
+
+fn write_generations(first: usize, count: usize) -> impl Iterator<Item = &'static std::sync::atomic::AtomicU64> {
+    let first = first % WRITE_BLOCKS;
+    let end = first + count;
+    BLOCK_WRITE_GEN[first..end.min(WRITE_BLOCKS)].iter().chain(&BLOCK_WRITE_GEN[..end.saturating_sub(WRITE_BLOCKS)])
+}
+
 #[inline]
 fn bump_write_blocks(first: usize, last: usize) {
-    let to = last.min(WRITE_BLOCKS);
-    for g in &BLOCK_WRITE_GEN[first.min(to)..to] {
-        g.fetch_add(1, std::sync::atomic::Ordering::Release);
+    let count = last.saturating_sub(first);
+    if count >= WRITE_BLOCKS {
+        ALL_WRITE_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+    } else {
+        for generation in write_generations(first, count) {
+            generation.fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
     }
 }
 
-/// Monotonic write-generation signature for `[from, to)` across 64 KiB blocks
-/// below 4 GiB, plus the current `ask_once_end` generation (`None` if `>= 4 GiB`
-/// or wider than `4 MiB`).
+/// Monotonic write-generation signature for `[from, to)` across 64 KiB blocks,
+/// plus the current `ask_once_end` generation (`None` if wider than `4 MiB`).
 pub(crate) fn block_write_sig(from: usize, to: usize) -> Option<(u64, u64)> {
     if from >= to {
         return Some((0, ASK_END_GEN.load(std::sync::atomic::Ordering::Acquire)));
@@ -225,13 +246,9 @@ pub(crate) fn block_write_sig(from: usize, to: usize) -> Option<(u64, u64)> {
         return None;
     }
     let first = from / BLOCK;
-    let last = to.div_ceil(BLOCK);
-    if last > WRITE_BLOCKS {
-        return None;
-    }
-    let mut sum = 0u64;
-    for g in &BLOCK_WRITE_GEN[first..last] {
-        sum = sum.wrapping_add(g.load(std::sync::atomic::Ordering::Acquire));
+    let mut sum = ALL_WRITE_GEN.load(std::sync::atomic::Ordering::Acquire);
+    for generation in write_generations(first, to.div_ceil(BLOCK) - first) {
+        sum = sum.wrapping_add(generation.load(std::sync::atomic::Ordering::Acquire));
     }
     Some((sum, ASK_END_GEN.load(std::sync::atomic::Ordering::Acquire)))
 }

@@ -3465,6 +3465,8 @@ fn land() {
     }
 }
 
+static RELAY_HELPER_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The thread that settles the flights once the card has run them all
 /// ([`late`]): without it a bottom-of-pipe write would reach the title only
 /// at the next call that settles, and a title thread that polls such a
@@ -3480,6 +3482,10 @@ fn late_helper() {
         tracing::warn!("no event for the thread that settles submissions sent ahead");
         return;
     };
+    let relayed = relay();
+    if relayed {
+        RELAY_HELPER_READY.store(true, Ordering::Release);
+    }
     loop {
         let target = {
             let mut line = line();
@@ -3489,7 +3495,7 @@ fn late_helper() {
                     break None;
                 }
                 // (With the relay the flights are another thread's.)
-                if !relay() && !line.line.is_empty() && !line.settling {
+                if !relayed && !line.line.is_empty() && !line.settling {
                     break Some(line.target);
                 }
                 line = LINE_MOVED.wait(line).unwrap_or_else(|e| e.into_inner());
@@ -3500,6 +3506,10 @@ fn late_helper() {
             land();
             helping.next("helper: looking at what queues hold");
             crate::queue::release_held(false);
+            if relayed {
+                helping.next("helper: dropping retired resources");
+                bury(FINISHED.load(Ordering::Acquire));
+            }
             continue;
         };
         // The card first, without the submission lock: the submitting
@@ -5270,7 +5280,11 @@ impl Host {
         }
         if last > 0 {
             FINISHED.store(last, Ordering::Release);
-            bury(last);
+            // Driver releases can stall. Keep them off the thread that
+            // publishes completions and unblocks the in-flight list limit.
+            if !RELAY_HELPER_READY.load(Ordering::Acquire) {
+                bury(last);
+            }
         }
         stage.next("landing: the rest");
         self.log_messages();
@@ -5305,8 +5319,8 @@ impl Host {
             }
             join_ranges(written, ranges);
             *settling = false;
-            // The landed lists are reset, and what queues hold looked at,
-            // by the helper thread (they take locks a waiter may hold).
+            // The helper resets the lists and releases retired resources
+            // after the waiters can make progress.
             *poke = true;
         }
         LINE_MOVED.notify_all();
@@ -8780,33 +8794,45 @@ impl Batch {
             spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         }
-        let ahead = spans.len() > 1;
+        let ahead = spans.len() > 1 && !crate::watch::kept();
         if ahead {
             let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
             crate::watch::ask_ahead(&ranges);
         }
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
-        crate::shadow::wide_each(spans.len() + due.len(), move |i| {
+        // Claim short groups of buffer checks together. In the large
+        // flushes most checks do no copying, so claiming and counting
+        // them one at a time makes the workers contend on two counters.
+        const GROUP: usize = 8;
+        let group = if many { GROUP } else { 1 };
+        crate::shadow::wide_each(spans.len().div_ceil(group) + due.len(), move |i| {
             // The textures first: they are the longer pieces.
             let Some(i) = i.checked_sub(due.len()) else {
                 due[i].refresh();
                 return;
             };
-            let (shadow, from, to) = &spans[i];
-            if many && shadow.nothing_new(*from, *to - *from) {
-                FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                return;
+            let from_index = i * group;
+            let mut clean = 0;
+            for (shadow, from, to) in &spans[from_index..(from_index + group).min(spans.len())] {
+                if many && shadow.nothing_new(*from, *to - *from) {
+                    clean += 1;
+                } else {
+                    Self::update(shadow, *from, *to);
+                }
             }
-            Self::update(shadow, *from, *to);
+            if clean != 0 {
+                FLUSHES[2].fetch_add(clean, Ordering::Relaxed);
+            }
         });
         if ahead {
             crate::watch::ask_ahead_done();
         }
         // The time counted is the time it took, not the threads' sum.
         let took = started.elapsed().as_micros() as u64;
-        let summed = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed)).iter().zip(before).map(|(now, was)| now.saturating_sub(was)).collect::<Vec<_>>();
-        PREPARING[2].fetch_sub(summed[1], Ordering::Relaxed);
-        PREPARING[0].fetch_sub(summed[0], Ordering::Relaxed);
+        let copies = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before[0]);
+        let textures = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before[1]);
+        PREPARING[2].fetch_sub(textures, Ordering::Relaxed);
+        PREPARING[0].fetch_sub(copies, Ordering::Relaxed);
         PREPARING[0].fetch_add(took, Ordering::Relaxed);
         SPLIT[6].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }

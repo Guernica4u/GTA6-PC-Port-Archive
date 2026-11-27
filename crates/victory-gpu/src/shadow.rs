@@ -70,7 +70,7 @@ pub(crate) struct Shadow {
     clean_to: AtomicU64,
     clean_sig: AtomicU64,
     clean_ask_end: AtomicU64,
-    clean_busy: std::sync::atomic::AtomicBool,
+    clean_revision: AtomicU64,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -2817,12 +2817,8 @@ mod piece_tests {
     }
 }
 
-/// The pages of `[a, e)` (title addresses, `a < e`) that a copy whose
-/// first page is `base` must take from title memory before it holds the
-/// title's bytes: those it never took (`copied` 0), whether or not the
-/// title wrote them since tracking began, and those `written` (as
-/// `crate::watch::writes` gives it, by page in order) shows written after
-/// the copy took them. As [`Shadow::copy_stale`] decides it.
+/// Byte intervals within individual pages of `[a, e)` that the copy has
+/// never taken, or that the journal shows were written since it took them.
 ///
 /// [`Shadow::stale_under_writes`] and [`Shadow::merge_under_writes`] looked
 /// at `written` alone, so a page of a range shaders may be writing that the
@@ -2831,11 +2827,9 @@ mod piece_tests {
 /// shaders read zeros there (fxceless/victory-fork#206: missing geometry
 /// with `VICTORY_LATE_WAIT`/`VICTORY_RELAY`).
 ///
-/// Of a page taken in part since (`parts`, [`stamp_taken`]) only the 4 KiB
-/// parts that hold bytes of `[a, e)` count, each by its own note; `each`
-/// gives a written page's parts' writes ([`crate::watch::part_writes`]),
-/// asked only of such pages.
-fn stale_pages_in(
+/// Use 4 KiB stamps wherever available so a write to one part does not
+/// force a read and comparison of the rest of its 64 KiB page.
+fn stale_ranges_in(
     base: usize,
     copied: &[u64],
     parts: &crate::watch::PartsTaken,
@@ -2843,27 +2837,43 @@ fn stale_pages_in(
     e: usize,
     written: &[(usize, u64)],
     each: &dyn Fn(usize) -> Option<[u64; PARTS]>,
-) -> Vec<usize> {
-    (a / PAGE..e.div_ceil(PAGE))
-        .filter(|&page| page >= base)
-        .filter(|&page| {
-            let Some(&at) = copied.get(page - base) else {
-                return false;
-            };
-            let write = written.binary_search_by_key(&page, |&(p, _)| p).map_or(0, |i| written[i].1);
-            if at != 0 && write <= at {
-                return false;
+) -> Vec<(usize, usize)> {
+    let mut stale = Vec::new();
+    let first = (a / PAGE).max(base);
+    let last = e.div_ceil(PAGE).min(base + copied.len());
+    let mut writes = written.iter().skip_while(|&&(page, _)| page < first).peekable();
+    for page in first..last {
+        let at = copied[page - base];
+        let write = writes.next_if(|&&(p, _)| p == page).map_or(0, |&(_, write)| write);
+        if at != 0 && write <= at {
+            continue;
+        }
+        let taken = parts.get(&(page - base));
+        let lo = a.max(page * PAGE);
+        let hi = e.min((page + 1) * PAGE);
+        if at == 0 && taken.is_none() {
+            stale.push((lo, hi));
+            continue;
+        }
+        let part_writes = (write > at).then(|| each(page)).flatten();
+        if taken.is_none() && part_writes.is_none() {
+            stale.push((lo, hi));
+            continue;
+        }
+        for k in parts_within(page, lo, hi) {
+            let stamp = at.max(taken.map_or(0, |stamps| stamps[k]));
+            if stamp != 0 && part_writes.as_ref().map_or(write, |stamps| stamps[k]) <= stamp {
+                continue;
             }
-            let Some(stamps) = parts.get(&(page - base)) else {
-                return true;
-            };
-            let writes = if write == 0 { None } else { each(page) };
-            parts_within(page, a, e).any(|k| {
-                let at = at.max(stamps[k]);
-                at == 0 || (write != 0 && writes.map_or(write, |w| w[k]) > at)
-            })
-        })
-        .collect()
+            let (from, to) = part_span(page, k, lo, hi);
+            if from > lo && let Some((_, end)) = stale.last_mut() && *end == from {
+                *end = to;
+            } else {
+                stale.push((from, to));
+            }
+        }
+    }
+    stale
 }
 
 /// The parts of a page: 4 KiB each, as the kernel names them.
@@ -3152,6 +3162,44 @@ mod stale_tests {
     use super::*;
 
     #[test]
+    fn an_asking_for_another_page_does_not_validate_a_clean_memo() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+        if !crate::watch::once() {
+            return;
+        }
+        // SAFETY: a private write-watched reservation for this test.
+        let at = unsafe {
+            VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_COMMIT | MEM_RESERVE | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(at, 0);
+        let mut data = vec![0u8; PAGE];
+        let copy = Shadow::unbacked(at as u64, data.as_mut_ptr(), PAGE as u64, false);
+        crate::watch::ask_once(&[(at, at + PAGE)]);
+        assert!((0..100).any(|_| {
+            crate::watch::ask_once(&[(at, at + PAGE)]);
+            if !crate::watch::kept_covers(at, at + PAGE) {
+                return false;
+            }
+            // The zeroed host copy already matches the untouched title page.
+            copy.watched.store(1, Ordering::Relaxed);
+            let (sig, asking) = crate::watch::block_write_sig(at, at + PAGE).unwrap();
+            copy.stamp_clean(at, at + PAGE, sig, asking);
+            copy.fast_nothing_new(at, PAGE)
+        }));
+        crate::watch::ask_once_end();
+
+        // SAFETY: a committed page in the reservation of this test.
+        unsafe { (at as *mut u8).write_volatile(2) };
+        crate::watch::ask_once(&[(at + PAGE, at + 2 * PAGE)]);
+        assert!(!copy.fast_nothing_new(at, PAGE));
+        assert!(copy.update(at, PAGE) > 0);
+        crate::watch::ask_once_end();
+        assert_eq!(data[0], 2);
+    }
+
+    #[test]
     fn pages_never_taken_are_stale_written_or_not() {
         let base = 0x100;
         let copied = [5, 0, 5, 5];
@@ -3161,27 +3209,43 @@ mod stale_tests {
         let written = [(0x102, 6), (0x103, 4)];
         let none = crate::watch::PartsTaken::new();
         let whole = |_: usize| None;
-        assert_eq!(stale_pages_in(base, &copied, &none, at(0x100), at(0x104), &written, &whole), [0x101, 0x102]);
-        // Part of a page counts as the page; pages outside the copy do not.
-        assert_eq!(stale_pages_in(base, &copied, &none, at(0x101) + 8, at(0x101) + 16, &[], &whole), [0x101]);
-        assert!(stale_pages_in(base, &copied, &none, at(0x104), at(0x106), &[(0x104, 9)], &whole).is_empty());
+        assert_eq!(
+            stale_ranges_in(base, &copied, &none, at(0x100), at(0x104), &written, &whole),
+            [(at(0x101), at(0x102)), (at(0x102), at(0x103))]
+        );
+        // Clip to the requested bytes and ignore pages outside the copy.
+        assert_eq!(
+            stale_ranges_in(base, &copied, &none, at(0x101) + 8, at(0x101) + 16, &[], &whole),
+            [(at(0x101) + 8, at(0x101) + 16)]
+        );
+        assert!(stale_ranges_in(base, &copied, &none, at(0x104), at(0x106), &[(0x104, 9)], &whole).is_empty());
         // Page 0x101 never taken whole, its part 0 taken at 7: what lies in
         // part 0 is as it was, what lies in part 1 never was taken.
         let mut parts = crate::watch::PartsTaken::new();
         let mut stamps = [0; PARTS];
         stamps[0] = 7;
         parts.insert(1, stamps);
-        assert!(stale_pages_in(base, &copied, &parts, at(0x101) + 8, at(0x101) + 16, &[], &whole).is_empty());
-        assert_eq!(stale_pages_in(base, &copied, &parts, at(0x101) + 8, at(0x101) + 5000, &[], &whole), [0x101]);
-        // Page 0x102 written at 6 in part 3 alone, part 0 taken at 7 since.
+        assert!(stale_ranges_in(base, &copied, &parts, at(0x101) + 8, at(0x101) + 16, &[], &whole).is_empty());
+        assert_eq!(
+            stale_ranges_in(base, &copied, &parts, at(0x101) + 8, at(0x101) + 5000, &[], &whole),
+            [(at(0x101) + KERNEL_PAGE, at(0x101) + 5000)]
+        );
+        // Adjacent dirty parts merge, while the clean gap stays untouched.
         parts.insert(2, stamps);
         let each = |_: usize| {
             let mut w = [0; PARTS];
+            w[0] = 6;
             w[3] = 6;
+            w[4] = 6;
+            w[6] = 6;
             Some(w)
         };
-        assert!(stale_pages_in(base, &copied, &parts, at(0x102), at(0x102) + 100, &written, &each).is_empty());
-        assert_eq!(stale_pages_in(base, &copied, &parts, at(0x102), at(0x103), &written, &each), [0x102]);
+        assert!(stale_ranges_in(base, &copied, &parts, at(0x102), at(0x102) + 100, &written, &each).is_empty());
+        let page = at(0x102);
+        assert_eq!(
+            stale_ranges_in(base, &copied, &parts, page, page + 6 * KERNEL_PAGE + 8, &written, &each),
+            [(page + 3 * KERNEL_PAGE, page + 5 * KERNEL_PAGE), (page + 6 * KERNEL_PAGE, page + 6 * KERNEL_PAGE + 8)]
+        );
     }
 }
 
@@ -3512,7 +3576,7 @@ impl Shadow {
             clean_to: AtomicU64::new(0),
             clean_sig: AtomicU64::new(0),
             clean_ask_end: AtomicU64::new(0),
-            clean_busy: std::sync::atomic::AtomicBool::new(false),
+            clean_revision: AtomicU64::new(0),
             flights: Mutex::default(),
             before: Mutex::default(),
             merging: RwLock::default(),
@@ -4054,7 +4118,7 @@ impl Shadow {
         busy.into_iter().any(|(a, e)| match crate::watch::asked(a, e) {
             Some((_, written)) => {
                 let parts = self.parts_taken.lock().unwrap_or_else(|e| e.into_inner());
-                !stale_pages_in(base, &copied, &parts, a, e, &written, &one_part_writes).is_empty()
+                !stale_ranges_in(base, &copied, &parts, a, e, &written, &one_part_writes).is_empty()
             }
             None => true,
         })
@@ -4114,16 +4178,16 @@ impl Shadow {
                 note_stale(1);
                 return true;
             };
-            let stale: Vec<usize> = {
+            let stale = {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                 let parts = self.parts_taken.lock().unwrap_or_else(|e| e.into_inner());
-                stale_pages_in(base, &copied, &parts, a, e, &written, &one_part_writes)
+                stale_ranges_in(base, &copied, &parts, a, e, &written, &one_part_writes)
             };
             if stale.is_empty() {
                 continue;
             }
-            let pin_from = stale[0] * PAGE;
-            let pin_to = (stale[stale.len() - 1] + 1) * PAGE;
+            let pin_from = stale[0].0 / PAGE * PAGE;
+            let pin_to = stale[stale.len() - 1].1.next_multiple_of(PAGE);
             let _demand_pin = crate::demand::pin_range(pin_from, pin_to.saturating_sub(pin_from));
             // The lock of the copy's reference (the snapshot, or the
             // CPU's side of a copy in the card's memory), from before
@@ -4151,14 +4215,13 @@ impl Shadow {
             let left = std::sync::atomic::AtomicI64::new(*runs_left as i64);
             let over = std::sync::atomic::AtomicBool::new(false);
             let done: Vec<Mutex<Done>> = stale.iter().map(|_| Mutex::new(None)).collect();
-            let page_of = |i: usize| -> (usize, usize) { ((stale[i] * PAGE).max(a), ((stale[i] + 1) * PAGE).min(e)) };
             let one = |i: usize| {
-                let (lo, hi) = page_of(i);
-                if lo < hi && !over.load(Ordering::Relaxed) {
+                let (lo, hi) = stale[i];
+                if !over.load(Ordering::Relaxed) {
                     // SAFETY: the reference holds the copy's bytes at the
                     // copy's offsets, and these are in a declared range; the
                     // locks held above keep out what else writes them, and
-                    // no two pages are the same.
+                    // the intervals are disjoint.
                     let runs = unsafe { self.merge_page_under_writes(lo, hi - lo, held as *mut u8, &left) };
                     match runs {
                         Ok(runs) => *done[i].lock().unwrap_or_else(|e| e.into_inner()) = runs,
@@ -4179,7 +4242,7 @@ impl Shadow {
                 let Some(runs) = runs.into_inner().unwrap_or_else(|e| e.into_inner()) else {
                     continue;
                 };
-                let (lo, hi) = ((stale[i] * PAGE).max(a), ((stale[i] + 1) * PAGE).min(e));
+                let (lo, hi) = stale[i];
                 MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
                 MERGED[2].fetch_add(runs.iter().map(|r| r.1 as u64).sum(), Ordering::Relaxed);
                 crate::copystat_footprint::pending_wrote(
@@ -4192,9 +4255,7 @@ impl Shadow {
                 // Taken: the page if the range holds all of it that is in
                 // the copy, else the parts of it the range holds whole; the
                 // rest of it is the refresh's.
-                if lo < hi {
-                    taken.push((lo, hi));
-                }
+                taken.push((lo, hi));
             }
             drop(before);
             drop(merging);
@@ -4334,9 +4395,8 @@ impl Shadow {
         copied.get(first..last).is_some_and(|slice| slice.iter().all(|&at| at != 0))
     }
 
-    /// Lock-free fast check for [`Shadow::nothing_new`]: returns `true` only
-    /// when `[address, address + len)` lies inside the memoized clean span
-    /// and no writes occurred in any overlapping 64 KiB block since then.
+    /// Checks the memo before looking up the copy's per-page stamps.
+    /// The range needs a current guard or write-watch answer as well.
     pub(crate) fn fast_nothing_new(&self, address: usize, len: usize) -> bool {
         if self.place.is_some() {
             return true;
@@ -4350,8 +4410,9 @@ impl Shadow {
         if !matches!(watched, 1 | GUARDED) || self.pending_len.load(Ordering::Acquire) != 0 {
             return false;
         }
+        let revision = self.clean_revision.load(Ordering::Acquire);
         let cs = self.clean_sig.load(Ordering::Acquire);
-        if cs == 0 {
+        if revision % 2 != 0 || cs == 0 {
             return false;
         }
         let cf = self.clean_from.load(Ordering::Relaxed) as usize;
@@ -4359,22 +4420,17 @@ impl Shadow {
         if from < cf || to > ct {
             return false;
         }
-        let Some((sig, ask_end)) = crate::watch::block_write_sig(cf, ct) else {
-            return false;
-        };
-        if sig != cs || self.clean_sig.load(Ordering::Acquire) != cs {
-            return false;
-        }
-        (watched == GUARDED && crate::watch::published(from, to))
-            || (watched == 1 && crate::watch::kept() && self.asked_ahead())
-            || ask_end == self.clean_ask_end.load(Ordering::Relaxed)
+        let known = (watched == GUARDED && crate::watch::published(from, to)) || crate::watch::kept_covers(from, to);
+        known
+            && crate::watch::block_write_sig(cf, ct).is_some_and(|(sig, _)| sig == cs)
+            && self.clean_sig.load(Ordering::Acquire) == cs
+            && self.clean_revision.load(Ordering::Acquire) == revision
     }
 
     fn stamp_clean(&self, from: usize, to: usize, sig: u64, ask_end: u64) {
-        if self
-            .clean_busy
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-            .is_err()
+        let revision = self.clean_revision.load(Ordering::Relaxed);
+        if revision % 2 != 0
+            || self.clean_revision.compare_exchange(revision, revision + 1, Ordering::AcqRel, Ordering::Relaxed).is_err()
         {
             return;
         }
@@ -4395,7 +4451,9 @@ impl Shadow {
                 let u_from = cf.min(from);
                 let u_to = ct.max(to);
                 if let Some((u_sig, u_ask)) = crate::watch::block_write_sig(u_from, u_to)
-                    && (u_ask == ca || self.watched.load(Ordering::Relaxed) == GUARDED && crate::watch::published(cf, ct))
+                    // Neither span can have changed while we sampled the union.
+                    && crate::watch::block_write_sig(from, to) == Some((sig, ask_end))
+                    && crate::watch::block_write_sig(cf, ct) == Some((prev_sig, ca))
                 {
                     (new_from, new_to, new_sig, new_ask_end) = (u_from, u_to, u_sig, u_ask);
                 }
@@ -4405,7 +4463,7 @@ impl Shadow {
         self.clean_to.store(new_to as u64, Ordering::Release);
         self.clean_ask_end.store(new_ask_end, Ordering::Release);
         self.clean_sig.store(new_sig, Ordering::Release);
-        self.clean_busy.store(false, Ordering::Release);
+        self.clean_revision.store(revision + 2, Ordering::Release);
     }
 
     /// Whether [`Shadow::update`] of `[address, address + len)` would copy
@@ -4444,12 +4502,11 @@ impl Shadow {
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let ranged = self.ranged(from, to);
         let parts = self.parts_taken.lock().unwrap_or_else(|e| e.into_inner());
+        let clean_before = (!pending).then(|| crate::watch::block_write_sig(from, to)).flatten();
         let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, &parts, ranged);
         drop((copied, parts));
-        if same && !pending {
-            if let Some((sig, ask_end)) = crate::watch::block_write_sig(from, to) {
-                self.stamp_clean(from, to, sig, ask_end);
-            }
+        if same && let Some((sig, ask_end)) = clean_before {
+            self.stamp_clean(from, to, sig, ask_end);
         }
         #[cfg(feature = "diagnostics")]
         if same {
@@ -4471,15 +4528,15 @@ impl Shadow {
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
+            let clean_before = (self.pending_len.load(Ordering::Acquire) == 0)
+                .then(|| crate::watch::block_write_sig(from, to))
+                .flatten();
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 // (A range whose blocks rest after a write has no guard now.)
                 let guarded = crate::watch::guarded(from, to) || self.watched.load(Ordering::Relaxed) == GUARDED;
                 self.watched.store(if guarded { GUARDED } else { 1 }, Ordering::Relaxed);
-                let clean_after = (self.pending_len.load(Ordering::Acquire) == 0)
-                    .then(|| crate::watch::block_write_sig(from, to))
-                    .flatten();
                 let copied = self.copy_stale(from, to, now, &written);
-                if let Some((sig, ask_end)) = clean_after {
+                if let Some((sig, ask_end)) = clean_before {
                     self.stamp_clean(from, to, sig, ask_end);
                 }
                 self.refresh_check(from, to);
