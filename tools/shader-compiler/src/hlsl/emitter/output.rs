@@ -144,8 +144,15 @@ uint tb_fmac_half(uint a, uint b, uint c) {
     pub(in crate::hlsl) fn reg_decls(&self) -> String {
         let is_v = |r: &str| r.len() > 1 && r.starts_with('v') && r[1..].bytes().all(|b| b.is_ascii_digit());
         let mut out = String::new();
+        // The VCC and other special registers are always declared by the header,
+        // so never repeat them here.
+        const ALWAYS_DECLARED: [&str; 7] = [
+            "exec_lo", "exec_hi", "vcc_lo", "vcc_hi", "scc", "m0", "nul",
+        ];
         let scalars: Vec<String> =
-            self.regs.iter().filter(|r| !(self.vreg_array && is_v(r))).map(|r| {
+            self.regs.iter()
+                .filter(|r| !ALWAYS_DECLARED.contains(&r.as_str()) && !(self.vreg_array && is_v(r)))
+                .map(|r| {
                 if r == "tb_fp_mode" { format!("{r} = 0xc0u") } else { format!("{r} = 0u") }
             }).collect();
         if !scalars.is_empty() {
