@@ -75,12 +75,14 @@ repository nearer the drive's root.
 
 On Windows 10 the in-box Direct3D 12 runtime refuses directly indexed
 descriptor heaps (shader model 6.6), so every host pipeline is refused and
-the title crashes once it draws. `victory.exe` asks for the Agility SDK
-1.620 runtime in a `D3D12` folder beside it: from the
+the title crashes once it draws. Build with `--features agility-sdk`:
+`victory.exe` then loads the Agility SDK 1.620 runtime from a `D3D12`
+folder beside it. From the
 [Microsoft.Direct3D.D3D12](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12)
 1.620.x package (a `.nupkg` is a zip), copy `build\native\bin\x64\D3D12Core.dll`
 (and `d3d12SDKLayers.dll` for the debug layer) to `target\release\D3D12\`.
-Windows 11 does not need it: without the folder its own runtime is used.
+With the feature the folder is required (Direct3D 12 does not fall back to
+the in-box runtime without it), and `victory` says so at start.
 
 A run in the world takes about 33 GB of Windows commit (RAM plus paging
 file) and about 10 GB of video memory. The tested machine has 32 GB of RAM

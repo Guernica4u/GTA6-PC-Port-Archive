@@ -151,6 +151,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let cli = Cli::parse();
+    sdkpath::check()?;
     match cli.command {
         Command::Inspect {
             file,
