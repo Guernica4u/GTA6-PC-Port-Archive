@@ -1222,7 +1222,7 @@ float4 ps(Vertex input) : SV_Target { return input.color; }
             );
         }
         let target = target.unwrap();
-        let rtv = host.rtv(&target, None);
+        let rtv = host.rtv(Some(&target), None);
         let (readback, data) = host.shared_buffer(total).unwrap();
         // SAFETY: live view of the texture in the render-target state.
         unsafe {

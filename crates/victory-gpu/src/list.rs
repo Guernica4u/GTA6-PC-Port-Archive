@@ -2840,7 +2840,7 @@ mod tests {
             // SAFETY: an open host list and live texture in RENDER_TARGET.
             unsafe {
                 host_list(list1).unwrap().list.ClearRenderTargetView(
-                    host.rtv(&host_tex, None),
+                    host.rtv(Some(&host_tex), None),
                     &unorm([255, 128, 64, 255]),
                     None,
                 );
