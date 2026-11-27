@@ -15,7 +15,10 @@ use super::*;
 /// column 3, behind the three columns of TEXCOORD4) in dword 3 of
 /// parameter 3, after TEXCOORD5 and TEXCOORD7, while the high half of
 /// TEXCOORD4's second dword stays zero.
-type PackedLayout = Vec<(u8, Vec<(u8, u8, u8, u8)>)>;
+type PackedLayout = Vec<(u8, Vec<Placed>)>;
+
+/// An element placed in a parameter: (dword, row, first column, columns).
+type Placed = (u8, u8, u8, u8);
 
 fn packed_layout(elements: &[SigElement], packs: &[(u8, Option<u8>)]) -> PackedLayout {
     let of_row = |r: u8| {
@@ -30,7 +33,7 @@ fn packed_layout(elements: &[SigElement], packs: &[(u8, Option<u8>)]) -> PackedL
     packs.sort_unstable();
     packs.dedup_by_key(|p| p.0);
     // Per parameter: its first row, the dwords used, the elements.
-    let mut layout: Vec<(u8, u8, Vec<(u8, u8, u8, u8)>)> = Vec::new();
+    let mut layout: Vec<(u8, u8, Vec<Placed>)> = Vec::new();
     let mut behind = Vec::new();
     for &(a, b) in &packs {
         let mut placed = Vec::new();
