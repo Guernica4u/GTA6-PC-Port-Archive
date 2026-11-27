@@ -86,11 +86,6 @@ WAVE64 = {
 }
 
 
-# Programs the form for 32-lane hosts cannot run yet: the scan's permute fetches lanes
-# EXEC has not got, which that form refuses.
-NATIVE_ONLY = {"scan"}
-
-
 def program(body, width):
     size = "64" if width == 64 else "32"
     exec_, saved = ("exec", "s[12:13]") if width == 64 else ("exec_lo", "s12")
@@ -203,8 +198,6 @@ def main(argv=None):
         for form, width, bodies in (("32", 32, WAVE32), ("64", 64, WAVE64), ("64-paired", 64, WAVE64)):
             paired = form == "64-paired"
             for name, body in bodies.items():
-                if paired and name in NATIVE_ONLY:
-                    continue
                 words = words_of(program(body, width), args.llvm_mc, *WAVE_OPTIONS[width])
                 emitted = subprocess.check_output(
                     [args.emitter.resolve(), form, *(f"{word:08x}" for word in words)], text=True, timeout=30)
