@@ -39,13 +39,13 @@ impl PastHeap {
         }
     }
 
-    /// Counts a title slot past a heap of `count` slots: the skips so far,
-    /// the highest index seen, and the heap's size.
-    fn note(&self, index: u32, count: u32) -> (u64, u32, u32) {
-        let skips = self.skips.fetch_add(1, Ordering::Relaxed) + 1;
+    /// Counts a title slot past a heap of `count` slots: the highest index
+    /// seen among them.
+    fn note(&self, index: u32, count: u32) -> u32 {
+        self.skips.fetch_add(1, Ordering::Relaxed);
         let highest = self.highest.fetch_max(index, Ordering::Relaxed).max(index);
         self.count.store(count, Ordering::Relaxed);
-        (skips, highest, count)
+        highest
     }
 
     /// The skips so far, the highest index seen, and the heap's size.
@@ -67,11 +67,11 @@ pub(crate) fn slots_past(count: u32, highest: u32) -> u32 {
     highest.saturating_sub(count.saturating_sub(1))
 }
 
-/// Whether the `count`th skipped slot is worth a warning: the first one, and
-/// then every doubling, so the log shows how far past the heap the title went
-/// without a line per slot.
-fn worth_a_warning(count: u64) -> bool {
-    count == 1 || count.is_power_of_two()
+/// Whether the `past`th title slot past the host heap is worth a warning:
+/// the first one, and then every doubling, so the log shows how far past the
+/// heap the title went without a line per slot.
+fn worth_a_warning(past: u32) -> bool {
+    past > 0 && past.is_power_of_two()
 }
 
 pub(crate) struct HostHeap {
@@ -785,10 +785,11 @@ impl HostHeap {
             // Diagnostic (NVIDIA heap cap): the title's slots past the host
             // heap. The count of them is in the run's statistics; a warning
             // per slot floods the log.
-            let (skips, highest, _) = PAST_HEAP.note(index, self.count);
-            if worth_a_warning(skips) {
+            let highest = PAST_HEAP.note(index, self.count);
+            let past = slots_past(self.count, highest);
+            if worth_a_warning(past) {
                 tracing::warn!(
-                    skips,
+                    past,
                     index,
                     highest,
                     count = self.count,
@@ -1891,15 +1892,15 @@ mod tests {
 
     /// The title's slots past a capped host heap are counted, and the log
     /// names the first of them and every doubling after it: a warning per
-    /// skip floods the log (310 720 lines in one world load).
+    /// slot past the heap floods the log (310 720 lines in one world load).
     #[test]
     fn the_slots_past_a_capped_heap_are_counted_and_the_log_names_a_few() {
         let past = PastHeap::new();
         assert_eq!(past.get(), (0, 0, 0));
-        assert_eq!(past.note(1_245_183, 934_464), (1, 1_245_183, 934_464));
-        assert_eq!(past.note(934_464, 934_464), (2, 1_245_183, 934_464));
+        assert_eq!(past.note(1_245_183, 934_464), 1_245_183);
+        assert_eq!(past.note(934_464, 934_464), 1_245_183);
         assert_eq!(past.get(), (2, 1_245_183, 934_464));
-        // The warnings: the first skip and then every doubling.
+        // The warnings: the first slot past the heap and then every doubling.
         assert!(worth_a_warning(1));
         assert!(worth_a_warning(2));
         assert!(!worth_a_warning(3));
@@ -1907,9 +1908,11 @@ mod tests {
         assert!(!worth_a_warning(5));
         assert!(worth_a_warning(1 << 20));
         assert!(!worth_a_warning((1 << 20) + 1));
-        // A run with 2 097 152 skips names 22 of them.
-        let named = (1..=2_097_152).filter(|n| worth_a_warning(*n)).count();
-        assert_eq!(named, 22);
+        assert!(!worth_a_warning(0));
+        // A title 310 720 slots past the heap names 19 of them, however many
+        // times the slots are skipped.
+        let named = (1..=310_720).filter(|n| worth_a_warning(*n)).count();
+        assert_eq!(named, 19);
         // The title's slots are numbered from zero: the ones past the heap
         // are those from the heap's last slot to the highest index seen.
         assert_eq!(slots_past(934_464, 1_245_183), 310_720);
