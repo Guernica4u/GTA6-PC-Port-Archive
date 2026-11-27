@@ -401,6 +401,44 @@ fn a_literal_sampler_takes_the_private_static_the_runtime_appends() {
 }
 
 #[test]
+fn a_missing_literal_sampler_binds_the_private_register() {
+    // A compute program whose literal sampler state the root does not hold.
+    // The runtime appends the state after every sampler register the root
+    // uses; the translator must bind the same private register.
+    let mut words = SAMPLE[..4].to_vec();
+    words.extend([0xb0140092, 0xbe9503ff, 0x00c00000, 0xbe9603ff, 0x18500000, 0xbe970380]);
+    words.extend(&SAMPLE[6..]);
+    let isa: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let mut ex = super::super::mesh::heap_extract(&[], 0x400, &isa);
+    ex.stage = Stage::Compute;
+    ex.shader_model = (6, 6);
+    ex.required_features = Some(3 << 25);
+    ex.fssm = fssm(&[CONSTANTS, RESOURCE_HEAP, SAMPLER_HEAP], &[USED]);
+    ex.resources = vec![
+        PsvResource { res_type: 2, space: 0, lower: 500, upper: 500 },
+        PsvResource { res_type: 1, space: 1, lower: 5, upper: 5 },
+    ];
+    let mut point = [0u32; 13];
+    point[1..4].fill(3); // clamp
+    point[9] = 12.0_f32.to_bits();
+    point[10] = 5;
+    point[11] = 1;
+    point[12] = 0;
+    ex.root_sig = Some(crate::meta::RootSig {
+        version: 2,
+        flags: 0x400,
+        params: Vec::new(),
+        num_static_samplers: 1,
+        static_samplers: vec![point],
+    });
+    ex.has_root_sig = true;
+    let insns = crate::rdna2::disassemble(&ex.isa);
+    let em = super::super::Emitter::new(&ex, insns.clone());
+    assert_eq!(em.private_samplers.len(), 1);
+    assert!(em.private_samplers.values().all(|&r| r == 6), "{:?}", em.private_samplers);
+}
+
+#[test]
 fn cube_sample_with_lod_clamp_lowers_without_an_offset() {
     // The sample instruction with dim=3 (cube) and modi=1 (clamp).
     // v[4:6] coordinates, v7 clamp, v8 result.
@@ -444,4 +482,104 @@ fn cube_sample_with_derivatives_and_a_lod_clamp_lowers() {
     let call = cube_gradient_call(0xf08c0118);
     let expected = format!("{}, {}, asfloat(v11));", along(4, 5), along(6, 7));
     assert!(call.ends_with(&expected), "{call}");
+}
+
+/// The Lanes `bindless-table` program under its root: one table with two raw
+/// UAVs (u0 and u1, space1), one root constant (b0) and the direct-indexing
+/// flag, followed by `private` root SRVs of the runtime (registers in space 32766).
+fn table_constant_and_heap(private: &[u32]) -> ShaderExtract {
+    use crate::meta::{RootParam, RootRange};
+    let words = [
+        0xbe800304u32, 0xbe810380, // s[0:1] = table 0
+        0xf4080200, 0xfa000020, // s[8:11] = table[s0:1] + 0x20
+        0x8f028505, // s2 = s5 << 5, the root constant
+        0xf4080303, 0x04000000, // s[12:15] = heap[s6:7][s2]
+        0x7e000281, // v0 = 1
+        0xe0700000, 0x80020000, // table UAV store
+        0x7e0202ff, 0x7ab1e232, // v1
+        0xe0700000, 0x80030100, // heap UAV store
+        0xbf810000,
+    ];
+    let isa: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let mut ex = super::super::mesh::heap_extract(&[], 0x400, &isa);
+    ex.stage = Stage::Compute;
+    ex.shader_model = (6, 6);
+    ex.psv_threads = Some([64, 1, 1]);
+    ex.fssm = fssm(
+        &[[3, 8, 1, 1, 0x4], [0, 0, 1, 0, 0x105], [5, 0, 1, 0, 6]],
+        &[[0x303, 8, 1, 1, 0x404], [2, 0, 0, 0, 0x1_0504]],
+    );
+    ex.resources = vec![
+        PsvResource { res_type: 7, space: 1, lower: 1, upper: 1 },
+        PsvResource { res_type: 2, space: 0, lower: 0, upper: 0 },
+    ];
+    let root = ex.root_sig.as_mut().unwrap();
+    root.version = 2;
+    root.params = vec![
+        RootParam { visibility: 0, kind: RootParamKind::Table(vec![
+            RootRange { range_type: 1, num: 2, base_register: 0, space: 1, offset_in_table: u32::MAX }]) },
+        RootParam { visibility: 0, kind: RootParamKind::Constants { register: 0, space: 0, num32: 1 } },
+    ];
+    root.params.extend(private.iter().map(|&register| RootParam {
+        visibility: 0, kind: RootParamKind::Descriptor { kind: 3, register, space: 32766 },
+    }));
+    ex
+}
+
+#[test]
+fn the_runtimes_private_root_srvs_leave_a_compute_roots_layout_alone() {
+    let guest = super::super::translate(&table_constant_and_heap(&[])).unwrap().hlsl;
+    for line in [
+        "cbuffer TBIndex0_0 : register(b0, space0) { uint tb_index0_0; };",
+        "s5 = tb_index0_0.x;",
+        "s12 = tb_heap_index(s2 >> 5);",
+        "uint tb_heap_index(uint i) { return i; }",
+        "RWByteAddressBuffer raw_ubuf1 : register(u1, space1);",
+    ] {
+        assert!(guest.contains(line), "{line}\n{guest}");
+    }
+    // With the index map appended, the root constant and every register stay
+    // where the title's root put them. Only the heap index goes through the map.
+    let mapped = super::super::translate(&table_constant_and_heap(&[0])).unwrap().hlsl;
+    let expected = guest.replace(
+        "uint tb_heap_index(uint i) { return i; }",
+        "uint tb_heap_index(uint i) { return tb_heap_map.Load(0) == 0u ? i : tb_heap_map.Load(4u+i*4u); }",
+    );
+    let declared: String = mapped.lines()
+        .filter(|line| *line != "ByteAddressBuffer tb_heap_map : register(t0, space32766);")
+        .flat_map(|line| [line, "\n"]).collect();
+    assert_ne!(declared, mapped, "{mapped}");
+    assert_eq!(declared, expected);
+    // The stride table alone, or after the map, changes how the heap descriptor
+    // is loaded, not where the constant is. A root SRV of the title's own is a
+    // parameter like any other: it does change the root's shape.
+    for private in [&[1][..], &[0, 1]] {
+        let strided = super::super::translate(&table_constant_and_heap(private)).unwrap().hlsl;
+        for line in ["cbuffer TBIndex0_0 : register(b0, space0) { uint tb_index0_0; };", "s5 = tb_index0_0.x;", "tb_heap_strides.Load"] {
+            assert!(strided.contains(line), "{private:?}: {line}\n{strided}");
+        }
+    }
+}
+
+#[test]
+fn scalar_load_through_a_root_descriptor_address_is_refused() {
+    // A root SRV's address arrives in s7:s8 (user-data class 1). A scalar load
+    // through it reads the buffer's own words, not a descriptor of a table.
+    let words = [
+        0xbe800307, // s0 = s7
+        0xbe810308, // s1 = s8
+        0xf4000080, 0xfa000000, // s2 = [s0:1 + 0]
+        0x7e000202, // v0 = s2
+        0xbf810000,
+    ];
+    let mut ex = pixel(&words);
+    ex.stage = Stage::Compute;
+    ex.required_features = None;
+    ex.fssm = fssm(&[[1, 0, 2, 5, 0x307]], &[[0x100, 0, 5, 1, 0x30704]]);
+    ex.resources = vec![PsvResource { res_type: 4, space: 7, lower: 5, upper: 5 }];
+    assert!(refusal(&ex).contains("s_load at 0x8: base s7 is a root descriptor address"));
+    // The same load through a register no record names is a table fetch, as before.
+    ex.fssm = fssm(&[], &[]);
+    ex.resources.clear();
+    assert!(super::super::translate(&ex).is_ok());
 }

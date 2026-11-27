@@ -127,24 +127,32 @@ Frosty’s menu material at entry 2 illustrates the overlap with AnyPS5’s inst
 
 ## ProjectScarlett refusals
 
-On November 25, 2026, preparation compiled 20,583 of 25,079 recorded requests and refused 4,496. None failed in DXC or the validator. [Preparation record](../evidence/projectscarlett-shader-preparation.json)
+On November 26, 2026, preparation compiled 36,653 of 41,064 recorded requests and refused 4,411. None failed in DXC or the validator. [Preparation record](../evidence/projectscarlett-shader-preparation.json)
 
 | Refusal reason | Requests |
 | --- | --- |
-| Mesh request recorded without a root signature | 1,551 |
-| Wave reduction that may execute in divergent control flow | 1,502 |
-| Image store to a table that isn't an unordered-access table | 432 |
-| Buffer store to a table that isn't an unordered-access table | 145 |
-| Raw buffer `IDXEN` access that needs the console descriptor stride | 129 |
-| Lane operation with a non-constant lane | 115 |
+| Mesh request recorded without a root signature | 1,567 |
+| Image store to a table that isn't an unordered-access table | 670 |
+| Sampler built from literal words that the recorded root doesn't hold | 465 |
+| Raw buffer `IDXEN` access that needs the console descriptor stride | 337 |
+| Image sample from an unordered-access table the root doesn't describe (`u7`) | 236 |
+| Lane operation with a non-constant lane | 203 |
+
+Translator changes since then have removed many of these. On November 27 the translator alone, without DXC, translated 38,263 of 42,672 recorded requests.
 
 The counts are per recorded request, so they overstate what a live run loses: a request recorded without its root signature can't be translated offline. Rank failures by the pipelines a run lost with the [pipeline failure record](PROJECTSCARLETT.md#finding-why-pipelines-fail).
+
+### ProjectScarlett shadow rays
+
+The game traces rays in its own compute programs, as loops over the console's raw acceleration structure nodes, which the translator can't run. Four shadow programs have those loops replaced with native ray queries: the two irradiance cache shadow traces, the sun shadows and the spot lamp shadows ([lowering](../tools/shader-compiler/src/hlsl/scarlett_rays.rs)). Each is matched by name and exact code. A [replay of recorded requests](../tools/check_scarlett_rays.py) matched the expected geometry on an RTX 4070 Ti SUPER and a Radeon iGPU.
+
+In the game these dispatches still do nothing, because its ray tracing scenes aren't built yet. The native query counts every triangle, where the console's sun walk ignores a hit on an object marked with a zero word.
 
 ### Block dispatcher
 
 When a program's loops can't be nested, the translator puts its basic blocks into one loop in which each thread runs the block it is at. The blocks are tested in program order on the thread's current block, so one pass follows every forward jump and only a jump back needs another. One test skips 24 blocks.
 
-Such programs are compiled without DXC's lifetime markers, or at `-O0` when that fails or the target is `cs_6_6`. At the default level with the markers, RADV (Mesa 26.1.8) spent 130 seconds and 20 GB on one ProjectScarlett pixel program. Without them it took 0.1 seconds.
+All programs are first compiled without DXC's lifetime markers, with which DXC can spend most of a large compile in Jump Threading. A DXC that lists `-fnew-inlining-behavior` also gets it for every target but `lib_6_3`. `cs_6_6` uses `-O1` and falls back to `-O0`. Other targets use the default level; one that runs out of time falls back to `-O0`, and output that is rejected is compiled again with the markers. Dispatcher programs never keep the markers: they fall back to `-O0`. At the default level with the markers, RADV (Mesa 26.1.8) spent 130 seconds and 20 GB on one ProjectScarlett pixel program. Without them it took 0.1 seconds.
 
 ### Whole-wave branches
 
@@ -160,11 +168,19 @@ A [GPU check](../tools/check_mask_ballots_gpu.py) compares both widths with a mo
 
 Most wave reduction refusals come from programs over 6,000 instructions, where the translator doesn't try its one-lane-per-wave form. In a trial on an earlier set of 1,442 such compute shaders, removing that limit translated 1,211. Six sampled outputs compiled in 2 to 12 seconds with DXC optimization off, and mostly produced 1 to 2 MB of DXIL. Large compiles in a recorded run took the driver 6 minutes or more, so the limit stays until the generated code compiles faster. The outputs weren't tested in a game.
 
+### Lanes counted by key
+
+Ray binning counts the lanes of a wave by a key each lane holds. The console serves one key per pass of a loop: it sums the lanes that hold the first remaining lane's key across the wave, and one of them adds the count to a buffer. The loop ends when a mask of the remaining lanes is empty, which a thread that holds only its own bit can't tell, so these programs were refused. When a loop has exactly that shape, the translator now has every counting lane add 1 at its own key ([rewrite](../tools/shader-compiler/src/hlsl/rewrite/key_counts.rs)). The buffer ends the same, no lane reads another, and the host's wave width doesn't matter. The loop stays as it was if anything reads a register it leaves different, or if another instruction uses the counters, since they pass through values the console's never hold. The rewrite is a last resort: a program the translator handles any other way keeps that translation. A 32-lane program, for example, keeps the wave together for the loop's lane reads ([retry](../tools/shader-compiler/src/hlsl/lockstep.rs)), so it is not rewritten.
+
+On 27,116 recorded ProjectScarlett requests, four more translate, all `CS_ScreenProbes_TraceRays_Fallback`, and every other request gives the same result or the same output byte for byte. A [GPU check](../tools/check_key_counts_gpu.py) compares 12 cases of a synthetic 64-lane loop with a model of the console, for groups of one and two waves. This hasn't been tested in the game.
+
 ### 64-lane programs on 32-lane hosts
 
 Many console compute programs need all 64 lanes of a wave, and a host such as an NVIDIA card runs at most 32. When the [host profile](USAGE.md#host-profile) shows that, the provider asks the compiler for a second translation of the program (`--wave32-host`), cached beside the ordinary one as `<hash>_w32`. A 64-lane host never asks, so it keeps the ordinary translation.
 
 In that [translation](../tools/shader-compiler/src/hlsl/paired_wave64.rs) each host thread runs two console lanes, `n` and `n + 32`. Scalar registers and lane masks hold their full console values, identical across the wave, so branches and scalar instructions need no special cases. Vector registers are stored once per lane, each vector instruction runs once for each, and the masks it produces are rebuilt from all 64 results. An instruction that crosses lanes in a way the translation doesn't know is refused.
+
+A group of exactly 32 threads fills half a console wave: lanes 0 to 31 run its threads and lanes 32 to 63 never start. A reduction over the whole wave still reads those lanes, so the ordinary translation, which gives each thread one lane, refuses the program. Every host gets the two-lane form instead, as one 32-lane host wave whose upper lanes begin outside EXEC. The check below runs its programs this way too, all but the shared-memory one, and those cases match on an RTX 4070 Ti SUPER and on an AMD Raphael iGPU.
 
 A [GPU check](../tools/check_paired_wave64.py) compares 18 synthetic programs with a model of the console, 256 waves each. All match on an RTX 4070 Ti SUPER and on a Radeon 610M forced to 32 lanes. The check covers lane masks and branches, lane reads and counts, DPP and row exchanges, shared memory with barriers, interleaved loops and groups of four waves. It doesn't cover buffers or textures, and it can't detect a missing memory ordering. Console code may also rely on a wave running in step without a barrier, which neither translation guarantees.
 

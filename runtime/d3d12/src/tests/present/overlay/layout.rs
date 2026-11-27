@@ -20,7 +20,7 @@ fn rows_start_on_256_byte_boundaries() {
 
 #[test]
 fn panel_sits_in_the_requested_corner() {
-    let panel = panel_size(1);
+    let panel = panel_size((BASE_WIDTH, BASE_HEIGHT), 1);
     let screen = (1920, 1080);
     assert_eq!(origin(Corner::TopLeft, panel, screen, 1), Some((16, 16)));
     assert_eq!(origin(Corner::TopRight, panel, screen, 1), Some((1920 - 380 - 16, 16)));
@@ -30,9 +30,9 @@ fn panel_sits_in_the_requested_corner() {
 
 #[test]
 fn panel_that_does_not_fit_is_skipped() {
-    assert_eq!(origin(Corner::TopRight, panel_size(1), (400, 1080), 1), None);
-    assert_eq!(origin(Corner::TopRight, panel_size(1), (1920, 100), 1), None);
-    assert!(origin(Corner::TopRight, panel_size(1), (380 + 32, BASE_HEIGHT + 32), 1).is_some());
+    assert_eq!(origin(Corner::TopRight, panel_size((BASE_WIDTH, BASE_HEIGHT), 1), (400, 1080), 1), None);
+    assert_eq!(origin(Corner::TopRight, panel_size((BASE_WIDTH, BASE_HEIGHT), 1), (1920, 100), 1), None);
+    assert!(origin(Corner::TopRight, panel_size((BASE_WIDTH, BASE_HEIGHT), 1), (380 + 32, BASE_HEIGHT + 32), 1).is_some());
 }
 
 #[test]

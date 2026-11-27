@@ -219,7 +219,11 @@ fn next_bit(valid: &[u64], mut at: usize, limit: usize, set: bool) -> usize {
     at.min(limit)
 }
 
-fn query_region(address: usize) -> Result<(usize, MEMORY_BASIC_INFORMATION)> {
+/// Where a run of pages with one state and protection ends, that state, and
+/// whether a plain store may publish into it.
+type Region = (usize, MEMORY_BASIC_INFORMATION, bool);
+
+fn query_region(address: usize) -> Result<Region> {
     let mut info = MEMORY_BASIC_INFORMATION::default();
     // SAFETY: VirtualQuery probes the address and fills a local structure.
     if unsafe {
@@ -236,7 +240,27 @@ fn query_region(address: usize) -> Result<(usize, MEMORY_BASIC_INFORMATION)> {
         .checked_add(info.RegionSize)
         .filter(|&end| end > address)
         .ok_or(E_INVALIDARG)?;
-    Ok((end, info))
+    Ok((end, info, stores_directly(&info)))
+}
+
+/// Ordinary committed read-write data pages take a plain store. A write-watch
+/// region keeps the native write, so what the title's watch records for a
+/// published texture stays as it was on every host: a watch that Wine keeps
+/// with page protection misses the native write but would record a store.
+fn stores_directly(info: &MEMORY_BASIC_INFORMATION) -> bool {
+    info.State == MEM_COMMIT
+        && info.Protect == PAGE_READWRITE
+        && super::guarded_copy::available()
+        && !watched(info.BaseAddress)
+}
+
+/// Whether the region records CPU writes for GetWriteWatch. The query fails on
+/// a region that was not allocated with MEM_WRITE_WATCH, and with no reset
+/// flag it leaves the record alone.
+fn watched(base: *mut core::ffi::c_void) -> bool {
+    let (mut address, mut count, mut granularity) = (core::ptr::null_mut(), 1usize, 0u32);
+    // SAFETY: the outputs are locals sized for one address.
+    unsafe { GetWriteWatch(0, base, 4096, Some(&mut address), Some(&mut count), Some(&mut granularity)) == 0 }
 }
 
 fn mapped_region(info: &MEMORY_BASIC_INFORMATION) -> bool {
@@ -249,8 +273,13 @@ fn write_mapped(
     base: usize,
     bytes: &[u8],
     range: Range<usize>,
-    region: &mut (usize, MEMORY_BASIC_INFORMATION),
+    region: &mut Region,
 ) -> Result<()> {
+    if let Some(addr) = base.checked_add(range.start)
+        && let Some(result) = super::super::heap::backing::try_write_xmem_bytes(addr as u64, &bytes[range.start..range.end])
+    {
+        return result;
+    }
     let mut at = range.start;
     while at < range.end {
         let addr = base.checked_add(at).ok_or(E_INVALIDARG)?;
@@ -278,11 +307,20 @@ fn write_mapped(
             let mut written = 0;
             // SAFETY: the source is an owned initialized slice. Guest mappings
             // remain owned by the guest until the submission fence completes.
-            // Use the native write for data pages so Wine doesn't repeat its
-            // region scan for every run. Keep the instruction-cache flush for
+            // Plain data pages take a store: under Wine the native write is a
+            // request to the server for every run, even in this process. The
+            // guest can still unmap the pages after the query above, so the
+            // store reports a fault as the native write does. Write-watch and
+            // copy-on-write pages keep the native write, which also saves
+            // Wine's region scan. Keep the instruction-cache flush for
             // executable mappings.
             unsafe {
-                if matches!(access, PAGE_READWRITE | PAGE_WRITECOPY) {
+                if region.2 {
+                    if !super::guarded_copy::copy(addr as *mut u8, block) {
+                        return Err(E_FAIL.into());
+                    }
+                    written = block.len();
+                } else if matches!(access, PAGE_READWRITE | PAGE_WRITECOPY) {
                     let status = NtWriteVirtualMemory(
                         GetCurrentProcess(),
                         addr as *mut _,
@@ -311,3 +349,7 @@ fn write_mapped(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "../../tests/device/placement_writeback.rs"]
+mod tests;

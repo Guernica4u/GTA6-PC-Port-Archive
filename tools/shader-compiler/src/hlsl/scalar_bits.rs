@@ -17,7 +17,9 @@ fn shape(m: &str) -> Option<Shape> {
     let (src, dst, reads_dst, indexed) = match m {
         "s_bcnt0_i32_b32" | "s_ff0_i32_b32" | "s_flbit_i32" => (1, 1, false, false),
         "s_bcnt0_i32_b64" | "s_ff0_i32_b64" | "s_flbit_i32_b64" | "s_flbit_i32_i64" => (2, 1, false, false),
-        "s_brev_b64" => (2, 2, false, false),
+        "s_brev_b64" | "s_quadmask_b64" => (2, 2, false, false),
+        "s_quadmask_b32" => (1, 1, false, false),
+        "s_bitreplicate_b64_b32" => (1, 2, false, false),
         "s_bitset0_b64" | "s_bitset1_b64" => (1, 2, true, false),
         "s_bitcmp0_b64" | "s_bitcmp1_b64" => (2, 0, false, true),
         _ => return None,
@@ -138,6 +140,7 @@ fn ordinary_sites(em: &Emitter<'_>) -> BTreeSet<usize> {
             | "s_lshl_b32" | "s_lshr_b32" | "s_ashr_i32" | "s_lshl_b64" | "s_lshr_b64"
             | "s_ashr_i64" | "s_not_b32" | "s_not_b64" | "s_bcnt1_i32_b32"
             | "s_bcnt1_i32_b64" | "s_bcnt0_i32_b32" | "s_bcnt0_i32_b64"
+            | "s_quadmask_b32" | "s_quadmask_b64"
             | "s_abs_i32" | "s_bfe_u32" | "s_bfe_i32" =>
                 width>0 && ins.dst.first().and_then(|d| register(d,width)).is_some(),
             "s_mov_b32" | "s_mov_b64" | "s_movk_i32" | "s_cmov_b32" | "s_cmov_b64"
@@ -145,7 +148,7 @@ fn ordinary_sites(em: &Emitter<'_>) -> BTreeSet<usize> {
             | "s_ff0_i32_b32" | "s_ff0_i32_b64" | "s_ff1_i32_b32"
             | "s_flbit_i32_b32" | "s_flbit_i32_b64" | "s_flbit_i32" | "s_flbit_i32_i64"
             | "s_sext_i32_i8" | "s_sext_i32_i16" | "s_bitset0_b32" | "s_bitset1_b32"
-            | "s_bitset0_b64" | "s_bitset1_b64" | "s_mul_i32" =>
+            | "s_bitset0_b64" | "s_bitset1_b64" | "s_bitreplicate_b64_b32" | "s_mul_i32" =>
                 known_scc && width>0 && ins.dst.first().and_then(|d| register(d,width)).is_some(),
             _ => false,
         };
@@ -199,6 +202,35 @@ pub(super) fn emit(em: &mut Emitter<'_>, idx: usize, ins: &Insn) -> Result<bool,
             em.line(&format!("uint {index} = {a} & 63u;"));
             em.line(&format!("uint {low} = {dl} {op} ({index} < 32u ? (1u << ({index} & 31u)) : 0u);"));
             em.line(&format!("uint {high} = {dh} {op} ({index} >= 32u ? (1u << ({index} & 31u)) : 0u);"));
+            em.ws(dst, &low)?;
+            em.ws(&hi(dst), &high)?;
+        }
+        "s_quadmask_b32" | "s_quadmask_b64" => {
+            // Bit k of the result is set when any bit of quad k (bits 4k..4k+3) is.
+            let quads = |word: &str, first: u32| format!(
+                "((({word} | ({word} >> 1u) | ({word} >> 2u) | ({word} >> 3u)) >> (4u * tb_bit{t}k)) & 1u) << (tb_bit{t}k + {first}u)");
+            em.line(&format!("uint {low} = 0u;"));
+            em.line(&format!("[unroll] for (uint tb_bit{t}k = 0u; tb_bit{t}k < 8u; tb_bit{t}k++) {{"));
+            em.line(&format!("    {low} |= {};", quads(&a, 0)));
+            if m == "s_quadmask_b64" {
+                em.line(&format!("    {low} |= {};", quads(&upper, 8)));
+            }
+            em.line("}");
+            em.line(&format!("scc = uint({low} != 0u);"));
+            em.ws(dst, &low)?;
+            if m == "s_quadmask_b64" {
+                em.ws(&hi(dst), "0u")?;
+            }
+        }
+        "s_bitreplicate_b64_b32" => {
+            // Each source bit k becomes destination bits 2k and 2k + 1.
+            for (word, half) in [(&low, "0u"), (&high, "16u")] {
+                em.line(&format!("uint {word} = ({a} >> {half}) & 0xffffu;"));
+                for (shift, mask) in [(8, "0x00ff00ffu"), (4, "0x0f0f0f0fu"), (2, "0x33333333u"), (1, "0x55555555u")] {
+                    em.line(&format!("{word} = ({word} | ({word} << {shift}u)) & {mask};"));
+                }
+                em.line(&format!("{word} |= {word} << 1u;"));
+            }
             em.ws(dst, &low)?;
             em.ws(&hi(dst), &high)?;
         }

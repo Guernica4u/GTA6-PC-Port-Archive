@@ -3,7 +3,7 @@ use crate::{ShaderExtract, Stage, rdna2::disassemble};
 
 // Assembled by llvm-mc -mcpu=gfx1030. Include aliasing destinations,
 // especially scalar searches that overwrite the high source word.
-const OPS: [(&str, u32); 12] = [
+const OPS: [(&str, u32); 15] = [
     ("s_brev_b64", 0xbe82_0c02),
     ("s_bcnt0_i32_b32", 0xbe82_0d02),
     ("s_bcnt0_i32_b64", 0xbe83_0e02),
@@ -16,6 +16,9 @@ const OPS: [(&str, u32); 12] = [
     ("s_bitset1_b64", 0xbe82_1e02),
     ("s_bitcmp0_b64", 0xbf0e_0402),
     ("s_bitcmp1_b64", 0xbf0f_0402),
+    ("s_quadmask_b32", 0xbe82_2c02),
+    ("s_quadmask_b64", 0xbe82_2d02),
+    ("s_bitreplicate_b64_b32", 0xbe82_3b02),
 ];
 
 fn extract(words: &[u32]) -> ShaderExtract {
@@ -78,6 +81,23 @@ fn refuses_unknown_halves_wave_masks_and_branch_entries() {
         let at = ops.iter().position(|i| i.mnemonic == "s_brev_b64").unwrap();
         let mut emitter = Emitter::new(&ex, ops.clone());
         assert!(emit(&mut emitter, at, &ops[at]).is_err(), "{words:x?}");
+    }
+}
+
+#[test]
+fn quad_masks_and_replication_of_wave_masks_are_refused() {
+    for words in [
+        // s_quadmask_b64 s[2:3], exec
+        vec![0xbe82_2d7e, 0xbf81_0000],
+        // s_quadmask_b32 s2, vcc_lo
+        vec![0xbe82_2c6a, 0xbf81_0000],
+        // s_bitreplicate_b64_b32 s[2:3], s3 without a reaching definition
+        vec![0xbe82_3b03, 0xbf81_0000],
+    ] {
+        let ex = extract(&words);
+        let ops = disassemble(&ex.isa);
+        let mut emitter = Emitter::new(&ex, ops.clone());
+        assert!(emit(&mut emitter, 0, &ops[0]).is_err(), "{words:x?}");
     }
 }
 
@@ -223,5 +243,25 @@ fn scalar_bit_cpu_oracle_fixture() {
         }
         hlsl.push_str("}\n");
         println!("BEGIN_SCALAR {name}\n{hlsl}END_SCALAR {name}");
+    }
+}
+
+#[test]
+fn nor_xnor_and_orn1_saveexec_combine_with_exec() {
+    // s_mov_b32 s4, 1; s_mov_b32 s5, 2; then each saveexec form (llvm-mc -mcpu=gfx1030).
+    for (op, lo, high) in [
+        (0xbe86_4204, "~(s4 | exec_lo)", None),
+        (0xbe86_4304, "~(s4 ^ exec_lo)", None),
+        (0xbe86_4504, "~s4 | exec_lo", None),
+        (0xbe86_2a04, "~(s4 | exec_lo)", Some("~(s5 | exec_hi)")),
+        (0xbe86_2b04, "~(s4 ^ exec_lo)", Some("~(s5 ^ exec_hi)")),
+        (0xbe86_3804, "~s4 | exec_lo", Some("~s5 | exec_hi")),
+    ] {
+        let ex = extract(&[0xbe84_03ff, 1, 0xbe85_03ff, 2, op, 0xbf81_0000]);
+        let hlsl = super::super::translate(&ex).unwrap_or_else(|e| panic!("{op:x}: {e}")).hlsl;
+        assert!(hlsl.contains(&format!("= {lo};")), "{hlsl}");
+        assert!(hlsl.contains("s6 = exec_lo;"), "{hlsl}");
+        assert_eq!(high.is_some_and(|h| hlsl.contains(&format!("= {h};"))), high.is_some(), "{hlsl}");
+        assert!(hlsl.contains("scc = ("), "{hlsl}");
     }
 }

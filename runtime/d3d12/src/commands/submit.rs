@@ -86,6 +86,8 @@ pub(super) unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut
     let mut tails = Vec::new();
     let mut list_index = 0;
     let trace_samples = std::cell::RefCell::new(Vec::new());
+    // Shader-visible ranges the batch reads without being able to write them.
+    let read_views = std::cell::RefCell::new(Vec::new());
     // The lists in this batch that write or wait on fence labels.
     let batch = std::cell::RefCell::new(String::new());
     let result = translate_batch(
@@ -157,6 +159,7 @@ pub(super) unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut
                 .map_err(|_| E_OUTOFMEMORY)?;
             writes.extend(state.placed_writes.iter().cloned());
             shader_views.extend(state.sampled_heaps.iter().cloned());
+            read_views.borrow_mut().extend(state.read_heaps.iter().cloned());
             trace_samples.borrow_mut().extend(state.trace_samples.iter().cloned());
             if state.native() != &list.native {
                 tails.try_reserve(1).map_err(|_| E_OUTOFMEMORY)?;
@@ -169,6 +172,7 @@ pub(super) unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut
                 .then(|| placement::held::Waits::new(splits.len().into()));
             let waits = holds.clone();
             unsafe {
+                placement::gather_reads(parent(&queue.parent), &read_views.borrow(), &mut textures);
                 placement::submit(
                     parent(&queue.parent),
                     &queue.native,

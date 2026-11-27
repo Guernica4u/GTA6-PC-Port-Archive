@@ -30,6 +30,29 @@ impl<'a> Emitter<'a> {
         return Ok(());
     }
 
+    /// A DPP8 or DPP16 row-mirror move in a wave that is kept together. Both
+    /// forms fetch only active sources here: an inactive one reads zero.
+    pub(in crate::hlsl) fn emit_lockstep_dpp_move(&mut self, d: Opnd, ins: &Insn) -> Result<(), String> {
+        let control = *ins.raw.get(1).ok_or("lane move without its control word")?;
+        let source = Opnd::Vgpr(control as u8);
+        self.touch(&source);
+        let value = r(&source)?;
+        let t = self.tmp;
+        self.tmp += 1;
+        let lane = format!("t{t}lane");
+        let partner = match ins.src.first() {
+            // Three selector bits for each lane of a group of eight, FI=0.
+            Some(Opnd::Raw(233)) => format!("({lane} & ~7u) | (({:#x}u >> (3u * ({lane} & 7u))) & 7u)", control >> 8),
+            // row_mirror with every bank and row, FI=0, BOUND_CTRL=1, no modifiers.
+            Some(Opnd::Raw(250)) if control >> 8 == 0xff0940 => format!("({lane} & ~15u) | (15u - ({lane} & 15u))"),
+            _ => return Err("whole-wave lane reads: unsupported lane move".into()),
+        };
+        self.line(&format!("uint {lane} = WaveGetLaneIndex(); uint t{t}src = {partner};"));
+        self.line(&format!("uint t{t}value = WaveReadLaneAt({value}, t{t}src);"));
+        self.line(&format!("if ((WaveActiveBallot((exec_lo & 1u) != 0u).x & (1u << t{t}src)) == 0u) t{t}value = 0u;"));
+        self.wv(&d, &format!("t{t}value"))
+    }
+
     /// Read a lane from the other half of the wave.
     pub(in crate::hlsl) fn emit_permlanex16(&mut self, s: &[Opnd], d: Opnd, ins: &Insn) -> Result<(), String> {
         let flags = (ins.raw[0] >> 11) & 0xf;

@@ -10,8 +10,9 @@ pub(super) fn scale_for(height: u32) -> u32 {
     (height / 1080).clamp(1, 3)
 }
 
-pub(super) fn panel_size(scale: u32) -> (u32, u32) {
-    (BASE_WIDTH * scale, BASE_HEIGHT * scale)
+/// A panel of `width` by `height` pixels at 1080p, at `scale`.
+pub(super) fn panel_size((width, height): (u32, u32), scale: u32) -> (u32, u32) {
+    (width * scale, height * scale)
 }
 
 /// Buffer-to-texture copies need each row to start on a 256-byte boundary.

@@ -162,12 +162,14 @@ pub(super) unsafe extern "system" fn barrier(
         state.error = E_NOTIMPL;
         return;
     };
-    if let Err(error) =
-        unsafe { record(list, &native, slice::from_raw_parts(groups, count as usize)) }
-    {
+    let groups = unsafe { slice::from_raw_parts(groups, count as usize) };
+    if let Err(error) = unsafe { record(list, &native, groups) } {
         crate::diagnostics::recording_error(format_args!(
             "enhanced resource barrier group ({error:?})"
         ));
         state.error = error;
+    } else {
+        // SAFETY: record checked each group's count and pointer.
+        unsafe { state.active.indirect.groups(groups) };
     }
 }

@@ -19,6 +19,7 @@ pub(super) unsafe extern "system" fn transition(
     // only after checking the union tag.
     let guest = unsafe { slice::from_raw_parts(barriers, count as usize) };
     let cmd = state.native().clone();
+    let indirect = core::cell::Cell::new(state.active.indirect);
     let result = translate_batch(
         guest,
         Vec::new(),
@@ -157,6 +158,11 @@ pub(super) unsafe extern "system" fn transition(
             let mut handoffs = handoffs.into_iter().peekable();
             let mut first = 0;
             let submit = |run: &[RecordedBarrier]| {
+                let mut order = indirect.get();
+                for b in run {
+                    order.transition(b.kind, b.transition.flags, b.transition.after);
+                }
+                indirect.set(order);
                 if !run.is_empty() {
                     (cmd.vtable().ResourceBarrier)(
                         cmd.as_raw(),
@@ -180,6 +186,7 @@ pub(super) unsafe extern "system" fn transition(
             Ok(())
         },
     );
+    state.active.indirect = indirect.get();
     if let Err(error) = result {
         state.error = error;
     }
@@ -277,4 +284,36 @@ pub(super) fn global_cache_barrier(state: &mut Recording) {
     };
     // SAFETY: the native open list consumes the stack-backed group during Barrier.
     unsafe { native.Barrier(&[group]) };
+    state.active.indirect.barrier(barrier.SyncAfter, barrier.AccessAfter);
+}
+
+/// Make the next `ExecuteIndirect` read its arguments after everything
+/// recorded so far (see `indirect_order`).
+pub(super) fn order_indirect_reads(state: &mut Recording) {
+    // A bundle takes no barriers; the list that executes it orders its reads.
+    if state.list_type == D3D12_COMMAND_LIST_TYPE_BUNDLE {
+        return;
+    }
+    let Some(native) = state.enhanced_barriers() else {
+        static MISSING: std::sync::Once = std::sync::Once::new();
+        crate::diagnostics::log_once(&MISSING, || {
+            "ExecuteIndirect arguments are not ordered after earlier writes: no enhanced barriers".to_string()
+        });
+        return;
+    };
+    let barrier = indirect_order::BARRIER;
+    let group = D3D12_BARRIER_GROUP {
+        Type: D3D12_BARRIER_TYPE_GLOBAL,
+        NumBarriers: 1,
+        Anonymous: D3D12_BARRIER_GROUP_0 {
+            pGlobalBarriers: &barrier,
+        },
+    };
+    // SAFETY: the native open list consumes the stack-backed group during Barrier.
+    unsafe { native.Barrier(&[group]) };
+    state.active.indirect.barrier(barrier.SyncAfter, barrier.AccessAfter);
+    static FIRST: std::sync::Once = std::sync::Once::new();
+    crate::diagnostics::log_once(&FIRST, || {
+        "recorded a barrier ordering ExecuteIndirect arguments after earlier writes".to_string()
+    });
 }

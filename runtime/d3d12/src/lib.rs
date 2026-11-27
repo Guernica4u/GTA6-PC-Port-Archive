@@ -12,6 +12,7 @@ mod diagnostics;
 mod exports;
 mod failures;
 mod guids;
+mod performance;
 mod present;
 mod private_driver;
 mod progress;
@@ -194,6 +195,8 @@ extern "C" fn install_on_attach() {
         // SAFETY: `atexit` registers a per-DLL detach callback in the MSVC CRT.
         unsafe { atexit(uninstall_on_detach) };
     }
+    // The title can create its window as soon as its entry point runs.
+    present::install_splash();
 }
 
 #[cfg(not(test))]

@@ -118,6 +118,14 @@ fn host_wave_range(device: &Device) -> Option<(u32, u32)> {
         .then_some((options.WaveLaneCountMin, options.WaveLaneCountMax))
 }
 
+/// The PCI vendor and device identifiers of `adapter`, by which the operating
+/// system lists its sensors.
+pub(crate) fn pci_ids(adapter: &windows::Win32::Graphics::Dxgi::IDXGIAdapter1) -> Option<(u32, u32)> {
+    // SAFETY: the description is returned by value from the live adapter.
+    let description = unsafe { adapter.GetDesc1() }.ok()?;
+    Some((description.VendorId, description.DeviceId))
+}
+
 /// Whether the GPU reads imported game memory. The first caller waits for the
 /// probe, which runs one small GPU copy.
 pub(super) fn section_import(device: &Device) -> SectionImport {

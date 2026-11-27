@@ -37,6 +37,8 @@ REFUSALS = (
     ("wave_width", r"(?:conflicting wave widths for ballot and reduction|wave operation requires complete \d+-lane compute waves|resolve Wave32 requires a compatible wave reduction)"),
     ("lane_spill", r"(?:lane op at 0x[0-9a-f]+: non-constant lane operand|is used both as a lane spill area and as a vector|v_readlane at 0x[0-9a-f]+: unexpected destination)"),
     ("heap_atomic", r"atomic through a heap descriptor unsupported"),
+    # Heap-indexed IDXEN access, retried with the stride table appended.
+    ("heap_stride", r"raw buffer IDXEN needs the console descriptor stride"),
     ("packed_root", r"(?:unsupported packed compute root parameter|packed root arguments exceed 64 dwords|root argument offset outside signature|unsupported mutation of a root address|root address or padding used as shader data)"),
 
 )

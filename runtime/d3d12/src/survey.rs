@@ -17,7 +17,8 @@ use core::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{LazyLock, Mutex, Once};
 use windows::Win32::Foundation::{
-    EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_ILLEGAL_INSTRUCTION, HMODULE,
+    EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_GUARD_PAGE, EXCEPTION_ILLEGAL_INSTRUCTION,
+    EXCEPTION_IN_PAGE_ERROR, HMODULE,
 };
 use windows::Win32::System::Diagnostics::Debug::{
     AddVectoredExceptionHandler, EXCEPTION_POINTERS, RtlCaptureStackBackTrace, RtlPcToFileHeader,
@@ -164,6 +165,12 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
             }
         }
         return CONTINUE_SEARCH;
+    }
+    // A texture publication stores into pages the title may have just unmapped.
+    if matches!(record_.ExceptionCode, EXCEPTION_ACCESS_VIOLATION | EXCEPTION_IN_PAGE_ERROR | EXCEPTION_GUARD_PAGE)
+        && crate::device::placement::recover_guarded_copy(context)
+    {
+        return CONTINUE_EXECUTION;
     }
     if record_.ExceptionCode == EXCEPTION_ACCESS_VIOLATION {
         if enabled() {

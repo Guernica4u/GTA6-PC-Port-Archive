@@ -1,7 +1,7 @@
 //! Nanite's software rasterizer shares a 4×4 transform and up to 256
 //! transformed vertices across the workgroup. Each 64-lane wave separately
 //! chooses a scanline loop when one of its triangles is wider than four pixels.
-use super::{compute_group, fssm_bindings, r, Emitter, Enc, Insn, Opnd};
+use super::{compute_group, fssm_bindings, not_skipping, r, Emitter, Enc, Insn, Opnd};
 
 pub(super) fn prepare(em: &mut Emitter<'_>) -> Result<(), String> {
     if compute_group(em.ex) != [128, 1, 1]
@@ -58,7 +58,7 @@ pub(super) fn emit_vote(
     vote: &Insn,
     skipped: &[usize],
 ) -> Result<(), String> {
-    let guards: Vec<_> = skipped.iter().map(|i| format!("!j{i}")).collect();
+    let guards: Vec<_> = skipped.iter().map(|&i| not_skipping(i)).collect();
     let reached = if guards.is_empty() {
         String::from("true")
     } else {

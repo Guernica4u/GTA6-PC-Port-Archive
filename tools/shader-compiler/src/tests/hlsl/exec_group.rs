@@ -629,3 +629,19 @@ fn adjacent_pixel_register_writes_keep_order_and_exec_boundaries() {
         assert_eq!(group(&body), format!("{grouped}{boundary}\n{grouped}"));
     }
 }
+
+#[test]
+fn mesh_register_writes_select_instead_of_branching() {
+    let body = "    if (exec_lo & 1u) v1 = (v2 + v3);\n    // 0x0004 v_mov_b32\n    if (exec_lo & tb_lane_bit) v4 = asuint(asfloat(v1) * 2.0);\n";
+    let written = super::select_writes(body);
+    assert_eq!(written, "    v1 = select((exec_lo & 1u) != 0u, (v2 + v3), v1);\n    // 0x0004 v_mov_b32\n    v4 = select((exec_lo & tb_lane_bit) != 0u, asuint(asfloat(v1) * 2.0), v4);\n");
+    // Loads, wave reads, stores and blocks keep their branch.
+    for kept in [
+        "    if (exec_lo & 1u) v1 = buf0.Load(v2);\n",
+        "    if (exec_lo & 1u) v1 = WaveReadLaneAt(v2, 0u);\n",
+        "    if (exec_lo & 1u) tb_lds_store(v1, v2);\n",
+        "    if (exec_lo & 1u) {\n        v1 = v2;\n    }\n",
+    ] {
+        assert_eq!(super::select_writes(kept), kept);
+    }
+}

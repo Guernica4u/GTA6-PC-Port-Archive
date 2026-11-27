@@ -47,7 +47,7 @@ pub(super) fn emit(em: &mut Emitter<'_>, i: usize, ins: &Insn, target: Option<us
     match ins.mnemonic.as_str() {
         "s_cbranch_execz" => {
             let target = target.ok_or("backward page wave branch")?;
-            em.line(&format!("if (({mask}.x | {mask}.y) == 0u) j{target} = true;"));
+            em.skip_to(target, Some(&format!("({mask}.x | {mask}.y) == 0u")));
         }
         "s_ff1_i32_b64" => {
             em.ws(&ins.dst[0], &format!("({mask}.x != 0u ? uint(firstbitlow({mask}.x)) : {mask}.y != 0u ? 32u + uint(firstbitlow({mask}.y)) : 0xffffffffu)"))?;

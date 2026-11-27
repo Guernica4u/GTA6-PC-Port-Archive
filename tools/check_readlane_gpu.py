@@ -4,7 +4,8 @@
 Covers constant-lane Wave32/Wave64 broadcasts, masked-EXEC and branch-skipped lanes,
 Wave32 multi-wave isolation, Wave32 v_mbcnt_lo_u32_b32(exec_lo) ballot preservation,
 uniform loops coexisting with SGPR spills, and dynamic SGPR GROUP_READ fallback with
-wave-width masking. No game data is required.
+wave-width masking. Mixed register cases exercise an EXEC-independent lane write,
+a first-active-lane selector and later vector use. No game data is required.
 """
 import argparse
 import json
@@ -42,6 +43,8 @@ CASES = [
     ("wave64_swizzle_branch_dyn_63", 64, 64, 63, True, "broadcast"),
     ("wave64_dyn_sgpr_high_bits_47", 64, 64, 47, False, "broadcast"),
     ("wave32_64t_dyn_sgpr_31", 64, 32, 31, False, "broadcast"),
+    ("wave32_mixed_dynamic_11", 32, 32, 11, False, "mixed"),
+    ("wave32_mixed_empty_exec", 32, 32, 11, False, "mixed_empty"),
 ]
 
 
@@ -52,7 +55,12 @@ def seed_and_expected(lanes, wave_width, target_lane, skip_last, mode, values):
     for lane in range(lanes):
         src = (lane & ~(wave_width - 1)) | target_lane
         val = values[src]
-        if mode == "mbcnt":
+        if mode in ("mixed", "mixed_empty"):
+            written = 0x5a5a31f2
+            vector_value = written if mode == "mixed" and lane == target_lane else lane + 17
+            broadcast = written if mode == "mixed" else 3
+            expected[VIEW + lanes + lane] = broadcast ^ vector_value
+        elif mode == "mbcnt":
             prefix = lane if lane < 31 else 31
             out = ((prefix & 0xff) << 24) | (val & 0x00ffffff)
             expected[VIEW + lanes + lane] = out

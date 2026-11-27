@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from project_tuxbox.runtime_shaders import (
-    ShaderRefused, _serve_requests, ordered_requests, runtime_jobs,
+    ShaderRefused, _serve_requests, ordered_requests, runtime_jobs, serve,
 )
 
 
@@ -46,11 +46,14 @@ class RuntimeShaderWorkers(unittest.TestCase):
             path.write_text(name)
         return path
 
-    def start(self, compile_one, jobs=2, archive=None):
+    def start(self, compile_one, jobs=2, archive=None, notified=False):
         def worker():
             try:
-                _serve_requests(self.session, self.stop, self.logs.append,
-                                self.root / "xshader", lambda: sleep(0.005), archive, jobs)
+                if notified:
+                    serve(self.session, self.stop, self.logs.append, archive, jobs)
+                else:
+                    _serve_requests(self.session, self.stop, self.logs.append,
+                                    self.root / "xshader", lambda: sleep(0.005), archive, jobs)
             except Exception as exc:
                 self.errors.append(exc)
 
@@ -111,6 +114,32 @@ class RuntimeShaderWorkers(unittest.TestCase):
         self.release.set()
         self.until(lambda: not any(self.requests.iterdir()))
         self.assertEqual(counts, Counter({p.stem: 1 for p in (slow, fast, later)}))
+
+    def test_request_published_beside_a_running_job_starts_at_once(self):
+        slow = self.request("slow")
+        fast = self.request("fast")
+        staged = self.root / fast.name
+        fast.rename(staged)
+        running = Event()
+        started = []
+
+        def compile_one(source, key, tools, cache, session, remember=None):
+            if source == slow:
+                running.set()
+                if not self.release.wait(5):
+                    raise TimeoutError("test gate")
+            else:
+                started.append(monotonic())
+            return False
+
+        self.start(compile_one, notified=True)
+        self.until(running.is_set)
+        # Publish partway through what was a 50 ms rescan interval.
+        sleep(0.01)
+        published = monotonic()
+        staged.rename(fast)
+        self.until(lambda: started)
+        self.assertLess(started[0] - published, 0.02)
 
     def test_shutdown_drains_active_jobs_without_starting_new_jobs(self):
         paths = [self.request(str(i)) for i in range(5)]

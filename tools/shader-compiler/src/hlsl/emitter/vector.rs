@@ -130,6 +130,9 @@ impl<'a> Emitter<'a> {
         if matches!(m.as_str(), "v_interp_p1ll_f16" | "v_interp_p1lv_f16" | "v_interp_p2_f16") {
             return self.emit_f16_interp(ins);
         }
+        if lockstep::for_lane_reads() && m == "v_mov_b32" && matches!(s.first(), Some(Opnd::Raw(233 | 250))) {
+            return self.emit_lockstep_dpp_move(d, ins);
+        }
         if ins.enc == Enc::Vop2 && ins.op == wave_sum::DPP8_EXCHANGE {
             return self.emit_dpp8_exchange(m.clone(), s, d, ins);
         }
@@ -289,7 +292,7 @@ impl<'a> Emitter<'a> {
         if let Some(result) = int16::expression(ins)? {
             return self.wv(&d, &result);
         }
-        if self.lower_f64(ins)? {
+        if self.lower_f64(ins)? || self.lower_quad_sad(ins)? || self.lower_half_exact(ins)? {
             return Ok(());
         }
         if int32::handles(ins) && self.ex.stage != Stage::Compute {
@@ -653,7 +656,9 @@ impl<'a> Emitter<'a> {
                 } else if matches!(s[0], Opnd::ExecLo | Opnd::ExecHi) && !self.resolve_wave32 {
                     // Each invocation holds only its own EXEC bit; the guest reads the wave mask.
                     format!("WaveActiveBallot((exec_lo & 1u) != 0u).{}", if s[0] == Opnd::ExecLo { "x" } else { "y" })
-                } else { mask_ballots::word(self, self.cur_idx, &s[0]).unwrap_or(a) };
+                } else {
+                    mask_ballots::word(self, self.cur_idx, &s[0]).or_else(|| lockstep::word(self, self.cur_idx, &s[0], false)).unwrap_or(a)
+                };
                 self.line(&format!("uint t{t} = countbits({a} & {});", low_mask(lane)));
                 self.line("#else");
                 self.line(&format!("uint t{t} = 0u;"));

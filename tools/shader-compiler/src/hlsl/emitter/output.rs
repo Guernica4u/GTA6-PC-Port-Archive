@@ -66,7 +66,10 @@ uint2 tb_field64(uint lo, uint hi, uint control, bool sign) {
 }
 "#);
         }
-        if self.insns.iter().any(|i| normalized_half_to_integer(&i.mnemonic)) {
+        if self.insns.iter().any(|i| half_exact::needs_helpers(&i.mnemonic)) {
+            h.push_str(half_exact::HELPERS);
+        }
+        if self.insns.iter().any(|i| normalized_half_to_integer(&i.mnemonic) || half_exact::uses_normalized_half(&i.mnemonic)) {
             h.push_str(include_str!("../../normalized_half.hlsl"));
         }
         let uses_half_unary = self.insns.iter().any(|i| half_unary_op(&i.mnemonic).is_some());
@@ -361,14 +364,15 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             if self.paired {
                 for r in ["v0", "v1", "v2"] { self.regs.insert(r.to_string()); }
             }
-            let nparams = ex.root_sig.as_ref().map(|r| r.params.len()).unwrap_or(4);
+            let guest_params = ex.root_sig.as_ref().map(sampler_heap::guest_params);
+            let nparams = guest_params.map_or(4, <[_]>::len);
             let g = match self.packed.as_ref().map(|p| &p.abi) {
-                None if self.resolve_wave32 || lone_lane::on() && ray_resolve::applies(ex) => ray_resolve::group_x_register(ex)
+                None if (self.resolve_wave32 || lone_lane::on()) && ray_resolve::applies(ex) => ray_resolve::group_x_register(ex)
                     .ok_or("unverified resolve compute user-data layout")?,
                 Some(RootAbi::RegisterWave32 | RootAbi::RegisterWave64) => 6 + 2 * (nparams - 2), // two tables followed by root CBV pairs
                 Some(RootAbi::ArgumentBlock) => 4,
                 Some(RootAbi::Ps09Raster) => 11,
-                None if ex.root_sig.as_ref().is_some_and(|r| r.flags & 0x400 != 0 && r.params.len() == 2 && r.params.iter().all(|p| matches!(p.kind, crate::meta::RootParamKind::Table(_))))
+                None if ex.root_sig.as_ref().is_some_and(|r| r.flags & 0x400 != 0) && guest_params.is_some_and(|params| params.len() == 2 && params.iter().all(|p| matches!(p.kind, crate::meta::RootParamKind::Table(_))))
                     && tuxbox_dxbc::compute_table::two_tables_and_heap(&ex.fssm) => 7,
                 None if sampler_heap::user_data_end(ex).is_some() =>
                     sampler_heap::user_data_end(ex).unwrap(),
@@ -414,10 +418,15 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
                 writeln!(h, "    uint tb_wave_tid = gtid.x + {tx}u * (gtid.y + {ty_}u * gtid.z);").unwrap();
             }
             let masked_dpp = self.insns.iter().any(|i| i.op == OP_DPP_BINARY && group_extrema::destination_mask(i).is_some());
-            if self.compute_swizzle || self.indexed_lane || self.single_wave32 || masked_dpp {
+            let remap_wave = self.resolve_wave32 && [tx, ty_, tz] != [32, 1, 1];
+            if !remap_wave && (self.compute_swizzle || self.indexed_lane || self.single_wave32 || masked_dpp) {
                 writeln!(h, "    uint tb_lane = gtid.x + {tx}u * (gtid.y + {ty_}u * gtid.z);").unwrap();
             }
-            if self.resolve_wave32 {
+            if remap_wave {
+                // A full wave uses its immutable physical lane to reconstruct guest XYZ.
+                writeln!(h, "    uint tb_lane = WaveGetLaneIndex(); uint tb_lane_bit = 1u << tb_lane;").unwrap();
+                writeln!(h, "    v0 = tb_lane % {tx}u; v1 = (tb_lane / {tx}u) % {ty_}u; v2 = tb_lane / ({tx}u * {ty_}u);").unwrap();
+            } else if self.resolve_wave32 {
                 writeln!(h, "    v0 = WaveGetLaneIndex(); v1 = gtid.y; v2 = gtid.z; uint tb_lane_bit = 1u << v0;").unwrap();
             } else {
                 writeln!(h, "    v0 = gtid.x; v1 = gtid.y; v2 = gtid.z;").unwrap();

@@ -16,7 +16,7 @@ impl<'a> Emitter<'a> {
         if active.is_empty() {
             self.line(&format!("uint readlane{idx} = {load};"));
         } else {
-            let guard: Vec<_> = active.iter().map(|label| format!("!j{label}")).collect();
+            let guard: Vec<_> = active.iter().map(|&label| not_skipping(label)).collect();
             self.line(&format!("uint readlane{idx} = ({}) ? {load} : 0u;", guard.join(" && ")));
         }
         self.line("GroupMemoryBarrierWithGroupSync();");
@@ -26,7 +26,7 @@ impl<'a> Emitter<'a> {
     pub(in crate::hlsl) fn emit_compute_swizzle(&mut self, idx: usize, ins: &Insn, active: &[usize]) -> Result<(), String> {
         if ins.mnemonic == GROUP_GATHER {
             // Every lane publishes its value; each reads the lane its index names.
-            let guard: Vec<_> = active.iter().map(|label| format!("!j{label}")).collect();
+            let guard: Vec<_> = active.iter().map(|&label| not_skipping(label)).collect();
             let value = r(&ins.src[0])?;
             let value = if guard.is_empty() { value } else { format!("({}) ? {value} : 0u", guard.join(" && ")) };
             self.line(&format!("tb_swizzle[tb_lane] = {value};"));
@@ -36,10 +36,15 @@ impl<'a> Emitter<'a> {
             return Ok(());
         }
         if ins.mnemonic == GROUP_READ {
+            let mask = if ins.aux.imm == 31 { 31u32 } else { 63u32 };
+            if self.lockstep.is_some() && self.required_wave_size == Some(mask + 1) {
+                // The whole wave is here (see `lockstep`), so the lane is read directly.
+                self.line(&format!("uint swizzle{idx} = WaveReadLaneAt({}, {} & {mask}u);", r(&ins.src[0])?, r(&ins.src[1])?));
+                return Ok(());
+            }
             if self.dispatched || !self.compute_swizzle {
                 return Err("group lane read requires structured compute swizzle lowering".into());
             }
-            let mask = if ins.aux.imm == 31 { 31u32 } else { 63u32 };
             let width = mask + 1;
             let count = compute_group(self.ex)
                 .into_iter()
@@ -50,14 +55,23 @@ impl<'a> Emitter<'a> {
             }
             // READLANE ignores EXEC. Publish each lane's actual VGPR even when
             // that lane skipped the guest branch, then guard only the load on
-            // active skip flags and mask the selector to 0..width-1.
-            self.line(&format!("tb_swizzle[tb_lane] = {};", r(&ins.src[0])?));
+            // active skip flags and mask the selector to 0..width-1. Inside an
+            // accepted loop the lane was kept in the loop but already finished:
+            // mask the publish too, so the remaining lanes read a zero.
+            let value = r(&ins.src[0])?;
+            let value = if self.in_accepted_swizzle_loop() && !active.is_empty() {
+                let guard: Vec<_> = active.iter().map(|&label| not_skipping(label)).collect();
+                format!("({}) ? {value} : 0u", guard.join(" && "))
+            } else {
+                value
+            };
+            self.line(&format!("tb_swizzle[tb_lane] = {value};"));
             self.line("GroupMemoryBarrierWithGroupSync();");
             let load = format!("tb_swizzle_read((tb_lane & ~{mask}u) | ({} & {mask}u))", r(&ins.src[1])?);
             if active.is_empty() {
                 self.line(&format!("uint swizzle{idx} = {load};"));
             } else {
-                let guard: Vec<_> = active.iter().map(|label| format!("!j{label}")).collect();
+                let guard: Vec<_> = active.iter().map(|&label| not_skipping(label)).collect();
                 self.line(&format!("uint swizzle{idx} = ({}) ? {load} : 0u;", guard.join(" && ")));
             }
             self.line("GroupMemoryBarrierWithGroupSync();");
@@ -73,7 +87,7 @@ impl<'a> Emitter<'a> {
         // Skipped and EXEC-masked lanes contribute zero. Rendezvous before
         // reapplying the guest branch guard to the destination write.
         let mut predicate = String::from("(exec_lo & 1u) != 0u");
-        for label in active { write!(predicate, " && !j{label}").unwrap(); }
+        for &label in active { write!(predicate, " && {}", not_skipping(label)).unwrap(); }
         let value = r(&ins.src[0])?;
         self.line(&format!("tb_swizzle[tb_lane] = ({predicate}) ? {value} : 0u;"));
         self.line("GroupMemoryBarrierWithGroupSync();");

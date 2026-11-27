@@ -1,6 +1,118 @@
 use super::*;
 
 #[test]
+fn high_half_pixel_attribute_does_not_read_the_spill_vgpr() {
+    let mut ex = pixel_wave_test_extract();
+    ex.input_sig = [0, 1]
+        .map(|register| crate::meta::SigElement {
+            name: "TEXCOORD".into(),
+            index: register,
+            sysval: 0,
+            comp_type: 6,
+            register,
+            mask: 15,
+            rw_mask: 2,
+        })
+        .to_vec();
+    ex.output_sig = vec![crate::meta::SigElement {
+        name: "SV_Target".into(),
+        index: 0,
+        sysval: 64,
+        comp_type: 1,
+        register: 0,
+        mask: 1,
+        rw_mask: 1,
+    }];
+    let words = [
+        0xbe85_0387u32, // s_mov_b32 s5, 7
+        0xd761_0080, 0x0001_0005, // v_writelane_b32 v128, s5, 0
+        0xd742_0010, 0x0002_0180, // v_interp_p1ll_f16 v16, v0, attr0.z high
+        0xd75a_0029, 0x0442_0380, // v_interp_p2_f16 v41, v1, attr0.z, v16 high
+        0xd760_0006, 0x0001_0180, // v_readlane_b32 s6, v128, 0
+        0x4a00_5206, // v_add_nc_u32 v0, s6, v41
+        0xf800_0801, 0, // exp mrt0 v0, off, off, off done
+        0xbf81_0000, // s_endpgm
+    ];
+    ex.isa = words.into_iter().flat_map(u32::to_le_bytes).collect();
+    let hlsl = super::translate(&ex).map(|out| out.hlsl).unwrap();
+    for statement in [
+        "tb_s10000 = s5;",
+        "s6 = tb_s10000;",
+        "v0 = (s6 + v41);",
+        "tb_f16_rne(i.i1.y)",
+    ] {
+        assert!(hlsl.contains(statement), "{statement}: {hlsl}");
+    }
+
+    // An actual VGPR operand holding the weight still conflicts with the spill.
+    let mut aliased = words;
+    aliased[4] |= 128 << 9;
+    ex.isa = aliased.into_iter().flat_map(u32::to_le_bytes).collect();
+    let error = super::translate(&ex).err().expect("mixed-use spill refused");
+    assert!(error.contains("v128 is used both as a lane spill area and as a vector"));
+}
+
+#[test]
+fn interpolated_half_after_clip_uses_declared_signature_component() {
+    let mut ex = pixel_wave_test_extract();
+    let sig = |name: &str, sysval, comp_type, register, mask, rw_mask| crate::meta::SigElement {
+        name: name.into(), index: 0, sysval, comp_type, register, mask, rw_mask,
+    };
+    ex.input_sig = vec![
+        sig("SV_ClipDistance", 2, 3, 0, 15, 0),
+        sig("SV_Position", 1, 3, 1, 15, 0),
+        sig("COLOR", 0, 6, 2, 15, 8),
+        sig("TEXCOORD", 0, 1, 3, 1, 0),
+    ];
+    ex.flat_inputs = vec![3];
+    ex.fssm.resize(0x23c, 0);
+    ex.fssm[0x238] = 3;
+    // v_interp_p1ll_f16 v4, v0, attr1.y high: component W of COLOR0.
+    let words = [0xd742_0004u32, 0x0002_0141];
+    let isa: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+    let insns = crate::rdna2::disassemble(&isa);
+    let selected = |ex: &ShaderExtract| params::inputs(ex, &insns).get(1).and_then(|p| p.component(1, true));
+    assert_eq!(selected(&ex), Some((2, 3)));
+    ex.input_sig[2].rw_mask = 4;
+    assert_eq!(selected(&ex), None, "the program did not declare W as a read");
+    ex.input_sig[2].rw_mask = 8;
+    ex.fssm[0x238] = 4;
+    assert_eq!(selected(&ex), None, "hardware count does not match the producer");
+
+    // Keeping an unread half before COLOR makes attr1.y high select Y;
+    // dropping it selects W. Both are declared, so the count cannot decide.
+    ex.input_sig = vec![
+        sig("SV_ClipDistance", 2, 3, 0, 15, 0),
+        sig("TEXCOORD", 0, 6, 1, 1, 0),
+        sig("COLOR", 0, 6, 2, 15, 10),
+    ];
+    ex.fssm[0x238] = 2;
+    assert_eq!(selected(&ex), None, "two valid layouts select different components");
+}
+
+#[test]
+fn full_interpolant_after_an_unused_input_keeps_its_exported_slot() {
+    let mut ex = pixel_wave_test_extract();
+    let sig = |name: &str, sysval, register, read| crate::meta::SigElement {
+        name: name.into(), index: 0, sysval, comp_type: 3, register, mask: 15, rw_mask: read,
+    };
+    ex.input_sig = vec![
+        sig("TEXCOORD", 0, 0, 0), sig("COLOR", 0, 1, 4),
+        sig("SV_ClipDistance", 2, 2, 0),
+    ];
+    ex.fssm.resize(0x23c, 0);
+    ex.fssm[0x238] = 3;
+    // gfx1030 v_interp_p1_f32 v2, v0, attr1.z.
+    let insns = crate::rdna2::disassemble(&0xc808_0600u32.to_le_bytes());
+    assert_eq!((insns[0].aux.imm, insns[0].aux.imm2), (1, 2));
+    let layout = params::inputs(&ex, &insns);
+    assert!(matches!(layout.get(1), Some(params::Param::Full(1))));
+    assert_eq!(sig_lookup(&ex.input_sig, 1, 2), Some((1, 2)));
+    ex.input_sig[1].rw_mask = 2;
+    assert_eq!(params::inputs(&ex, &insns).len(), 1);
+}
+
+#[test]
 fn vector_add_sub_can_discard_the_carry_destination() {
     use super::float64::tests::translate;
 
@@ -751,6 +863,113 @@ fn sgpr_lane_readlane_refused_on_spill_area() {
 }
 
 #[test]
+fn lower_first_lane_reads_ignores_unused_vop3_s0_padding() {
+    let ff1 = Insn {
+        offset: 0, enc: Enc::Sop1, op: 0x14, mnemonic: "s_ff1_i32_b64".into(),
+        dst: vec![Opnd::Sgpr(0)], src: vec![Opnd::Sgpr(0)], aux: Default::default(), dwords: 1, raw: vec![0],
+    };
+    // VOP3-encoded VOP1 (op 0x1ab = v_rcp_iflag_f32) pads unused src[1]/src[2] with Sgpr(0).
+    let rcp = Insn {
+        offset: 4, enc: Enc::Vop3, op: 0x1ab, mnemonic: "v_rcp_iflag_f32".into(),
+        dst: vec![Opnd::Vgpr(40)], src: vec![Opnd::Vgpr(40), Opnd::Sgpr(0), Opnd::Sgpr(0)],
+        aux: Default::default(), dwords: 2, raw: vec![0, 0],
+    };
+    let read = sgpr_lane_readlane(39, 0, 4);
+    let clobber = Insn {
+        offset: 16, enc: Enc::Sop2, op: 0x0e, mnemonic: "s_and_b64".into(),
+        dst: vec![Opnd::Sgpr(0)], src: vec![Opnd::Sgpr(72), Opnd::ExecLo],
+        aux: Default::default(), dwords: 1, raw: vec![0],
+    };
+    let mut insns = vec![ff1, rcp, read, clobber];
+    lower_first_lane_reads(&mut insns);
+    assert_eq!(insns[2].mnemonic, "v_readfirstlane_b32");
+    assert_eq!(insns[2].dst, vec![Opnd::Sgpr(4)]);
+    assert_eq!(insns[2].src, vec![Opnd::Vgpr(39)]);
+}
+
+fn first_lane_election(offset: usize) -> Insn {
+    Insn {
+        offset, enc: Enc::Sop1, op: 0x14, mnemonic: "s_ff1_i32_b64".into(),
+        dst: vec![Opnd::Sgpr(0)], src: vec![Opnd::Sgpr(0)], aux: Default::default(), dwords: 1, raw: vec![0],
+    }
+}
+
+fn sop2_at(offset: usize, mnemonic: &str, dst: Vec<Opnd>, src: Vec<Opnd>) -> Insn {
+    Insn {
+        offset, enc: Enc::Sop2, op: 0, mnemonic: mnemonic.into(), dst, src,
+        aux: Default::default(), dwords: 1, raw: vec![0],
+    }
+}
+
+fn branch_at(offset: usize, mnemonic: &str) -> Insn {
+    Insn {
+        offset, enc: Enc::Sopp, op: 2, mnemonic: mnemonic.into(), dst: vec![], src: vec![],
+        aux: Default::default(), dwords: 1, raw: vec![0],
+    }
+}
+
+#[test]
+fn lower_first_lane_reads_allows_a_branch_after_the_result_is_consumed() {
+    let mut read = sgpr_lane_readlane(57, 0, 18);
+    read.offset = 8;
+    let mut insns = vec![
+        first_lane_election(0),
+        read,
+        sop2_at(0x10, "s_add_u32", vec![Opnd::Sgpr(18)], vec![Opnd::Sgpr(18), Opnd::ConstInt(1)]),
+        branch_at(0x14, "s_cbranch_scc1"),
+        branch_at(0x18, "s_endpgm"),
+    ];
+    lower_first_lane_reads(&mut insns);
+    assert_eq!(insns[1].mnemonic, "v_readfirstlane_b32");
+    assert_eq!(insns[1].dst, vec![Opnd::Sgpr(18)]);
+    assert_eq!(insns[1].src, vec![Opnd::Vgpr(57)]);
+}
+
+#[test]
+fn lower_first_lane_reads_keeps_a_live_lane_index_across_a_branch() {
+    let mut read = sgpr_lane_readlane(57, 0, 18);
+    read.offset = 8;
+    let mut insns = vec![
+        first_lane_election(0),
+        read,
+        branch_at(0x10, "s_cbranch_scc1"),
+        sop2_at(0x14, "s_add_u32", vec![Opnd::Sgpr(0)], vec![Opnd::Sgpr(0), Opnd::ConstInt(1)]),
+        branch_at(0x18, "s_endpgm"),
+    ];
+    lower_first_lane_reads(&mut insns);
+    assert_eq!(insns[1].mnemonic, "v_readlane_b32");
+}
+
+#[test]
+fn lower_first_lane_reads_finds_an_election_past_sixty_four_instructions() {
+    let mut insns = vec![first_lane_election(0)];
+    insns.extend((1..=70).map(|i| Insn {
+        offset: 4 * i, enc: Enc::Sopp, op: 0, mnemonic: "s_nop".into(),
+        dst: vec![], src: vec![], aux: Default::default(), dwords: 1, raw: vec![0],
+    }));
+    let mut read = sgpr_lane_readlane(57, 0, 18);
+    read.offset = 4 * 71;
+    insns.push(read);
+    insns.push(branch_at(4 * 72, "s_endpgm"));
+    lower_first_lane_reads(&mut insns);
+    assert_eq!(insns[71].mnemonic, "v_readfirstlane_b32");
+}
+
+#[test]
+fn lower_first_lane_reads_stops_at_an_exec_write() {
+    let mut read = sgpr_lane_readlane(57, 0, 18);
+    read.offset = 0x10;
+    let cmp = Insn {
+        offset: 8, enc: Enc::Vopc, op: 0, mnemonic: "v_cmpx_eq_u32".into(),
+        dst: vec![], src: vec![Opnd::Sgpr(7), Opnd::Vgpr(8)],
+        aux: Default::default(), dwords: 1, raw: vec![0],
+    };
+    let mut insns = vec![first_lane_election(0), cmp, read, branch_at(0x14, "s_endpgm")];
+    lower_first_lane_reads(&mut insns);
+    assert_eq!(insns[2].mnemonic, "v_readlane_b32");
+}
+
+#[test]
 fn const_lane_readlane_still_group_read_when_group_reads() {
     let mut insns = vec![const_lane_readlane(4, 3, 7)];
     lower_lane_spills(&mut insns, false, true).expect("group read");
@@ -766,4 +985,52 @@ fn floating_max_masked_prologue_rejects_immediate_select_identity() {
     let mut insns = masked_reduction_insns(32, "v_max_f32", 4, Some(f32::NEG_INFINITY.to_bits()), 2);
     insns[3].src[0] = Opnd::ConstInt(f32::NEG_INFINITY.to_bits() as i64);
     assert!(lower_wave_reductions(&mut insns).is_err());
+}
+
+fn mixed_lane_compute(group: [u32; 3], words: &[u32]) -> Result<Translated, String> {
+    let mut ex = pixel_wave_test_extract();
+    ex.stage = Stage::Compute;
+    ex.psv_threads = Some(group);
+    ex.isa = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    translate(&ex)
+}
+
+#[test]
+fn mixed_lane_wave32_preserves_width_and_encoding_guards() {
+    let words = [
+        0xd4c2_000b, 0x0201_0100, // v_cmp_eq_u32 s11, v0, 0
+        0xbe84_3c0b,             // s_and_saveexec_b32 s4, s11
+        0xd761_0001, 0x0201_1608, // v_writelane_b32 v1, s8, 11
+        0x7e0a_0504,             // v_readfirstlane_b32 s5, v4
+        0xd760_0007, 0x0200_0b01, // v_readlane_b32 s7, v1, s5
+        0xbf81_0000,             // s_endpgm
+    ];
+    assert_eq!(mixed_lane_compute([32, 1, 1], &words).unwrap().required_wave_size, Some(32));
+    assert!(mixed_lane_compute([16, 1, 1], &words).is_err());
+    assert!(mixed_lane_compute([32, 1, 1], &words[2..]).is_err());
+
+    let mut control = words;
+    control[2] = 0xbe84_246a; // s_and_saveexec_b64 s[4:5], vcc
+    assert!(mixed_lane_compute([32, 1, 1], &control).is_err());
+    control[2] = words[2];
+    control[4] = 0x0200_0a08; // v_writelane_b32 v1, s8, s5 (dynamic write)
+    assert!(mixed_lane_compute([32, 1, 1], &control).err().unwrap().contains("unsupported v_writelane_b32 encoding"));
+    control[4] = words[4];
+    control[7] |= 0x0800_0000; // VOP3 modifier
+    assert!(mixed_lane_compute([32, 1, 1], &control).err().unwrap().contains("unsupported v_readlane_b32 encoding"));
+}
+
+#[test]
+fn mixed_lane_wave32_refuses_unverified_control_flow() {
+    let words = [
+        0xd4c2_000b, 0x0201_0100, // v_cmp_eq_u32 s11, v0, 0
+        0xbe84_3c0b,             // s_and_saveexec_b32 s4, s11
+        0xbf82_0001,             // s_branch into the second word of WRITELANE
+        0xd761_0001, 0x0201_1608, // v_writelane_b32 v1, s8, 11
+        0x7e0a_0504,             // v_readfirstlane_b32 s5, v4
+        0xd760_0007, 0x0200_0b01, // v_readlane_b32 s7, v1, s5
+        0xbf81_0000,             // s_endpgm
+    ];
+    let error = mixed_lane_compute([32, 1, 1], &words).err().unwrap();
+    assert!(error.contains("whole-wave scalar dispatch"), "{error}");
 }

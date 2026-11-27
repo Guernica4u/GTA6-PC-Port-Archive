@@ -226,9 +226,9 @@ fn wave32_masked_exec_readlane_stages_through_groupshared_and_ignores_exec() {
         tr.hlsl
     );
     assert!(!tr.hlsl.contains("WaveReadLaneAt("), "{}", tr.hlsl);
-    // Staging must be hoisted BEFORE the skip guard `if (!(j...))`.
+    // Staging must be hoisted BEFORE the skip guard `if (tb_skip < ...)`.
     let stage_pos = tr.hlsl.find("tb_swizzle[tb_lane] = v1;").unwrap();
-    let guard_pos = tr.hlsl.find("if (!(j").unwrap();
+    let guard_pos = tr.hlsl.find("if (tb_skip < ").unwrap();
     assert!(stage_pos < guard_pos, "staging must precede skip guard:\n{}", tr.hlsl);
 }
 
@@ -424,7 +424,7 @@ fn refuses_out_of_range_unproven_dynamic_and_non_uniform_loop_readlanes() {
 }
 
 #[test]
-fn f1_refuses_non_uniform_branch_skipping_entire_readlane_loop_and_prior_non_uniform_loop() {
+fn f1_non_uniform_branch_skipping_a_readlane_loop_takes_the_whole_wave_and_prior_loop_is_refused() {
     let [r0, r1] = readlane_const(7, 1, 31);
     // F1a: `if (exec != 0) { for (s10 = 4; s10 != 0; --s10) v_readlane_b32 ... }`
     let skip_loop = [
@@ -437,10 +437,11 @@ fn f1_refuses_non_uniform_branch_skipping_entire_readlane_loop_and_prior_non_uni
         0xbf85_fffb, // 0x1c: s_cbranch_scc1 L_loop
         0xbf81_0000, // 0x20: s_endpgm
     ];
-    let err = crate::hlsl::translate(&compute_shader([32, 1, 1], &skip_loop, None))
-        .err()
-        .expect("non-uniform branch skipping entire barrier loop must be refused");
-    assert!(err.contains("non-uniform loop"), "{err}");
+    // The barrier lowering refuses it; the whole wave then takes the branch.
+    let kept = crate::hlsl::translate(&compute_shader([32, 1, 1], &skip_loop, None)).unwrap();
+    assert_eq!(kept.required_wave_size, Some(32));
+    assert!(kept.hlsl.contains("WaveActiveAnyTrue((exec_lo & 1u) != 0u)"), "{}", kept.hlsl);
+    assert!(kept.hlsl.contains("WaveReadLaneAt(") && !kept.hlsl.contains("tb_swizzle"), "{}", kept.hlsl);
 
     // F1b: Preceding non-uniform loop would desync function-wide `tb_guard` before barrier loop.
     let prior_non_uniform = [
@@ -673,7 +674,7 @@ fn f5_indexed_lane_preserves_exec_ballot_for_v_mbcnt_lo() {
 #[test]
 fn f6_hoisted_indexed_read_guards_load_against_oob_on_partial_groups() {
     // [7, 3, 1] -> tb_swizzle[21]. Lane 0 sets s24 = 30 and skips past s24 = 5 + readlane.
-    // The hoisted load MUST guard tb_swizzle[...] on `!j...` while keeping both barriers unconditional.
+    // The hoisted load MUST guard tb_swizzle[...] on `tb_skip` while keeping both barriers unconditional.
     let [rs0, rs1] = readlane_sgpr(7, 1, 24);
     let words = [
         0xbe98_039e, // s_mov_b32 s24, 30
@@ -687,7 +688,7 @@ fn f6_hoisted_indexed_read_guards_load_against_oob_on_partial_groups() {
         .expect("partial group guarded hoisted readlane");
     assert!(tr.hlsl.contains("#define TB_SWIZZLE_WORDS 21u\ngroupshared uint tb_swizzle[TB_SWIZZLE_WORDS];"), "{}", tr.hlsl);
     assert!(
-        tr.hlsl.contains("(!j5) ? tb_swizzle_read((tb_lane & ~31u) | (s24 & 31u)) : 0u;"),
+        tr.hlsl.contains("((tb_skip < 5u)) ? tb_swizzle_read((tb_lane & ~31u) | (s24 & 31u)) : 0u;"),
         "{}",
         tr.hlsl
     );
@@ -843,7 +844,7 @@ fn unproven_swizzle_fallback_refuses_partial_groups_and_preserves_skipped_lanes(
         tr.hlsl
     );
     assert!(
-        !tr.hlsl.contains("tb_swizzle[tb_lane] = (!j"),
+        !tr.hlsl.contains("tb_swizzle[tb_lane] = (tb_skip"),
         "GROUP_READ must not zero branch-skipped lanes:\n{}",
         tr.hlsl
     );

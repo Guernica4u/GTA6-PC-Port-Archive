@@ -1,5 +1,6 @@
 from pathlib import Path
 import os
+import struct
 import subprocess
 import sys
 import tempfile
@@ -7,7 +8,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from project_tuxbox.console_cbv import configure_console_cbv, console_cbv_layer
-from project_tuxbox.host import PINNED_PROTON, SHADER_CACHE, Host, claim_package_drive, configure_nvidia_shader_cache, configure_pipeline_cache, proton_installation, requires_offline, seed_shader_cache, warn_scarlett_dxc
+from project_tuxbox.host import PINNED_PROTON, SHADER_CACHE, Host, claim_package_drive, configure_nvidia_shader_cache, configure_pipeline_cache, proton_installation, report_unindexed_nvidia_cache, requires_offline, seed_shader_cache, warn_scarlett_dxc
 
 
 class ScarlettWindowsDxc(unittest.TestCase):
@@ -498,6 +499,76 @@ class NvidiaShaderCache(unittest.TestCase):
         env = {}
         configure_nvidia_shader_cache(env)
         self.assertEqual(env, {})
+
+    @staticmethod
+    def driver_cache(cache, name, entries, stored, toc=None):
+        """A cache file pair: an index of (offset, size) entries and a sparse .bin of stored bytes."""
+        bucket = cache / "GLCache" / "61f5fb60d33740dc5bc6da0ef0f7e3fc" / "565982cbdff4b94c"
+        bucket.mkdir(parents=True, exist_ok=True)
+        header = b"CDVN" + bytes(28)
+        if toc is None:
+            toc = header + b"".join(struct.pack("<16sII", bytes(16), *entry) for entry in entries)
+        (bucket / f"{name}.toc").write_bytes(toc)
+        blob = bucket / f"{name}.bin"
+        with open(blob, "wb") as file:
+            file.write(header)
+            file.truncate(stored)
+        return blob
+
+    def test_a_fully_indexed_cache_is_not_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp)
+            # Each record has 32 bytes of its own before the payload its entry sizes.
+            self.driver_cache(cache, "full", [(32, 7515), (7579, 1000)], 7579 + 32 + 1000)
+            self.driver_cache(cache, "empty", [], 32)
+            reports = []
+            report_unindexed_nvidia_cache(cache, reports.append)
+            self.assertEqual(reports, [])
+
+    def test_a_cache_past_its_index_is_reported_and_left_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = Path(tmp) / "prefix"
+            cache = prefix / "shadercache"
+            # The measured file: the last entry ends 11 KB past 4 GiB in an 8.3 GB .bin.
+            large = self.driver_cache(cache, "large", [(32, 7514), (0xFFFF27CB, 66486)], 8304209601)
+            small = self.driver_cache(cache, "small", [(32, 968)], 1000 + (3 << 20))
+            before = {path: (path.stat().st_size, path.stat().st_mtime_ns) for path in cache.rglob("*.*")}
+            reports = []
+            configure_nvidia_shader_cache({"WINEPREFIX": str(prefix)}, reports.append)
+            self.assertEqual(len(reports), 3)
+            self.assertIn(f"{large} has stopped being indexed: 3,824 MiB of its 7.7 GiB is past the end", reports[1])
+            self.assertIn(f"{small} has stopped being indexed: 3 MiB of its 0.0 GiB is past the end", reports[2])
+            self.assertIn("Move the .bin and .toc aside", reports[1])
+            self.assertEqual({path: (path.stat().st_size, path.stat().st_mtime_ns) for path in cache.rglob("*.*")},
+                             before)
+            explicit = []
+            configure_nvidia_shader_cache({"__GL_SHADER_DISK_CACHE_PATH": str(cache)}, explicit.append)
+            self.assertEqual(explicit[1:], reports[1:])
+
+    def test_a_cache_at_the_index_limit_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp)
+            blob = self.driver_cache(cache, "limit", [(0xFFFFFF00, 224)], 1 << 32)
+            reports = []
+            report_unindexed_nvidia_cache(cache, reports.append)
+            self.assertEqual(len(reports), 1)
+            self.assertIn(f"{blob} has stopped being indexed: it has reached 4 GiB", reports[0])
+
+    def test_unreadable_cache_files_are_not_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp)
+            report = Mock()
+            report_unindexed_nvidia_cache(cache, report)
+            header = b"CDVN" + bytes(28)
+            self.driver_cache(cache, "nothing", [], 5 << 20, toc=b"")
+            self.driver_cache(cache, "short", [], 5 << 20, toc=header[:20])
+            self.driver_cache(cache, "torn", [], 5 << 20, toc=header + bytes(23))
+            self.driver_cache(cache, "foreign", [], 5 << 20, toc=bytes(32 + 24))
+            self.driver_cache(cache, "alone", [(32, 968)], 5 << 20).unlink()
+            (cache / "GLCache" / "61f5fb60d33740dc5bc6da0ef0f7e3fc" / "565982cbdff4b94c" / "folder.toc").mkdir()
+            report_unindexed_nvidia_cache(cache, report)
+            report_unindexed_nvidia_cache(cache / "missing", report)
+            report.assert_not_called()
 
     def test_a_device_bucket_beside_glcache_fills_only_missing_files(self):
         with tempfile.TemporaryDirectory() as tmp:

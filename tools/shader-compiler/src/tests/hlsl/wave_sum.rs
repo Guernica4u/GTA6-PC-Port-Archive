@@ -1075,3 +1075,27 @@ fn wave64_total_is_rejected_when_a_scratch_temp_is_read_later() {
         assert!(!live.iter().any(|i| i.mnemonic == "tb_wave_total_u32"));
     }
 }
+
+#[test]
+fn guard_can_derive_its_scalar_from_a_verified_reduction() {
+    for width in [32, 64] {
+        let (mut ex, mut words, cmp) = fixture::shader(width);
+        // Copy the first reduction result and add 1 before comparing with zero.
+        words.splice(cmp..cmp, [0xbe89_0307, 0x8007_8109]);
+        for (add, accepted) in [(0x8007_8109, true), (0x8007_0809, false)] {
+            // Adding an unproven s8 alongside the copy of s7 must still fail.
+            words[cmp + 1] = add;
+            ex.isa = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            ex.isa_data = ex.isa.clone();
+            let mut insns = crate::rdna2::disassemble(&ex.isa);
+            assert_eq!(super::super::lower_wave_reductions(&mut insns).unwrap(), Some(width));
+            let branch = insns.iter().position(|ins| ins.offset == (cmp + 3) * 4).unwrap();
+            let read = insns[..branch].iter().rposition(|ins| ins.op == READ_LANE).unwrap();
+            let region_end = insns[insns.len() - 2].offset;
+            assert_eq!(uniform_forward_guard(&insns, branch, region_end, &[read]), accepted, "wave{width}");
+            if accepted {
+                super::super::translate(&ex).unwrap();
+            }
+        }
+    }
+}

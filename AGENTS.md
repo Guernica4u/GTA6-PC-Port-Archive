@@ -34,9 +34,10 @@ TuxBox is a compatibility layer that runs Xbox Series X|S games on Linux and Win
 
 ```sh
 python tuxbox.py check --no-gpu   # while you work
-python tuxbox.py check            # before a pull request, on a real GPU
+python tuxbox.py check            # the full check, on a real GPU
 ```
 
+- Before a pull request, run the [checks relevant to the change](CONTRIBUTING.md#test-what-your-change-touches). Run the full check when you can't tell what it affects.
 - Report failures as they are, with the output. Never describe a skipped or failed check as passing.
 - Shared code needs a run on an AMD card and an NVIDIA card. Say which one is still missing.
 - Compiling is not proof that translated shaders are correct. Compare their output with a reference on the GPU.

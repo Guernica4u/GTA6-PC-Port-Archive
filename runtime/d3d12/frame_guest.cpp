@@ -252,7 +252,8 @@ std::string run(const wchar_t* adapter, bool present, const wchar_t* window_mode
 int wmain(int argc, wchar_t** argv) {
     const wchar_t* mode = nullptr;
 #ifdef GUEST_FRAME_4K
-    if (argc < 2 || (wcscmp(argv[1], L"owned") && wcscmp(argv[1], L"oversized") && wcscmp(argv[1], L"fit")))
+    if (argc < 2 || (wcscmp(argv[1], L"owned") && wcscmp(argv[1], L"oversized") && wcscmp(argv[1], L"fit") &&
+                     wcscmp(argv[1], L"splash")))
         return 2;
     mode = argv[1];
     --argc;

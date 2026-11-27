@@ -222,6 +222,19 @@ unsafe fn create(
         at += bytes;
     }
 
+    // Decided from the title's own stages, before any of them is replaced.
+    pipeline.image_writes = original
+        .iter()
+        .flatten()
+        .try_fold(Vec::new(), |mut slots, (code, _)| {
+            for slot in tuxbox_dxbc::image_writes::table_image_writes(code)? {
+                if !slots.contains(&slot) {
+                    slots.push(slot);
+                }
+            }
+            Some(slots)
+        })
+        .map(Into::into);
     if let (Some((mesh, _)), Some(root), Some(field)) = (original[7], guest_root, root_record)
         && original[2..7].iter().all(Option::is_none)
         && original[0].is_none()
@@ -281,11 +294,17 @@ unsafe fn create(
     // to that register whatever its state. Build the mesh table again with the
     // missing states as private static samplers, as the vertex/pixel roots do,
     // and keep the root as declared only if the program does not translate then.
+    // Against a root with no static samplers the translation names private
+    // samplers instead, which the root needs just the same.
     if original[0].is_none()
         && let (Some(root), Some((pixel, _)), Some((mesh, _)), Some(field), Some(table)) =
             (guest_root, original[1], original[7], root_record, pipeline.raster_table.as_ref())
         && let Ok(signature) = tuxbox_dxbc::rootsig::parse_rts0(table.pixel_root.as_ref().unwrap_or(root).payload())
-        && let Some(samplers) = tuxbox_dxbc::inline_sampler::unmatched(pixel, 0, &signature)
+        && let Some(samplers) = if signature.static_samplers.is_empty() {
+            super::compute_table::rootless_pixel_samplers(pixel)
+        } else {
+            tuxbox_dxbc::inline_sampler::unmatched(pixel, 0, &signature)
+        }
         && let Ok(Some(extended)) =
             super::mesh_table::reflected(&device.native, root, mesh, Some(pixel), node_mask, &samplers)
         && let Some(variant) = extended.pixel_root.as_ref().and_then(|r| shader_cache::raster_with_root(pixel, r.payload()))
@@ -358,6 +377,40 @@ unsafe fn create(
         let root = match layout {
             TableLayout::Original => Some(root),
             TableLayout::Reflected(table) => {
+                let payload = table.layout.payload().to_vec();
+                // A heap-indexed IDXEN access needs each slot's buffer stride:
+                // retry on the same root with the stride table appended, as
+                // the direct compute path does. Only a stage whose refusal
+                // reason matches the missing stride (and whose translation
+                // succeeds against that root) takes that retry.
+                let untranslated = [vertex, pixel].into_iter().any(|source| {
+                    shader_cache::raster_with_root(source, &payload)
+                        .is_none_or(|variant| shader_cache::prepared(&variant).is_none())
+                });
+                let strides_retry = if untranslated
+                    && [vertex, pixel].into_iter().any(|source| {
+                        shader_cache::refused_for_heap_strides(source, &payload)
+                    })
+                {
+                    let retry = super::compute_table::reflected_with_strides(
+                        &device.native, root, Program::Raster { vertex, pixel }, node_mask,
+                    )
+                    .ok()
+                    .and_then(|layout| match layout {
+                        TableLayout::Reflected(strided) => Some(strided),
+                        _ => None,
+                    });
+                    retry.filter(|strided| {
+                        let payload = strided.layout.payload().to_vec();
+                        [vertex, pixel].into_iter().all(|source| {
+                            shader_cache::raster_with_root(source, &payload)
+                                .is_some_and(|variant| shader_cache::prepared(&variant).is_some())
+                        })
+                    })
+                } else {
+                    None
+                };
+                let table = strides_retry.unwrap_or(table);
                 unsafe { field.write(table.native.as_raw()) };
                 Some(&pipeline.raster_table.insert(table).layout)
             }
@@ -425,7 +478,7 @@ unsafe fn create(
     }
     if let Some((code, Some(index))) = original[5]
         && let Some(root) =
-            super::compute_scene::private_root(&device.native, code, &stages[index], guest_root, node_mask)?
+            super::compute_scene::private_root(&device.native, code, &stages[index], guest_root, None, node_mask)?
     {
         if fields
             .iter()

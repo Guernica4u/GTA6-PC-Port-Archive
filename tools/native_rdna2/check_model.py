@@ -26,9 +26,9 @@ OPS = ["v_cvt_f64_f32", "v_cvt_f32_f64", "v_min_f64", "v_max_f64", "v_frexp_exp_
 ALL_MODES = range(1024)
 
 
-def build(rocm, work):
+def build(rocm, work, source=HERE / "kernels.hip"):
     bundle, code, host = work / "kernels.hsaco", work / "kernels.co", work / "host"
-    subprocess.run([rocm / "bin/hipcc", "--offload-arch=gfx1030", "-O2", "--genco", HERE / "kernels.hip", "-o", bundle],
+    subprocess.run([rocm / "bin/hipcc", "--offload-arch=gfx1030", "-O2", "--genco", source, "-o", bundle],
                    check=True, capture_output=True)
     subprocess.run([rocm / "llvm/bin/clang-offload-bundler", "--unbundle", "--type=o", f"--input={bundle}",
                     "--targets=hipv4-amdgcn-amd-amdhsa--gfx1030", f"--output={code}"], check=True)

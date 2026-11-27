@@ -83,8 +83,9 @@ impl Insn {
 }
 
 // Scalar bit counts and searches read a pair, but only overwrite one SGPR.
+// S_BITREPLICATE_B64_B32 reads one SGPR and writes a pair.
 pub fn wide_bit_result(mnemonic: &str) -> bool {
-    mnemonic.ends_with("_b64") && !mnemonic.ends_with("_i32_b64")
+    mnemonic.ends_with("_b64") && !mnemonic.ends_with("_i32_b64") || mnemonic == "s_bitreplicate_b64_b32"
 }
 
 pub fn writes_scalar(op: &Insn, register: u8) -> bool {
@@ -100,7 +101,7 @@ pub fn writes_scalar(op: &Insn, register: u8) -> bool {
         || (m.ends_with("_i64") && !m.ends_with("_i32_i64"))
         || m.ends_with("_u64")
         || m.starts_with("v_cmp")
-        || matches!(m, "s_bitreplicate_b64_b32" | "s_memtime" | "s_memrealtime")
+        || matches!(m, "s_memtime" | "s_memrealtime")
     {
         2
     } else {

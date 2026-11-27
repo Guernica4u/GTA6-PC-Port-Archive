@@ -155,9 +155,11 @@ fn read_bindings(
         // below confirms that parameter's register and SGPR.
         let raster_constants = multi_table.is_some() && class == 2;
         // A root SRV: its 64-bit address arrives in two SGPRs, and the record
-        // names its root parameter the same way (as mesh_table reads it).
-        let raster_root_srv = multi_table.is_some() && class == 0x100;
-        let table = if stage == 5 || raster_constants || raster_root_srv { location >> 16 }
+        // names its root parameter the same way (as mesh_table reads it). A
+        // compute root can carry one after its tables; the user-data check
+        // below confirms the parameter, as for a raster stage.
+        let root_srv = (multi_table.is_some() || stage == 5 && root.is_some()) && class == 0x100;
+        let table = if stage == 5 || raster_constants || root_srv { location >> 16 }
             else { raster_table.map_or(0, |(table, _)| table) };
         // Root-less raster programs (RAGE) can receive their descriptor table in
         // s9 instead of s8. The descriptor encodings are otherwise identical.
@@ -186,7 +188,10 @@ fn read_bindings(
                 let mut types = rows.chunks_exact(stride).filter_map(|row| {
                     if word(row, 8)? != register || word(row, 12)? != register { return None; }
                     let ty = word(row, 0)?;
-                    ((ty == raw && shape == 1) || ((ty == typed || ty == structured)
+                    // An acceleration structure is a raw SRV in PSV, told apart only by
+                    // its resource kind (24-byte rows). FSSM gives its descriptor shape 4.
+                    let scene = !uav && shape == 4 && word(row, 16) == Some(RT_ACCELERATION_STRUCTURE);
+                    ((ty == raw && (shape == 1 || scene)) || ((ty == typed || ty == structured)
                         && (4..=2048).contains(&shape) && shape.is_multiple_of(4))).then_some(ty)
                 });
                 let ty = types.next()?;
@@ -212,7 +217,7 @@ fn read_bindings(
             // Constants in a later parameter of an extended compute root; the
             // user-data check below confirms parameter, register and size.
             (2, _) if stage == 5 && root.is_some() && location >> 16 >= 2 => (4, 2),
-            (0x100, _) if raster_root_srv && location & 0xff == 4 && shape == 1 => (ROOT_SRV, 4),
+            (0x100, _) if root_srv && location & 0xff == 4 && shape == 1 => (ROOT_SRV, 4),
             (0x401, _) => (3, 1),                 // inlined static sampler
             _ => return None,
         };
@@ -383,6 +388,9 @@ pub fn missing_root_descriptors(bytes: &[u8], root: &crate::rootsig::RootSig) ->
 /// Binding kind for a root SRV read through its GPU address in two SGPRs. The
 /// shader names it with its own register, which the host root must then carry.
 pub const ROOT_SRV: u32 = 5;
+
+/// PSV resource kind (DXIL `ResourceKind`) of a ray tracing acceleration structure.
+const RT_ACCELERATION_STRUCTURE: u32 = 16;
 
 /// A raster descriptor record under a root with several leading tables names its
 /// table in the high half of the location, as compute records do, and table N is

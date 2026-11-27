@@ -1,6 +1,6 @@
 # Set up ProjectScarlett (GTA VI) on Linux
 
-This guide stages GTA VI 1.0.2.1 (`ProjectScarlett`) with TuxBox's providers and starts it on GE-Proton. The furthest recorded run got into the story intro, where GPU queues stalled. The game isn't playable. [What to expect](#what-to-expect) · [Title progress](PROGRESS.md) · [Run record](../evidence/projectscarlett-gameplay.json)
+This guide stages GTA VI 1.0.2.1 (`ProjectScarlett`) with TuxBox's providers and starts it on GE-Proton. The game reaches the prologue cutscene and then crashes; it isn't playable. [What to expect](#what-to-expect) · [Title progress](PROGRESS.md) · [Run record](../evidence/projectscarlett-gameplay.json)
 
 You supply the game package. TuxBox doesn't include any game files. The recorded runs use package `RockstarGamesInc.28872443D20A7` 1.0.2.1, whose `game_scarlett_master.exe` has SHA-256 `e95020b2fa4a721db3df59fdecf75621730ac559d8835252f6c3b658d5a08993`. Other builds may need different providers or shader requests.
 
@@ -21,11 +21,11 @@ python -m pip install -r requirements.txt
 python build.py
 ```
 
-To build only what ProjectScarlett loads, run `python build.py <target>` for each of `xmem`, `d3d12`, `xg`, `xapu`, `acphal`, `xcrdapi`, `gameinput` and `xgameruntime`. Some Linux distributions currently need the build workarounds described in [issue #4](https://github.com/brcly/TuxBox/issues/4).
+To build only what ProjectScarlett loads, run `python build.py <target>` for each of `xmem`, `d3d12`, `bvh`, `xg`, `xapu`, `acphal`, `xcrdapi`, `gameinput` and `xgameruntime`. Some Linux distributions currently need the build workarounds described in [issue #4](https://github.com/brcly/TuxBox/issues/4).
 
 ## Stage a working copy
 
-Keep the original package unchanged and launch a copy. The package doesn't contain any of the provider DLL names, so TuxBox's copies are added beside the game files rather than replacing them.
+Keep the original package unchanged and launch a copy. The package has its own `XboxBvhBuilder.dll`, which TuxBox's replaces in that copy. The other providers are added beside the game files.
 
 ```sh
 cp -a --reflink=auto /path/to/GTA6.Xbox.v1.0.2.1 /path/to/scarlett-run
@@ -38,15 +38,19 @@ cp build/xmem-smoke/{xmem,tuxbox_xhttp}.dll \
    build/gameinput/GameInput.dll \
    build/xgameruntime/xgameruntime.dll \
    /path/to/scarlett-run/
+# Replaces the package's file. --remove-destination keeps a hard-linked
+# original from being written through.
+cp --remove-destination build/bvh/XboxBvhBuilder.dll /path/to/scarlett-run/
 ```
 
 On a copy-on-write filesystem such as Btrfs or XFS, `--reflink=auto` copies the package almost instantly without using more disk space. If you use a hard-link copy (`cp -al`) to save space, never write into the linked game files. Writing to one also changes the original package.
 
 | Provider | Build output | Loaded by |
 | --- | --- | --- |
-| `xmem.dll` | `build/xmem-smoke/` | the executable, `Bink2Scarlett.dll`, `XboxBvhBuilder.dll`, `amd_fidelityfx_upscaler_xbox.dll` |
+| `xmem.dll` | `build/xmem-smoke/` | the executable, `Bink2Scarlett.dll`, `amd_fidelityfx_upscaler_xbox.dll` |
 | `tuxbox_xhttp.dll` | `build/xmem-smoke/` | `xmem.dll`, which forwards `XMemSetWinHttpHooks` to it |
-| `d3d12_xs.dll` | `build/d3d12-smoke/` | the executable, `XboxBvhBuilder.dll`, `amd_fidelityfx_upscaler_xbox.dll` |
+| `d3d12_xs.dll` | `build/d3d12-smoke/` | the executable, `amd_fidelityfx_upscaler_xbox.dll` |
+| `XboxBvhBuilder.dll` | `build/bvh/` | the executable |
 | `xg_xs.dll` | `build/xg-provider/` | the executable |
 | `xapu.dll`, `chad.dll` | `build/xapu/` | the executable |
 | `AcpHal.dll` | `build/acphal/` | the executable |
@@ -63,6 +67,8 @@ compiler. The runtime reports an actual compiler load failure separately
 from other pipeline errors. This is not a confirmed fix for the black-screen
 report in #39.
 
+The package's `XboxBvhBuilder.dll` runs its own console compute programs, and vkd3d-proton can't compile them: the log shows `Function 'xbox.…' is declared but has no definition` and failed compute pipelines. TuxBox's builder passes acceleration structure builds to the graphics driver instead. This removes those failures, but the title's ray tracing scenes still aren't built, so it doesn't make ray tracing work.
+
 Copy the providers again after each rebuild. The launcher enables the constant-buffer layer only when the staged `d3d12_xs.dll` is byte-identical to `build/d3d12-smoke/d3d12_xs.dll`. With it, the launcher also adds `force_raw_va_cbv` to `VKD3D_CONFIG`, so constant buffers bound by address are read from the guest's 16-byte offsets.
 
 ## Launch
@@ -75,7 +81,7 @@ The game installs a Breakpad crash handler that uploads minidumps to an online c
 
 An offline launch also stops umu-run from updating the Steam Runtime. If the runtime isn't installed yet, run another program through TuxBox once first, such as `python tuxbox.py check`.
 
-The game log goes to the terminal only. Add `--log-file build/scarlett.log` to keep it, and `--mangohud` to record frame times, both before the package path. The prefix defaults to `~/.local/share/project-tuxbox/prefixes/GE-Proton11-14-x86_64`. Pass `--prefix` to use another one.
+The game log goes to the terminal only. Add `--log-file build/scarlett.log` to keep it, `--overlay` to see frame times and memory use over the game, and `--mangohud` to record frame times with MangoHud, all before the package path. The prefix defaults to `~/.local/share/project-tuxbox/prefixes/GE-Proton11-14-x86_64`. Pass `--prefix` to use another one.
 
 ## Shader preparation
 
@@ -212,29 +218,39 @@ matched across configurations. See `--help` for reproduction arguments and
 
 
 
-### Experimental persistent DXC
+### DXC helper
 
-On Linux, build the helper against the same Microsoft DXC release used by
-TuxBox. Set `DXC_ROOT` to the extracted release directory.
+On Linux, launch-time preparation and the live worker compile through a small
+helper, `tools/dxc_worker.cpp`. It runs DXC's own stages and passes, except
+correlated value propagation, which takes about a quarter of DXC's time on
+translated programs and changes very little in them. On 1,500 recorded
+ProjectScarlett requests, 16 at a time, a cold compile took 51 s instead of
+60 s.
 
-```sh
-mkdir -p build
-c++ -std=c++17 -O2 -isystem "$DXC_ROOT/include" tools/dxc_worker.cpp \
-    -L "$DXC_ROOT/lib" -ldxcompiler -o build/dxc-worker
-export TUXBOX_PERSISTENT_DXC="$PWD/build/dxc-worker"
-```
+The launcher builds the helper into `build/dxc-helper` the first time it is
+needed. That takes a C++ compiler and a Microsoft DXC 1.9.2609 release with
+its headers and library, as the staged toolchain has. Without them, or with
+another release, the launcher says why and uses the `dxc` command line. Set
+`TUXBOX_PERSISTENT_DXC=0` to always use the command line, or give it the path
+of a helper you built.
 
-The live worker starts helpers on demand for optimized `cs_6_0` requests.
+The helper's output differs from the command line's in two ways besides the
+skipped pass. It keeps resource and value names that `dxc` strips, so the
+files are about 38% larger, and its container digest is left empty. DXC's
+first stage does not hand a program's `[WaveSize]` to the later passes, so
+the helper writes it back.
+
 Each helper handles one request at a time and stays open for the session.
 The worker retries once if a helper exits during compilation and falls
-back to the CLI if the helper or validation fails. Each newly compiled
-result still passes DXV before publication. The CLI handles other profiles
-and slow requests. The experimental cache identity includes the helper
-binary. Unset `TUXBOX_PERSISTENT_DXC` to use the default CLI.
+back to the command line if the helper cannot build a program or validation
+fails. A compile that runs out of time is treated as a slow command line
+compile. Each newly compiled result still passes DXV before publication. `-O0`
+compiles always use the command line. The cache identity includes the helper
+binary, so turning it on or off compiles into a separate cache.
 
 For a synthetic comparison, run the worker benchmark described above
-with `--jobs 4` and add `--dxc-helper build/dxc-worker` for the experimental
-variant. Give each run a fresh output path. Compare per-request SHA-256
+with `--jobs 4` and add `--dxc-helper` with the built helper's path for the
+second run. Give each run a fresh output path. Compare per-request SHA-256
 values and latency.
 
 ## Prepare shaders after an update
@@ -248,6 +264,9 @@ python tuxbox.py run --prepare-only --backend proton --prefix PREFIX /path/to/sc
 ```
 
 ## What to expect
+
+The game currently gets as far as the prologue cutscene, which appears, and then
+crashes. The runs described below are earlier ones with saved records or reports.
 
 The two shader and memory paths added on November 26, 2026 have passed TuxBox's
 checks. The [memory copy](USAGE.md#memory-copy) on AMD's Linux driver hasn't
@@ -269,7 +288,8 @@ On November 25, 2026, an offline run on a GeForce RTX 4070 Ti SUPER got into the
 story intro. The game's own crash report records the state `Game Running`, frame
 32,534 and the story intro script after 18 minutes 11 seconds. GPU queues stalled
 on fence waits there. The run ended on a game assert (exit code 3) after a command
-list ran out of descriptor memory. The prologue cutscene did not appear.
+list ran out of descriptor memory. The prologue cutscene did not appear in that
+run.
 [Run record](../evidence/projectscarlett-gameplay.json)
 
 - **Fence stalls.** TuxBox now records the game's fence value writes, keeps a
@@ -281,17 +301,22 @@ list ran out of descriptor memory. The prologue cutscene did not appear.
 - **Descriptor memory.** Since #172, shader-visible descriptor slots are reused
   once the GPU has finished the work that referenced them, and the oldest are
   evicted when the heap fills. The [Lanes self-test](../examples/lanes/README.md#self-test)
-  checks this, but no long game run has confirmed it yet. Compute dispatches
-  whose root has no descriptor tables and indexes the resource heap directly
-  are still skipped on paged layouts
-  ([#232](https://github.com/brcly/TuxBox/issues/232); draft fix in
-  [#235](https://github.com/brcly/TuxBox/pull/235)).
+  checks this, but no long game run has confirmed it yet. Dispatches and draws
+  that index the resource heap directly were skipped on paged layouts
+  ([#232](https://github.com/brcly/TuxBox/issues/232));
+  [#235](https://github.com/brcly/TuxBox/pull/235),
+  [#294](https://github.com/brcly/TuxBox/pull/294) and
+  [#295](https://github.com/brcly/TuxBox/pull/295) added their descriptor maps,
+  which no long game run has confirmed either.
 - **Missing effects.** Many shaders are still unsupported, and large compute
   pipelines can receive empty stand-ins. Expect missing or wrong rendering.
   Image correctness hasn't been checked. [Shader coverage](SHADERS.md#projectscarlett-refusals)
-- **Long loads.** The driver takes minutes, and sometimes most of an hour, to
-  compile the largest translated compute shaders.
-- **Memory.** A long run needs about 15 GB of RAM plus swap. On a machine whose
+- **Long loads.** Shaders the game hasn't requested before are translated while
+  it runs, and the driver takes minutes to compile the largest ones. Earlier
+  runs on another Proton build saw single compiles of most of an hour.
+- **Memory.** A run needs far more than the console's. On November 27 one used
+  28.5 GB of RAM and swap within a few minutes, so a 32 GB machine needs disk
+  swap as well. [Where to improve](FOCUS.md#memory). On a machine whose
   `/tmp` is held in memory, clear large temporary files before launching.
 - **Not yet verified:** input and audio during play, frame times, and any other
   GPU or Windows.
@@ -787,7 +812,9 @@ totals or distinct shaders. No retail inputs were used locally.
 
 The generic translator supports nine additional scalar bit instructions and applies the ordinary-scalar proof to the three forms already added by #56
 (32/64-bit zero counts, zero searches, leading-bit searches, reversal,
-bit setting/clearing and testing). The local reaching-definition check
+bit setting/clearing and testing). The same proof admits `s_quadmask_b32/b64`
+and `s_bitreplicate_b64_b32` on ordinary values; applied to EXEC or VCC they
+are pixel-quad operations and stay refused. The local reaching-definition check
 requires ordinary scalar values, not an assumed full-wave EXEC/VCC mask.
 Unknown halves, branch entries and indirect control flow remain unsupported;
 private packed and mesh paths are outside this proof. The rules follow
@@ -797,7 +824,7 @@ CPU-only controls:
 
 - Capture `cargo test --manifest-path tools/shader-compiler/Cargo.toml --target x86_64-unknown-linux-gnu scalar_bit_cpu_oracle_fixture -- --nocapture`
   to a fresh fixture file. Run `python tools/check_scalar_bits.py --help`
-  for the DXC/DXV numerical oracle: 1,944 cases, 7,776 checked values.
+  for the DXC/DXV numerical oracle: 2,430 cases, 9,720 checked values.
 - Run `python tools/check_scalar_native.py --help` with the baseline and
   candidate xshader executables: 13 synthetic native programs recovered,
   six deliberately unsupported controls retained, one unchanged control.
@@ -860,3 +887,55 @@ unless the staged file matches the local build. This does not rebuild or
 replace a DLL, prove which source revision produced the local build, or
 inspect modules actually loaded by Wine. Record the build revision and
 driver separately.
+
+### Identify a slow slot-62 compute pipeline request
+
+With diagnostic logging enabled, slow `CreatePipelineState #N CS ...`
+messages include `request=<key> bytes=<size>`. The short CS hash still
+identifies the original guest program, while the full request key names
+the actual selected translation (`<key>.cso` in the shader cache), including
+a root-specific request or its `_w32` variant. `request=original` means the
+original bytecode was passed to the host, not a translated cache entry.
+Set `TUXBOX_TRACE_PIPELINE_REQUESTS=1` to also record starts and finishes of
+short attempts. The identifier after `#` is local to the process.
+Times include any compile-slot wait and the host pipeline call; they do not
+isolate the driver. This currently covers the Xbox slot-62 compute factory,
+not all graphics or pipeline-stream paths. Share keys and sizes only, not
+title shader files or private raw logs.
+
+
+To test the memory-pressure hypothesis in issue #231, sample the actual
+guest process (not the UMU parent) during the cold launch:
+
+```sh
+python tools/sample_process_cpu.py PID --seconds 300 --interval 1 --output cold-memory.jsonl
+```
+
+The samples share the existing UTC nanosecond timestamp and include host
+available RAM, total/free/used swap, guest RSS, peak RSS and guest swap in
+KiB. Missing fields are null. Compare timestamps with the pipeline log;
+neither a large swap value nor a slow pipeline alone establishes causation.
+The sampler does not attribute host memory to individual driver threads.
+Keep detailed samples local; share aggregate memory observations.
+
+### Investigating compute loop guards after a device loss
+
+Compare the exact same recorded requests against two xshader builds without
+executing title programs or modifying a cache:
+
+```sh
+python tools/audit_shader_guards.py REQUESTS --baseline OLD_XSHADER --candidate NEW_XSHADER --json guard-summary.json
+```
+
+This reports the number of compute translations with the generic structured
+loop guard (65,536) or block dispatcher guard (1,000,000), including newly
+admitted compute programs. It also counts dispatchers without that generic
+guard, and persistent PC-range dispatchers separately. The range check is
+not an iteration limit. The report includes aggregate before/after shape
+transitions, including existing compute translations that gain or lose a
+generic guard. Both emitters use private digest-verified
+copies of each input, with the original request mode (including `.wave32`).
+Use `--select` with an exact local worklist, or `--include-keys` for local
+per-request attribution. The default report omits request keys and paths.
+These are static emitted sites, not executed iterations, timing or evidence
+that a particular loop caused a GPU fault. Keep per-request reports private.

@@ -1,6 +1,6 @@
 //! Ordinary VOP3 integer forms with a 32-bit result: the signed no-carry
 //! add/subtract, 16x16+32 multiply-add, saturating integer packs and sums of
-//! absolute differences over bytes, halves and words. Add/subtract and unsigned MAD
+//! absolute differences over bytes, halves and words, and the masked byte SAD. Add/subtract and unsigned MAD
 //! accept integer immediates, and byte SAD accepts an inline zero accumulator.
 //! Signed add/subtract also support saturating arithmetic with clamp.
 use super::{int16::half, r, signed_add_overflow, Enc, Insn, Opnd};
@@ -9,7 +9,7 @@ pub(super) fn handles(ins: &Insn) -> bool {
     ins.enc == Enc::Vop3 && matches!(ins.mnemonic.as_str(),
         "v_add_nc_i32" | "v_sub_nc_i32" | "v_mad_u32_u16" | "v_mad_i32_i16"
         | "v_cvt_pk_u16_u32" | "v_cvt_pk_i16_i32"
-        | "v_sad_u8" | "v_sad_hi_u8" | "v_sad_u16" | "v_sad_u32")
+        | "v_sad_u8" | "v_sad_hi_u8" | "v_sad_u16" | "v_sad_u32" | "v_msad_u8")
 }
 
 pub(super) fn expression(ins: &Insn) -> Result<Option<String>, String> {
@@ -73,6 +73,8 @@ pub(super) fn expression(ins: &Insn) -> Result<Option<String>, String> {
         "v_sad_hi_u8" => format!("((({}) << 16) + {})", sad(8), r(&ins.src[2])?),
         "v_sad_u16" => format!("({} + {})", sad(16), r(&ins.src[2])?),
         "v_sad_u32" => format!("((max({a}, {b}) - min({a}, {b})) + {})", r(&ins.src[2])?),
+        // MSAD_U8 skips each byte whose S1 byte is zero (measured natively).
+        "v_msad_u8" => format!("({} + {})", super::quad_sad::sad(&a, &b, true), r(&ins.src[2])?),
         // Without clamp these wrap exactly like the unsigned forms.
         "v_add_nc_i32" => format!("({a} + {b})"),
         "v_sub_nc_i32" => format!("({a} - {b})"),

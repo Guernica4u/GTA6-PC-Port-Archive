@@ -126,8 +126,9 @@ fn sums_of_absolute_differences_accumulate_into_source_2() {
         assert!(expression(&native(first | 0x0800, 0x041a_0b04)).is_err(), "{name} op_sel");
         assert!(expression(&native(first, 0x041a_0b04 & !511 | 4)).is_err(), "{name} sgpr");
     }
-    // Masked and quad SADs remain refused.
-    assert!(!handles(&native(0xd571_0007, 0x041a_0b04)));
+    // The masked byte SAD is handled here; quad SADs have their own module.
+    assert!(handles(&native(0xd571_0007, 0x041a_0b04)));
+    assert!(!handles(&native(0xd572_0006, 0x041a_0b04)));
 }
 
 #[test]

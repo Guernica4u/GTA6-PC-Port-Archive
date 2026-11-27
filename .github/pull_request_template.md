@@ -1,21 +1,16 @@
 ## Summary
 
-## Verified on Lanes
+## Tested
 
-A pull request is not merged until Lanes passes on a GPU. Run:
+Run the [checks relevant to this change](../CONTRIBUTING.md#test-what-your-change-touches).
 
-```sh
-python tuxbox.py check
-```
-
-- [ ] `python tuxbox.py check` passed on this branch
+- [ ] The checks relevant to this change passed
 - [ ] Changed or new behaviour is covered by a Lanes scenario, or the reason it cannot be is stated below
+- [ ] Where the table calls for AMD and NVIDIA, they passed on both. Otherwise, say which vendor still needs to run them:
 
 GPU, driver and backend:
 
-- [ ] This changes code both vendors run, and the check passed on an AMD and an NVIDIA card ([why](../CONTRIBUTING.md#amd-and-nvidia)). Otherwise, say which vendor still needs to run it:
-
-Paste the summary printed at the end:
+Commands run and their results:
 
 ```text
 ```

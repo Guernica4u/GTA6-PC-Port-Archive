@@ -43,6 +43,86 @@ fn other_high_offset_bits_and_gds_stay_refused() {
 }
 
 #[test]
+fn uniform_scc_loop_around_the_exchange_translates() {
+    // A 32-thread, single-wave group: an SCC back-edge (uniform, never per-lane)
+    // means every invocation runs the loop and the shared exchange the same
+    // number of times, so the loop is accepted.
+    let ex = fixture::shader_loop(0x041f, 0, 5);
+    assert_eq!(disassemble(&ex.isa)[0].mnemonic, "ds_swizzle_b32");
+    let hlsl = translate(&ex).map(|t| t.hlsl)
+        .expect("uniform SCC loop over a compute swizzle translates");
+    assert!(hlsl.contains("tb_swizzle"), "{hlsl}");
+    assert!(hlsl.contains("GroupMemoryBarrierWithGroupSync()"), "{hlsl}");
+}
+
+#[test]
+fn unconditional_loop_around_the_exchange_translates() {
+    let ex = fixture::shader_loop(0x041f, 0, 2);
+    let hlsl = translate(&ex).map(|t| t.hlsl)
+        .expect("unconditional loop over a compute swizzle translates");
+    assert!(hlsl.contains("tb_swizzle"), "{hlsl}");
+}
+
+#[test]
+fn divergent_vcc_loop_around_the_exchange_is_refused() {
+    // A VCC back-edge can run lane-selectively: lanes in the loop body run the
+    // exchange a different number of times, which is unsafe.
+    let error = translate(&fixture::shader_loop(0x041f, 0, 7))
+        .map(|t| t.hlsl)
+        .unwrap_err();
+    assert!(error.contains("compute swizzle inside a loop"), "{error}");
+}
+
+#[test]
+fn per_thread_execz_back_edge_is_refused() {
+    // This emitter keeps EXEC as a per-thread bit, so an execz back-edge is
+    // per-invocation: threads can leave the loop on different iterations.
+    let error = translate(&fixture::shader_loop(0x041f, 0, 8))
+        .map(|t| t.hlsl)
+        .unwrap_err();
+    assert!(error.contains("compute swizzle inside a loop"), "{error}");
+}
+
+#[test]
+fn multi_wave_group_is_refused() {
+    // A 64-thread group runs two 32-lane waves with independent SCC registers,
+    // so a uniform-SCC back-edge is no longer group-uniform.
+    let error = translate(&fixture::shader_loop_64(0x041f, 0))
+        .map(|t| t.hlsl)
+        .unwrap_err();
+    assert!(error.contains("compute swizzle inside a loop"), "{error}");
+}
+
+#[test]
+fn forward_exit_inside_the_loop_is_refused() {
+    // A per-thread forward exit out of the loop body leaves the barrier count
+    // mismatched: threads that leave stop reaching the exchange while others
+    // keep iterating.
+    let error = translate(&fixture::shader_loop_exit_guard(0x041f))
+        .map(|t| t.hlsl)
+        .unwrap_err();
+    assert!(error.contains("compute swizzle inside a loop"), "{error}");
+}
+
+#[test]
+fn countdown_loop_with_early_exit_translates() {
+    // A countdown loop around the exchange with a per-thread early exit before
+    // the loop: the emitted loop keeps every lane together (a whole-wave vote),
+    // masks the publish on the exit flag and keeps the finished lanes' exchange
+    // contributions at zero. This is the GPU control driver.
+    let ex = fixture::shader_loop_exit_countdown(0x041f);
+    let hlsl = translate(&ex).map(|t| t.hlsl)
+        .expect("countdown loop with per-thread exit translates");
+    assert!(hlsl.contains("tb_swizzle"), "{hlsl}");
+    assert!(hlsl.contains("WaveActiveAnyTrue(tb_c"), "{hlsl}");
+    assert!(hlsl.contains("(tb_skip < 7u)"), "{hlsl}"); // masked publish
+    // One variable holds every pending forward branch.
+    assert_eq!(hlsl.matches("uint tb_skip = 0u;").count(), 1, "{hlsl}");
+    assert!(!hlsl.contains("bool j"), "{hlsl}");
+    assert!(hlsl.contains("GroupMemoryBarrierWithGroupSync()"), "{hlsl}");
+}
+
+#[test]
 fn paired_wave64_lowers_quad_and_bitmask_swizzles_without_shared_memory() {
     use crate::hlsl::translate_paired_wave64;
 

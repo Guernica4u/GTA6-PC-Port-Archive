@@ -338,6 +338,12 @@ impl Arena {
             .ok_or(E_OUTOFMEMORY)?;
         let memory = GuestMemory::allocate(bytes, 0x0480_0004)?;
         let base_address = memory.address;
+        // The title's allocator need not clear what it returns. A slot nobody
+        // has written must read as no descriptor: leftover bytes there are
+        // neither an authored record nor an empty one, and a table that spans
+        // such a slot would be refused whole.
+        // SAFETY: the allocation above is `bytes` long and owned by this arena.
+        unsafe { core::ptr::write_bytes(base_address as *mut u8, 0, bytes) };
         let visible_cpu_start = unsafe { visible.GetCPUDescriptorHandleForHeapStart() }.ptr;
         let visible_gpu_start = if desc.Flags == D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE {
             unsafe { visible.GetGPUDescriptorHandleForHeapStart() }.ptr

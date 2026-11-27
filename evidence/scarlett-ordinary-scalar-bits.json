@@ -13,10 +13,10 @@
       "dxc": "3dfc856b76291ffc7e45e21fd37ab80e85b34101de76a03253df6608785c92a0",
       "dxv": "33778294d67143d9f81526f4759c66d5a67a95ea9873448ef3595650a643cbd3"
     },
-    "fixture_sha256": "7da5d07b872e3e33ea8f81b1ee7114289c0a937b4c5bd9ac1472fb610d4f5442",
-    "instructions": 12,
-    "cases": 1944,
-    "compared_words": 7776,
+    "fixture_sha256": "88478e26d3b91383fcfa5c899f497182a96a2c7339b08b3aa5b2677b061195cb",
+    "instructions": 15,
+    "cases": 2430,
+    "compared_words": 9720,
     "mismatches": 0,
     "rows": [
       {
@@ -113,6 +113,30 @@
         "words": 648,
         "hlsl_sha256": "3d8e5a315e83cc09a43a995ca98d3ee54871932156863a12dba08257fe40569d",
         "dxil_sha256": "d20fac7ed6fa478308b013fac369ecfa9b31ce4f6dbcee515bf33f4eb13bc2b6",
+        "mismatches": 0
+      },
+      {
+        "opcode": "s_quadmask_b32",
+        "cases": 162,
+        "words": 648,
+        "hlsl_sha256": "2fbcc88297d328b80bef6b04245d8c3421b513b9912c37c31ac3336096cdc30c",
+        "dxil_sha256": "98d1cd21ac7dd6f2dad15553527e4f0d3111d258b26b23df390bbbaf8d05a67b",
+        "mismatches": 0
+      },
+      {
+        "opcode": "s_quadmask_b64",
+        "cases": 162,
+        "words": 648,
+        "hlsl_sha256": "b3bdff10b6d5c65fd48d584c84653410b82219afa136427376d97f561d210229",
+        "dxil_sha256": "149486c518e4df6abfb4ce87b09522eb4ff19d5b8b9940596f75670db0e9a277",
+        "mismatches": 0
+      },
+      {
+        "opcode": "s_bitreplicate_b64_b32",
+        "cases": 162,
+        "words": 648,
+        "hlsl_sha256": "62f7769acd982fb61f0a8ef095ff2c99cf8eae015ef68d1518fdba2472f72950",
+        "dxil_sha256": "b43be77393fe5780d5909201fe4a4e411f6f5c204a8e7ee2fc561200d8c5c884",
         "mismatches": 0
       }
     ]

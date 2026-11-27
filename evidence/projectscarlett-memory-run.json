@@ -1,0 +1,61 @@
+{
+  "schema": 1,
+  "date_utc": "2026-11-27",
+  "title": "ProjectScarlett",
+  "package_version": "1.0.2.1",
+  "executable_sha256": "e95020b2fa4a721db3df59fdecf75621730ac559d8835252f6c3b658d5a08993",
+  "host": {
+    "gpu": "GeForce RTX 4070 Ti SUPER",
+    "gpu_memory_mib": 16376,
+    "driver": "620.73.04",
+    "backend": "GE-Proton11-14",
+    "memory_gib": 31,
+    "swap": "30 GiB zram and a 32 GiB disk swap file"
+  },
+  "launch": {
+    "network": "disabled",
+    "memory_limit": "MemoryHigh=19G, MemoryMax=21G, MemorySwapMax=48G",
+    "shader_preparation": "completed beforehand on the same translator",
+    "source": "main at 12e4b06 with a temporary XMem memory log that is not committed",
+    "log_sha256": "ea37462937a95c004b58163656b616edf389c20debff447a0d2072faf5a081fe"
+  },
+  "title_crash_report": {
+    "sha256": "03edda99be4495b68cbbc1718dd46ece04235c251f6e852ef0dda9ee933ff696",
+    "game_state": "Game Running",
+    "running_time": "0h:12m:39s",
+    "frame": 2840,
+    "streaming_script": "fbk_stry000_FBK_STRY000_INTRO",
+    "streaming_state": "Prestream"
+  },
+  "result": {
+    "exit_code": 5,
+    "seconds": 803.4,
+    "kernel_fault": "Xid 31, MMU fault on a graphics virtual write",
+    "device_lost": true,
+    "gpu_memory_allocations_fell_back_to_system_memory": true,
+    "seconds_from_first_failed_allocation_to_device_loss": 13,
+    "crash_cause_established": false
+  },
+  "memory_samples_15s": {
+    "before_world": {
+      "gpu_gib": 9.6,
+      "process_resident_gib": 4.5,
+      "process_swapped_gib": 19.5,
+      "host_available_gib": 12.5
+    },
+    "at_failure": {
+      "gpu_gib": 15.6,
+      "process_resident_gib": 12.4,
+      "process_swapped_gib": 21.4,
+      "host_available_gib": 2.8
+    },
+    "disk_swap_used_mib_after_exit": 6.7
+  },
+  "title_memory_budget_queried": false,
+  "not_verified": [
+    "image correctness",
+    "input and audio",
+    "frame times",
+    "play beyond this run"
+  ]
+}

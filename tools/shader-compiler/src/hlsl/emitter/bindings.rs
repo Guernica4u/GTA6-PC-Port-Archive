@@ -104,6 +104,10 @@ impl<'a> Emitter<'a> {
         self.loop_ranges.iter().any(|&(head, back)| (head..=back).contains(&idx))
     }
 
+    pub(in crate::hlsl) fn in_accepted_swizzle_loop(&self) -> bool {
+        self.in_accepted_swizzle_loop_stack.last().copied().unwrap_or(false)
+    }
+
     pub(in crate::hlsl) fn space_suffix(&self, kind: u32, register: u32) -> String {
         match self.binding_spaces.get(&(kind, register)) {
             Some(space) if *space != 0 => format!(", space{space}"),

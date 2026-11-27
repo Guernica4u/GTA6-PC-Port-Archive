@@ -49,8 +49,10 @@ impl Flow {
         };
         for (i, op) in code.iter().enumerate() {
             let branch = op.enc == Enc::Sopp && Emitter::branch_cond(op.op).is_some();
+            // Lowered reads retain the complete original VOP3 encoding, including literals.
             let lane_spill = op.enc == Enc::Sop1
-                && op.raw.len() == 2
+                && (op.raw.len() == 2 || op.raw.len() == 3
+                    && [0, 9, 18].iter().any(|shift| (op.raw[1] >> shift) & 511 == 255))
                 && matches!(op.raw[0] >> 16, 0xd760 | 0xd761)
                 && matches!(op.mnemonic.as_str(), "s_mov_b32" | ray_resolve::READ_LANE);
             if (!op.is_complete() && !lane_spill)

@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <string>
 #include <windows.h>
 #include <d3d12.h>
@@ -14,9 +15,16 @@ public:
     void verify(ID3D12CommandQueue* queue, ID3D12Resource* source, UINT64 token,
                 COLORREF corner, COLORREF center);
 private:
+    void measure(RECT& client, POINT& origin);
+    std::array<COLORREF, 5> sample() const;
+    bool shows(COLORREF corner, COLORREF center, ULONGLONG milliseconds) const;
+    bool transparent() const;
+    bool splash_shows(ULONGLONG milliseconds) const;
     HWND window_ = nullptr;
+    HWND splash_window_ = nullptr;
     bool owns_title_ = false;
     bool check_size_ = false;
+    bool splash_ = false;
     std::string sizing_;
 };
 }

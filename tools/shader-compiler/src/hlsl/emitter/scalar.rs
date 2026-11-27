@@ -51,16 +51,7 @@ impl<'a> Emitter<'a> {
                     let c = if self.paired || self.resolve_wave32 || self.lockstep.is_some() {
                         wave_cull::branch_condition(self, ins, &c)
                     } else { c };
-                    // The condition is evaluated either way. Or-ing it in keeps
-                    // the branch out of an unoptimised compute program's control
-                    // flow (see `flag_or`).
-                    if self.ex.stage != Stage::Compute {
-                        self.line(&format!("if ({c}) j{t} = true;"));
-                    } else if c == "true" {
-                        self.line(&format!("j{t} = true;"));
-                    } else {
-                        self.line(&format!("j{t} = j{t} | ({c});"));
-                    }
+                    self.skip_to(t, (c != "true").then_some(c.as_str()));
                 }
                 Ok(())
             }
@@ -336,14 +327,15 @@ impl<'a> Emitter<'a> {
                 // Population count of a 64-bit value — typically the number of active
                 // lanes (wave-level allocation). One invocation = one lane, so a lane
                 // mask counts as 0 or 1.
-                let a = mask_ballots::word(self, idx, &s[0]).unwrap_or(a);
-                let ah = mask_ballots::word(self, idx, &hi(&s[0])).map_or_else(|| r(&hi(&s[0])), Ok)?;
+                let a = mask_ballots::word(self, idx, &s[0]).or_else(|| lockstep::word(self, idx, &s[0], false)).unwrap_or(a);
+                let ah = mask_ballots::word(self, idx, &hi(&s[0])).or_else(|| lockstep::word(self, idx, &s[0], true))
+                    .map_or_else(|| r(&hi(&s[0])), Ok)?;
                 self.ws(&d, &format!("(countbits({a}) + countbits({ah}))"))?;
                 self.line(&format!("scc = ({} != 0u) ? 1u : 0u;", name(&d)?));
                 Ok(())
             }
             "s_bcnt1_i32_b32" => {
-                let a = mask_ballots::word(self, idx, &s[0]).unwrap_or(a);
+                let a = mask_ballots::word(self, idx, &s[0]).or_else(|| lockstep::word(self, idx, &s[0], false)).unwrap_or(a);
                 self.ws(&d, &format!("countbits({a})"))?;
                 self.line(&format!("scc = ({} != 0u) ? 1u : 0u;", name(&d)?));
                 Ok(())
@@ -361,15 +353,16 @@ impl<'a> Emitter<'a> {
                 self.ws(&d, &ff0_b64_expr(&a, &ah))
             }
             "s_ff1_i32_b32" => {
-                let a = mask_ballots::word(self, idx, &s[0]).unwrap_or(a);
+                let a = mask_ballots::word(self, idx, &s[0]).or_else(|| lockstep::word(self, idx, &s[0], false)).unwrap_or(a);
                 self.ws(&d, &format!("firstbitlow({a})"))
             }
             // s_ff1_i32_b64 is firstbitlow over the 64-bit value: the low word
             // decides when it is nonzero, otherwise the high word.
             "s_ff1_i32_b64" => {
                 self.touch(&hi(&s[0]));
-                let a = mask_ballots::word(self, idx, &s[0]).unwrap_or(a);
-                let ah = mask_ballots::word(self, idx, &hi(&s[0])).map_or_else(|| r(&hi(&s[0])), Ok)?;
+                let a = mask_ballots::word(self, idx, &s[0]).or_else(|| lockstep::word(self, idx, &s[0], false)).unwrap_or(a);
+                let ah = mask_ballots::word(self, idx, &hi(&s[0])).or_else(|| lockstep::word(self, idx, &s[0], true))
+                    .map_or_else(|| r(&hi(&s[0])), Ok)?;
                 self.ws(&d, &ff1_b64_expr(&a, &ah))
             }
             "s_sext_i32_i8" => self.ws(&d, &format!("asuint(asint({a} << 24) >> 24)")),
@@ -402,6 +395,9 @@ impl<'a> Emitter<'a> {
                         Some("andn2") => format!("{src} & ~{exec}"),
                         Some("orn2") => format!("{src} | ~{exec}"),
                         Some("andn1") => format!("~{src} & {exec}"),
+                        Some("nor") => format!("~({src} | {exec})"),
+                        Some("xnor") => format!("~({src} ^ {exec})"),
+                        Some("orn1") => format!("~{src} | {exec}"),
                         _ => return Err("unsupported saveexec".into()),
                     })
                 };

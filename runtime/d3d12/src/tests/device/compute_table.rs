@@ -40,3 +40,19 @@ fn bindless_compute_roots_have_no_tables_and_index_the_heap() {
     // A table keeps the existing reflected paths.
     assert!(!bindless_compute_root(&root(0x400, &[TABLE, CONSTANTS])));
 }
+
+#[test]
+fn tabled_compute_roots_that_index_the_heap_take_the_index_map() {
+    assert!(heap_indexed_tabled_root(&root(0x400, &[TABLE]), false));
+    assert!(heap_indexed_tabled_root(&root(0x400, &[TABLE, TABLE, CONSTANTS]), false));
+    assert!(!heap_indexed_tabled_root(&root(0, &[TABLE]), false));
+    // 15 constant parameters of four and two tables leave exactly the map's
+    // two DWORDs; a third table leaves one.
+    let full = |extra: &[u32]| root(0x400, &[&[CONSTANTS; 15][..], extra].concat());
+    assert!(heap_indexed_tabled_root(&full(&[TABLE, TABLE]), false));
+    assert!(!heap_indexed_tabled_root(&full(&[TABLE, TABLE, TABLE]), false));
+    // Appending both the index map (2 DWORDs) and the stride table (2 DWORDs)
+    // requires 4 free DWORDs (budget <= 60).
+    assert!(heap_indexed_tabled_root(&full(&[]), true));
+    assert!(!heap_indexed_tabled_root(&full(&[TABLE]), true));
+}

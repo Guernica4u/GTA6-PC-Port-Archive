@@ -194,7 +194,7 @@ def run_checks(*, gpu=True, host_options=(), baseline=None, windows_dxc=None, ru
         for line in compare_benchmarks(baseline, output):
             report(line)
     if not gpu:
-        report("\nThe GPU checks were not run. A change cannot be merged until Lanes passes on a GPU.")
+        report("\nThe GPU checks were not run. A change that affects the GPU also needs the relevant ones before merging.")
     elif not failed:
         report(f"\nAll checks that ran passed. Attach the GPU results to the pull request: {output}"
                if skipped else f"\nAll checks passed. Attach the GPU results to the pull request: {output}")

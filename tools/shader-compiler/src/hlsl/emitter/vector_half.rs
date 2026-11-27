@@ -107,9 +107,12 @@ impl<'a> Emitter<'a> {
                 return Err("unresolved packed UNORM16 pixel export".into());
             }
         }
-        let lo = self.fm(ins, 0)?;
-        let hi = self.fm(ins, 1)?;
-        return self.wv(&d, &format!("((uint)round(saturate({lo}) * 65535.0) | ((uint)round(saturate({hi}) * 65535.0) << 16))"));
+        // Round the exact product once: rounding x * 65535 to float first can
+        // create a false tie (measured against native RDNA2 execution).
+        let bits = |i: usize| -> Result<String, String> {
+            Ok(Self::select_source(ins, format!("asuint({})", f(&ins.src[i])?), i as u8))
+        };
+        return self.wv(&d, &format!("(tb_norm_f32({}, false) | (tb_norm_f32({}, false) << 16))", bits(0)?, bits(1)?));
     }
 
     /// Half precision fused multiply and add.

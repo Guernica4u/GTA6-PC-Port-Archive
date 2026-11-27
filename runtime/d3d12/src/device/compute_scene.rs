@@ -5,16 +5,47 @@ use windows::Win32::Foundation::{E_INVALIDARG, E_POINTER};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{Interface, Result};
 
-// A translated compute program opts into the private root ABI by declaring a
-// native TLAS at t0, space1. A hit that needs face normals also declares raw
-// t1 and t2 in that space. Match the DXIL actually supplied to the driver.
+// A translated compute program opts into a private root ABI by declaring
+// native TLAS SRVs in a space the title does not use. Two layouts exist:
+// - Space 1 holds one scene at t0 for a title that binds only space 0. A hit
+//   that needs face normals also declares raw t1 and t2 in that space.
+// - SCENE_SPACE holds one scene per title acceleration structure. Register i
+//   is the title's i-th structure, ordered by (space, register). A translation
+//   declares only the scenes it reads.
+// Match the DXIL actually supplied to the driver.
+pub(crate) const SCENE_SPACE: u32 = 900;
+const MAX_SCENES: usize = 8;
+
 pub(crate) struct InlineProgram {
     pub(crate) source_hash: String,
     pub(crate) triangle_geometry: bool,
     pub(crate) first_dispatch: Once,
 }
 
-fn bindings(shader: &[u8]) -> Option<impl Iterator<Item = &[u8]>> {
+// PSVResourceBindInfo1 has six DWORDs: type, space, lower, upper, kind, flags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Binding {
+    pub(crate) class: u32,
+    pub(crate) space: u32,
+    pub(crate) lower: u32,
+    pub(crate) upper: u32,
+    pub(crate) kind: u32,
+}
+
+const RAW_SRV: u32 = 4;
+const KIND_RAW: u32 = 11;
+const KIND_SCENE: u32 = 16;
+
+impl Binding {
+    fn scene(&self) -> bool {
+        self.kind == KIND_SCENE
+    }
+    fn single(&self) -> bool {
+        self.class == RAW_SRV && self.lower == self.upper
+    }
+}
+
+fn bindings(shader: &[u8]) -> Option<Vec<Binding>> {
     let directory = tuxbox_dxbc::Dxbc::parse(shader).ok()?;
     let part = directory.chunk(b"PSV0")?;
     let psv = shader.get(part.offset..part.offset.checked_add(part.size)?)?;
@@ -24,12 +55,20 @@ fn bindings(shader: &[u8]) -> Option<impl Iterator<Item = &[u8]>> {
     if stride < 24 {
         return None;
     }
-    Some(
-        after_runtime
-            .get(8..)?
-            .get(..count.checked_mul(stride)?)?
-            .chunks_exact(stride),
-    )
+    after_runtime
+        .get(8..)?
+        .get(..count.checked_mul(stride)?)?
+        .chunks_exact(stride)
+        .map(|r| {
+            Some(Binding {
+                class: word(r, 0)?,
+                space: word(r, 4)?,
+                lower: word(r, 8)?,
+                upper: word(r, 12)?,
+                kind: word(r, 16)?,
+            })
+        })
+        .collect()
 }
 
 fn word(bytes: &[u8], offset: usize) -> Option<u32> {
@@ -38,18 +77,35 @@ fn word(bytes: &[u8], offset: usize) -> Option<u32> {
     ))
 }
 
-// PSVResourceBindInfo1 has six DWORDs: type, space, lower, upper, kind, flags.
-fn inline_layout(guest: &[u8], host: &[u8]) -> Option<(u32, bool)> {
-    let mut private = 0u8;
-    for r in bindings(host)? {
-        if word(r, 4)? != 1 {
-            continue;
+/// The private SRVs a translated program declares, and the title register
+/// each scene stands for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Layout {
+    pub(crate) space: u32,
+    /// Private scene registers in ascending order with the title's (space, register).
+    pub(crate) scenes: Vec<(u32, (u32, u32))>,
+    pub(crate) triangle_geometry: bool,
+}
+
+impl Layout {
+    /// Root SRVs appended after the title's parameters, in this order.
+    pub(crate) fn private_registers(&self) -> Vec<u32> {
+        let mut registers: Vec<u32> = self.scenes.iter().map(|&(r, _)| r).collect();
+        if self.triangle_geometry {
+            registers.extend([1, 2]);
         }
-        let slot = word(r, 8)?;
-        if word(r, 0)? != 4
-            || slot != word(r, 12)?
-            || !matches!((slot, word(r, 16)?), (0, 16) | (1 | 2, 11))
-        {
+        registers
+    }
+}
+
+pub(crate) fn inline_layout(guest: &[Binding], host: &[Binding]) -> Option<Layout> {
+    if host.iter().any(|r| r.space == SCENE_SPACE) {
+        return scene_space_layout(guest, host);
+    }
+    let mut private = 0u8;
+    for r in host.iter().filter(|r| r.space == 1) {
+        let slot = r.lower;
+        if !r.single() || !matches!((slot, r.kind), (0, KIND_SCENE) | (1 | 2, KIND_RAW)) {
             return None;
         }
         let bit = 1 << slot;
@@ -62,22 +118,52 @@ fn inline_layout(guest: &[u8], host: &[u8]) -> Option<(u32, bool)> {
         return None;
     }
     let mut scene = None;
-    for r in bindings(guest)? {
-        if word(r, 4)? == 1 {
+    for r in guest {
+        if r.space == 1 {
             return None;
         } // A space owned by the title stays title-owned.
-        if word(r, 16)? == 16 {
-            let slot = word(r, 8)?;
-            if word(r, 0)? != 4
-                || word(r, 4)? != 0
-                || word(r, 12)? != slot
-                || scene.replace(slot).is_some()
-            {
-                return None;
-            }
+        if r.scene() && (!r.single() || r.space != 0 || scene.replace(r.lower).is_some()) {
+            return None;
         }
     }
-    Some((scene?, private == 7))
+    Some(Layout {
+        space: 1,
+        scenes: vec![(0, (0, scene?))],
+        triangle_geometry: private == 7,
+    })
+}
+
+fn scene_space_layout(guest: &[Binding], host: &[Binding]) -> Option<Layout> {
+    if guest.iter().any(|r| r.space == SCENE_SPACE) {
+        return None;
+    }
+    let mut titles: Vec<(u32, u32)> = Vec::new();
+    for r in guest.iter().filter(|r| r.scene()) {
+        if !r.single() {
+            return None;
+        }
+        titles.push((r.space, r.lower));
+    }
+    titles.sort_unstable();
+    if titles.windows(2).any(|w| w[0] == w[1]) {
+        return None;
+    }
+    let mut scenes = Vec::new();
+    for r in host.iter().filter(|r| r.space == SCENE_SPACE) {
+        if !r.single() || !r.scene() {
+            return None;
+        }
+        scenes.push((r.lower, *titles.get(r.lower as usize)?));
+    }
+    scenes.sort_unstable();
+    if scenes.is_empty() || scenes.len() > MAX_SCENES || scenes.windows(2).any(|w| w[0].0 == w[1].0) {
+        return None;
+    }
+    Some(Layout {
+        space: SCENE_SPACE,
+        scenes,
+        triangle_geometry: false,
+    })
 }
 
 // Keep the guest-provided serialization for cloning a selected PSO's layout.
@@ -166,7 +252,8 @@ pub(crate) struct SceneRoot {
     pub(crate) program: Arc<InlineProgram>,
     pub(crate) native: ID3D12RootSignature,
     pub(crate) original: RootSource,
-    pub(crate) source: SceneSource,
+    /// Where each title scene is bound, in private register order.
+    pub(crate) sources: Arc<[SceneSource]>,
     pub(crate) appended: u32,
 }
 
@@ -222,13 +309,22 @@ unsafe fn describe(params: &[D3D12_ROOT_PARAMETER1]) -> String {
     text
 }
 
-unsafe fn scene_source(
+unsafe fn scene_sources(
     params: &[D3D12_ROOT_PARAMETER1],
-    guest_register: u32,
-    private_count: u32,
-) -> Result<SceneSource> {
-    let mut source = None;
-    let mut cost = 2 * u64::from(private_count); // two DWORDs per root SRV
+    layout: &Layout,
+) -> Result<Vec<SceneSource>> {
+    let private = layout.private_registers();
+    let mut sources: Vec<Option<SceneSource>> = vec![None; layout.scenes.len()];
+    let index_of = |space: u32, register: u32| {
+        layout.scenes.iter().position(|&(_, title)| title == (space, register))
+    };
+    let mut place = |index: usize, source: SceneSource| -> Result<()> {
+        if sources[index].replace(source).is_some() {
+            return Err(E_INVALIDARG.into());
+        }
+        Ok(())
+    };
+    let mut cost = 2 * private.len() as u64; // two DWORDs per root SRV
     for (slot, p) in params.iter().enumerate() {
         let slot = slot as u32;
         let visible = p.ShaderVisibility == D3D12_SHADER_VISIBILITY_ALL;
@@ -257,20 +353,20 @@ unsafe fn scene_source(
                         if r.RangeType != D3D12_DESCRIPTOR_RANGE_TYPE_SRV {
                             continue;
                         }
-                        if r.RegisterSpace == 1 && r.BaseShaderRegister < private_count {
+                        let end = r.BaseShaderRegister.saturating_add(r.NumDescriptors);
+                        if r.RegisterSpace == layout.space
+                            && private.iter().any(|&reg| (r.BaseShaderRegister..end).contains(&reg))
+                        {
                             return Err(E_INVALIDARG.into());
                         }
-                        if r.RegisterSpace == 0
-                            && let Some(index) = guest_register.checked_sub(r.BaseShaderRegister)
-                            && index < r.NumDescriptors
-                        {
-                            let offset = u32::try_from(offset + u64::from(index))
-                                .map_err(|_| E_INVALIDARG)?;
-                            if source
-                                .replace(SceneSource::Table { slot, offset })
-                                .is_some()
+                        for (index, &(_, (space, register))) in layout.scenes.iter().enumerate() {
+                            if r.RegisterSpace == space
+                                && let Some(within) = register.checked_sub(r.BaseShaderRegister)
+                                && within < r.NumDescriptors
                             {
-                                return Err(E_INVALIDARG.into());
+                                let offset = u32::try_from(offset + u64::from(within))
+                                    .map_err(|_| E_INVALIDARG)?;
+                                place(index, SceneSource::Table { slot, offset })?;
                             }
                         }
                     }
@@ -286,15 +382,11 @@ unsafe fn scene_source(
                         continue;
                     }
                     let d = p.Anonymous.Descriptor;
-                    match (d.RegisterSpace, d.ShaderRegister) {
-                        (1, reg) if reg < private_count => return Err(E_INVALIDARG.into()),
-                        (0, reg)
-                            if reg == guest_register
-                                && source.replace(SceneSource::RootSrv(slot)).is_some() =>
-                        {
-                            return Err(E_INVALIDARG.into());
-                        }
-                        _ => {}
+                    if d.RegisterSpace == layout.space && private.contains(&d.ShaderRegister) {
+                        return Err(E_INVALIDARG.into());
+                    }
+                    if let Some(index) = index_of(d.RegisterSpace, d.ShaderRegister) {
+                        place(index, SceneSource::RootSrv(slot))?;
                     }
                 }
                 _ => return Err(E_INVALIDARG.into()),
@@ -304,29 +396,41 @@ unsafe fn scene_source(
     if cost > 64 {
         return Err(E_INVALIDARG.into());
     }
-    source.ok_or_else(|| E_INVALIDARG.into())
+    sources
+        .into_iter()
+        .map(|source| source.ok_or_else(|| E_INVALIDARG.into()))
+        .collect()
 }
 
 // Clone the root actually supplied by the caller, appending only the private
-// SRVs in space1. Use the shader's embedded root when no root was supplied.
+// SRVs in its private space. Use the shader's embedded root when no root was supplied.
 pub(super) fn private_root(
     device: &ID3D12Device,
     source: &[u8],
     translated: &[u8],
     explicit: Option<&RootSource>,
+    host_root: Option<&RootSource>,
     node_mask: u32,
 ) -> Result<Option<SceneRoot>> {
-    let Some((guest_register, triangle_geometry)) = inline_layout(source, translated) else {
+    let (Some(guest), Some(host)) = (bindings(source), bindings(translated)) else {
+        return Ok(None);
+    };
+    let Some(layout) = inline_layout(&guest, &host) else {
         return Ok(None);
     };
     let program = Arc::new(InlineProgram {
         source_hash: super::shader_cache::source_digest(source).ok_or(E_INVALIDARG)?,
-        triangle_geometry,
+        triangle_geometry: layout.triangle_geometry,
         first_dispatch: Once::new(),
     });
-    let private_count = if triangle_geometry { 3 } else { 1 };
+    let private = layout.private_registers();
+    let private_count = private.len() as u32;
     let original = explicit.cloned().unwrap_or_else(|| RootSource::new(source));
-    let bytes = &original.bytes;
+    // Extend the host root the program is bound with: the reflected table
+    // layout when the title's root needed one, otherwise the title's root.
+    // Bindings are still matched against the title's root.
+    let base = host_root.cloned().unwrap_or_else(|| original.clone());
+    let bytes = &base.bytes;
     let mut reader = None::<ID3D12VersionedRootSignatureDeserializer>;
     // The native deserializer owns and validates every pointer in the returned description.
     unsafe {
@@ -359,9 +463,9 @@ pub(super) fn private_root(
             return Err(E_INVALIDARG.into());
         }
         let mut params = core::slice::from_raw_parts(ptr, count as usize).to_vec();
-        let binding = scene_source(&params, guest_register, private_count);
+        let binding = scene_sources(&params, &layout);
         crate::diagnostics::log_once(&Once::new(), || {
-            let hash = super::shader_cache::source_digest(&bytes[original.payload.clone()])
+            let hash = super::shader_cache::source_digest(&bytes[base.payload.clone()])
                 .unwrap_or_default();
             format!(
                 "shader {} root {hash} v{} flags={:#x} staticSamplers={samplers} scene={binding:?}{}",
@@ -372,14 +476,14 @@ pub(super) fn private_root(
             )
         });
         let binding = binding?;
-        for register in 0..private_count {
+        for &register in &private {
             params.push(D3D12_ROOT_PARAMETER1 {
                 ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
                     Descriptor: D3D12_ROOT_DESCRIPTOR1 {
                         ShaderRegister: register,
-                        RegisterSpace: 1,
+                        RegisterSpace: layout.space,
                         Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
                     },
                 },
@@ -401,8 +505,12 @@ pub(super) fn private_root(
             program,
             native: device.CreateRootSignature(node_mask, bytes)?,
             original,
-            source: binding,
+            sources: binding.into(),
             appended: count,
         }))
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/device/compute_scene.rs"]
+mod tests;

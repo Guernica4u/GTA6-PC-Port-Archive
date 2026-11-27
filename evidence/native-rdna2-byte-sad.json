@@ -1,0 +1,61 @@
+{
+  "scope": "Native RDNA2 execution of synthetic byte SAD inputs under MODE 0 and 0x3ff, compared with the byte SAD reference model",
+  "device": "AMD Radeon RX 6950 XT",
+  "seed": 521278738,
+  "records": 16384,
+  "modes": [
+    "0x000",
+    "0x3ff"
+  ],
+  "inputs_sha256": "082f92bf44d3897d9c1371840505ff4b3fae0761698e34739af6f001c66e3c05",
+  "kernels_sha256": "ee7e1d28fee2c817b353f0d6c9f6c7bd41c5464ac7b6054c85b4baea030b211f",
+  "model_comparisons": 81920,
+  "mismatches": 0,
+  "kernels": [
+    {
+      "kernel": "v_msad_u8",
+      "instruction": "v_msad_u8",
+      "comparisons": 16384,
+      "mismatches": 0,
+      "mode_independent": true,
+      "examples": [],
+      "native_results_sha256": "01da72816c8d7ffb270056fd965db61f2e42c52e5f10f278b552004f89ad5c0d"
+    },
+    {
+      "kernel": "v_qsad_pk_u16_u8",
+      "instruction": "v_qsad_pk_u16_u8",
+      "comparisons": 16384,
+      "mismatches": 0,
+      "mode_independent": true,
+      "examples": [],
+      "native_results_sha256": "aadbaba86804fcd79a391bfe0758321a37961b3d2c6d44a4a991f86a2971d57a"
+    },
+    {
+      "kernel": "v_mqsad_pk_u16_u8",
+      "instruction": "v_mqsad_pk_u16_u8",
+      "comparisons": 16384,
+      "mismatches": 0,
+      "mode_independent": true,
+      "examples": [],
+      "native_results_sha256": "8dc0c6d150008fbaadc3702e657d3632cfd01cd37a6ddcc66b5bc989eec3a995"
+    },
+    {
+      "kernel": "v_mqsad_u32_u8_0",
+      "instruction": "v_mqsad_u32_u8",
+      "comparisons": 16384,
+      "mismatches": 0,
+      "mode_independent": true,
+      "examples": [],
+      "native_results_sha256": "d1e64377f9652dea016d0c3b04de03a13f076f6b180f804a75a9293f0c032b09"
+    },
+    {
+      "kernel": "v_mqsad_u32_u8_1",
+      "instruction": "v_mqsad_u32_u8",
+      "comparisons": 16384,
+      "mismatches": 0,
+      "mode_independent": true,
+      "examples": [],
+      "native_results_sha256": "4cabf87fee4e835785997ddc87e531d670a64b0cf64cd1277b979239bc67c03c"
+    }
+  ]
+}

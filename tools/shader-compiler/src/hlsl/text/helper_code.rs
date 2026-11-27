@@ -28,7 +28,30 @@ float tb_cubetc(float x, float y, float z) { float ax = abs(x), ay = abs(y), az 
 float tb_cubeid(float x, float y, float z) { float ax = abs(x), ay = abs(y), az = abs(z); if (az >= ax && az >= ay) return z < 0.0 ? 5.0 : 4.0; if (ay >= ax) return y < 0.0 ? 3.0 : 2.0; return x < 0.0 ? 1.0 : 0.0; }
 float3 tb_cube_dir(float s, float t, float face) { float u = (s - 1.5) * 2.0, v = (t - 1.5) * 2.0; int f = (int)round(face); if (f == 0) return float3(1.0, -v, -u); if (f == 1) return float3(-1.0, -v, u); if (f == 2) return float3(u, 1.0, v); if (f == 3) return float3(u, -1.0, -v); if (f == 4) return float3(u, -v, 1.0); return float3(-u, -v, -1.0); }
 float tb_mull(float a, float b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }
-uint tb_f16_cvt(float x, bool rtz) { uint u = asuint(x); uint s = (u >> 16) & 0x8000u; uint a = u & 0x7fffffffu; if (a > 0x7f800000u) return s | 0x7e00u | ((a >> 13) & 0x3ffu); if (a == 0x7f800000u) return s | 0x7c00u; if (rtz) { if (a >= 0x477fe000u) return s | 0x7bffu; } else { if (a >= 0x477ff000u) return s | 0x7c00u; } if (a >= 0x38800000u) { uint r = (a >> 13) - 0x1c000u; uint rem = a & 0x1fffu; if (!rtz && (rem > 0x1000u || (rem == 0x1000u && (r & 1u) != 0u))) r += 1u; return s | r; } if (a < 0x33000000u) return s; uint e = a >> 23; uint mant = (a & 0x7fffffu) | 0x800000u; uint sh = 126u - e; uint q = mant >> sh; uint rem = mant & ((1u << sh) - 1u); uint half = 1u << (sh - 1u); if (!rtz && (rem > half || (rem == half && (q & 1u) != 0u))) q += 1u; return s | q; }
+uint tb_f16_cvt(float x, bool rtz) {
+    uint u = asuint(x);
+    uint s = (u >> 16) & 0x8000u;
+    uint a = u & 0x7fffffffu;
+    uint nearest = uint(!rtz);
+    // Computed without branches, as a program inlines this at every conversion.
+    // Each range of magnitudes has a result; the last matching selection wins.
+    uint r = (a >> 13) - 0x1c000u;
+    uint rem = a & 0x1fffu;
+    r += nearest & (uint(rem > 0x1000u) | (uint(rem == 0x1000u) & r & 1u));
+    uint sh = (126u - (a >> 23)) & 31u;
+    uint mant = (a & 0x7fffffu) | 0x800000u;
+    uint q = mant >> sh;
+    uint lost = mant & ((1u << sh) - 1u);
+    uint half = 1u << ((sh - 1u) & 31u);
+    q += nearest & (uint(lost > half) | (uint(lost == half) & q & 1u));
+    uint value = s | q;
+    value ^= (value ^ s) & (0u - uint(a < 0x33000000u));
+    value ^= (value ^ (s | r)) & (0u - uint(a >= 0x38800000u));
+    value ^= (value ^ (s | (0x7c00u - uint(rtz)))) & (0u - uint(a >= 0x477ff000u - 0x1000u * uint(rtz)));
+    value ^= (value ^ (s | 0x7c00u)) & (0u - uint(a == 0x7f800000u));
+    value ^= (value ^ (s | 0x7e00u | ((a >> 13) & 0x3ffu))) & (0u - uint(a > 0x7f800000u));
+    return value;
+}
 "#;
 
 pub(in crate::hlsl) const MAD24_SAT: &str = r#"

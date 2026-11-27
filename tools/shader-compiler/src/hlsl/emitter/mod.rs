@@ -24,3 +24,5 @@ mod interpolation;
 mod vector_exchange;
 mod vector_wide;
 mod vector_half;
+
+pub(in crate::hlsl) use control_flow::not_skipping;

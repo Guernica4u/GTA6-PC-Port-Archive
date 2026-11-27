@@ -22,6 +22,8 @@ impl<'a> Emitter<'a> {
             lds_tile: lds_tile::LdsTile::recognize(ex, &insns),
             packed: None,
             loop_depth: 0,
+            accepted_swizzle_loops: BTreeSet::new(),
+            in_accepted_swizzle_loop_stack: Vec::new(),
             ex,
             insns,
             res: HashMap::new(),
@@ -64,6 +66,10 @@ impl<'a> Emitter<'a> {
                     let recovered = tuxbox_dxbc::inline_sampler::sites(&ex.isa, if ex.stage == Stage::Pixel { 5 } else { 0 })?;
                     (recovered.descriptors == r.static_samplers).then_some(recovered.sites)
                 })
+                // A root-sig program whose literal sampler states the root does
+                // not hold take the private registers the runtime appends
+                // (space 32765); the states the root holds are matched as usual.
+                .or_else(|| sampler_heap::missing_private_samplers(ex))
                 // Root-less programs that declare several samplers: the literal words cannot
                 // be matched to the title's registers here, so use the private slots that
                 // inline_sampler::sites derives from the ISA alone (space 32765). The runtime
@@ -108,6 +114,8 @@ impl<'a> Emitter<'a> {
             msel: HashMap::new(),
             bsel: HashMap::new(),
             dsel_loads: HashMap::new(),
+            size_reads: BTreeSet::new(),
+            count_reads: BTreeMap::new(),
             dsel_runtime: HashMap::new(),
             dsel_moves: HashMap::new(),
             live: Vec::new(),

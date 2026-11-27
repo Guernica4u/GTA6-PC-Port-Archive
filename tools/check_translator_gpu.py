@@ -6,6 +6,7 @@ runs the result on the GPU and compares every output word with a reference
 model. No game data is used. Builds the translator's example emitters first.
 """
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
@@ -16,6 +17,8 @@ import sys
 from time import monotonic
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from project_tuxbox.jobs import check_jobs  # noqa: E402
 MANIFEST = ROOT / "tools/shader-compiler/Cargo.toml"
 TARGET = "x86_64-unknown-linux-gnu"
 
@@ -45,15 +48,19 @@ CHECKS = {
     "packed-chain-saturate": assembled("check_packed_chain_gpu", "--include-saturate"),
     "packed-chain-unoptimized": assembled("check_packed_chain_gpu", "--optimization", "O0"),
     "sad-mad64": assembled("check_sad_mad64_gpu"),
+    "scalar-masks": assembled("check_scalar_masks_gpu"),
+    "byte-sad": assembled("check_byte_sad_gpu"),
+    "half-exact": assembled("check_half_exact_gpu"),
     "f64": assembled("check_f64_exact_gpu"),
     "swizzle": Check("check_compute_swizzle", emitter="compute_swizzle"),
+    "swizzle-loop": Check("check_compute_swizzle_loop", emitter="compute_swizzle_loop"),
     "readlane": Check("check_readlane_gpu", emitter="readlane_probe", dxc=True),
     **{f"wave-extrema-{width}": Check("check_wave_extrema", emitter="wave_extrema", dxc=True,
                                       extra=("--width", str(width)))
        for width in (32, 64)},
     **{f"wave-guard-{width}-{variant}": Check("check_wave_guard", emitter="wave_guard",
                                               extra=("--width", str(width), "--variant", variant))
-       for width in (32, 64) for variant in ("original", "chain", "chain-zero")},
+       for width in (32, 64) for variant in ("original", "chain", "chain-zero", "result-chain")},
     "wave-guard-64-2d": Check("check_wave_guard", emitter="wave_guard",
                               extra=("--width", "64", "--group", "8", "8", "1")),
     "wave-guard-64-3d": Check("check_wave_guard", emitter="wave_guard",
@@ -63,6 +70,7 @@ CHECKS = {
     "image-cmpswap": Check("check_image_cmpswap_gpu", emitter="image_cmpswap", llvm=True, dxc=True),
     "paired-wave64": Check("check_paired_wave64", emitter="paired_wave64", llvm=True, dxc=True),
     "mask-ballots": Check("check_mask_ballots_gpu", emitter="mask_ballots", llvm=True, dxc=True),
+    "key-counts": Check("check_key_counts_gpu", emitter="key_counts", dxc=True),
     "dpp8-exchange": Check("check_dpp8_exchange", emitter="lone_lane_probe", dxc=True),
     **{f"dpp8-exchange-{layout}": Check("check_dpp8_exchange", emitter="lone_lane_probe", dxc=True,
                                        extra=("--layout", layout))
@@ -72,6 +80,7 @@ CHECKS = {
        for layout in ("linear", "2d", "3d")},
     "pixel-heap-offsets": Check("check_pixel_heap_offsets", emitter="pixel_heap_offsets", dxc=True),
     "straight-pixel-quads": Check("check_straight_pixel_quads", emitter="straight_pixel_quads", dxc=True),
+    "translated-mesh": Check("check_translated_mesh_gpu", emitter="xshader", llvm=True, dxc=True),
     "pixel-link": Check("check_portable_pixel_link", emitter="xshader", dxc=True),
     "pixel-link-slot86": Check("check_slot86_portable_link", emitter="xshader", dxc=True),
     "raw-index": Check("check_raw_index",
@@ -83,6 +92,10 @@ CHECKS = {
                             extra=("--root-srv-remap",)),
     "pixel-code-offset": Check("check_pixel_code_offset",
                                capture=("pixel_embedded_table_offset_is_bounded_and_aligned", "--hlsl"), dxc=True),
+    "buffer-count": Check("check_buffer_count",
+                          capture=("buffer_record_counts_for_the_gpu_check", "--hlsl")),
+    "descriptor-size": Check("check_descriptor_size",
+                             capture=("texture_size_from_descriptor_fields_for_the_gpu_check", "--hlsl")),
     "dynamic-cbv": Check("check_dynamic_cbv", capture=("bounded_dynamic_cbv", "--hlsl"), dxc=True),
     "dynamic-code-offset": Check("check_dynamic_code_offset",
                                  capture=("bounded_runtime_code_offset", "--hlsl")),
@@ -213,8 +226,7 @@ def main(argv=None):
           flush=True)
     host = {"provider": a.provider.resolve(), "proton": a.proton.resolve(), "prefix": a.prefix.resolve(),
             "compiler-dir": a.compiler_dir.resolve(), "adapter": a.adapter.lower()}
-    results = []
-    for name in a.only or CHECKS:
+    def run_check(name):
         started = monotonic()
         log = work / f"{name}.log"
         with log.open("w") as stream:
@@ -230,11 +242,19 @@ def main(argv=None):
                 status = "no program"
         lines = log.read_text(errors="replace").strip().splitlines()
         summary = lines[-1][:300] if lines else ""
-        results.append({"check": name, "passed": status == 0, "seconds": round(monotonic() - started, 1),
-                        "summary": summary})
-        print(f"{'PASS' if status == 0 else 'FAIL'}  {name}  {summary}", flush=True)
-        if status != 0:
-            print("\n".join(lines[-12:]), flush=True)
+        row = {"check": name, "passed": status == 0, "seconds": round(monotonic() - started, 1),
+               "summary": summary}
+        return row, lines
+
+    results = []
+    # Each check has its own work directory, Wine prefix and sandbox. Results are
+    # reported in the listed order.
+    with ThreadPoolExecutor(check_jobs()) as pool:
+        for row, lines in pool.map(run_check, a.only or CHECKS):
+            results.append(row)
+            print(f"{'PASS' if row['passed'] else 'FAIL'}  {row['check']}  {row['summary']}", flush=True)
+            if not row["passed"]:
+                print("\n".join(lines[-12:]), flush=True)
     passed = all(row["passed"] for row in results)
     (work / "summary.json").write_text(json.dumps(
         {"schema": 1, "adapter": host["adapter"], "passed": passed, "checks": results}, indent=2) + "\n")

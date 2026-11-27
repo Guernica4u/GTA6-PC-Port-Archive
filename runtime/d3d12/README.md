@@ -82,7 +82,7 @@ Frosty passes a 72-byte `0x20004` record and the default adapter. The factory ac
 | `guest-frame` | `d3d12-factory.exe` exercises the default and explicit `0x20004` factories, process debug flags and compute queue fences. |
 | `guest-frame` | `xbox-frame.exe` requests a direct queue at slot 8 and a compute queue at slot 48. It signals and waits on a separate compute fence. On the direct queue it clears one 37 × 13 RGBA8 texture, snapshots it, then clears a 208-pixel rectangle and snapshots it again. After the second submission completes, it compares every channel of all 962 pixels and checks three guard regions. |
 | `guest-frame` | `xbox-frame-negative.exe` creates two guest devices on one adapter. It checks rejection of foreign allocators and fences, invalid copies, a mixed-device batch and an open list. A valid copy and completed fence after a failed recording verify list recovery. |
-| `present` | `xbox-frame.exe --present` also submits the texture via queue slot 30 (`PresentX`) after each clear. A single-plane RGBA8 copy feeds a double-buffered DXGI swap chain. The guest samples all four corners and the center of the displayed window on both frames. The 4K RGB10 test repeats this with a host-owned window, an oversized title window and a 960 × 540 title window. The client area fits the monitor and the GPU still renders all 3840 × 2160 pixels. [Window sizes and screen samples](../../evidence/matrix-awakens/tuxbox-present-sizing.json) |
+| `present` | `xbox-frame.exe --present` also submits the texture via queue slot 30 (`PresentX`) after each clear. A single-plane RGBA8 or RGB10A2 copy feeds a double-buffered DXGI swap chain. The guest samples all four corners and the center of the displayed window on both frames. The 4K RGB10 test repeats this with a host-owned window, an oversized title window and a 960 × 540 title window. The client area fits the monitor and the GPU still renders all 3840 × 2160 pixels. [Window sizes and screen samples](../../evidence/matrix-awakens/tuxbox-present-sizing.json) |
 
 The guest-frame and presentation suites inspect the guest executables' PE imports before launch. Each must request the Xbox factory from the adjacent DLL and leave desktop D3D12 device creation to the provider. Passing results apply to the homebrew calls exercised on that adapter and provider. [Run results](../../docs/RESULTS.md)
 
@@ -105,10 +105,10 @@ python build.py d3d12
 python tuxbox.py verify --only graphics-abi --only guest-frame --output build/d3d12-results.json
 ```
 
-The presentation check needs a visible, unobscured window. On Linux, use an isolated Xvfb display with a hardware Vulkan driver that supports presentation to it. Use a dedicated Proton prefix for the display so an existing Wine session cannot attach the guest to another desktop.
+The presentation checks sample the screen. On a Linux Wayland desktop they run on a private rootful Xwayland, where other windows can't cover them; `TUXBOX_CHECK_DISPLAY=desktop` uses the current display instead, which needs the windows left visible. Without Wayland, run them on a display with a hardware Vulkan driver that can present to it.
 
 ```sh
-xvfb-run -a -s "-screen 0 1280x720x24" python tuxbox.py verify --only present --prefix build/present-prefix --output build/present-results.json
+python tuxbox.py verify --only present --output build/present-results.json
 ```
 
 On Windows, run the same suite on the interactive desktop with `python tuxbox.py verify --backend native --only present --output build/present-results.json`. Add `--adapter VVVV:DDDD` to any verification command to select a GPU by hexadecimal PCI vendor and device IDs. The JSON records the provider, binary hashes, exit status and receipt for each gate.

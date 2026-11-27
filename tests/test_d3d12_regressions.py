@@ -1,5 +1,14 @@
+import contextlib
+import io
+import json
+import os
+from pathlib import Path
+import subprocess
+from tempfile import TemporaryDirectory
 import unittest
-from tools.check_d3d12_regressions import validate,DIGEST
+from unittest.mock import patch
+from tools import check_d3d12_regressions as controls
+from tools.check_d3d12_regressions import validate,DIGEST,DEFAULT,LAUNCHER_CBV,launcher_cbv
 
 class D3D12RegressionTests(unittest.TestCase):
     def test_adapter_and_exit_are_checked(self):
@@ -88,6 +97,100 @@ class D3D12RegressionTests(unittest.TestCase):
         self.assertFalse(validate("alias-deferred","10de:2704",0,output.replace("ms=0","ms=1999"))[0])
         self.assertFalse(validate("alias-deferred","10de:2704",0,output.replace(line,"unrelated",1))[0])
         self.assertFalse(validate("alias-deferred","10de:2704",0,output+"\nFailed to signal event")[0])
+
+    def test_root_cbv_offsets_requires_every_16_byte_step(self):
+        line="d3d12-root-cbv-offsets PASS pci=10de:2704 offsets=17/17 step=16 words=408/408"
+        self.assertTrue(validate("root-cbv-offsets","10de:2704",0,line)[0])
+        self.assertFalse(validate("root-cbv-offsets","10de:2704",0,line.replace("17/17","5/17"))[0])
+        self.assertFalse(validate("root-cbv-offsets","10de:2704",1,"d3d12-root-cbv-window failed: root CBV offsets=5/17 wrong=16,32,48")[0])
+        self.assertFalse(validate("root-cbv-window","10de:2704",0,line)[0])
+        self.assertNotIn("root-cbv-offsets",DEFAULT)
+        self.assertIn("root-cbv-offsets",LAUNCHER_CBV)
+
+    def test_launcher_cbv_returns_what_the_launcher_sets(self):
+        layer="/tuxbox/build/frosty-cbv-layer"
+        with TemporaryDirectory() as temp, patch("project_tuxbox.console_cbv.console_cbv_layer",return_value=layer) as build:
+            proton=Path(temp)
+            # The guest's provider needs no match with the development build.
+            with patch.dict(os.environ,{"VKD3D_CONFIG":"other"},clear=True):
+                settings=launcher_cbv(proton,proton/"guest.exe")
+            self.assertEqual(settings,{"VKD3D_CONFIG":"force_raw_va_cbv,other","VK_ADD_LAYER_PATH":layer,
+                                       "VK_INSTANCE_LAYERS":"VK_LAYER_TUXBOX_console_cbv",
+                                       "PRESSURE_VESSEL_FILESYSTEMS_RO":layer})
+            build.assert_called_once()
+            # A Proton build with the feature binds the offsets itself and takes no layer.
+            (proton/"tuxbox-features").write_text("cbv_16_byte_alignment\n")
+            with patch.dict(os.environ,{},clear=True):
+                settings=launcher_cbv(proton,proton/"guest.exe")
+            self.assertEqual(settings,{"VKD3D_CONFIG":"cbv_16_byte_alignment,force_raw_va_cbv",
+                                       "VKD3D_DISABLE_EXTENSIONS":"VK_EXT_descriptor_buffer,VK_EXT_descriptor_heap"})
+            build.assert_called_once()
+
+    def run_controls(self,root,cases,settings):
+        """Run the controls with every host tool replaced, returning the guest commands and the receipt."""
+        for name in ("build/d3d12_xs.dll","build/d3d12-root-cbv-window.exe","dxc/dxcompiler.dll","dxc/dxil.dll",
+                     "proton/files/bin/wine","proton/files/bin/wineserver","proton/version","prefix/user.reg",
+                     "proton/files/lib/wine/vkd3d-proton/x86_64-windows/d3d12.dll",
+                     "proton/files/lib/wine/vkd3d-proton/x86_64-windows/d3d12core.dll",
+                     "proton/files/lib/wine/dxvk/x86_64-windows/dxgi.dll"):
+            (root/name).parent.mkdir(parents=True,exist_ok=True)
+            (root/name).write_text(name)
+        commands=[]
+        def guest(command,stdout,**_):
+            commands.append(command)
+            window="--offsets" not in command
+            stdout.write(b"d3d12-root-cbv-window PASS pci=10de:2704 words=120/120 window=65536 offsets=0,256,65280,65536,65792\n"
+                         if window else b"d3d12-root-cbv-offsets PASS pci=10de:2704 offsets=17/17 step=16 words=408/408\n")
+            for i,n in enumerate((65536,131072,131072,65536,131072) if window else (),1):
+                stdout.write(f"TuxBox d3d12_xs: buffer backing path=imported count={i} source=view bytes={n}\n".encode())
+            return subprocess.CompletedProcess(command,0)
+        arguments=["--adapter","10de:2704","--work",str(root/"work"),"--output",str(root/"out.json")]
+        for name,value in (("build-dir","build"),("proton","proton"),("prefix","prefix"),("compiler-dir","dxc")):
+            arguments+=["--"+name,str(root/value)]
+        for case in cases:
+            arguments+=["--case",case]
+        with patch.object(controls.shutil,"which",return_value="/tool"), \
+             patch.object(controls.subprocess,"run",side_effect=guest), \
+             patch.object(controls,"launcher_cbv",side_effect=settings) as launcher, \
+             contextlib.redirect_stdout(io.StringIO()) as printed:
+            code=controls.main(arguments)
+        return code,commands,json.loads((root/"out.json").read_text()),launcher,printed.getvalue()
+
+    def test_root_cbv_offsets_runs_with_the_launcher_settings(self):
+        settings={"VKD3D_CONFIG":"force_raw_va_cbv","VK_ADD_LAYER_PATH":"/tuxbox/build/frosty-cbv-layer",
+                  "VK_INSTANCE_LAYERS":"VK_LAYER_TUXBOX_console_cbv"}
+        with TemporaryDirectory() as temp:
+            root=Path(temp)
+            code,commands,report,launcher,_=self.run_controls(root,("root-cbv-window","root-cbv-offsets"),[settings])
+            self.assertEqual(code,0)
+            # Cases run side by side, so either guest can start first.
+            window,offsets=sorted(commands,key=lambda command:"--offsets" in command)
+            for key,value in settings.items():
+                at=offsets.index(key)
+                self.assertEqual(offsets[at-1:at+2],["--setenv",key,value])
+                # The other controls keep running against vkd3d-proton's defaults.
+                self.assertNotIn(key,window)
+            proton,executable=launcher.call_args.args
+            self.assertEqual(proton,(root/"proton").resolve())
+            self.assertEqual(executable.name,"d3d12-root-cbv-window.exe")
+            first,second=report["cases"]
+            self.assertNotIn("launcher_cbv",first)
+            self.assertTrue(second["passed"])
+            self.assertEqual(second["launcher_cbv"],{"VKD3D_CONFIG":"force_raw_va_cbv",
+                             "VK_INSTANCE_LAYERS":"VK_LAYER_TUXBOX_console_cbv","VKD3D_DISABLE_EXTENSIONS":""})
+            # The receipt names the route without the path of the checkout.
+            self.assertNotIn("frosty-cbv-layer",(root/"out.json").read_text())
+
+    def test_root_cbv_offsets_fails_when_the_settings_cannot_be_made(self):
+        with TemporaryDirectory() as temp:
+            root=Path(temp)
+            failed=subprocess.CalledProcessError(1,["build_frosty_cbv_layer.sh"])
+            code,commands,report,_,printed=self.run_controls(root,("root-cbv-offsets",),[failed])
+            # The guest is not run with other settings, where AMD would pass and say nothing.
+            self.assertEqual((code,commands),(1,[]))
+            self.assertEqual((report["cases"][0]["passed"],report["cases"][0]["exit"]),(False,1))
+            self.assertIn("root-cbv-offsets FAIL constant-buffer setup failed",printed)
+            self.assertIn("constant-buffer setup failed",(root/"work/root-cbv-offsets.log").read_text())
 
     def test_root_cbv_window_requires_full_imports(self):
         line="d3d12-root-cbv-window PASS pci=10de:2704 words=120/120 window=65536 offsets=0,256,65280,65536,65792"

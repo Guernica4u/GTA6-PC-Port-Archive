@@ -8,7 +8,7 @@ On Linux, the launcher prepares shaders before opening Frosty, from a profile of
 
 The launcher shows compilation progress and reuses the cache on later runs. After a TuxBox update, shaders that translate to the same source reuse their compiled output. While ProjectScarlett runs, a small panel over the game shows shader and pipeline progress. Pass `--prepare-only` to prepare the cache without opening the game, or `--no-shader-prep` to skip preparation for one launch. Place either option before the game path.
 
-On Linux, each prefix keeps its GPU caches in its `shadercache` folder: vkd3d-proton's pipeline cache and, on NVIDIA, the driver cache. TuxBox asks the NVIDIA driver not to trim its cache, with a 4 GiB limit. A larger cache file stopped being indexed, so every launch compiled the same pipelines again. [Environment variables](ENVIRONMENT.md) lists these and the other settings.
+On Linux, each prefix keeps its GPU caches in its `shadercache` folder: vkd3d-proton's pipeline cache and, on NVIDIA, the driver cache. TuxBox asks the NVIDIA driver not to trim its cache, with a 4 GiB limit. A larger cache file stopped being indexed, so every launch compiled the same pipelines again. A launch reports a cache file that has outgrown its index and leaves the file in place. [Environment variables](ENVIRONMENT.md) lists these and the other settings.
 
 ## Project Scarlett graphics trials
 
@@ -43,6 +43,24 @@ The copy has known limits:
 - **Retail titles aren't proven.** In a contributor's tests of the change this comes from ([#200](https://github.com/brcly/TuxBox/pull/200), RX 6700 XT), ProjectScarlett reached the account picker far more slowly than with direct imports, and crashed in two of three runs.
 
 A way for RADV to read the game's pages directly would replace it ([#191](https://github.com/brcly/TuxBox/issues/191)).
+
+## Performance overlay
+
+Add `--overlay` before the game path to draw TuxBox's own panel over the game. It works through TuxBox's graphics provider, so it needs no other software.
+
+| Shows | Notes |
+| --- | --- |
+| Frame rate, 1% low, frame times and their graph | Measured between presented frames. The panel freezes when the game stops presenting. |
+| Processor use, the whole system and the game | |
+| Graphics card load, temperature, clock and power | From NVIDIA's management library, or the Linux kernel's sensor files. AMD and Intel cards on Windows show `-`. |
+| Game memory, system memory, swap and video memory | |
+| Shaders being translated, pipelines being built and empty stand-ins | |
+
+```sh
+python tuxbox.py run --overlay --app-id Lanes build/lanes
+```
+
+`TUXBOX_OVERLAY_POS` sets the corner (top left by default), and `TUXBOX_FRAME_LOG` writes every frame time to a CSV file. [Environment variables](ENVIRONMENT.md) has both. The overlay's own cost and its behaviour on Windows haven't been measured.
 
 ## Game logs
 

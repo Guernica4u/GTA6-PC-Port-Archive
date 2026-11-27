@@ -1,15 +1,15 @@
 {
   "schema": 1,
-  "date_utc": "2026-11-25",
+  "date_utc": "2026-11-26",
   "executable_sha256": "e95020b2fa4a721db3df59fdecf75621730ac559d8835252f6c3b658d5a08993",
-  "compiler_sha256": "c28f447023d6379631a665c5845c06bf539e35c235ac43fab0691171f5f33aba",
-  "log_sha256": "869f7292e5d29d88ebcea5d009034c7eb3f855977432bdb2b111c8c5b67feb4c",
+  "compiler_sha256": "b3f7a13a87f99e89d442d3da7fed13e9ff3e29a72a43853c27cec6bcc49d0151",
+  "log_sha256": "133a5e115058b6ab51c2abd11b7c1efe142b356c453ec161f89d1fe18f0ad403",
   "requests": {
-    "total": 25079,
-    "compiled": 20583,
-    "unsupported": 4496,
+    "total": 41064,
+    "compiled": 36653,
+    "unsupported": 4411,
     "failed": 0
   },
-  "duration_seconds": 1426,
-  "dxil_reused": 2227
+  "duration_seconds": 1396,
+  "dxil_reused": 24129
 }

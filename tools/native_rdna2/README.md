@@ -11,3 +11,19 @@ python tools/native_rdna2/check_model.py --work build/native-rdna2 --output buil
 ```
 
 It needs ROCm (`hipcc`, `clang-offload-bundler` and `libhsa-runtime64`), by default under `/opt/rocm`. [Example receipt](../../evidence/native-rdna2-f64-modes.json)
+
+`sad.hip` and `check_sad.py` do the same for the byte SAD forms (`v_msad_u8`, `v_qsad_pk_u16_u8`, `v_mqsad_pk_u16_u8`, `v_mqsad_u32_u8`). They compare the model of `tools/check_byte_sad_gpu.py` under MODE 0 and 0x3ff:
+
+```
+python tools/native_rdna2/check_sad.py --work build/native-rdna2-sad --output build/native-rdna2-sad.json
+```
+
+[Example receipt](../../evidence/native-rdna2-byte-sad.json)
+
+`half.hip` and `check_half.py` do the same for the f16 frexp and ldexp forms and the normalized 16-bit packs, against the model of `tools/check_half_exact_gpu.py`:
+
+```
+python tools/native_rdna2/check_half.py --work build/native-rdna2-half --output build/native-rdna2-half.json
+```
+
+[Example receipt](../../evidence/native-rdna2-half.json)

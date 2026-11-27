@@ -1,12 +1,15 @@
-//! A MangoHud-style panel over the presented frame that shows shader
-//! translation and pipeline building progress.
+//! MangoHud-style panels over the presented frame: shader translation and
+//! pipeline building progress, and performance readings.
 //!
-//! The text is rasterized with GDI into a small bitmap, written into a
+//! Each panel is rasterized with GDI into a small bitmap, written into a
 //! per-frame upload buffer and copied onto the back buffer in the same command
 //! list as the frame itself. It uses only D3D12 and GDI, so it behaves the same
 //! on Windows and under Wine, and it never touches the guest's own image.
 
 mod layout;
+mod performance;
+
+pub(super) use performance::PerformancePanel;
 
 use crate::progress::{self, Mode, Snapshot};
 use core::ffi::c_void;
@@ -34,17 +37,23 @@ const WARNING: u32 = 0xe2bc8c;
 const PERIOD: u32 = 24;
 const STEP_MS: u128 = 60;
 
-pub(super) struct Overlay {
-    mode: Mode,
+/// One panel's pixels and its per-frame upload buffers.
+struct Surface {
     format: PixelFormat,
     dxgi_format: DXGI_FORMAT,
     scale: u32,
     size: (u32, u32),
+    /// `None` when the panel cannot be shown on this swap chain.
     origin: Option<(u32, u32)>,
     pixels: Vec<u32>,
     version: u64,
-    key: Option<([String; 4], u32)>,
     uploads: [Option<Upload>; 2],
+}
+
+pub(super) struct Overlay {
+    mode: Mode,
+    surface: Surface,
+    key: Option<([String; 4], u32)>,
     started: Instant,
 }
 
@@ -63,57 +72,39 @@ pub(super) struct Placement {
     y: u32,
 }
 
-impl Overlay {
-    pub(super) fn new(format: DXGI_FORMAT, width: u32, height: u32) -> Self {
+impl Surface {
+    /// A panel of `base` pixels at 1080p in `corner` of the screen.
+    fn new(format: DXGI_FORMAT, screen: (u32, u32), base: (u32, u32), corner: Corner) -> Self {
         let pixel_format = match format {
             DXGI_FORMAT_R10G10B10A2_UNORM => PixelFormat::Rgb10A2,
             _ => PixelFormat::Rgba8,
         };
         let supported = matches!(format, DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R10G10B10A2_UNORM);
-        let scale = layout::scale_for(height);
-        let size = layout::panel_size(scale);
-        let corner = Corner::parse(std::env::var("TUXBOX_PROGRESS_OVERLAY_POS").ok().as_deref());
-        let origin = layout::origin(corner, size, (width, height), scale);
-        let mode = if supported && origin.is_some() { Mode::from_env() } else { Mode::Off };
+        let scale = layout::scale_for(screen.1);
+        let size = layout::panel_size(base, scale);
         Self {
-            mode,
             format: pixel_format,
             dxgi_format: format,
             scale,
             size,
-            origin,
+            origin: layout::origin(corner, size, screen, scale).filter(|_| supported),
             pixels: Vec::new(),
             version: 0,
-            key: None,
             uploads: [None, None],
-            started: Instant::now(),
         }
     }
 
-    /// Draw the panel into frame `index`'s upload buffer when it should be on
-    /// screen. Call after waiting for that frame's previous use to retire.
-    pub(super) fn prepare(&mut self, device: &ID3D12Device, index: usize) -> Option<Placement> {
-        if self.mode == Mode::Off {
-            return None;
-        }
+    fn set(&mut self, pixels: Vec<u32>) {
+        self.pixels = pixels;
+        self.version += 1;
+    }
+
+    /// Frame `index`'s copy of the current pixels. Call after waiting for that
+    /// frame's previous use to retire.
+    fn place(&mut self, device: &ID3D12Device, index: usize) -> Option<Placement> {
         let (x, y) = self.origin?;
-        let snapshot = progress::snapshot();
-        if !progress::visible(self.mode, &snapshot) {
+        if self.version == 0 {
             return None;
-        }
-        let phase = if snapshot.working() { ((self.started.elapsed().as_millis() / STEP_MS) % u128::from(PERIOD)) as u32 } else { 0 };
-        let text = progress::lines(&snapshot);
-        let key = (text.clone(), phase);
-        if self.key.as_ref() != Some(&key) {
-            // SAFETY: GDI objects are created, used and released inside the call.
-            match unsafe { rasterize(self.size, self.scale, &text, &snapshot, phase) } {
-                Some(pixels) => {
-                    self.pixels = pixels;
-                    self.version += 1;
-                    self.key = Some(key);
-                }
-                None => return None,
-            }
         }
         let pitch = layout::row_pitch(self.size.0);
         let slot = self.uploads.get_mut(index)?;
@@ -121,8 +112,8 @@ impl Overlay {
             match create_upload(device, pitch, self.size.1) {
                 Ok(upload) => *slot = Some(upload),
                 Err(error) => {
-                    crate::diagnostics::log(&format!("progress overlay disabled: upload buffer {:?}", error.code()));
-                    self.mode = Mode::Off;
+                    crate::diagnostics::log(&format!("overlay panel disabled: upload buffer {:?}", error.code()));
+                    self.origin = None;
                     return None;
                 }
             }
@@ -150,6 +141,37 @@ impl Overlay {
             x,
             y,
         })
+    }
+}
+
+impl Overlay {
+    pub(super) fn new(format: DXGI_FORMAT, width: u32, height: u32) -> Self {
+        let corner = Corner::parse(std::env::var("TUXBOX_PROGRESS_OVERLAY_POS").ok().as_deref());
+        let surface = Surface::new(format, (width, height), (layout::BASE_WIDTH, layout::BASE_HEIGHT), corner);
+        let mode = if surface.origin.is_some() { Mode::from_env() } else { Mode::Off };
+        Self { mode, surface, key: None, started: Instant::now() }
+    }
+
+    /// Draw the panel into frame `index`'s upload buffer when it should be on
+    /// screen. Call after waiting for that frame's previous use to retire.
+    pub(super) fn prepare(&mut self, device: &ID3D12Device, index: usize) -> Option<Placement> {
+        if self.mode == Mode::Off {
+            return None;
+        }
+        let snapshot = progress::snapshot();
+        if !progress::visible(self.mode, &snapshot) {
+            return None;
+        }
+        let phase = if snapshot.working() { ((self.started.elapsed().as_millis() / STEP_MS) % u128::from(PERIOD)) as u32 } else { 0 };
+        let text = progress::lines(&snapshot);
+        let key = (text.clone(), phase);
+        if self.key.as_ref() != Some(&key) {
+            let drawing = progress_drawing(self.surface.size, self.surface.scale, text, &snapshot, phase);
+            // SAFETY: GDI objects are created, used and released inside the call.
+            self.surface.set(unsafe { rasterize(self.surface.size, self.surface.scale, &drawing) }?);
+            self.key = Some(key);
+        }
+        self.surface.place(device, index)
     }
 }
 
@@ -228,8 +250,57 @@ fn colorref(rgb: u32) -> COLORREF {
     COLORREF((rgb & 0xff) << 16 | (rgb & 0xff00) | (rgb >> 16 & 0xff))
 }
 
-/// Render the panel to 0x00RRGGBB pixels, top row first.
-unsafe fn rasterize(size: (u32, u32), scale: u32, text: &[String; 4], snapshot: &Snapshot, phase: u32) -> Option<Vec<u32>> {
+/// A panel's contents: filled rectangles, then lines of text over them.
+#[derive(Default)]
+struct Drawing {
+    /// x, y, width, height, colour.
+    fills: Vec<(u32, u32, u32, u32, u32)>,
+    /// x, y, text, colour.
+    texts: Vec<(i32, i32, String, u32)>,
+}
+
+impl Drawing {
+    /// The bordered background every panel starts from.
+    fn panel((width, height): (u32, u32), scale: u32) -> Self {
+        Self {
+            fills: vec![
+                (0, 0, width, height, BORDER),
+                (scale, scale, width - 2 * scale, height - 2 * scale, BACKGROUND),
+            ],
+            texts: Vec::new(),
+        }
+    }
+
+    /// Lines of text down from the top of the panel.
+    fn lines(&mut self, scale: u32, lines: impl IntoIterator<Item = (String, u32)>) {
+        for (index, (line, colour)) in lines.into_iter().enumerate() {
+            let (pad, scale) = (12 * scale as i32, scale as i32);
+            self.texts.push((pad, 10 * scale + index as i32 * 18 * scale, line, colour));
+        }
+    }
+}
+
+fn progress_drawing(size: (u32, u32), scale: u32, text: [String; 4], snapshot: &Snapshot, phase: u32) -> Drawing {
+    let mut drawing = Drawing::panel(size, scale);
+    // Progress bar: a block sweeps along the track while work is in flight.
+    let pad = 12 * scale;
+    let track_width = size.0 - 2 * pad;
+    let bar_y = size.1 - 18 * scale;
+    let bar_height = 6 * scale;
+    drawing.fills.push((pad, bar_y, track_width, bar_height, TRACK));
+    if snapshot.working() {
+        let (start, end) = layout::marching_block(track_width, phase, PERIOD);
+        drawing.fills.push((pad + start, bar_y, end - start, bar_height, ACCENT));
+    } else {
+        drawing.fills.push((pad, bar_y, track_width, bar_height, MUTED));
+    }
+    let problems = if snapshot.shaders.timed_out > 0 { WARNING } else { MUTED };
+    drawing.lines(scale, text.into_iter().zip([ACCENT, TEXT, problems, MUTED]));
+    drawing
+}
+
+/// Render a panel to 0x00RRGGBB pixels, top row first.
+unsafe fn rasterize(size: (u32, u32), scale: u32, drawing: &Drawing) -> Option<Vec<u32>> {
     let (width, height) = size;
     let scale = scale as i32;
     // SAFETY: every handle below is created here, checked, and released
@@ -262,27 +333,12 @@ unsafe fn rasterize(size: (u32, u32), scale: u32, text: &[String; 4], snapshot: 
         };
         let previous = SelectObject(dc, bitmap.into());
         let pixels = core::slice::from_raw_parts_mut(bits.cast::<u32>(), (width * height) as usize);
-        let mut fill = |x0: u32, y0: u32, w: u32, h: u32, colour: u32| {
+        for &(x0, y0, w, h, colour) in &drawing.fills {
             for y in y0..(y0 + h).min(height) {
                 for x in x0..(x0 + w).min(width) {
                     pixels[(y * width + x) as usize] = colour;
                 }
             }
-        };
-        fill(0, 0, width, height, BORDER);
-        let border = scale as u32;
-        fill(border, border, width - 2 * border, height - 2 * border, BACKGROUND);
-        // Progress bar: a block sweeps along the track while work is in flight.
-        let pad = 12 * scale as u32;
-        let track_width = width - 2 * pad;
-        let bar_y = height - 18 * scale as u32;
-        let bar_height = 6 * scale as u32;
-        fill(pad, bar_y, track_width, bar_height, TRACK);
-        if snapshot.working() {
-            let (start, end) = layout::marching_block(track_width, phase, PERIOD);
-            fill(pad + start, bar_y, end - start, bar_height, ACCENT);
-        } else {
-            fill(pad, bar_y, track_width, bar_height, MUTED);
         }
 
         let font = CreateFontW(
@@ -303,12 +359,10 @@ unsafe fn rasterize(size: (u32, u32), scale: u32, text: &[String; 4], snapshot: 
         );
         let old_font = SelectObject(dc, font.into());
         SetBkMode(dc, TRANSPARENT);
-        let problems = if snapshot.shaders.timed_out > 0 { WARNING } else { MUTED };
-        let colours = [ACCENT, TEXT, problems, MUTED];
-        for (index, (line, colour)) in text.iter().zip(colours).enumerate() {
-            SetTextColor(dc, colorref(colour));
+        for (x, y, line, colour) in &drawing.texts {
+            SetTextColor(dc, colorref(*colour));
             let wide: Vec<u16> = line.encode_utf16().collect();
-            let _ = TextOutW(dc, pad as i32, 10 * scale + index as i32 * 18 * scale, &wide);
+            let _ = TextOutW(dc, *x, *y, &wide);
         }
         let _ = GdiFlush();
         let out: Vec<u32> = pixels.iter().map(|p| p & 0x00ff_ffff).collect();

@@ -1,9 +1,12 @@
 //! Keep CPU-backed tiled Xbox textures coherent with their desktop images.
 mod descriptors;
+mod guarded_copy;
 mod publication;
 mod upload;
+mod waits;
 mod writeback;
 pub(crate) use descriptors::{DescriptorMap, DescriptorRange, HeapViews, PlacedView, Views};
+pub(crate) use guarded_copy::recover as recover_guarded_copy;
 pub(crate) use publication::QueueAccess;
 
 use super::Device;
@@ -14,7 +17,6 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use tuxbox_xg_layout::{Desc, Plane};
 use windows::Win32::Foundation::{E_INVALIDARG, E_NOTIMPL, E_OUTOFMEMORY, E_POINTER};
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::Win32::System::{Diagnostics::Debug::ReadProcessMemory, Threading::GetCurrentProcess};
 use windows::core::{HRESULT, Result};
 
 pub(crate) fn supported_state(state: D3D12_RESOURCE_STATES, flags: D3D12_RESOURCE_FLAGS) -> bool {
@@ -96,6 +98,32 @@ struct Contents {
     previous: Vec<Vec<u8>>,
     uploaded: u64,
     readers: Vec<(ID3D12Fence, u64)>,
+}
+
+impl Contents {
+    /// Keep `bytes` as mip `level`'s snapshot and return the one it replaces,
+    /// for reuse as scratch.
+    fn store(&mut self, level: usize, bytes: Vec<u8>) -> Vec<u8> {
+        // The bytes arrive in the upload scratch buffer, which keeps the
+        // capacity of the largest mip it has compared, with those pages
+        // touched. Snapshots last as long as their texture, so let the system
+        // reclaim the whole pages past this mip's bytes. Shrinking would not:
+        // Wine shrinks a large heap block in place and keeps its pages.
+        let start = (bytes.as_ptr() as usize + bytes.len()).next_multiple_of(4096);
+        let end = (bytes.as_ptr() as usize + bytes.capacity()) & !4095;
+        if end >= start + (64 << 10) {
+            // SAFETY: whole pages inside the Vec's own allocation and past its
+            // length. MEM_RESET keeps them committed; only their contents,
+            // which the Vec does not read, are discarded.
+            unsafe {
+                windows::Win32::System::Memory::VirtualAlloc(
+                    Some(start as *const c_void), end - start,
+                    windows::Win32::System::Memory::MEM_RESET, windows::Win32::System::Memory::PAGE_READWRITE,
+                );
+            }
+        }
+        std::mem::replace(&mut self.previous[level], bytes)
+    }
 }
 
 struct Alias {
@@ -328,22 +356,11 @@ impl Texture {
         let size = (mip.source.end - mip.source.start) as usize;
         output.clear();
         output.try_reserve_exact(size).map_err(|_| E_OUTOFMEMORY)?;
-        let mut copied = 0;
-        // SAFETY: the OS checks the guest mapping. A partial transfer never
-        // exposes uninitialized bytes, including when pages are decommitted.
-        let result = unsafe {
-            ReadProcessMemory(
-                GetCurrentProcess(),
-                (self.address + mip.source.start) as *const _,
-                output.as_mut_ptr().cast(),
-                size,
-                Some(&mut copied),
-            )
-        };
-        if result.is_err() || copied != size {
+        output.resize(size, 0);
+        if !super::heap::backing::read_guest_bytes(self.address + mip.source.start, output) {
+            output.clear();
             return Ok(false);
         }
-        unsafe { output.set_len(size) };
         Ok(true)
     }
 
@@ -614,6 +631,13 @@ fn unique(textures: &mut Vec<Arc<Texture>>) {
     textures.dedup_by(|a, b| Arc::ptr_eq(a, b));
 }
 
+/// Add the placed textures viewed in `heaps` to a batch's reads. The batch
+/// cannot write through these ranges, so a writable view there is a read too.
+pub(crate) unsafe fn gather_reads(device: *mut c_void, heaps: &[Range<usize>], textures: &mut Vec<Arc<Texture>>) {
+    let device = unsafe { &*device.cast::<Device>() };
+    device.state.placements.views.gather_reads(heaps, textures);
+}
+
 // Descriptor contents may change after command-list Close. Resolve SRVs in the
 // shader-visible heaps that actually participated in a draw or dispatch.
 pub(crate) unsafe fn submit(
@@ -673,6 +697,7 @@ pub(crate) unsafe fn submit(
     refresh
         .try_reserve(textures.len())
         .map_err(|_| E_OUTOFMEMORY)?;
+    let mut publication_waits = Vec::new();
     for texture in textures.iter() {
         let mut pending = false;
         for write in submission
@@ -695,8 +720,7 @@ pub(crate) unsafe fn submit(
             // CPU bytes still contain the old version. The native image contains
             // the ordered GPU write and can be read directly by the next batch.
             if !held::blocked(&write.reader, write.tick) {
-                unsafe { queue.Wait(&write.published, write.tick)? };
-                crate::commands::queue_trace::waited(queue, "wait for an earlier texture publication", &write.published, write.tick);
+                waits::include(&mut publication_waits, &write.published, write.tick);
             }
             pending = true;
         }
@@ -705,6 +729,10 @@ pub(crate) unsafe fn submit(
         }
     }
 
+    for (fence, value) in publication_waits {
+        unsafe { queue.Wait(&fence, value)? };
+        crate::commands::queue_trace::waited(queue, "wait for an earlier texture publication", &fence, value);
+    }
     let transfer = &mut submission.transfer;
     transfer.refresh(&device.native, &refresh)?;
     let required = textures
@@ -716,16 +744,20 @@ pub(crate) unsafe fn submit(
         unsafe { queue.Wait(&transfer.fence, required)? };
         crate::commands::queue_trace::waited(queue, "wait for texture uploads", &transfer.fence, required);
     }
+    let mut reader_waits = Vec::new();
     for texture in writes.iter() {
         for (fence, value) in &lock(&texture.contents).readers {
             if fence != reader
                 && unsafe { fence.GetCompletedValue() } < *value
                 && !held::blocked(fence, *value)
             {
-                unsafe { queue.Wait(fence, *value)? };
-                crate::commands::queue_trace::waited(queue, "wait for another queue's texture reads", fence, *value);
+                waits::include(&mut reader_waits, fence, *value);
             }
         }
+    }
+    for (fence, value) in reader_waits {
+        unsafe { queue.Wait(&fence, value)? };
+        crate::commands::queue_trace::waited(queue, "wait for another queue's texture reads", &fence, value);
     }
     let tick = transfer.tick()?;
     let publication = if writes.is_empty() {
@@ -793,3 +825,7 @@ pub(crate) unsafe fn submit(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "../tests/device/placement/contents.rs"]
+mod tests;

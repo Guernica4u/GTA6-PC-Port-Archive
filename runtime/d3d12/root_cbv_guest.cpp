@@ -1,7 +1,12 @@
 // Exercise the full root-CBV window, including a page crossing on Scarlett.
+// With --offsets, bind the view at every 16-byte step up to 256 instead: Xbox
+// titles place constant buffers there, and a host that needs coarser uniform
+// buffer offsets reads from an earlier address without reporting an error.
 #include "compute_fixture.h"
 #include "frame_cli.h"
 #include "root_cbv.h"
+#include <algorithm>
+#include <vector>
 namespace {
 using namespace frame_abi;
 using namespace compute_fixture;
@@ -10,7 +15,7 @@ using Root = void(WINAPI*)(ID3D12GraphicsCommandList*,ID3D12RootSignature*);
 using View = void(WINAPI*)(ID3D12GraphicsCommandList*,UINT,UINT64);
 using Signal = HRESULT(WINAPI*)(ID3D12CommandQueue*,ID3D12Fence*,UINT64);
 constexpr UINT page=65536;
-std::string run(const wchar_t* requested,bool) {
+std::string run(const wchar_t* requested,bool fine) {
     DXGI_ADAPTER_DESC1 selected{};
     constexpr std::array<UINT,18> release_profile{0x20004,0,UINT_MAX,0,0,0,UINT_MAX,UINT_MAX,0,1,0,0,0,0,0,0,0,0};
     auto device=create_device(requested,selected,release_profile.data(),__uuidof(ID3D12Device11));
@@ -42,7 +47,10 @@ std::string run(const wchar_t* requested,bool) {
     auto result=buffer(device.Get(),D3D12_HEAP_TYPE_DEFAULT,sizeof(initial),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     auto readback=buffer(device.Get(),D3D12_HEAP_TYPE_READBACK,sizeof(initial),D3D12_RESOURCE_STATE_COPY_DEST);
     UINT pass=0;
-    for(UINT offset:{0u,256u,page-256u,page,page+256u}){
+    std::vector<UINT> offsets{0u,256u,page-256u,page,page+256u};
+    if(fine){offsets.clear();for(UINT offset=0;offset<=256;offset+=16)offsets.push_back(offset);}
+    std::string wrong;
+    for(UINT offset:offsets){
         ComPtr<ID3D12CommandAllocator> allocator;
         check(device->CreateCommandAllocator(q.Type,IID_PPV_ARGS(&allocator)),"allocator");
         const UINT desc[]{D3D12_COMMAND_LIST_TYPE_COMPUTE,0,1,0};
@@ -69,13 +77,21 @@ std::string run(const wchar_t* requested,bool) {
         check(readback->Map(0,&range,&ptr),"readback");
         const bool equal=std::memcmp(ptr,expected.data(),sizeof(expected))==0;
         readback->Unmap(0,&empty);
-        if(!equal)throw std::runtime_error("root CBV mismatch at offset "+std::to_string(offset));
+        if(!equal&&!fine)throw std::runtime_error("root CBV mismatch at offset "+std::to_string(offset));
+        // Count every offset, so a failing host shows which boundary it reads from.
+        if(!equal)wrong+=(wrong.empty()?"":",")+std::to_string(offset);
     }
     char receipt[160];
+    if(fine){
+        const size_t bad=wrong.empty()?0:1+std::count(wrong.begin(),wrong.end(),',');
+        if(bad)throw std::runtime_error("root CBV offsets="+std::to_string(offsets.size()-bad)+"/"+std::to_string(offsets.size())+" wrong="+wrong);
+        std::snprintf(receipt,sizeof(receipt),"d3d12-root-cbv-offsets PASS pci=%04x:%04x offsets=17/17 step=16 words=408/408",selected.VendorId,selected.DeviceId);
+        return receipt;
+    }
     std::snprintf(receipt,sizeof(receipt),"d3d12-root-cbv-window PASS pci=%04x:%04x words=120/120 window=65536 offsets=0,256,65280,65536,65792",selected.VendorId,selected.DeviceId);
     return receipt;
 }
 }
 int wmain(int argc,wchar_t** argv){
-    return tuxbox_test::frame_main(argc,argv,"d3d12-root-cbv-window",false,run);
+    return tuxbox_test::frame_main(argc,argv,"d3d12-root-cbv-window",true,run,L"--offsets"," [--offsets]");
 }

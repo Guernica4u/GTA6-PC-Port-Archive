@@ -59,6 +59,38 @@ def wave_expected():
     return [n + sum(range(n & ~63, (n & ~63) + 64)) for n in range(WAVE_THREADS)]
 
 
+# A gfx1030 Wave32 program with a vector register that is also used by
+# WRITELANE. Lane 12 is the first with EXEC set, so its v5 selects lane 9.
+# WRITELANE and READLANE must both reach lane 9 with its EXEC bit clear.
+LANE_WRITE_WORD = 0x7F15CAFE
+LANE_CODE = (
+    0xF4080402, 0xFA000000,     # s_load_dwordx4 s[16:19], s[4:5], 0
+    0x3A120093,                 # v_xor_b32 v9, 19, v0
+    0xD5260005, 0x02010700,     # v_sub_nc_u32 v5, v0, 3
+    0xD4C6000B, 0x02011900,     # v_cmp_ge_u32 s11, v0, 12
+    0xBE8A3C0B,                 # s_and_saveexec_b32 s10, s11
+    0xBE8803FF, LANE_WRITE_WORD, # s_mov_b32 s8, LANE_WRITE_WORD
+    0xD7610009, 0x02011208,     # v_writelane_b32 v9, s8, 9
+    0x7E0E0505,                 # v_readfirstlane_b32 s7, v5
+    0xD7600007, 0x02000F09,     # v_readlane_b32 s7, v9, s7
+    0xBEFE030A,                 # s_mov_b32 exec_lo, s10
+    0x3A0C1207,                 # v_xor_b32 v6, s7, v9
+    0x34100082,                 # v_lshlrev_b32 v8, 2, v0
+    0xBF8CC07F,                 # s_waitcnt lgkmcnt(0)
+    0xE0701000, 0x80040608,     # buffer_store_dword v6, v8, s[16:19], 0 offen
+    0xBF810000,                 # s_endpgm
+)
+
+
+def lane_shader():
+    return uav_shader(list(LANE_CODE), width=32)
+
+
+def lane_expected():
+    """Every lane combines the broadcast with its own retained VGPR value."""
+    return [0 if lane == 9 else LANE_WRITE_WORD ^ (lane ^ 19) for lane in range(32)]
+
+
 # The `compute-root` programs, checked with `llvm-mc -mcpu=gfx1030 -show-encoding`.
 # Each stores ROOT_EXPECTED through the descriptor at a byte offset of table 1,
 # whose pointer arrives in s5. Their FSSM record and PSV binding name it a raw
@@ -115,12 +147,35 @@ def recovered_root_shader():
     return stage_container(0x50060, image(7, first + second, user, used), [(b"PSV0", psv)])
 
 
+def root_srv_shader():
+    """A store through table 1 by a program whose records also name a root SRV.
+
+    The scenario's root is three tables and a root SRV. The record of that
+    root SRV names parameter 3, whose address arrives in s7-s8, and PSV names
+    it a raw buffer, t5, space7; the program does not read through it. The raw
+    UAV at slot 2 (0x40) of table 1 is u4, space2, where the root declares an
+    SRV. Both have user-data records.
+    """
+    info = bytearray(48)
+    info[24] = 5
+    struct.pack_into("<3I", info, 36, ROOT_THREADS, 1, 1)
+    resources = ([4, 7, 5, 5], [7, 2, 4, 4])
+    psv = pack([len(info)]) + info + pack([2, 16, *resources[0], *resources[1]])
+    user = ([1, 0, 2, 5, 0x307], [3, 16, 1, 4, 0x105])
+    used = ([0x100, 0, 5, 1, 0x30704], [0x303, 16, 4, 1, 0x10504])
+    return stage_container(0x50060, image(7, root_code(0x40), user, used), [(b"PSV0", psv)])
+
+
 BINDLESS_INDEX = 80
 BINDLESS_EXPECTED = 0x7AB1E002
 
 
-def bindless_compute_shader():
-    """Direct-indexed raw UAV store at a guest index outside the paged limit."""
+def bindless_compute_shader(table=False):
+    """Direct-indexed raw UAV store at a guest index outside the paged limit.
+
+    With `table` the root also has a descriptor table of four UAVs, which the
+    program does not read: it still picks its UAV by heap index.
+    """
     code = [0xbe8403ff, BINDLESS_INDEX, 0x8f048504,
             0xf4080205, 0x08000000, 0xbf8cc07f,
             0x7e0002ff, BINDLESS_EXPECTED, 0xe0700000, 0x80020000, 0xbf810000]
@@ -128,6 +183,9 @@ def bindless_compute_shader():
     info[24] = 5
     struct.pack_into("<3I", info, 36, 64, 1, 1)
     root = pack([2, 0, 24, 0, 24, 0x400])
+    if table:
+        # One table parameter at 24, its header at 36 and one 1.1 range at 44.
+        root = pack([2, 1, 24, 0, 68, 0x400, 0, 0, 36, 1, 44, 1, 4, 0, 0, 0, 0])
     return stage_container(0x50066, image(7, code, [(5, 0, 1, 0, 10)]), [
         (b"SFI0", struct.pack("<Q", 1 << 25)),
         (b"PSV0", pack([48]) + info + pack([0])),
@@ -176,6 +234,76 @@ def bindless_sampler_shader():
     ])
 
 
+# The `bindless-texture-store` program, checked with `llvm-mc -mcpu=gfx1030
+# -show-encoding`. It stores one word to one texel of the heap texture at a
+# guest index: the only kind of write a placed texture can receive through the
+# heap. `bindless_compute_shader` above writes a buffer and no image.
+BINDLESS_STORE_TEXTURE = 100
+BINDLESS_STORE_TEXEL = (3, 2)
+BINDLESS_STORE_EXPECTED = 0x7AB1E003
+
+
+def bindless_texture_store_shader():
+    """Direct-indexed store to one texel of a heap texture."""
+    code = [
+        0xB0100000 | BINDLESS_STORE_TEXTURE,  # s_movk_i32 s16, the texture's heap index
+        0x8F008510,                           # s_lshl_b32 s0, s16, 5
+        0xF40C0101, 0x00000000,               # s_load_dwordx8 s[4:11], s[2:3], s0
+        0x7E0002FF, BINDLESS_STORE_EXPECTED,  # v_mov_b32 v0, the word
+        0x7E020280 | BINDLESS_STORE_TEXEL[0],  # v_mov_b32 v1, x
+        0x7E040280 | BINDLESS_STORE_TEXEL[1],  # v_mov_b32 v2, y
+        0xBF8CC07F,                           # s_waitcnt lgkmcnt(0)
+        0xF0201108, 0x00010001,               # image_store v0, v[1:2], s[4:11] dmask:0x1 dim:2D unorm
+        0xBF810000,                           # s_endpgm
+    ]
+    info = bytearray(48)
+    info[24] = 5
+    struct.pack_into("<3I", info, 36, 64, 1, 1)
+    root = pack([2, 0, 24, 0, 24, 0x400])
+    # FSSM user data: class 5, the resource heap base in s2.
+    return stage_container(0x50066, image(7, code, [(5, 0, 1, 0, 2)]), [
+        (b"SFI0", struct.pack("<Q", 1 << 25)),
+        (b"PSV0", pack([48]) + info + pack([0])),
+        (b"RTS0", root),
+    ])
+
+
+# The `bindless-table-store` program, checked with `llvm-mc -mcpu=gfx1030
+# -show-encoding`. Its root allows direct heap indexing, but it stores its word
+# through a descriptor table: the typed UAV u1 at slot 1 of table 0, whose
+# pointer arrives in s4. It can therefore write that one texture and no other.
+BINDLESS_TABLE_SLOT = 1
+BINDLESS_TABLE_EXPECTED = 0x7AB1E004
+
+
+def bindless_table_store_shader():
+    """A store to one texel of the texture at a table slot, under a root that allows heap indexing."""
+    code = [
+        0xBE800304,                           # s_mov_b32 s0, s4
+        0xBE810380,                           # s_mov_b32 s1, 0
+        0xF40C0200, 0xFA000000 | 32 * BINDLESS_TABLE_SLOT,  # s_load_dwordx8 s[8:15], s[0:1], slot
+        0x7E0002FF, BINDLESS_TABLE_EXPECTED,  # v_mov_b32 v0, the word
+        0x7E020280 | BINDLESS_STORE_TEXEL[0],  # v_mov_b32 v1, x
+        0x7E040280 | BINDLESS_STORE_TEXEL[1],  # v_mov_b32 v2, y
+        0xBF8CC07F,                           # s_waitcnt lgkmcnt(0)
+        0xF0201108, 0x00020001,               # image_store v0, v[1:2], s[8:15] dmask:0x1 dim:2D unorm
+        0xBF810000,                           # s_endpgm
+    ]
+    info = bytearray(48)
+    info[24] = 5
+    struct.pack_into("<3I", info, 36, 64, 1, 1)
+    resources = ([6, 0, BINDLESS_TABLE_SLOT, BINDLESS_TABLE_SLOT],)  # PSV: typed UAV u1, space0
+    psv = pack([len(info)]) + info + pack([len(resources), 16, *resources[0]])
+    # FSSM user data: descriptor u1 at dword offset 8 of table 0 (s4). Used
+    # resources: a typed UAV there, an eight-dword image descriptor.
+    user = ([3, 8 * BINDLESS_TABLE_SLOT, 1, BINDLESS_TABLE_SLOT, 0x004],)
+    used = ([0x303, 8 * BINDLESS_TABLE_SLOT, BINDLESS_TABLE_SLOT, 1, 0x408],)
+    return stage_container(0x50066, image(7, code, user, used), [
+        (b"SFI0", struct.pack("<Q", 1 << 25)),
+        (b"PSV0", psv),
+    ])
+
+
 def declaration(name, data):
     values = ",".join(str(byte) for byte in data)
     return (f"constexpr unsigned char {name}[] = {{{values}}};\n"
@@ -185,14 +313,26 @@ def declaration(name, data):
 
 def header():
     words = ",".join(f"{word}u" for word in wave_expected())
+    lane_words = ",".join(f"{word}u" for word in lane_expected())
     return ("// Generated from shader_fixture.py.\n"
             + declaration("xbox_shader", shader()) + declaration("wave_shader", wave_shader())
             + f"constexpr unsigned wave_shader_expected[] = {{{words}}};\n"
+            + declaration("lane_shader", lane_shader())
+            + f"constexpr unsigned lane_shader_expected[] = {{{lane_words}}};\n"
             + declaration("recovered_root_shader", recovered_root_shader())
+            + declaration("root_srv_shader", root_srv_shader())
             + declaration("bindless_compute_shader", bindless_compute_shader())
+            + declaration("bindless_table_compute_shader", bindless_compute_shader(table=True))
             + f"constexpr unsigned bindless_index = {BINDLESS_INDEX};\nconstexpr unsigned bindless_expected = {BINDLESS_EXPECTED:#x};\n"
             + declaration("bindless_sampler_shader", bindless_sampler_shader())
             + f"constexpr unsigned bindless_texture = {BINDLESS_TEXTURE}, bindless_output = {BINDLESS_OUTPUT};\n"
+            + declaration("bindless_texture_store_shader", bindless_texture_store_shader())
+            + f"constexpr unsigned bindless_store_texture = {BINDLESS_STORE_TEXTURE}, "
+              f"bindless_store_x = {BINDLESS_STORE_TEXEL[0]}, bindless_store_y = {BINDLESS_STORE_TEXEL[1]}, "
+              f"bindless_store_expected = {BINDLESS_STORE_EXPECTED:#x};\n"
+            + declaration("bindless_table_store_shader", bindless_table_store_shader())
+            + f"constexpr unsigned bindless_table_slot = {BINDLESS_TABLE_SLOT}, "
+              f"bindless_table_expected = {BINDLESS_TABLE_EXPECTED:#x};\n"
             + declaration("root_shader", root_shader(0x40)) + declaration("root_refused_shader", root_shader(0xA0))
             + f"constexpr unsigned root_shader_expected = {ROOT_EXPECTED:#x};\n")
 

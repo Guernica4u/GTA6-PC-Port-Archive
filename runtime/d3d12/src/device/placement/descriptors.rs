@@ -146,6 +146,15 @@ impl DescriptorMap<PlacedView> {
             }
         }
     }
+
+    /// Every placed texture viewed in `heaps`, whatever the view allows.
+    pub(crate) fn gather_reads(&self, heaps: &[Range<usize>], reads: &mut Vec<Arc<super::Texture>>) {
+        if heaps.is_empty() { return; }
+        let views = lock(&self.0);
+        for heap in heaps {
+            reads.extend(views.range(heap.clone()).filter_map(|(_, view)| view.texture.upgrade()));
+        }
+    }
 }
 impl<V: Clone> DescriptorMap<V> {
     pub(crate) fn lookup(&self, handle: usize) -> Option<V> {

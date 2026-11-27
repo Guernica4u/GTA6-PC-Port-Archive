@@ -1,4 +1,4 @@
-//! Emit synthetic RDNA2 constant-lane `v_readlane_b32` compute shaders through
+//! Emit synthetic RDNA2 constant and indexed `v_readlane_b32` compute shaders through
 //! the real HLSL translator for DXC/DXV validation and D3D12 GPU readback.
 use tuxbox_xshader::{hlsl, ShaderExtract, Stage};
 
@@ -75,6 +75,7 @@ fn instrument(hlsl: &str, lanes: u32, end_marker: &str, result_reg: &str) -> Str
 
 fn main() {
     let case = std::env::args().nth(1).expect("case name");
+    let mixed_lane = matches!(case.as_str(), "wave32_mixed_dynamic_11" | "wave32_mixed_empty_exec");
     let (group, words, result_reg, expect_wave32): ([u32; 3], Vec<u32>, &str, bool) = match case.as_str() {
         "wave32_active_0" => {
             let [r0, r1] = readlane(7, 1, 0);
@@ -335,6 +336,35 @@ fn main() {
                 false,
             )
         }
+        "wave32_mixed_dynamic_11" | "wave32_mixed_empty_exec" => {
+            // Assemble for gfx1030 wave32. Flatten the 2D group, seed v9 with
+            // distinct values, and let the first active lane choose (12 + 63)
+            // & 31 = 11. The read and write both see lane 11 with EXEC clear.
+            // The empty-mask case must skip the lane write and keep s7.
+            let threshold = if case == "wave32_mixed_dynamic_11" { 12 } else { 32 };
+            (
+                [8, 4, 1],
+                vec![
+                    0x3408_0283,             // v_lshlrev_b32 v4, 3, v1
+                    0x3808_0900,             // v_or_b32 v4, v0, v4
+                    0x4a12_0891,             // v_add_nc_u32 v9, 17, v4
+                    0x4a0a_08bf,             // v_add_nc_u32 v5, 63, v4
+                    0xbe87_0383,             // s_mov_b32 s7, 3
+                    0xd4c6_000b, 0x0201_0104 | ((128 + threshold) << 9), // v_cmp_ge_u32 s11, v4, threshold
+                    0xbe84_3c0b,             // s_and_saveexec_b32 s4, s11
+                    0xbf88_0007,             // s_cbranch_execz done
+                    0xbe88_03ff, 0x5a5a_31f2, // s_mov_b32 s8, 0x5a5a31f2
+                    0xd761_0009, 0x0201_1608, // v_writelane_b32 v9, s8, 11
+                    0x7e0e_0505,             // v_readfirstlane_b32 s7, v5
+                    0xd760_0007, 0x0200_0f09, // v_readlane_b32 s7, v9, s7
+                    0xbefe_0304,             // done: s_mov_b32 exec_lo, s4
+                    0x3a0c_1207,             // v_xor_b32 v6, s7, v9
+                    0xbf81_0000,             // s_endpgm
+                ],
+                "v6",
+                true,
+            )
+        }
         other => panic!("unknown readlane probe case: {other}"),
     };
     let end_off = (words.len() - 1) * 4;
@@ -348,5 +378,13 @@ fn main() {
             assert_eq!(tr.required_wave_size, None, "{case} must be portable (no WaveSize)");
         }
     }
-    print!("{}", instrument(&tr.hlsl, group[0], &end_marker, result_reg));
+    if mixed_lane {
+        // Use the same logical lane mapping for the readback slot, independent
+        // of how D3D12 assigns SV_GroupThreadID to the hardware lanes.
+        assert_eq!(tr.hlsl.matches(&end_marker).count(), 1);
+        let store = format!("    output[32u + WaveGetLaneIndex()] = {result_reg};\n{end_marker}");
+        print!("RWBuffer<uint> output : register(u0);\n{}", tr.hlsl.replace(&end_marker, &store));
+    } else {
+        print!("{}", instrument(&tr.hlsl, group[0], &end_marker, result_reg));
+    }
 }

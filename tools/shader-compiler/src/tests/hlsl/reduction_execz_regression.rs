@@ -23,7 +23,7 @@ fn reduction_execz_votes_only_at_proven_guards() {
         let translated = translate(&guarded_shader(width, &[])).expect("guarded reduction");
         assert_eq!(translated.required_wave_size, Some(width));
         assert_eq!(translated.hlsl.matches("!WaveActiveAnyTrue((exec_lo & 1u) != 0u)").count(), 1);
-        assert!(translated.hlsl.contains(" | ((exec_lo & 1u) == 0u);"));
+        assert!(translated.hlsl.contains("uint((exec_lo & 1u) == 0u) * "));
     }
 }
 

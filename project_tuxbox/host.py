@@ -5,6 +5,7 @@ from pathlib import Path
 import platform
 import re
 import shutil
+import struct
 import subprocess
 import sys
 from contextlib import nullcontext
@@ -264,6 +265,63 @@ def adopt_nvidia_glcache(cache):
         shutil.rmtree(device, ignore_errors=True)
 
 
+# The driver keeps each cache as a .bin of records and a .toc that indexes
+# them. Both start with the same 32-byte header. A .toc entry is a 16-byte
+# hash, then the record's offset and payload size as 32-bit values, and each
+# record in the .bin carries 32 bytes of its own before the payload.
+NVIDIA_CACHE_MAGIC = b"CDVN"
+NVIDIA_CACHE_HEADER = 32
+NVIDIA_TOC_ENTRY = struct.Struct("<16sII")
+
+
+def _nvidia_indexed_bytes(toc):
+    """How much of the .bin beside toc its index covers, or None if unreadable."""
+    try:
+        with open(toc, "rb") as index:
+            if index.read(len(NVIDIA_CACHE_MAGIC)) != NVIDIA_CACHE_MAGIC:
+                return None
+            entries = os.fstat(index.fileno()).st_size - NVIDIA_CACHE_HEADER
+            if entries < 0 or entries % NVIDIA_TOC_ENTRY.size:
+                return None
+            if not entries:
+                return NVIDIA_CACHE_HEADER
+            # Entries are appended in file order, so the last one ends the index.
+            index.seek(-NVIDIA_TOC_ENTRY.size, os.SEEK_END)
+            _, offset, size = NVIDIA_TOC_ENTRY.unpack(index.read(NVIDIA_TOC_ENTRY.size))
+    except (OSError, struct.error):
+        return None
+    return offset + NVIDIA_CACHE_HEADER + size
+
+
+def report_unindexed_nvidia_cache(cache, report):
+    """Say when a driver cache file holds pipelines its index cannot find.
+
+    The index addresses the file with 32-bit offsets. The driver still appends
+    past 4 GiB, and it compiles those pipelines again on every launch. Nothing
+    is changed here: moving a cache aside is the person's decision.
+    """
+    try:
+        indexes = sorted((Path(cache) / "GLCache").glob("*/*/*.toc"))
+    except OSError:
+        return
+    for toc in indexes:
+        blob = toc.with_suffix(".bin")
+        indexed = _nvidia_indexed_bytes(toc)
+        try:
+            stored = blob.stat().st_size
+        except OSError:
+            continue
+        if indexed is None or stored <= indexed and stored < 1 << 32:
+            continue
+        if stored > indexed:
+            fault = (f"{(stored - indexed) / (1 << 20):,.0f} MiB of its {stored / (1 << 30):.1f} GiB is past the "
+                     "end of its index and is compiled again on every launch")
+        else:
+            fault = "it has reached 4 GiB, the most its index can address, so nothing added to it is found again"
+        report(f"NVIDIA shader cache {blob} has stopped being indexed: {fault}. Move the .bin and .toc aside "
+               "while no game is running to let the driver start a new cache.")
+
+
 def configure_nvidia_shader_cache(env, report=None):
     """Keep this prefix's compiled GPU pipelines for the next launch.
 
@@ -284,6 +342,7 @@ def configure_nvidia_shader_cache(env, report=None):
         env.setdefault("__GL_SHADER_DISK_CACHE_SIZE", str(NVIDIA_CACHE_BYTES))
         if report:
             report(f"NVIDIA shader cache: {explicit} (path set by the environment)")
+            report_unindexed_nvidia_cache(explicit, report)
         return
     prefix = env.get("WINEPREFIX")
     if not prefix:
@@ -304,6 +363,7 @@ def configure_nvidia_shader_cache(env, report=None):
     env.setdefault("__GL_SHADER_DISK_CACHE_SIZE", str(NVIDIA_CACHE_BYTES))
     if report:
         report(f"NVIDIA shader cache: {cache}")
+        report_unindexed_nvidia_cache(cache, report)
 
 
 def configure_pipeline_cache(env, prefix):

@@ -40,7 +40,7 @@ class ScarlettPreparation(unittest.TestCase):
                 raise ValueError("invalid digest")
 
             stderr = io.StringIO()
-            host = SimpleNamespace(env={"WINEPREFIX": str(root)})
+            host = SimpleNamespace(env={"WINEPREFIX": str(root), "TUXBOX_PERSISTENT_DXC": "0"})
             with patch("project_tuxbox.scarlett_prep.scarlett_requests", return_value=requests), \
                     patch("project_tuxbox.scarlett_prep.snapshot_compiler_cache", return_value=(None, None)), \
                     patch("project_tuxbox.scarlett_prep.desktop_progress", return_value=nullcontext(None)), \

@@ -7,7 +7,13 @@ import struct
 import tempfile
 
 from project_tuxbox.verify import (
-    lanes_imports, missing_provider_imports, private_x_server, screen_capture_problem, xauthority_entry)
+    lanes_imports, missing_provider_imports, private_x_server, screen_capture_problem, splash_skip_reason, xauthority_entry)
+
+
+class SplashSkipTests(unittest.TestCase):
+    def test_only_software_presentation_skips_the_splash(self):
+        self.assertIsNone(splash_skip_reason({}))
+        self.assertIn("software", splash_skip_reason({"MESA_VK_WSI_DEBUG": "sw"}))
 
 
 class PrivateXServerTests(unittest.TestCase):
@@ -146,3 +152,17 @@ class ProviderImportTests(unittest.TestCase):
                 missing_provider_imports(modules, Path("xmem.dll"), ("XMemAllocDefault", "XMemFreeDefault")),
                 ["XMemAllocDefault", "XMemFreeDefault"])
         self.assertEqual(missing_provider_imports(modules, Path("GameInput.dll"), ("#1",)), ["#1"])
+
+
+class MeshWorkerReceiptTests(unittest.TestCase):
+    def test_exact_loaded_stages(self):
+        from project_tuxbox.verify import missing_mesh_worker_receipt
+        mesh, pixel, other = ("a"*64, "b"*64, "c"*64)
+        log = (f"prepared mesh shader loaded, source SHA-256 {mesh}\n"
+               f"prepared pixel shader loaded, source SHA-256 {pixel}\n")
+        self.assertIsNone(missing_mesh_worker_receipt(log, {mesh, pixel, other}))
+        self.assertIn("mesh", missing_mesh_worker_receipt(log, {pixel, other}))
+        self.assertIn("pixel", missing_mesh_worker_receipt(log, {mesh, other}))
+        self.assertIn("mesh", missing_mesh_worker_receipt(log.splitlines()[1], {mesh, pixel}))
+        self.assertIn("mesh", missing_mesh_worker_receipt(log.replace(mesh, mesh+"f"), {mesh, pixel}))
+        self.assertIn("pixel", missing_mesh_worker_receipt(log + f"prepared pixel shader loaded, source SHA-256 {other}\n", {mesh, pixel}))

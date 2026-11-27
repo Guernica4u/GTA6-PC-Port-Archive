@@ -47,7 +47,7 @@ impl<'a> Emitter<'a> {
         // Validate loop structure.
         // Several back-edges to one header = `continue`s. The last one (highest address)
         // closes the loop; each earlier one becomes a forward jump to that closing branch
-        // which also forces another iteration (see the `|| j{B}` at the loop bottom).
+        // which also forces another iteration (see the `tb_skip == B` at the loop bottom).
         let mut heads: HashMap<usize, usize> = HashMap::new(); // L -> B
         for (&b, &l) in &back {
             let e = heads.entry(l).or_insert(b);
@@ -90,8 +90,9 @@ impl<'a> Emitter<'a> {
         for (&branch, &label) in &target {
             earliest.entry(label).and_modify(|first| *first = (*first).min(branch)).or_insert(branch);
         }
-        for l in &labels {
-            self.line(&format!("bool j{l} = false;"));
+        if !labels.is_empty() {
+            // See `skip_to`.
+            self.line("uint tb_skip = 0u;");
         }
         if !loops.is_empty() {
             self.line("uint tb_guard = 0u;");
@@ -102,7 +103,7 @@ impl<'a> Emitter<'a> {
 
         let insns = self.insns.clone();
         let view_cull = self.view_cull;
-        let probe_trace = insns.iter().any(|op| matches!(op.mnemonic.as_str(),"tb_radiance_query" | "tb_reflection_far_query"));
+        let probe_trace = insns.iter().any(|op| matches!(op.mnemonic.as_str(),"tb_radiance_query" | "tb_reflection_far_query" | super::super::scarlett_rays::MNEMONIC));
         if view_cull.is_some() { self.line("uint cull_view = 0u; bool cull_candidate = false; uint3 cull_record = 0;"); }
         if insns.iter().any(|op| op.mnemonic == "tb_view_occluded") {
             self.line("bool hidden = false; uint hidden_id = 0u, hidden_view = 0u;");
@@ -150,6 +151,7 @@ impl<'a> Emitter<'a> {
                 // The back edge can store the index after a use. Bind again inside the loop.
                 self.drop_heap_handles();
                 self.loop_depth += 1;
+                self.in_accepted_swizzle_loop_stack.push(self.accepted_swizzle_loops.contains(&b));
                 self.line(&format!("tb_c{b} = false;"));
             }
             let mut active: Vec<usize> =
@@ -197,7 +199,7 @@ impl<'a> Emitter<'a> {
                 self.end_guard(&mut open);
                 cur.clear();
                 let mut condition=String::from("(exec_lo & 1u) != 0u");
-                for t in &active { write!(condition," && !j{t}").unwrap(); }
+                for &t in &active { write!(condition, " && {}", not_skipping(t)).unwrap(); }
                 self.line(&format!("uint election{i}base = tb_lane & ~63u;"));
                 self.line(&format!("if ((tb_lane & 63u)==0) tb_swizzle[election{i}base]=0xffffffffu;"));
                 self.line("GroupMemoryBarrierWithGroupSync();");
@@ -304,9 +306,10 @@ impl<'a> Emitter<'a> {
             }
             if active != cur || (open && heads.contains_key(&i)) {
                 self.end_guard(&mut open);
-                if !active.is_empty() {
-                    let c: Vec<String> = active.iter().map(|t| format!("j{t}")).collect();
-                    self.line(&format!("if (!({})) {{", c.join(self.flag_or())));
+                // Every pending target lies past the nearest one, so one comparison
+                // decides for all of them.
+                if let Some(&nearest) = active.iter().min() {
+                    self.line(&format!("if {} {{", not_skipping(nearest)));
                     open = true;
                 }
                 cur = active;
@@ -333,22 +336,44 @@ impl<'a> Emitter<'a> {
                 cur.clear();
             }
             if back.contains_key(&i) {
+                let head = back[&i];
+                // A loop whose body holds any group rendezvous must keep every lane
+                // together until the last one is done: a per-thread exit that leaves
+                // the loop early makes the lane stop hitting the barriers the other
+                // lanes wait on. Only the loops the pipeline proved safe for a shared
+                // exchange get the whole-wave vote: other loops keep their per-thread
+                // condition, exactly as they emitted before this feature existed.
+                let vote = self.accepted_swizzle_loops.contains(&i) && self.insns[head..=i].iter().enumerate().any(|(j, ins2)| {
+                    let idx = head + j;
+                    exchanges(ins2)
+                        || ins2.mnemonic == "s_barrier"
+                        || ins2.mnemonic == "tb_first_exec_lane"
+                        || ins2.mnemonic == "tb_indexed_readlane"
+                        || (self.single_wave32 && ins2.enc == Enc::Ds)
+                        || lds_waits.contains(&idx)
+                        || restored_waits.contains(&idx)
+                });
+                if vote {
+                    // Evaluate the back-edge condition unconditionally: the while
+                    // condition below votes over it, which must not be guarded.
+                    self.end_guard(&mut open);
+                    cur.clear();
+                }
                 // Evaluate the back-edge condition inside the guard (a skipped branch is not taken).
                 let cond = wave_cull::branch_condition(self, ins, Self::branch_cond(ins.op).unwrap_or("false"));
                 self.line(&format!("tb_c{i} = ({cond});"));
                 if labels.contains(&i) {
                     // A `continue` jumped here: iterate again regardless of the condition.
-                    self.line(&format!("tb_c{i} = tb_c{i} || j{i};"));
+                    self.line(&format!("tb_c{i} = tb_c{i} || (tb_skip == {i}u);"));
                 }
                 self.end_guard(&mut open);
                 cur.clear();
-                // Clear the flags of labels inside this loop body for the next iteration.
-                let head = back[&i];
-                for t in labels.iter().filter(|&&t| t > head && t <= i) {
-                    self.line(&format!("j{t} = false;"));
+                // Forget targets inside this loop body before the next iteration. A
+                // target past the latch stays pending and leaves the loop.
+                if labels.range(head + 1..=i).next().is_some() {
+                    self.line(&format!("tb_skip *= uint(tb_skip > {i}u);"));
                 }
-                let exits: Vec<String> = labels.iter().filter(|&&t| t > i).map(|t| format!("j{t}")).collect();
-                let exit = if exits.is_empty() { String::new() } else { format!(" && !({})", exits.join(self.flag_or())) };
+                let exits = labels.range(i + 1..).next().is_some();
                 let guard = if self.wave_cull || self.light_grid || probe_trace
                     || self.wave_bounded_latches.contains(&i)
                     || self.packed.as_ref().is_some_and(|p| p.copy_backedges.contains(&i) || p.bounded_backedges.contains(&i))
@@ -361,10 +386,17 @@ impl<'a> Emitter<'a> {
                     // The guest iterates cb0[12] views. Retired lanes must
                     // participate in the barriers for each remaining view.
                     self.line("} while (++cull_view < cb0[3].x);");
+                } else if vote {
+                    // Keep the whole wave in the loop while any lane still needs to
+                    // run; finished lanes stay in the loop, masked, and still hit the barriers.
+                    let exit = if exits { format!(" && tb_skip <= {i}u") } else { String::new() };
+                    self.line(&format!("}} while (WaveActiveAnyTrue(tb_c{i}{exit}){guard});"));
                 } else {
+                    let exit = if exits { format!(" && tb_skip <= {i}u") } else { String::new() };
                     self.line(&format!("}} while (tb_c{i}{exit}{guard});"));
                 }
                 self.loop_depth = self.loop_depth.saturating_sub(1);
+                self.in_accepted_swizzle_loop_stack.pop();
                 self.drop_heap_handles();
             }
         }
@@ -426,7 +458,7 @@ impl<'a> Emitter<'a> {
     pub(in crate::hlsl) fn emit_body_dispatch(&mut self, is_ps: bool, entry: usize) -> Result<(), String> {
         // Per-invocation dispatch cannot guarantee whole-wave arrival at a vote.
         if !self.reduction_execz_guards.is_empty() {
-            return Err("wave reduction EXECZ vote in a block-dispatched program".into());
+            return Err(lockstep::DISPATCHED_VOTE.into());
         }
         if !self.wave_bounded_latches.is_empty() {
             return Err("bounded wave reduction in a block-dispatched program".into());
@@ -544,16 +576,26 @@ impl<'a> Emitter<'a> {
         self.loop_depth = self.loop_depth.saturating_sub(1);
         Ok(())
     }
+
+    /// Take a forward branch to the instruction at `target` when `condition` holds.
+    ///
+    /// `tb_skip` is the farthest target this invocation has branched to, and it
+    /// skips everything before that instruction. One variable keeps large programs
+    /// from carrying a flag per target through every loop and join, which costs DXC
+    /// much of a large compile. Compute programs update it without a branch, which
+    /// keeps the control flow of an unoptimised compile small.
+    pub(in crate::hlsl) fn skip_to(&mut self, target: usize, condition: Option<&str>) {
+        let statement = match condition {
+            None => format!("tb_skip = max(tb_skip, {target}u);"),
+            Some(c) if self.ex.stage == Stage::Compute => format!("tb_skip = max(tb_skip, uint({c}) * {target}u);"),
+            Some(c) => format!("if ({c}) tb_skip = max(tb_skip, {target}u);"),
+        };
+        self.line(&statement);
+    }
 }
 
-impl Emitter<'_> {
-    /// How a guard combines jump flags. `||` makes one block per flag, and a
-    /// guard can name hundreds. Compute programs compile unoptimised or under
-    /// a DXC budget, so they take `|`: the resolve kernels' unoptimised DXIL
-    /// lost a third of its blocks and DXC finished optimising in 45 s instead
-    /// of 83-110 s. Optimised graphics stages keep `||`, which DXC threads
-    /// into smaller code (a mesh shader grew from 18 to 26 KiB with `|`).
-    fn flag_or(&self) -> &'static str {
-        if self.ex.stage == Stage::Compute { " | " } else { " || " }
-    }
+/// Whether this invocation runs the instructions before `target`, as far as the
+/// forward branches to it are concerned.
+pub(in crate::hlsl) fn not_skipping(target: usize) -> String {
+    format!("(tb_skip < {target}u)")
 }

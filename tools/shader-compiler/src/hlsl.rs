@@ -21,6 +21,7 @@ use std::fmt::Write as _;
 
 mod driver;
 mod emitter;
+use emitter::not_skipping;
 mod rewrite;
 mod text;
 pub use driver::*;
@@ -77,7 +78,10 @@ mod classify_materials;
 mod int16;
 mod int32;
 mod float64;
+mod quad_sad;
+mod half_exact;
 mod indexed_lane;
+mod mixed_lane;
 mod particle_sort;
 mod persistent;
 mod persistent_lanes;
@@ -113,12 +117,15 @@ pub const MAX_HLSL_BYTES: usize = 8 << 20;
 mod raw_index;
 mod reflection_compact;
 pub(crate) mod radiance_probe;
+pub(crate) mod scarlett_rays;
 mod screen_gather;
 mod reflection_far;
 mod sampler_heap;
 mod lane_reads;
 mod heap_offsets;
 mod heap_origins;
+mod operand_fields;
+mod descriptor_size;
 use sampler_heap::DirectSampler;
 mod reflection_probe;
 mod wave_scan;
@@ -192,6 +199,8 @@ enum Sym {
     /// A PC-relative pointer into the shader's own code section (`s_getpc_b64` + offsets),
     /// used to read constant tables embedded after the program.
     Code,
+    /// See `descriptor_size`. Kept under `descriptor_size::KEY` + the register.
+    Size(descriptor_size::SizePart),
 }
 
 /// An image op whose texture and/or sampler register holds one of several descriptors.
@@ -321,7 +330,7 @@ struct Emitter<'a> {
     reduction_execz_guards: BTreeSet<usize>,
     /// Set when every branch is a decision of the whole wave (see `lockstep`),
     /// with the condition codes to vote after the instructions that set them.
-    lockstep: Option<BTreeMap<usize, lockstep::Vote>>,
+    lockstep: Option<lockstep::Proof>,
     /// Structured loop latches with a verified guest trip bound.
     wave_bounded_latches: BTreeSet<usize>,
     portable_wave64: bool,
@@ -332,6 +341,11 @@ struct Emitter<'a> {
     /// Descriptor loads `(base register, descriptor id)` and base-dword moves `(dst, src)`
     /// per instruction, for maintaining the run-time `tb_dsel<reg>` selectors.
     dsel_loads: HashMap<usize, (u16, u32)>,
+    /// Descriptors whose size fields the program reads (`descriptor_size`).
+    size_reads: BTreeSet<u32>,
+    /// Buffer descriptors whose record count the program reads, and whether some
+    /// read is certain (`descriptor_size`).
+    count_reads: BTreeMap<u32, bool>,
     dsel_runtime: HashMap<usize, (u16, u8, u8, u32)>,
     dsel_moves: HashMap<usize, (u16, u16)>,
     /// Registers read before written (entry ABI), from `live_in`.
@@ -364,6 +378,13 @@ struct Emitter<'a> {
     chosen_samplers: BTreeSet<usize>,
     /// Instruction ranges of a mesh program's loops.
     loop_ranges: Vec<(usize, usize)>,
+    /// Back-edge instruction indices proven safe for a shared exchange
+    /// (single-wave group, uniform back-edge, no other branch in body).
+    /// Back-edge indices of loops whose single-wave group runs an exchange the
+    /// same number of times: only these vote in the emitted while loop.
+    accepted_swizzle_loops: BTreeSet<usize>,
+    /// Nesting stack of whether each open loop is an accepted swizzle loop.
+    in_accepted_swizzle_loop_stack: Vec<bool>,
     fspx_wave: Option<u32>,
     hair_multisample: bool,
     hoist_wave_exchanges: bool,

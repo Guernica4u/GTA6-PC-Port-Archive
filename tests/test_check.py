@@ -70,7 +70,7 @@ class CheckCommandTests(unittest.TestCase):
         code, commands, report = self.run_checks(gpu=False)
         self.assertEqual(code, 0)
         self.assertFalse(any("verify" in command for command in commands))
-        self.assertIn("cannot be merged until Lanes passes", report)
+        self.assertIn("also needs the relevant ones before merging", report)
 
     def test_compares_benchmark_timings_with_a_baseline(self):
         with TemporaryDirectory() as directory:

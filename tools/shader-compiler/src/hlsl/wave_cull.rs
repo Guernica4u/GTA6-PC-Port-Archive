@@ -192,14 +192,15 @@ pub(super) fn emit(em: &mut Emitter<'_>, idx: usize, i: &Insn, target: Option<us
         };
         if !test.is_empty() {
             if let Some(t) = target {
-                em.line(&format!("if ({test}) j{t} = true;"));
+                em.skip_to(t, Some(test));
             }
             return Ok(true);
         }
     }
     if !em.hoist_wave_exchanges && i.enc == super::Enc::Sopp && (6..=9).contains(&i.op) {
         if let Some(t) = target {
-            em.line(&format!("if ({}) j{t} = true;", branch_condition(em, i, "")));
+            let condition = branch_condition(em, i, "");
+            em.skip_to(t, Some(&condition));
         }
         // A backwards branch uses the enclosing loop's condition.
         return Ok(true);
@@ -216,9 +217,9 @@ pub(super) fn emit(em: &mut Emitter<'_>, idx: usize, i: &Insn, target: Option<us
             let target = target.ok_or("backward VCC branch in instance cull")?;
             if em.hoist_wave_exchanges {
                 let invert = if op == "s_cbranch_vccz" { "!" } else { "" };
-                em.line(&format!("if ({invert}any(page_vcc{idx})) j{target} = true;"));
+                em.skip_to(target, Some(&format!("{invert}any(page_vcc{idx})")));
             } else {
-                em.line(&format!("if (any(tb_page_ballot(tb_wave_tid, (vcc_lo & 1u) != 0u))) j{target} = true;"));
+                em.skip_to(target, Some("any(tb_page_ballot(tb_wave_tid, (vcc_lo & 1u) != 0u))"));
             }
         }
         "v_readfirstlane_b32" => {

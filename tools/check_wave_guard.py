@@ -35,9 +35,9 @@ def instrument(hlsl, width=32, mode='all', variant='original', group=None):
     if width == 64:
         if mode not in ("values", "state") or "[WaveSize(" in hlsl or "tb_reduction_read(" not in hlsl:
             raise ValueError("fixture must use portable wave64")
-        compare, end, label = "0x0050", "0x00ac", "j27"
+        compare, end, label = "0x0050", "0x00ac", "tb_skip == 27u"
         if variant != "original":
-            end, label = "0x00b4", "j29"
+            end, label = "0x00b4", "tb_skip == 29u"
         outputs = ("first", "s7") if mode == "values" else (f"uint({label})", "exec_lo & 1u")
         stores = (f"    output[64u + {index}] = {outputs[0]};\n"
                   f"    output[128u + {index}] = {outputs[1]};\n")
@@ -45,9 +45,9 @@ def instrument(hlsl, width=32, mode='all', variant='original', group=None):
         if width != 32 or mode != "all" or "[WaveSize(32)]" not in hlsl:
             raise ValueError("fixture must require wave32")
         compare, end = "0x0044", "0x0094"
-        label = "j23"
+        label = "tb_skip == 23u"
         if variant != "original":
-            end, label = "0x009c", "j25"
+            end, label = "0x009c", "tb_skip == 25u"
         stores = (
             "    output[32u + gtid.x] = first;\n"
             "    output[64u + gtid.x] = s7;\n"
@@ -81,6 +81,7 @@ def cases(width=32):
     yield "zero_sum", full, [0] * width
     yield "wrap_zero", full, [0x40000000] * 4 + [0] * (width - 4)
     yield "wrap_nonzero", full, [0x7fffffff] * width
+    yield "sum_minus_one", 7, [0x7fffffff, 0x7fffffff, 1] + [0] * (width - 3)
     yield "lane_zero", 1, [17] * width
     if width == 64:
         yield "upper_half", 0xffffffff00000000, list(range(width))
@@ -96,8 +97,9 @@ def seed_and_expected(mask, values, mode="all", variant="original"):
     active = [(mask >> lane) & 1 for lane in range(width)]
     seed[96:96 + width] = [v | (a << 31) for v, a in zip(values, active)]
     total = sum(v for v, a in zip(values, active) if a) & 0xffffffff
-    skip = total == 0 if variant == "original" else variant == "chain-zero"
-    second = 0 if skip and variant == "chain-zero" else total if skip else (total + sum(active)) & 0xffffffff
+    guard_value = {"original": total, "chain": 2, "chain-zero": 0, "result-chain": (total + 1) & 0xffffffff}[variant]
+    skip = guard_value == 0
+    second = guard_value if skip else (total + sum(active)) & 0xffffffff
     expected = seed.copy()
     if mode == "all":
         assert width == 32
@@ -118,7 +120,7 @@ def main():
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--adapter", required=True)
     parser.add_argument("--width", type=int, choices=(32, 64), default=32)
-    parser.add_argument("--variant", choices=("original", "chain", "chain-zero"), default="original")
+    parser.add_argument("--variant", choices=("original", "chain", "chain-zero", "result-chain"), default="original")
     parser.add_argument("--group", nargs=3, type=int, metavar=("X", "Y", "Z"),
                         help="64-thread workgroup shape for portable wave64")
     args = parser.parse_args()

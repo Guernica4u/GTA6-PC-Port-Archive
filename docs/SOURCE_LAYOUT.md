@@ -9,6 +9,7 @@
 | `tools/shader-compiler/` | The shader translator, `xshader` |
 | `examples/lanes/` | Lanes, the test game |
 | `project_tuxbox/` | The Python launcher, build and check commands |
+| `tools/` | GPU checks and developer tools |
 | `tests/` | Python tests |
 | `evidence/` | Recorded results |
 

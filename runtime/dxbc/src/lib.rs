@@ -11,6 +11,8 @@ pub mod xdat;
 #[cfg(feature = "native-bindings")]
 pub mod compute_table;
 #[cfg(feature = "native-bindings")]
+pub mod image_writes;
+#[cfg(feature = "native-bindings")]
 pub mod inline_sampler;
 #[cfg(feature = "native-bindings")]
 pub mod mesh_table;

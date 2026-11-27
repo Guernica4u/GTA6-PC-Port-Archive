@@ -174,13 +174,6 @@ pub(super) fn translate(
         em.resource_heap_base = Some(sgpr);
         em.compute_heap = true;
     }
-    if let Some(sgpr) = samplers.filter(|sgpr| {
-        bindings.as_ref().is_some_and(|mesh| !mesh.takes_sgpr(*sgpr))
-            && live.iter().any(|reg| reg == &format!("s{sgpr}"))
-    }) {
-        em.sampler_heap_base = Some(sgpr);
-        em.compute_heap = true;
-    }
     em.mesh_bindings = bindings;
     em.resolve_resources()?;
     em.resolve_structured_strides();
@@ -294,7 +287,7 @@ pub(super) fn translate(
     }
     h.push_str(&em.heap_handle_decls());
     em.heap_sampler_locals(&mut h);
-    h.push_str(&em.body);
+    h.push_str(&super::exec_group::select_writes(&em.body));
     h.push_str("    return result;\n}\n");
     h.push_str(
         r#"
@@ -375,7 +368,11 @@ fn validate_launch(body: &[Insn], group_shift: i64, lane_index: Opnd) -> Result<
             _ if ins.mnemonic.ends_with("_b64") => 2,
             _ => 1,
         };
+        // `v_readlane_b32` writes an SGPR, though the generic VOP3 decoder puts it in `Vgpr`.
+        let scalar_dst = ins.mnemonic == "v_readlane_b32";
         ins.dst.iter().any(|dst| match (*dst, reg) {
+            (V(first), S(n)) if scalar_dst => n == first,
+            (V(_), V(_)) if scalar_dst => false,
             (S(first), S(n)) | (V(first), V(n)) => n >= first && u16::from(n - first) < width,
             _ => false,
         })

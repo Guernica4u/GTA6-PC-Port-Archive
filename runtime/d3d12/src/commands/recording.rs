@@ -10,6 +10,8 @@ pub(super) struct ActiveList {
     mesh: OnceLock<Option<ID3D12GraphicsCommandList6>>,
     raytracing: Option<ID3D12GraphicsCommandList4>,
     pub(super) has_commands: bool,
+    /// Whether an `ExecuteIndirect` recorded now reads its arguments in order.
+    pub(super) indirect: indirect_order::Order,
 }
 
 impl ActiveList {
@@ -24,6 +26,7 @@ impl ActiveList {
             mesh: OnceLock::new(),
             raytracing,
             has_commands: false,
+            indirect: Default::default(),
         }
     }
 
@@ -333,10 +336,12 @@ impl Recording {
     }
 
     pub(super) fn record_write(&mut self, address: u64, bytes: u64) {
+        self.active.indirect.written();
         self.written_ranges.record(address, bytes);
     }
 
     pub(super) fn record_unknown_write(&mut self) {
+        self.active.indirect.written();
         self.written_ranges.record_unknown();
     }
 
@@ -460,7 +465,24 @@ impl Recording {
                 crate::diagnostics::display::record_null(tag, false);
             }
         };
-        if let Some(table) = self.bindings.reflected_table::<true>() {
+        if self.bindings.reflected_table::<true>().is_some() {
+            // A ray-query program can also need the reflected table layout:
+            // its scene root then extends the reflected root.
+            let scenes = if self.bindings.scene_root().is_some() {
+                match self.inline_scenes(list) {
+                    Ok(scenes) => Some(scenes),
+                    Err(error) => {
+                        Self::skip("compute dispatch: inline ray scene binding", error.code());
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            let Some(table) = self.bindings.reflected_table::<true>() else { return };
+            let scene = scenes.as_ref().and_then(|(vas, geometry)| {
+                self.bindings.scene_root().map(|root| (root, vas.as_slice(), *geometry))
+            });
             if let Err(error) = self.bindings.with_reflected_table::<true>(
                 table,
                 list,
@@ -469,10 +491,19 @@ impl Recording {
                 &mut self.descriptor_leases,
                 self.resource_heap.as_ref(),
                 &mut self.sampled_heaps,
+                &mut self.read_heaps,
                 &self.resources,
+                scene,
                 dispatch,
             ) {
                 Self::skip("compute dispatch with a reflected table", error.code());
+            } else if let Some((root, vas, _)) = scene {
+                crate::diagnostics::log_once(&root.program.first_dispatch, || {
+                    format!(
+                        "recorded inline compute shader {} dispatch with scene GPU VA {:#x} through a reflected table",
+                        root.program.source_hash, vas[0]
+                    )
+                });
             }
             return;
         }
@@ -494,54 +525,54 @@ impl Recording {
             unsafe { self.bindings.dispatch_with_root(&list.native, root, dispatch) };
             return;
         }
-        let Some(root) = self.bindings.scene_root() else {
+        if self.bindings.scene_root().is_none() {
             dispatch();
             return;
-        };
-        let result = self
-            .bindings
-            .scene_resource(list)
-            .and_then(|scene| {
-                if let Some([instances, normals]) = &scene.geometry {
-                    raytracing::retain(self, &[&scene.scene.0, &instances.0, &normals.0])?;
-                } else {
-                    raytracing::retain(self, &[&scene.scene.0])?;
-                }
-                Ok(scene)
-            })
-            .and_then(|scene| {
-                let va = scene.scene.1;
-                let geometry = scene
-                    .geometry
-                    .as_ref()
-                    .map(|[instances, normals]| [instances.1, normals.1]);
-                if scene.recheck_on_submit()
-                    && !matches!(
-                        self.scene_commands.last(),
-                        Some(raytracing::SceneCommand::Check(last)) if *last == scene
-                    )
-                {
-                    self.scene_commands
-                        .try_reserve(1)
-                        .map_err(|_| E_OUTOFMEMORY)?;
-                    self.scene_commands
-                        .push(raytracing::SceneCommand::Check(scene));
-                }
-                unsafe {
-                    self.bindings
-                        .dispatch_scene(&self.active.native, root, va, geometry, dispatch)
-                };
-                crate::diagnostics::log_once(&root.program.first_dispatch, || {
-                    format!(
-                        "recorded inline compute shader {} dispatch with scene GPU VA {va:#x}",
-                        root.program.source_hash
-                    )
-                });
-                Ok(())
+        }
+        let result = self.inline_scenes(list).map(|(vas, geometry)| {
+            let Some(root) = self.bindings.scene_root() else { return };
+            unsafe {
+                self.bindings
+                    .dispatch_scene(&self.active.native, root, &vas, geometry, dispatch)
+            };
+            crate::diagnostics::log_once(&root.program.first_dispatch, || {
+                format!(
+                    "recorded inline compute shader {} dispatch with scene GPU VA {:#x}",
+                    root.program.source_hash, vas[0]
+                )
             });
+        });
         if let Err(error) = result {
             Self::skip("compute dispatch: inline ray scene binding", error.code());
         }
+    }
+
+    /// Resolve the native scenes the bound ray-query program reads and keep
+    /// them alive with the list: their GPU addresses, in private register
+    /// order, and the geometry tables of a single scene.
+    fn inline_scenes(&mut self, list: &List) -> windows::core::Result<(Vec<u64>, Option<[u64; 2]>)> {
+        let scene = self.bindings.scene_resource(list)?;
+        let mut held: Vec<&ID3D12Resource> = scene.scenes.iter().map(|s| &s.0).collect();
+        held.extend(scene.geometry.iter().flatten().map(|g| &g.0));
+        raytracing::retain(self, &held)?;
+        let vas: Vec<u64> = scene.scenes.iter().map(|s| s.1).collect();
+        let geometry = scene
+            .geometry
+            .as_ref()
+            .map(|[instances, normals]| [instances.1, normals.1]);
+        if scene.recheck_on_submit()
+            && !matches!(
+                self.scene_commands.last(),
+                Some(raytracing::SceneCommand::Check(last)) if *last == scene
+            )
+        {
+            self.scene_commands
+                .try_reserve(1)
+                .map_err(|_| E_OUTOFMEMORY)?;
+            self.scene_commands
+                .push(raytracing::SceneCommand::Check(scene));
+        }
+        Ok((vas, geometry))
     }
 
     pub(super) fn draw(
@@ -550,7 +581,10 @@ impl Recording {
         rasterizes: bool,
         draw: impl FnOnce(&ID3D12GraphicsCommandList),
     ) {
-        self.record_unknown_write();
+        // Unlike a dispatch or a copy, a draw is not taken as a writer of
+        // indirect arguments: a barrier before each indirect draw would end
+        // the host's render pass every time.
+        self.written_ranges.record_unknown();
         let null_usage = self.bindings.null_usage.clone();
         let display_bound = self.display_bound;
         let native = self.active.native.clone();
@@ -598,27 +632,30 @@ impl Recording {
                 return;
             }
             if let Some(binding) = table.index_map {
-                // These PSOs have one descriptor table followed by one root
-                // constants parameter. The native ISA selects its scalar
-                // buffer with a word (and optional mask) from that parameter.
-                let descriptor = self
-                    .bindings
-                    .graphics_constant(1, binding.scalar_word)
-                    .and_then(|word| {
-                        self.resource_heap.as_ref()?.scalar_descriptor(
-                            word & binding.scalar_mask,
-                            self.descriptor_arena.as_deref(),
-                        )
-                    });
-                let Some(descriptor) = descriptor else {
-                    Self::skip("draw: no scalar descriptor for the indexed load", E_INVALIDARG);
-                    return;
-                };
-                if self.scalar_descriptors.try_reserve(1).is_err() {
-                    self.error = E_OUTOFMEMORY;
-                    return;
+                // When `scalar_mask != 0`, the native ISA selects its scalar
+                // buffer with a word from graphics root constants slot 1.
+                // General direct-indexed roots (`scalar_mask == 0`) only need
+                // the paged index map and arena retention.
+                if binding.scalar_mask != 0 {
+                    let descriptor = self
+                        .bindings
+                        .graphics_constant(1, binding.scalar_word)
+                        .and_then(|word| {
+                            self.resource_heap.as_ref()?.scalar_descriptor(
+                                word & binding.scalar_mask,
+                                self.descriptor_arena.as_deref(),
+                            )
+                        });
+                    let Some(descriptor) = descriptor else {
+                        Self::skip("draw: no scalar descriptor for the indexed load", E_INVALIDARG);
+                        return;
+                    };
+                    if self.scalar_descriptors.try_reserve(1).is_err() {
+                        self.error = E_OUTOFMEMORY;
+                        return;
+                    }
+                    self.scalar_descriptors.insert(descriptor);
                 }
-                self.scalar_descriptors.insert(descriptor);
                 if let Some(arena) = &self.descriptor_arena
                     && !self
                         .indexed_arenas
@@ -640,7 +677,9 @@ impl Recording {
                 &mut self.descriptor_leases,
                 self.resource_heap.as_ref(),
                 &mut self.sampled_heaps,
+                &mut self.read_heaps,
                 &self.resources,
+                None,
                 draw,
             ) {
                 Self::skip("draw with a reflected table", error.code());

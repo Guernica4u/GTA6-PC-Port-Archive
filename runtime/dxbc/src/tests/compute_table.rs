@@ -276,3 +276,64 @@ fn uncovered_bindings_do_not_collide_with_root_descriptor_names() {
         assert_eq!(uncovered_descriptor(&image, &resources, 5, 5, 64, &root), None);
     }
 }
+
+/// A one-program compute shader of 32x1x1 threads with 24-byte PSV resource rows
+/// ([type, space, lower, upper, kind, flags]).
+fn compute_shader(user: &[[u32; 5]], used: &[[u32; 5]], psv_rows: &[[u32; 6]]) -> Vec<u8> {
+    let xdat = crate::xdat::tests::container(&[(13, crate::xdat::tests::xbch(&program(user, used)))]);
+    let mut dxil = vec![0u8; 24];
+    put_u32(&mut dxil, 0, 5 << 16);
+    dxil[8..12].copy_from_slice(b"DXIL");
+    dxil.extend(xdat);
+    let mut psv = vec![0u8; 56];
+    put_u32(&mut psv, 0, 52);
+    psv[4 + 24] = 5;
+    for (index, threads) in [32, 1, 1].into_iter().enumerate() {
+        put_u32(&mut psv, 4 + 36 + index * 4, threads);
+    }
+    psv.extend((psv_rows.len() as u32).to_le_bytes());
+    psv.extend(24u32.to_le_bytes());
+    psv.extend(psv_rows.iter().flatten().flat_map(|w| w.to_le_bytes()));
+    crate::container::tests::container_with(&[(b"DXIL", &dxil), (b"PSV0", &psv)])
+}
+
+#[test]
+fn compute_acceleration_structure_is_a_table_srv() {
+    // CS_IrradianceCache_ShadowTrace: the scene at slot 4 of table 1 (s5) and a
+    // typed UAV at slot 6. The root lists its ranges in another order, so the
+    // host table is only right once every descriptor of the table is read.
+    let user = [[3, 0x20, 1, 355, 0x105], [3, 0x30, 1, 52, 0x105]];
+    let used = [[0x300, 0x20, 355, 4, 0x1_0504], [0x303, 0x30, 52, 4, 0x1_0504]];
+    let scene = [4, 1, 355, 355, 16, 0];
+    let uav = [6, 1, 52, 52, 10, 0];
+    let srv = |register| RootRange { range_type: 0, num: 1, base_register: register, space: 1, offset_in_table: u32::MAX };
+    let root = root((300..308).map(srv).collect());
+    assert_eq!(compute_root_bindings(&compute_shader(&user, &used, &[scene, uav]), &root).map(|(b, _)| b), Some(vec![
+        Binding { table: 1, kind: 0, register: 355, space: 1, slot: 4 },
+        Binding { table: 1, kind: 1, register: 52, space: 1, slot: 6 },
+    ]));
+    // Only the acceleration-structure kind makes a shape-4 raw SRV legal.
+    let raw = [4, 1, 355, 355, 11, 0];
+    assert_eq!(compute_root_bindings(&compute_shader(&user, &used, &[raw, uav]), &root), None);
+    let mut wide = used;
+    wide[0][3] = 8;
+    assert_eq!(compute_root_bindings(&compute_shader(&user, &wide, &[scene, uav]), &root), None);
+}
+
+#[test]
+fn compute_root_srv_carries_the_shader_register() {
+    let root = three_tables_srv_constants();
+    // Parameter 3's address arrives in s7-s8; the shader names it t5 space7.
+    let used = [[0x100, 0, 5, 1, 0x3_0704]];
+    let raw = [4, 7, 5, 5, 11, 0];
+    let srv = compute_shader(&[[1, 0, 2, 5, 0x307]], &used, &[raw]);
+    assert_eq!(compute_root_bindings(&srv, &root).map(|(b, _)| b),
+        Some(vec![Binding { table: 3, kind: ROOT_SRV, register: 5, space: 7, slot: 0 }]));
+    // Without the user-data row, or when parameter 3 is not a root SRV, it fails closed.
+    assert_eq!(compute_root_bindings(&compute_shader(&[], &used, &[raw]), &root), None);
+    let mut constants = root.clone();
+    constants.params[3].kind = RootParamKind::Constants { register: 5, space: 7, num32: 2 };
+    assert_eq!(compute_root_bindings(&srv, &constants), None);
+    // Root-less callers never see a root SRV binding.
+    assert_eq!(bindings(&srv, 5), None);
+}

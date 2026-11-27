@@ -823,6 +823,32 @@ fn prev_guarded(lines: &[Line<'_>], start: usize, before: usize) -> Option<usize
         .find(|&idx| matches!(lines[idx].kind, LineKind::Guarded { .. }))
 }
 
+/// Write each guarded register value as a `select`, which needs no branch.
+///
+/// Mesh programs run their lanes through one function, where DXC spends about
+/// half its time on the blocks of these guards. Only the pure register writes that
+/// `parse_guarded` accepts change; everything else keeps its branch.
+pub(super) fn select_writes(body: &str) -> String {
+    let mut output = String::with_capacity(body.len());
+    for line in body.split_inclusive('\n') {
+        let raw = line.trim_end_matches(['\n', '\r']);
+        let written = match parse_guarded(raw) {
+            Some(LineKind::Guarded { indent, guard, stmt, expr }) => stmt.split_once(" = ").map(|(dest, _)| {
+                format!("{indent}{dest} = select(({}) != 0u, {expr}, {dest});", guard.expr())
+            }),
+            _ => None,
+        };
+        match written {
+            Some(written) => {
+                output.push_str(&written);
+                output.push_str(&line[raw.len()..]);
+            }
+            None => output.push_str(line),
+        }
+    }
+    output
+}
+
 pub(super) fn group(body: &str) -> String {
     if body.is_empty() {
         return String::new();

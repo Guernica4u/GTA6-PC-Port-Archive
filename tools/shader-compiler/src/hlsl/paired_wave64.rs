@@ -6,6 +6,12 @@
 //! stored once per lane. A vector instruction is emitted once and run for each lane
 //! with that lane's registers and mask bits, and a mask it produces is rebuilt from
 //! all 64 results. No part of this needs a barrier.
+//!
+//! A group of exactly 32 threads is half a console wave: lanes 0..32 run the threads
+//! and lanes 32..64 never start. Each host thread still holds two lanes. The upper one
+//! begins outside EXEC, so it takes part only where the program widens EXEC itself, as
+//! a reduction over all 64 lanes does. Its thread ID, which the console leaves
+//! unspecified, continues the lower half's numbering.
 
 use std::collections::BTreeSet;
 
@@ -13,12 +19,29 @@ use super::*;
 
 /// Translate a wave64 compute program for hosts with 32-lane waves.
 pub fn translate_paired_wave64(ex: &ShaderExtract) -> Result<Translated, String> {
+    let first = paired_once(ex);
+    if first.is_ok() {
+        return first;
+    }
+    // As for the ordinary translation, the per-key count rewrite is a last resort.
+    let mut insns = disassemble(&ex.isa);
+    if lower_local_pc_transfers(&mut insns).is_err() {
+        return first;
+    }
+    match with_key_counts(&insns, || paired_once(ex)) {
+        Some(Ok(retried)) => Ok(retried),
+        _ => first,
+    }
+}
+
+fn paired_once(ex: &ShaderExtract) -> Result<Translated, String> {
     let threads = compute_group(ex).into_iter().try_fold(1u32, u32::checked_mul).unwrap_or(0);
-    if threads == 0 || threads % 64 != 0 || threads > 2048 {
-        return Err("paired wave64 needs whole console waves and at most 2048 threads".into());
+    if threads == 0 || !(threads % 64 == 0 || threads == HALF_WAVE) || threads > 2048 {
+        return Err("paired wave64 needs whole console waves, or half of one, and at most 2048 threads".into());
     }
     let mut insns = disassemble(&ex.isa);
     lower_local_pc_transfers(&mut insns)?;
+    let key_counts = if rewriting() { lower_key_counts(&mut insns) } else { Vec::new() };
     let mut em = Emitter::new(ex, insns);
     em.paired = true;
     em.required_wave_size = Some(32);
@@ -29,6 +52,7 @@ pub fn translate_paired_wave64(ex: &ShaderExtract) -> Result<Translated, String>
     if !em.resolve_packed(None)? {
         em.resolve_resources()?;
     }
+    counters_are_private(&em, &key_counts)?;
     em.infer_tbuf_types();
     if em.packed.is_none() && !em.uav_uint.is_empty() {
         em.resolve_wide_image_atomics()?;
@@ -55,6 +79,9 @@ pub fn translate_paired_wave64(ex: &ShaderExtract) -> Result<Translated, String>
     })
 }
 
+/// The group size that fills the lower half of one console wave and one host wave.
+pub(super) const HALF_WAVE: u32 = 32;
+
 /// A branch on a lane mask tests the whole console mask.
 pub(super) fn branch_condition(op: u32) -> Option<&'static str> {
     Some(match op {
@@ -70,9 +97,11 @@ pub(super) fn branch_condition(op: u32) -> Option<&'static str> {
 pub(super) fn prologue(em: &Emitter<'_>, header: &mut String, group_register: usize) {
     let [x, y, z] = compute_group(em.ex);
     let threads = x * y * z;
-    let _ = writeln!(header, "[WaveSize(32)]\n[numthreads({}, 1, 1)]", threads / 2);
+    // Half a console wave is one whole host wave, whose upper lanes start inactive.
+    let (host, upper) = if threads == HALF_WAVE { (threads, "0u") } else { (threads / 2, "0xffffffffu") };
+    let _ = writeln!(header, "[WaveSize(32)]\n[numthreads({host}, 1, 1)]");
     let _ = writeln!(header, "void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
-    let _ = writeln!(header, "    uint exec_lo = 0xffffffffu, exec_hi = 0xffffffffu, vcc_lo = 0u, vcc_hi = 0u, scc = 0u, m0 = 0u, nul = 0u;");
+    let _ = writeln!(header, "    uint exec_lo = 0xffffffffu, exec_hi = {upper}, vcc_lo = 0u, vcc_hi = 0u, scc = 0u, m0 = 0u, nul = 0u;");
     em.heap_sampler_locals(header);
     let mut names = Vec::new();
     for register in &em.regs {

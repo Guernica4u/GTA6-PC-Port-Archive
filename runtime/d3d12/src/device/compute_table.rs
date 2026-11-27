@@ -73,6 +73,16 @@ fn missing_literal_samplers(shader: &[u8], stage: u32, existing: &[[u32; 13]]) -
     if private.iter().all(covered) { Vec::new() } else { private }
 }
 
+/// The literal samplers of a pixel program under a root with no static samplers,
+/// which `inline_sampler::unmatched` leaves alone. One declared sampler keeps its
+/// register; otherwise each state takes a private register (space 32765) from 0,
+/// where the translation against a root with only those samplers reads them.
+pub(super) fn rootless_pixel_samplers(pixel: &[u8]) -> Option<Vec<[u32; 13]>> {
+    tuxbox_dxbc::inline_sampler::pixel(pixel)
+        .map(|s| vec![s])
+        .or_else(|| tuxbox_dxbc::inline_sampler::private(pixel, 0))
+}
+
 /// Private static samplers for each literal state no static sampler of the root
 /// visible to the stage has (`inline_sampler::unmatched`). They take registers
 /// after every sampler register the root uses: the translator names a sampler by
@@ -192,7 +202,7 @@ fn reflected_root(
         // CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED. The program picks descriptors by heap
         // index, so it needs no table layout, only the guest-to-host index map
         // once descriptors are paged.
-        (Program::Compute(shader), _) if bindless_compute_root(&signature) => {
+        (Program::Compute(shader), _) if bindless_compute_root(&signature) && heap_indexed_tabled_root(&signature, strides) => {
             // Compute never reads the scalar word; it only marks the map.
             scalar_index = Some((0, 0));
             index_map_visibility = D3D12_SHADER_VISIBILITY_ALL;
@@ -212,7 +222,17 @@ fn reflected_root(
             let extended = !simple && leading >= 1 && params[leading..].iter()
                 .all(|p| matches!(p.kind, RootParamKind::Constants { .. } | RootParamKind::Descriptor { .. }));
             if !simple && !extended {
+                if heap_indexed_tabled_root(&signature, strides) {
+                    return append_corroborated_ranges(device, original, shader, &signature, node, strides);
+                }
                 return Ok(TableLayout::Unsupported);
+            }
+            // The program can still pick resources by heap index. Without the
+            // map the root stays the guest's and its dispatch is skipped once
+            // descriptors are paged.
+            if heap_indexed_tabled_root(&signature, strides) {
+                scalar_index = Some((0, 0));
+                index_map_visibility = D3D12_SHADER_VISIBILITY_ALL;
             }
             if signature.static_samplers.is_empty() && signature.flags & 0x800 == 0 {
                 recovered_samplers = tuxbox_dxbc::inline_sampler::private(shader, 5).unwrap_or_default();
@@ -234,6 +254,12 @@ fn reflected_root(
                 checked.or_else(|| tuxbox_dxbc::compute_table::bindings(&layout_view(shader), 5))
             }
         }
+        (Program::Raster { pixel, .. }, _) if bindless_compute_root(&signature) && heap_indexed_tabled_root(&signature, strides) => {
+            scalar_index = Some((0, 0));
+            index_map_visibility = D3D12_SHADER_VISIBILITY_ALL;
+            recovered_samplers = literal_samplers(pixel, 0, &signature);
+            Some(Vec::new())
+        }
         // Several leading tables (each read from s8 + N), then any root descriptors and
         // constants, which pass through unchanged. Every descriptor must be confirmed
         // by the user-data layout of both stages.
@@ -249,9 +275,16 @@ fn reflected_root(
             let Some(bindings) = get(vertex, 1).zip(get(pixel, 0))
                 .and_then(|(v, p)| tuxbox_dxbc::compute_table::merge_raster_bindings(v, p))
             else {
+                if heap_indexed_tabled_root(&signature, strides) {
+                    return append_index_map_only(device, original, &signature, node, strides);
+                }
                 return Ok(TableLayout::Unsupported);
             };
             corroborated_raster = true;
+            if heap_indexed_tabled_root(&signature, strides) {
+                scalar_index = Some((0, 0));
+                index_map_visibility = D3D12_SHADER_VISIBILITY_ALL;
+            }
             // A static sampler the title compiled into the pixel shader and left out
             // of this root. The translation reads the root built here, so it finds it.
             // Otherwise (a heap-indexing program, or a state the root names another
@@ -273,6 +306,10 @@ fn reflected_root(
                 capture_stage_root(pixel, original);
                 if signature.flags & 0x400 != 0 { scalar_index = Some(index); }
             }
+            if scalar_index.is_none() && heap_indexed_tabled_root(&signature, strides) {
+                scalar_index = Some((0, 0));
+                index_map_visibility = D3D12_SHADER_VISIBILITY_ALL;
+            }
             if !rest.is_empty() && signature.flags & 0x800 == 0 && scalar_index.is_none() {
                 return Ok(TableLayout::Unsupported);
             }
@@ -290,13 +327,13 @@ fn reflected_root(
             let checked = ordinary.then(|| both_stages(true)).flatten();
             corroborated_raster = checked.is_some();
             let Some((mut bindings, pixel_bindings)) = checked.or_else(|| both_stages(false)) else {
+                if heap_indexed_tabled_root(&signature, strides) {
+                    return append_index_map_only(device, original, &signature, node, strides);
+                }
                 return Ok(TableLayout::Unsupported);
             };
             if signature.static_samplers.is_empty() && ordinary {
-                recovered_samplers = tuxbox_dxbc::inline_sampler::pixel(pixel)
-                    .map(|s| vec![s])
-                    .or_else(|| tuxbox_dxbc::inline_sampler::private(pixel, 0))
-                    .unwrap_or_default();
+                recovered_samplers = rootless_pixel_samplers(pixel).unwrap_or_default();
             }
             else if !signature.static_samplers.is_empty() {
                 recovered_samplers = literal_samplers(pixel, 0, &signature);
@@ -313,11 +350,14 @@ fn reflected_root(
             bindings.sort_by_key(|r| r.slot);
             Some(bindings)
         }
+        (Program::Raster { .. }, _) if heap_indexed_tabled_root(&signature, strides) => {
+            return append_index_map_only(device, original, &signature, node, strides);
+        }
         _ => return Ok(TableLayout::Unsupported),
     };
     let Some(bindings) = bindings else {
         if let Program::Compute(shader) = program {
-            return append_corroborated_ranges(device, original, shader, &signature, node);
+            return append_corroborated_ranges(device, original, shader, &signature, node, strides);
         }
         return Ok(TableLayout::Unsupported);
     };
@@ -537,7 +577,25 @@ fn bindless_compute_root(signature: &tuxbox_dxbc::rootsig::RootSig) -> bool {
     signature.flags & 0x400 != 0 && cost.is_some_and(|cost| cost <= 62)
 }
 
-/// Keep every embedded range and append FSSM slots the root left out.
+fn root_dword_cost(signature: &tuxbox_dxbc::rootsig::RootSig) -> u32 {
+    signature.params.iter().fold(0u32, |cost, p| cost.saturating_add(match p.kind {
+        RootParamKind::Table(_) => 1,
+        RootParamKind::Constants { num32, .. } => num32,
+        RootParamKind::Descriptor { .. } => 2,
+    }))
+}
+
+/// CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED with descriptor tables as well. Like a
+/// bindless root it takes the index map, if its root SRV still fits: a table
+/// costs one DWORD of 64, a root descriptor two. When `strides` is true, two
+/// additional DWORDs are reserved for the heap stride table (`t1, space32766`).
+fn heap_indexed_tabled_root(signature: &tuxbox_dxbc::rootsig::RootSig, strides: bool) -> bool {
+    let limit = if strides { 60 } else { 62 };
+    signature.flags & 0x400 != 0 && root_dword_cost(signature) <= limit
+}
+
+/// Keep every embedded range and append FSSM slots the root left out, plus the
+/// resource heap index map when `CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED` is set.
 /// Shaders that already translate keep their parameter indexes. The game's
 /// descriptor-table handle still addresses the slot FSSM recorded.
 fn append_corroborated_ranges(
@@ -546,14 +604,45 @@ fn append_corroborated_ranges(
     shader: &[u8],
     signature: &tuxbox_dxbc::rootsig::RootSig,
     node: u32,
+    strides: bool,
 ) -> Result<TableLayout> {
     if signature.version != 2 {
         return Ok(TableLayout::Unsupported);
     }
     let extra = tuxbox_dxbc::compute_table::missing_root_descriptors(shader, signature);
-    if extra.is_empty() {
+    let append_map = heap_indexed_tabled_root(signature, strides);
+    let append_strides =
+        strides && root_dword_cost(signature).saturating_add(if append_map { 2 } else { 0 }) <= 62;
+    if extra.is_empty() && !append_map {
         return Ok(TableLayout::Unsupported);
     }
+    append_ranges_and_map(device, original, &extra, signature, node, append_map, append_strides)
+}
+
+/// Keep all finite guest descriptor tables as-is and append the resource heap
+/// index map (and optional stride table) for a direct-indexed root.
+fn append_index_map_only(
+    device: &ID3D12Device,
+    original: &RootSource,
+    signature: &tuxbox_dxbc::rootsig::RootSig,
+    node: u32,
+    strides: bool,
+) -> Result<TableLayout> {
+    if signature.version != 2 || !heap_indexed_tabled_root(signature, strides) {
+        return Ok(TableLayout::Unsupported);
+    }
+    append_ranges_and_map(device, original, &[], signature, node, true, strides)
+}
+
+fn append_ranges_and_map(
+    device: &ID3D12Device,
+    original: &RootSource,
+    extra: &[tuxbox_dxbc::compute_table::Binding],
+    signature: &tuxbox_dxbc::rootsig::RootSig,
+    node: u32,
+    append_map: bool,
+    strides: bool,
+) -> Result<TableLayout> {
     let bytes = original.serialized();
     unsafe {
         let mut reader = None::<ID3D12VersionedRootSignatureDeserializer>;
@@ -566,11 +655,16 @@ fn append_corroborated_ranges(
         let reader = reader.ok_or(E_POINTER)?;
         let mut desc = *reader.GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1)?;
         let source = desc.Anonymous.Desc_1_1;
-        if source.NumParameters as usize != signature.params.len() || source.pParameters.is_null() {
+        if source.NumParameters as usize != signature.params.len()
+            || (source.NumParameters != 0 && source.pParameters.is_null())
+        {
             return Err(E_INVALIDARG.into());
         }
-        let mut parameters =
-            std::slice::from_raw_parts(source.pParameters, signature.params.len()).to_vec();
+        let mut parameters = if source.NumParameters == 0 {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(source.pParameters, signature.params.len()).to_vec()
+        };
         let mut stored = vec![Vec::new(); signature.params.len()];
         let mut lengths = vec![0u32; signature.params.len()];
         let mut accessed_views = Vec::new();
@@ -628,6 +722,39 @@ fn append_corroborated_ranges(
             lengths[index] = extent;
             accessed_views.extend(views.into_iter().map(|range| (index, range)));
         }
+        let index_map = if append_map {
+            let slot = parameters.len() as u32;
+            parameters.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: 0,
+                        RegisterSpace: 32766,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                    },
+                },
+            });
+            desc.Anonymous.Desc_1_1.NumParameters = parameters.len() as u32;
+            Some(IndexMapBinding { slot, scalar_word: 0, scalar_mask: 0 })
+        } else {
+            None
+        };
+        let heap_strides = strides.then_some(parameters.len() as u32);
+        if strides {
+            parameters.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: 1,
+                        RegisterSpace: 32766,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                    },
+                },
+            });
+            desc.Anonymous.Desc_1_1.NumParameters = parameters.len() as u32;
+        }
         desc.Anonymous.Desc_1_1.pParameters = parameters.as_ptr();
         let mut blob = None;
         D3D12SerializeVersionedRootSignature(&desc, &mut blob, None)?;
@@ -640,10 +767,10 @@ fn append_corroborated_ranges(
             layout: RootSource::new(bytes),
             lengths,
             accessed_views,
-            index_map: None,
+            index_map,
             mirrors: Vec::new(),
             pixel_root: None,
-            heap_strides: None,
+            heap_strides,
         })))
     }
 }

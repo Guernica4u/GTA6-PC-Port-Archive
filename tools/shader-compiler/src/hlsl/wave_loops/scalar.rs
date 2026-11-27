@@ -194,6 +194,11 @@ pub(super) fn scalar_step(em: &Emitter<'_>, flow: &Flow, effects: &[Effect], i: 
             if m == "v_readfirstlane_b32" {
                 return first_lane(op).is_some();
             }
+            // A validated physical lane write changes only its vector destination.
+            if m == super::super::mixed_lane::WRITE_LANE {
+                return matches!(op.dst.as_slice(), [Opnd::Vgpr(_)])
+                    && matches!(op.src.as_slice(), [value, Opnd::ConstInt(_) | Opnd::Literal(_)] if scalar_value(*value));
+            }
             if op.op == wave_sum::READ_LANE
                 || m.starts_with("v_cmp_")
                 || m.starts_with("v_cmpx_")

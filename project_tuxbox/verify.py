@@ -2,6 +2,7 @@
 from contextlib import contextmanager, nullcontext
 import ctypes
 import ctypes.util
+import copy
 import hashlib
 from datetime import datetime, timezone
 import json
@@ -17,11 +18,13 @@ import sys
 import subprocess
 import tempfile
 
+from .jobs import check_jobs
+from .prefix_pool import PrefixPool
 from .inspect import digest, export_table, image, launch_target
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / "build"
-BASE_SUITES = ("cpu", "xmem", "xapu", "xgameruntime", "xcrdapi", "graphics", "graphics-abi", "guest-frame", "present", "lanes", "lanes-selftest", "lanes-shader-cache", "lanes-raster-tables", "lanes-compute-root", "lanes-compute-root-recovery", "lanes-bindless-compute", "lanes-benchmark",
+BASE_SUITES = ("cpu", "xmem", "xapu", "xgameruntime", "xcrdapi", "graphics", "graphics-abi", "guest-frame", "present", "lanes", "lanes-selftest", "lanes-shader-cache", "lanes-raster-tables", "lanes-compute-root", "lanes-compute-root-recovery", "lanes-compute-root-srv", "lanes-bindless-compute", "lanes-benchmark",
                "cpu-benchmark", "d3d12-exports", "d3d12-features", "d3d12-indirect", "d3d12-queries", "d3d12-queues", "d3d12-tables",
                "d3d12-heaps", "d3d12-placement", "d3d12-copy-resource", "d3d12-draw", "d3d12-stream", "d3d12-frame-events",
                "d3d12-guids", "d3d12-signatures", "xg-provider")
@@ -29,10 +32,10 @@ OPTIONAL_PROVIDERS = {"dxc-utils": "dxc-utils/dxcompiler.dll", "xg": "xg/xg_xs.d
 SUITES = (*BASE_SUITES, "d3d12-mesh", *OPTIONAL_PROVIDERS)
 # The scenarios of `lanes.exe --selftest`, one gate each.
 LANES_SCENARIOS = ("labels", "cross-queue", "compute-frame", "skipped-command", "copy-memory", "shared-texture",
-                   "indirect-dispatch", "gpu-indirect-dispatch",
-                   "dispatch-wait", "direct-copy-wait", "texture-readback",
+                   "indirect-dispatch", "gpu-indirect-dispatch", "gpu-indirect-order",
+                   "dispatch-wait", "direct-copy-wait", "texture-readback", "texture-publication",
                    "ray-tracing-builder", "thread-dimensions",
-                   "descriptor-reclaim")
+                   "descriptor-reclaim", "unwritten-descriptors")
 
 
 class LanesShader:
@@ -156,40 +159,35 @@ def lanes_wave_shader(host, check, gpu_args, pci, memory_symbols):
                 host.env[name] = value
 
 
-def lanes_wave_alloc(host, check, gpu_args, pci, memory_symbols, work):
-    """Translate the wave32 masked DPP shader and verify the provider loads it.
-
-    The wave-alloc scenario creates a pipeline from a console shader whose wave32
-    masked DPP exclusive prefix the translator must lower to `WavePrefixSum`.
-    Without the wave-alloc lowering the compiler rejects the shader, so the
-    provider never loads a translation and this gate fails.
-    """
+def lanes_live_wave_shaders(host, check, gpu_args, pci, memory_symbols):
+    """Translate Wave32 programs live and verify the provider loads each result."""
     from .runtime_shaders import shader_session
+    from examples.lanes.shader_fixture import lane_shader
     from examples.lanes.wave_alloc_fixture import shader as wave_alloc_shader
-
-    lanes = LanesShader(host, wave_alloc_shader())
-    key, root, forget = lanes.key, lanes.root, lanes.forget
 
     saved = {name: host.env.get(name) for name in ("TUXBOX_LOG", "WINEDEBUG", "TUXBOX_SHADER_SESSION")}
     host.env.update(TUXBOX_LOG="1", WINEDEBUG="-all,+debugstr")
     host.env.pop("TUXBOX_SHADER_SESSION", None)
-    loaded = f"prepared compute shader loaded, source SHA-256 {key}"
 
-    def expect_loaded(output):
+    def expect_loaded(output, key):
+        loaded = f"prepared compute shader loaded, source SHA-256 {key}"
         return None if loaded in output else "the provider did not load the translated shader"
 
-    def launch(name, log_check):
-        return check(name, "lanes/lanes.exe", ["--selftest", "wave-alloc", *gpu_args, "--report"],
-                     rf"lanes-selftest PASS pci={pci} scenario=wave-alloc passed=1",
-                     providers={"lanes/xmem.dll": memory_symbols, "lanes/GameInput.dll": ("#1",),
-                                "lanes/d3d12_xs.dll": ("D3D12XboxCreateDevice",)},
-                     config="lanes/MicrosoftGame.config", device_factory="xbox", log_check=log_check)
-
     try:
-        forget()
-        with shader_session(root, host.env, lambda line: None):
-            launch("lanes-shader-cache-wave-alloc", expect_loaded)
-        forget()
+        for scenario, data in (("wave-alloc", wave_alloc_shader()), ("mixed-lane", lane_shader())):
+            shader = LanesShader(host, data)
+            shader.forget()
+            try:
+                with shader_session(shader.root, host.env, lambda line: None):
+                    check(f"lanes-shader-cache-{scenario}", "lanes/lanes.exe",
+                          ["--selftest", scenario, *gpu_args, "--report"],
+                          rf"lanes-selftest PASS pci={pci} scenario={scenario} passed=1",
+                          providers={"lanes/xmem.dll": memory_symbols, "lanes/GameInput.dll": ("#1",),
+                                     "lanes/d3d12_xs.dll": ("D3D12XboxCreateDevice",)},
+                          config="lanes/MicrosoftGame.config", device_factory="xbox",
+                          log_check=lambda output, key=shader.key: expect_loaded(output, key))
+            finally:
+                shader.forget()
     finally:
         for name, value in saved.items():
             if value is None:
@@ -352,6 +350,19 @@ def private_x_server(directory, geometry="2560x1440", timeout=10, adapter=None):
         yield server and (server[0], str(auth), {"MESA_VK_WSI_DEBUG": "sw"})
 
 
+def splash_skip_reason(display_environment):
+    """Why the package splash check cannot run on this test display, or None.
+
+    A GPU other than the desktop's presents to the private server through
+    software (`private_x_server`). There the first frame after the splash never
+    completes; the cause is not known. An AMD iGPU beside an NVIDIA desktop
+    reproduces it, while the other present checks pass.
+    """
+    if "MESA_VK_WSI_DEBUG" in display_environment:
+        return "this GPU presents to the test display through software"
+    return None
+
+
 def screen_capture_problem(display=None, library=None, xauthority=None):
     """Why the present checks cannot sample the screen on this host, or None.
 
@@ -460,9 +471,11 @@ def lanes_compute_root(host, check, gpu_args, pci, memory_symbols):
             return "the provider substituted a stand-in for the program its root can bind"
         return None
 
-    names = ("TUXBOX_LOG", "WINEDEBUG", "TUXBOX_SHADER_SESSION")
+    # This gate deliberately checks one refused program's stand-in. Do not
+    # inherit the caller's policy for the real game or another verification gate.
+    names = ("TUXBOX_LOG", "WINEDEBUG", "TUXBOX_SHADER_SESSION", "TUXBOX_NULL_PIPELINES")
     saved = {name: host.env.get(name) for name in names}
-    host.env.update(TUXBOX_LOG="1", WINEDEBUG="-all,+debugstr")
+    host.env.update(TUXBOX_LOG="1", WINEDEBUG="-all,+debugstr", TUXBOX_NULL_PIPELINES="1")
     host.env.pop("TUXBOX_SHADER_SESSION", None)
     try:
         forget(rootless)
@@ -485,9 +498,12 @@ def lanes_bindless_compute(host, check, gpu_args, pci, memory_symbols):
     """Dispatch the Lanes direct-indexed compute programs with a paged resource heap.
 
     One stores through a heap UAV; the other also samples a heap texture with a
-    literal sampler. Each runs with a roomy and a constrained resident limit.
+    literal sampler. A third stores like the first from a root that also has a
+    descriptor table. Each runs with a roomy and a constrained resident limit.
     """
-    from examples.lanes.shader_fixture import bindless_compute_shader, bindless_sampler_shader
+    from functools import partial
+    from examples.lanes.shader_fixture import (bindless_compute_shader, bindless_sampler_shader,
+                                               bindless_table_store_shader, bindless_texture_store_shader)
     from .runtime_shaders import shader_session
     from .shader_prep import SOURCE_CACHE
 
@@ -498,7 +514,11 @@ def lanes_bindless_compute(host, check, gpu_args, pci, memory_symbols):
     try:
         trials = [(scenario, hashlib.sha256(build()).hexdigest(), kind, limit)
                   for scenario, build in (("bindless-compute", bindless_compute_shader),
-                                          ("bindless-sampler", bindless_sampler_shader))
+                                          ("bindless-sampler", bindless_sampler_shader),
+                                          ("bindless-heap-read", bindless_compute_shader),
+                                          ("bindless-texture-store", bindless_texture_store_shader),
+                                          ("bindless-table-store", bindless_table_store_shader),
+                                          ("bindless-table-compute", partial(bindless_compute_shader, table=True)))
                   for kind, limit in (("wide", "1000000"), ("constrained", "64"))]
         for scenario, original, kind, limit in trials:
             messages = []
@@ -545,11 +565,25 @@ def lanes_bindless_compute(host, check, gpu_args, pci, memory_symbols):
 def lanes_compute_root_recovery(host, check, gpu_args, pci, memory_symbols):
     """Run the partially reflected second-table shader with paged descriptors."""
     from examples.lanes.shader_fixture import recovered_root_shader
+    lanes_reflected_compute_root(host, check, gpu_args, pci, memory_symbols, "compute-root-recovery",
+                                 recovered_root_shader(), slots=4, heap_limit="64")
+
+
+def lanes_compute_root_srv(host, check, gpu_args, pci, memory_symbols):
+    """Run the program under three tables and a root SRV that stores where the root declares an SRV."""
+    from examples.lanes.shader_fixture import root_srv_shader
+    lanes_reflected_compute_root(host, check, gpu_args, pci, memory_symbols, "compute-root-srv",
+                                 root_srv_shader(), slots=3)
+
+
+def lanes_reflected_compute_root(host, check, gpu_args, pci, memory_symbols, scenario, program, *, slots,
+                                 heap_limit=None):
+    """Run a scenario whose program must be translated against a root the provider reflects."""
     from .runtime_shaders import shader_session
     from .shader_prep import SOURCE_CACHE
 
     sources = Path(host.env["WINEPREFIX"]) / SOURCE_CACHE
-    rootless = {hashlib.sha256(recovered_root_shader()).hexdigest()}
+    rootless = {hashlib.sha256(program).hexdigest()}
     messages = []
 
     def requested(prefix):
@@ -568,20 +602,22 @@ def lanes_compute_root_recovery(host, check, gpu_args, pci, memory_symbols):
         if not compiled:
             return f"the worker translated no program against the two-table root: {messages}"
         if "substituted null compute pipeline" in output:
-            return "the recovered program received a stand-in"
-        if "created compute pipeline with 4 reflected FSSM descriptor slots" not in output:
-            return "the recovered program did not account for both reflected tables"
+            return "the program received a stand-in"
+        if f"created compute pipeline with {slots} reflected FSSM descriptor slots" not in output:
+            return f"the program's pipeline did not reflect {slots} descriptor slots"
         return None
 
     names = ("TUXBOX_LOG", "WINEDEBUG", "TUXBOX_SHADER_SESSION", "TUXBOX_DESCRIPTOR_HEAP_LIMIT", "TUXBOX_NULL_PIPELINES")
     saved = {name: host.env.get(name) for name in names}
-    host.env.update(TUXBOX_LOG="1", WINEDEBUG="-all,+debugstr", TUXBOX_DESCRIPTOR_HEAP_LIMIT="64", TUXBOX_NULL_PIPELINES="0")
+    host.env.update(TUXBOX_LOG="1", WINEDEBUG="-all,+debugstr", TUXBOX_NULL_PIPELINES="0")
+    if heap_limit:
+        host.env["TUXBOX_DESCRIPTOR_HEAP_LIMIT"] = heap_limit
     host.env.pop("TUXBOX_SHADER_SESSION", None)
     try:
         forget(rootless)
         with shader_session(sources.parent, host.env, messages.append):
-            check("lanes-compute-root-recovery", "lanes/lanes.exe", ["--selftest", "compute-root-recovery", *gpu_args, "--report"],
-                  rf"lanes-selftest PASS pci={pci} scenario=compute-root-recovery passed=1",
+            check(f"lanes-{scenario}", "lanes/lanes.exe", ["--selftest", scenario, *gpu_args, "--report"],
+                  rf"lanes-selftest PASS pci={pci} scenario={scenario} passed=1",
                   providers={"lanes/xmem.dll": memory_symbols, "lanes/GameInput.dll": ("#1",),
                              "lanes/d3d12_xs.dll": ("D3D12XboxCreateDevice",)},
                   config="lanes/MicrosoftGame.config", device_factory="xbox", log_check=expect_root_translations)
@@ -600,6 +636,17 @@ RASTER_SAMPLER_SLOTS = 1
 MESH_SAMPLER_SLOTS = 1
 
 
+def missing_mesh_worker_receipt(output, compiled):
+    """Require the exact mesh/pixel binaries loaded by the provider to be worker results."""
+    for stage in ("mesh", "pixel"):
+        loaded = set(re.findall(
+            rf"prepared {stage} shader loaded, source SHA-256 ([0-9a-f]{{64}})(?![0-9a-f])",
+            output))
+        if not loaded or not loaded.issubset(compiled):
+            return f"missing worker receipt for loaded {stage}: {loaded}"
+    return None
+
+
 def lanes_raster_tables(host, check, gpu_args, pci, memory_symbols):
     """Draw with the Lanes console raster programs under a root with two tables.
 
@@ -611,18 +658,26 @@ def lanes_raster_tables(host, check, gpu_args, pci, memory_symbols):
     adds to the reflected root. That root is serialized while the game runs, so
     nothing is prepared before launch: the host worker translates both programs
     against it. `mesh-samplers`: the same pixel program, declaring two samplers
-    the root has in another state, in a mesh pipeline. Only its records-only
-    mesh program's desktop translation (`mesh_samplers.hlsl`) is prepared; the
-    provider must add the literal state to the mesh root it builds and have the
-    worker translate the pixel program against that root.
+    the root has in another state, in a mesh pipeline. Both stages are
+    translated by the worker against the reflected root; the mesh program
+    exports guarded FP16-to-FP32 positions. No desktop shader is prepared.
+    `mesh-sampler-single`: the one-sampler pixel program in that mesh pipeline. `mesh-sampler-rootless`:
+    two pixel programs in mesh pipelines under a root with no static samplers,
+    whose literal samplers the provider must add to the mesh root whole.
+    `raster-heap-stride`: the vertex program reads a heap buffer by index under
+    a root with no parameters, so the provider must translate it against a root
+    with its stride table and bind that table, with a paged resource heap.
     """
-    from examples.lanes.raster_fixture import mesh, mesh_sampler_pixel, pixel, sampler_pixel, vertex
+    from examples.lanes.raster_fixture import (heap_stride_pixel, heap_stride_vertex, mesh, mesh_sampler_pixel, pixel,
+                                               rootless_sampler_pixel, sampler_pixel, vertex)
+    from examples.lanes.spill_fixture import pixel as spill_pixel
     from .runtime_shaders import shader_session
-    from .shader_prep import SOURCE_CACHE, compiler_tools, run_tool
+    from .shader_prep import SOURCE_CACHE
 
     sources = Path(host.env["WINEPREFIX"]) / SOURCE_CACHE
     rootless = {hashlib.sha256(data).hexdigest()
-                for data in (vertex(), pixel(), sampler_pixel(), mesh_sampler_pixel())}
+                for data in (vertex(), pixel(), sampler_pixel(), mesh_sampler_pixel(), rootless_sampler_pixel(),
+                             spill_pixel(), heap_stride_vertex(), heap_stride_pixel())}
     mesh_key = hashlib.sha256(mesh()).hexdigest()
     messages = []
 
@@ -630,17 +685,14 @@ def lanes_raster_tables(host, check, gpu_args, pci, memory_symbols):
         return {line.removeprefix("Compiled Xbox shader ") for line in messages
                 if line.startswith("Compiled Xbox shader ")}
 
+    def refused():
+        return {match[1] for line in messages if (match := re.match(r"Xbox shader ([0-9a-f]{64}):", line))}
+
     def forget(keys):
         # Only these programs' entries; a prefix may hold a title cache.
         for key in keys:
             for path in [*sources.glob(f"{key}.*"), *sources.parent.glob(f"runtime/*/{key}.*")]:
                 path.unlink()
-
-    def prepare_mesh():
-        # The console mesh program has records only; its translation is this desktop shader.
-        sources.mkdir(parents=True, exist_ok=True)
-        hlsl = Path(__file__).resolve().parents[1] / "examples/lanes/mesh_samplers.hlsl"
-        run_tool([compiler_tools()[1], "-T", "ms_6_5", "-E", "main", "-O3", "-Fo", sources / f"{mesh_key}.cso", hlsl])
 
     def expect_reflected(slots, mesh_pipeline=False):
         def problem(output):
@@ -654,23 +706,52 @@ def lanes_raster_tables(host, check, gpu_args, pci, memory_symbols):
                 return "the provider did not reflect the two-table root"
             if f"created raster pipeline with {slots} reflected FSSM descriptor slots" not in output:
                 return "the provider did not create the pipeline under the reflected root"
-            if compiled() & rootless:
+            if compiled() & (rootless | {mesh_key}):
                 return f"the worker translated a program without its root: {messages}"
+            if mesh_pipeline:
+                # A draw alone could pass with a prebuilt desktop mesh shader.
+                # Require the exact loaded binaries to have been requested from
+                # the Xbox shader worker during this scenario.
+                problem = missing_mesh_worker_receipt(output, compiled())
+                if problem:
+                    return f"{problem}; {messages}"
             return None
         return problem
 
-    names = ("TUXBOX_LOG", "WINEDEBUG", "TUXBOX_TRACE_RASTER_ROOTS", "TUXBOX_SHADER_SESSION", "TUXBOX_RASTER_ROOT_FALLBACK")
+    def expect_translated(output):
+        # An empty root needs no reflection: only the translation is in question.
+        if "substituted null " in output:
+            return f"the provider substituted a stand-in pipeline: {messages}"
+        if not compiled():
+            return f"the worker translated nothing: {messages}"
+        return None
+
+    def expect_strides(output):
+        problem = expect_translated(output)
+        if problem:
+            return problem
+        if "bound paged resource descriptor stride table at graphics root slot" not in output:
+            return "the draw did not bind the paged stride table"
+        if compiled() & rootless:
+            return f"the worker translated a program without its root: {messages}"
+        return None
+
+    names = ("TUXBOX_LOG", "WINEDEBUG", "TUXBOX_TRACE_RASTER_ROOTS", "TUXBOX_SHADER_SESSION",
+             "TUXBOX_RASTER_ROOT_FALLBACK", "TUXBOX_NULL_PIPELINES", "TUXBOX_DESCRIPTOR_HEAP_LIMIT")
     saved = {name: host.env.get(name) for name in names}
-    host.env.update(TUXBOX_LOG="1", WINEDEBUG="-all,+debugstr", TUXBOX_TRACE_RASTER_ROOTS="1")
+    host.env.update(TUXBOX_LOG="1", WINEDEBUG="-all,+debugstr", TUXBOX_TRACE_RASTER_ROOTS="1",
+                    TUXBOX_NULL_PIPELINES="0")
     # The fallback translates against the title's root and would hide a missing reflection.
     for name in ("TUXBOX_SHADER_SESSION", "TUXBOX_RASTER_ROOT_FALLBACK"):
         host.env.pop(name, None)
     try:
-        for scenario, slots in (("raster-tables", 3), ("raster-samplers", RASTER_SAMPLER_SLOTS),
-                                ("mesh-samplers", MESH_SAMPLER_SLOTS), ("mesh-sampler-single", MESH_SAMPLER_SLOTS)):
+        for scenario, slots in (("raster-tables", 3), ("lane-spill-interp", None), ("raster-samplers", RASTER_SAMPLER_SLOTS),
+                                ("mesh-samplers", MESH_SAMPLER_SLOTS), ("mesh-sampler-single", MESH_SAMPLER_SLOTS),
+                                ("mesh-sampler-rootless", MESH_SAMPLER_SLOTS), ("raster-heap-stride", None)):
+            if scenario == "raster-heap-stride":
+                # The stride table exists only for a paged heap.
+                host.env["TUXBOX_DESCRIPTOR_HEAP_LIMIT"] = "64"
             forget(rootless | {mesh_key})
-            if scenario.startswith("mesh-"):
-                prepare_mesh()
             messages.clear()
             with shader_session(sources.parent, host.env, messages.append):
                 check(f"lanes-{scenario}", "lanes/lanes.exe", ["--selftest", scenario, *gpu_args, "--report"],
@@ -678,10 +759,12 @@ def lanes_raster_tables(host, check, gpu_args, pci, memory_symbols):
                       providers={"lanes/xmem.dll": memory_symbols, "lanes/GameInput.dll": ("#1",),
                                  "lanes/d3d12_xs.dll": ("D3D12XboxCreateDevice",)},
                       config="lanes/MicrosoftGame.config", device_factory="xbox",
-                      log_check=expect_reflected(slots, scenario.startswith("mesh-")))
-            forget(compiled())
+                      log_check=expect_strides if scenario == "raster-heap-stride"
+                      else expect_translated if slots is None
+                      else expect_reflected(slots, scenario.startswith("mesh-")))
+            forget(compiled() | refused())
     finally:
-        forget(rootless | compiled() | {mesh_key})
+        forget(rootless | compiled() | refused() | {mesh_key})
         for name, value in saved.items():
             if value is None:
                 host.env.pop(name, None)
@@ -698,9 +781,16 @@ def verify(host, output, adapter, selected=None, samples=1):
     cases = []
     builds = {}
     present_display = None
+    skipped = []
     BUILD.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="guest-check-", dir=BUILD) as tmp:
         work = Path(tmp)
+        # Gates that neither share a cache nor measure time or the screen run
+        # side by side, each worker in a copy of the prefix. Proton only: the
+        # other backends were not measured.
+        parallel = host.backend == "proton" and check_jobs() > 1
+        prefixes = PrefixPool(work, check_jobs())
+        waiting, side_by_side = [], [parallel]
 
         def stage(relative, folder):
             src = BUILD / relative
@@ -719,50 +809,73 @@ def verify(host, output, adapter, selected=None, samples=1):
             folder = work / str(len(cases))
             folder.mkdir()
             receipt = folder / "result.txt"
-            try:
-                exe = stage(binary, folder)
-                if providers:
-                    pe = image(exe)
-                    modules = pe["imports"]
+
+            def attempt(runner, timeout):
+                """Run the guest on `runner` and return what to print about it."""
+                nonlocal match
+                shown = []
+                try:
+                    exe = stage(binary, folder)
+                    if providers:
+                        pe = image(exe)
+                        modules = pe["imports"]
+                        if config:
+                            row["guest_import_modules"] = lanes_imports(pe)
+                        if callable(match):
+                            match = match(modules)
+                        if device_factory is not None:
+                            desktop = next((entry["symbols"] for entry in modules
+                                            if entry["module"].lower() == "d3d12.dll"), ())
+                            if device_factory == "xbox" and desktop:
+                                raise ValueError("Frame fixture imports desktop D3D12 directly")
+                            # The Windows SDK import library selects this function by ordinal.
+                            if device_factory == "desktop" and not {"D3D12CreateDevice", "#101"}.intersection(desktop):
+                                raise ValueError("Expected device creation from desktop d3d12.dll")
+                        for dll, symbols in providers.items():
+                            provider = stage(dll, folder)
+                            missing = missing_provider_imports(modules, provider, symbols)
+                            if missing:
+                                raise ValueError(f"Missing static guest imports from {provider.name}: {missing}")
+                    for dependency in dependencies:
+                        stage(dependency, folder)
                     if config:
-                        row["guest_import_modules"] = lanes_imports(pe)
-                    if callable(match):
-                        match = match(modules)
-                    if device_factory is not None:
-                        desktop = next((entry["symbols"] for entry in modules
-                                        if entry["module"].lower() == "d3d12.dll"), ())
-                        if device_factory == "xbox" and desktop:
-                            raise ValueError("Frame fixture imports desktop D3D12 directly")
-                        # The Windows SDK import library selects this function by ordinal.
-                        if device_factory == "desktop" and not {"D3D12CreateDevice", "#101"}.intersection(desktop):
-                            raise ValueError("Expected device creation from desktop d3d12.dll")
-                    for dll, symbols in providers.items():
-                        provider = stage(dll, folder)
-                        missing = missing_provider_imports(modules, provider, symbols)
-                        if missing:
-                            raise ValueError(f"Missing static guest imports from {provider.name}: {missing}")
-                for dependency in dependencies:
-                    stage(dependency, folder)
-                if config:
-                    stage(config, folder)
-                    exe = launch_target(folder, "Lanes")
-                else:
-                    exe = launch_target(exe, None)
-                proc = host.run(exe, [*arguments, receipt.name], timeout=15, capture=True)
-                text = receipt.read_text(encoding="utf-8").rstrip("\r\n") if receipt.is_file() else None
-                row.update(exit_code=proc.returncode, receipt=text)
-                row["passed"] = (proc.returncode == expected_code and
-                                 (text is None if match is None else text is not None and re.fullmatch(match, text) is not None))
-                if row["passed"] and log_check:
-                    problem = log_check(proc.stdout.decode(errors="replace"))
-                    if problem:
-                        row.update(passed=False, error=problem)
-                if not row["passed"]:
-                    print(proc.stdout[-2000:].decode(errors="replace"))
-            except (OSError, ValueError, subprocess.TimeoutExpired) as error:
-                row["error"] = str(error)
-            print(f"{'PASS' if row['passed'] else 'FAIL'}  {name}", flush=True)
+                        stage(config, folder)
+                        exe = launch_target(folder, "Lanes")
+                    else:
+                        exe = launch_target(exe, None)
+                    proc = runner.run(exe, [*arguments, receipt.name], timeout=timeout, capture=True)
+                    text = receipt.read_text(encoding="utf-8").rstrip("\r\n") if receipt.is_file() else None
+                    row.update(exit_code=proc.returncode, receipt=text)
+                    row["passed"] = (proc.returncode == expected_code and
+                                     (text is None if match is None else text is not None and re.fullmatch(match, text) is not None))
+                    if row["passed"] and log_check:
+                        problem = log_check(proc.stdout.decode(errors="replace"))
+                        if problem:
+                            row.update(passed=False, error=problem)
+                    if not row["passed"]:
+                        shown.append(proc.stdout[-2000:].decode(errors="replace"))
+                except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+                    row["error"] = str(error)
+                shown.append(f"{'PASS' if row['passed'] else 'FAIL'}  {name}")
+                return "\n".join(shown)
+
+            if side_by_side[0]:
+                # The settings are those in force now; the guest runs later.
+                snapshot = copy.copy(host)
+                snapshot.env = dict(host.env)
+                # Guests starting together take longer to come up.
+                waiting.append((snapshot, lambda runner: attempt(runner, 30)))
+            else:
+                print(attempt(host, 15), flush=True)
             return row
+
+        def run_together(enable=False):
+            """Run the gates waiting to run side by side; `enable` collects more."""
+            if waiting:
+                for shown in prefixes.run(waiting):
+                    print(shown, flush=True)
+                waiting.clear()
+            side_by_side[0] = enable and parallel
 
         def unsampled(name, reason):
             row = {"gate": name, "passed": False, "error": f"screen capture unavailable: {reason}"}
@@ -949,39 +1062,62 @@ def verify(host, output, adapter, selected=None, samples=1):
             check("guest-command-errors", "d3d12-smoke/xbox-frame-negative.exe", [*gpu_args, "--report"],
                   rf"xbox-frame-negative PASS pci={pci} foreign-parents=2 copy-errors=2 recovered=1 rejected-batches=3 compute-present-rejected=1",
                   providers=frame_provider, device_factory="xbox")
+        run_together()
         if "present" in selected:
-            # The desktop's rootless XWayland can't be sampled; present into a private rootful
-            # Xwayland instead, and fail fast with the cause if that isn't possible either.
-            capture = screen_capture_problem()
-            server = private_x_server(work, adapter=adapter) if capture else nullcontext()
-            saved = {key: host.env.get(key) for key in ("DISPLAY", "XAUTHORITY", "MESA_VK_WSI_DEBUG")}
+            # Sample a private rootful Xwayland, where nothing on the desktop can cover
+            # the frames. `TUXBOX_CHECK_DISPLAY=desktop` uses the current display, which
+            # is also the fallback when no private server can be sampled.
+            desktop = os.environ.get("TUXBOX_CHECK_DISPLAY") == "desktop"
+            server = nullcontext() if desktop else private_x_server(work, adapter=adapter)
+            saved = {key: host.env.get(key) for key in ("DISPLAY", "XAUTHORITY", "MESA_VK_WSI_DEBUG",
+                                                      "TUXBOX_OVERLAY")}
             with server as private:
-                if private:
-                    capture = screen_capture_problem(display=private[0], xauthority=private[1])
-                    if capture is None:
-                        host.env.update(DISPLAY=private[0], XAUTHORITY=private[1], **private[2])
-                        present_display = "private rootful Xwayland"
-                        if private[2]:
-                            present_display += " without glamor"
-                        print(f"present: sampling a {present_display} on {private[0]}", flush=True)
+                splash_skip = None
+                if private and screen_capture_problem(display=private[0], xauthority=private[1]) is None:
+                    capture = None
+                    host.env.update(DISPLAY=private[0], XAUTHORITY=private[1], **private[2])
+                    present_display = "private rootful Xwayland"
+                    splash_skip = splash_skip_reason(private[2])
+                    if private[2]:
+                        present_display += " without glamor"
+                    print(f"present: sampling a {present_display} on {private[0]}", flush=True)
+                else:
+                    capture = screen_capture_problem()
                 try:
                     present = check if capture is None else (lambda name, *_args, **_kwargs: unsampled(name, capture))
                     present("guest-present", "d3d12-smoke/xbox-frame.exe", [*gpu_args, "--present", "--report"],
                             frame_match + r" displayed=2/2", providers=frame_provider, device_factory="xbox")
                     present("guest-present-rgb10", "d3d12-smoke/xbox-frame-rgb10.exe", [*gpu_args, "--present", "--report"],
                             frame_match + r" format=rgb10a2 displayed=2/2", providers=frame_provider, device_factory="xbox")
-                    for mode in ("owned", "oversized", "fit"):
+                    for mode in ("owned", "oversized", "fit", "splash"):
+                        if mode == "splash" and splash_skip:
+                            skipped.append({"gate": f"guest-present-4k-{mode}", "reason": splash_skip})
+                            print(f"SKIP  guest-present-4k-{mode}: {splash_skip}", flush=True)
+                            continue
                         present(f"guest-present-4k-{mode}", "d3d12-smoke/xbox-frame-4k.exe",
                                 [mode, *gpu_args, "--present", "--report"],
                                 rf"xbox-frame PASS pci={pci} submissions=2 snapshots=2 pixels=16588800/16588800 "
                                 r"inset=921600 guards=3 fence=2 compute_fence=7 format=rgb10a2 displayed=2/2 "
-                                r"client=\d+x\d+ origin=-?\d+,-?\d+ monitor=\d+x\d+", providers=frame_provider, device_factory="xbox")
+                                r"client=\d+x\d+ origin=-?\d+,-?\d+ monitor=\d+x\d+"
+                                + (" splash=held,ended" if mode == "splash" else ""),
+                                providers=frame_provider, device_factory="xbox",
+                                dependencies=("d3d12-smoke/splash/MicrosoftGame.Config", "d3d12-smoke/splash/splash.png")
+                                if mode == "splash" else ())
+                    # The same screen sampling shows the provider's panel over Lanes.
+                    host.env["TUXBOX_OVERLAY"] = "1"
+                    present("lanes-overlay", "lanes/lanes.exe", ["--replay", "--panel", *gpu_args, "--report"],
+                            rf"lanes-replay PASS pci={pci} course=16/16 win=16/16 safe-miss=1 collision=1 frames=2 "
+                            r"input=gameinput panel=1",
+                            providers={"lanes/xmem.dll": memory_symbols, "lanes/GameInput.dll": ("#1",),
+                                       "lanes/d3d12_xs.dll": (*graphics_symbols, "D3D12XboxCreateDevice")},
+                            config="lanes/MicrosoftGame.config", device_factory="xbox")
                 finally:
                     for key, value in saved.items():
                         if value is None:
                             host.env.pop(key, None)
                         else:
                             host.env[key] = value
+        run_together(enable=True)
         if "lanes" in selected:
             check("lanes-xbox-replay", "lanes/lanes.exe", ["--replay", *gpu_args, "--report"],
                   rf"lanes-replay PASS pci={pci} course=16/16 win=16/16 safe-miss=1 collision=1 frames=2 input=gameinput",
@@ -1006,6 +1142,7 @@ def verify(host, output, adapter, selected=None, samples=1):
                 host.env.pop("TUXBOX_DESCRIPTOR_HEAP_LIMIT", None)
             else:
                 host.env["TUXBOX_DESCRIPTOR_HEAP_LIMIT"] = saved_limit
+        run_together()
         if "lanes-benchmark" in selected:
             # Console shaders are only translated on the Proton backend, so the
             # pipeline readings exist there alone.
@@ -1026,7 +1163,7 @@ def verify(host, output, adapter, selected=None, samples=1):
         if "lanes-shader-cache" in selected and host.backend == "proton":
             lanes_shader_cache(host, check, gpu_args, pci, memory_symbols, work)
             lanes_wave_shader(host, check, gpu_args, pci, memory_symbols)
-            lanes_wave_alloc(host, check, gpu_args, pci, memory_symbols, work)
+            lanes_live_wave_shaders(host, check, gpu_args, pci, memory_symbols)
         if "lanes-raster-tables" in selected and host.backend == "proton":
             lanes_raster_tables(host, check, gpu_args, pci, memory_symbols)
         if "lanes-compute-root" in selected and host.backend == "proton":
@@ -1035,6 +1172,8 @@ def verify(host, output, adapter, selected=None, samples=1):
             lanes_bindless_compute(host, check, gpu_args, pci, memory_symbols)
         if "lanes-compute-root-recovery" in selected and host.backend == "proton":
             lanes_compute_root_recovery(host, check, gpu_args, pci, memory_symbols)
+        if "lanes-compute-root-srv" in selected and host.backend == "proton":
+            lanes_compute_root_srv(host, check, gpu_args, pci, memory_symbols)
         if "cpu-benchmark" in selected:
             readings = []
             for _ in range(samples):
@@ -1059,6 +1198,8 @@ def verify(host, output, adapter, selected=None, samples=1):
               "provider": host.version, "binaries_sha256": builds, "checks": cases}
     if present_display:
         report["present_display"] = present_display
+    if skipped:
+        report["skipped"] = skipped
     output.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = None
     try:
@@ -1100,6 +1241,7 @@ GATE_LABELS = {
     "guest-present-4k-owned": "4K RGB10 display scaled to a TuxBox window",
     "guest-present-4k-oversized": "4K RGB10 display fitted to the title window’s monitor",
     "guest-present-4k-fit": "4K RGB10 display scaled inside a smaller title window",
+    "guest-present-4k-splash": "Package splash over a fitted 4K title window until frames come steadily",
     "guest-present-rgb10": "Two RGB10A2 frames sampled from the desktop window",
     "d3d12-frame-events": "Frame origins, timeout tokens, completed presentation events and display statistics",
     "d3d12-heaps": "Placed resources and allocation offsets in a shared memory heap",
@@ -1125,6 +1267,7 @@ GATE_LABELS = {
     "guest-command-errors": "Guest command rejection, fence isolation and list recovery",
     "guest-present": "Xbox PresentX and two screen-verified frames",
     "lanes-xbox-replay": "Lanes Xbox imports, course, board readback and gameplay replay",
+    "lanes-overlay": "TuxBox's performance panel on screen over Lanes",
     "lanes-selftest-labels": "Bottom-of-pipe label writes with and without a flush",
     "lanes-selftest-cross-queue": "Compute and direct queues waiting on each other's labels",
     "lanes-selftest-compute-frame": "Compute queue frame submission",
@@ -1134,12 +1277,15 @@ GATE_LABELS = {
     "lanes-selftest-indirect-dispatch": "ExecuteIndirect matching a direct dispatch",
     "lanes-selftest-direct-copy-wait": "A direct queue waiting before and after a buffer copy",
     "lanes-selftest-gpu-indirect-dispatch": "GPU-written arguments controlling an indirect dispatch",
+    "lanes-selftest-gpu-indirect-order": "Indirect arguments and counts read after the dispatch that wrote them",
     "lanes-selftest-dispatch-wait": "A memory wait before and after a compute dispatch",
     "lanes-selftest-texture-readback": "A guest texture copied back to title memory",
+    "lanes-selftest-texture-publication": "GPU texture writes published to title memory, leaving padding, closed pages and memory past the texture alone",
     "lanes-benchmark": "Lanes frame, submission, fence handover, copy and pipeline timings",
     "lanes-selftest-ray-tracing-builder": "Single, copied and batched builds through XboxBvhBuilder",
     "lanes-selftest-thread-dimensions": "Slot 80 thread-dimension dispatch converted using the bound PSO group size",
     "lanes-selftest-descriptor-reclaim": "Shader-visible descriptor slot reclamation across completed, in-flight, ClearState, and OOM lists",
+    "lanes-selftest-unwritten-descriptors": "A descriptor table with slots the title never wrote, in a heap whose title memory held leftover bytes",
     "lanes-shader-cache-prepared": "A console shader translated before launch, loaded from the prepared cache",
     "lanes-shader-cache-compiled": "A console shader translated by the host worker while the game runs",
     "lanes-shader-cache-reused": "The worker's translation reused on the next launch without compiling",
@@ -1147,14 +1293,27 @@ GATE_LABELS = {
     "lanes-wave-shader-host": "A 64-lane console shader with the translation this graphics card needs",
     "lanes-raster-tables": "Console raster programs drawn under the root reflected from their two descriptor tables",
     "lanes-shader-cache-wave-alloc": "A wave32 masked DPP exclusive prefix lowered to WavePrefixSum and loaded by the provider",
+    "lanes-shader-cache-mixed-lane": "An EXEC-independent lane write and a dynamic lane read in a Wave32 compute shader",
+    "lanes-lane-spill-interp": "A console pixel program with a lane-spill area and an f16 interpolator selector of the same number",
     "lanes-raster-samplers": "A console pixel program's literal linear sampler, which the title's root names in another state",
+    "lanes-raster-heap-stride": "A console vertex program's indexed read of a heap buffer, through the paged stride table",
     "lanes-compute-root": "Root-less console compute programs translated only against a three-table root",
     "lanes-mesh-samplers": "The same literal sampler in a mesh pipeline, added to the mesh root the provider builds",
+    "lanes-mesh-sampler-rootless": "Literal samplers in mesh pipelines whose root has no static samplers",
     "lanes-compute-root-recovery": "Partially reflected compute root with an appended descriptor range and paging",
+    "lanes-compute-root-srv": "A console compute program under three tables and a root SRV that stores where the title's root declares an SRV",
     "lanes-bindless-compute-wide": "A direct-indexed compute program's heap UAV through the paged index map",
     "lanes-bindless-compute-constrained": "The same with fewer resident descriptors than the index it uses",
     "lanes-bindless-sampler-wide": "A direct-indexed compute program's literal sampler, added to its paged root",
     "lanes-bindless-sampler-constrained": "The same with fewer resident descriptors than the indices it uses",
+    "lanes-bindless-table-compute-wide": "A direct-indexed compute program's heap UAV when its root also has a table",
+    "lanes-bindless-table-compute-constrained": "The same with fewer resident descriptors than the index it uses",
+    "lanes-bindless-heap-read-wide": "A direct-indexed program with no image write leaving a heap UAV texture's title memory alone",
+    "lanes-bindless-heap-read-constrained": "The same with fewer resident descriptors than the indices in use",
+    "lanes-bindless-texture-store-wide": "A direct-indexed store to a heap UAV texture, published to title memory",
+    "lanes-bindless-texture-store-constrained": "The same with fewer resident descriptors than the index it uses",
+    "lanes-bindless-table-store-wide": "A table store under a direct-indexed root published alone, leaving another heap UAV texture's title memory alone",
+    "lanes-bindless-table-store-constrained": "The same with fewer resident descriptors than the indices in use",
     "lanes-package-replay": "Lanes gameplay replay (earlier guest with desktop graphics)", "cpu-replay": "8,388,608-move CPU replay",
 }
 

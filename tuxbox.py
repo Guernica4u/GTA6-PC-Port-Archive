@@ -80,6 +80,8 @@ def run_game(args, exe, host, package_dir, profile=None):
                         log.status("Shader preparation complete." if supported else
                                    "No matching shader preparation profile for this title and provider.")
                         return 0 if supported else 1
+            if args.overlay:
+                host.env["TUXBOX_OVERLAY"] = "1"
             log.status("Starting game")
             start = monotonic()
             code = host.run_game(exe, args.arguments, log, package=package_dir,
@@ -110,6 +112,8 @@ def main():
     run.add_argument("--log-file", type=Path, metavar="PATH", help="also append the game log to this file; none is saved otherwise")
     run.add_argument("--mangohud", action="store_true",
                      help="show Vulkan performance metrics and record frame times beside the log file on Linux")
+    run.add_argument("--overlay", action="store_true",
+                     help="show TuxBox's panel with frame rate, frame times and processor and memory use")
     run.add_argument("--require-current-provider", action="store_true",
                      help="refuse launch unless staged D3D12 DLL matches build/d3d12-smoke/d3d12_xs.dll")
     run.add_argument("--profile-pipelines", action="store_true",
@@ -131,7 +135,7 @@ def main():
     check.add_argument("--adapter", help="select a hardware graphics adapter by PCI vendor:device")
     gate = subs.add_parser("check", help="run every check a change needs before it can be merged")
     gate.add_argument("--no-gpu", action="store_true",
-                      help="run only the checks CI runs; the change still needs a GPU run before merging")
+                      help="run only the checks CI runs; see CONTRIBUTING.md for the GPU checks a change needs")
     gate.add_argument("--baseline", type=Path, metavar="RESULTS",
                       help="compare the Lanes benchmark with an earlier check's results")
     gate.add_argument("--windows-dxc", type=Path, metavar="DIR",

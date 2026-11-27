@@ -17,6 +17,7 @@ OPS = (
     "s_ff0_i32_b32", "s_ff0_i32_b64", "s_flbit_i32_b64",
     "s_flbit_i32", "s_flbit_i32_i64", "s_bitset0_b64",
     "s_bitset1_b64", "s_bitcmp0_b64", "s_bitcmp1_b64",
+    "s_quadmask_b32", "s_quadmask_b64", "s_bitreplicate_b64_b32",
 )
 MASK = (1 << 32) - 1
 
@@ -57,6 +58,14 @@ def reference(name, lo, hi, index):
         lo, hi = value & MASK, value >> 32
     elif name in ("s_bitcmp0_b64", "s_bitcmp1_b64"):
         scc = int(((x >> (index & 63)) & 1) == int(name == "s_bitcmp1_b64"))
+    elif name in ("s_quadmask_b32", "s_quadmask_b64"):
+        quads = 8 if name.endswith("b32") else 16
+        lo = sum(1 << k for k in range(quads) if (x >> 4 * k) & 15)
+        hi = 0 if name.endswith("b64") else hi
+        scc = int(lo != 0)
+    elif name == "s_bitreplicate_b64_b32":
+        value = sum(3 << 2 * k for k in range(32) if (lo >> k) & 1)
+        lo, hi = value & MASK, value >> 32
     else:
         raise ValueError(f"unknown opcode {name}")
     return lo, hi, index, scc

@@ -41,7 +41,7 @@ pub(crate) mod depth;
 mod descriptor_copy;
 pub(crate) mod descriptor_paging;
 mod dxgi;
-mod host_profile;
+pub(crate) mod host_profile;
 mod features;
 pub(crate) mod format;
 mod reserved;

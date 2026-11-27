@@ -26,6 +26,8 @@ pub fn independent_pixel_hlsl(shader: &ShaderExtract) -> Option<String> {
 pub fn requires_inline_ray_query(shader: &ShaderExtract) -> bool {
     #[cfg(feature = "legacy-hlsl")]
     if hlsl::radiance_probe::identify(shader).is_some() { return true; }
+    #[cfg(feature = "legacy-hlsl")]
+    if hlsl::scarlett_rays::identify(shader).is_some() { return true; }
     compute_hlsl::card_direct_shadow(shader)
 }
 

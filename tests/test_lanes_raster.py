@@ -67,9 +67,20 @@ class RasterFixtureTests(unittest.TestCase):
         self.assertIn("raster_sampler_texels[] = {1.0f, 3.0f};", text)
         self.assertIn("raster_sampler_linear = 1.5f, raster_sampler_point = 1.0f;", text)
         for name, data in (("mesh_sampler_mesh", raster_fixture.mesh()),
-                           ("mesh_sampler_pixel", raster_fixture.mesh_sampler_pixel())):
+                           ("mesh_sampler_pixel", raster_fixture.mesh_sampler_pixel()),
+                           ("mesh_rootless_pixel", raster_fixture.rootless_sampler_pixel())):
             values = re.search(rf"{name}\[\] = \{{([0-9,]+)\}};", text).group(1)
             self.assertEqual(bytes(int(value) for value in values.split(",")), data)
+        for name, data in (("heap_stride_vertex", raster_fixture.heap_stride_vertex()),
+                           ("heap_stride_pixel", raster_fixture.heap_stride_pixel())):
+            values = re.search(rf"{name}\[\] = \{{([0-9,]+)\}};", text).group(1)
+            self.assertEqual(bytes(int(value) for value in values.split(",")), data)
+
+    def test_heap_stride_program_takes_the_resource_heap_and_no_root(self):
+        found = parts(raster_fixture.heap_stride_vertex())
+        self.assertNotIn(b"RTS0", found)
+        self.assertEqual(found[b"SFI0"], struct.pack("<Q", 1 << 25))
+        self.assertEqual(rows(fssm(found[b"DXIL"]), 0xe8, 0xf8), [[5, 0, 1, 0, 8]])
 
     def test_sampler_program_declares_the_roots_register_and_builds_a_literal_state(self):
         data = raster_fixture.sampler_pixel()
@@ -103,9 +114,18 @@ class RasterFixtureTests(unittest.TestCase):
         self.assertNotIn(b"RTS0", mesh)
         self.assertEqual(struct.unpack_from("<I", mesh[b"DXIL"], 0)[0] >> 16, 13)
         self.assertEqual(mesh[b"PSV0"][28], 13)
+        self.assertEqual(mesh[b"PSV0"][31], 2)
+        self.assertEqual(struct.unpack_from("<HH", mesh[b"PSV0"], 16), (128, 128))
+        self.assertEqual(struct.unpack_from("<3I", mesh[b"PSV0"], 40), (128, 1, 1))
+        self.assertGreater(len(raster_fixture.MESH_CODE), 1)
         program = fssm(mesh[b"DXIL"])
         self.assertEqual(rows(program, 0xe8, 0xf8), [[0, 0, 1, 501, 0x200]])
         self.assertEqual(rows(program, 0xf0, 0xfc), [[2, 0, 501, 0, 0x2_0004]])
+
+    def test_rootless_program_adds_only_an_empty_feature_part(self):
+        found, base = parts(raster_fixture.rootless_sampler_pixel()), parts(raster_fixture.mesh_sampler_pixel())
+        self.assertEqual(found.pop(b"SFI0"), bytes(8))
+        self.assertEqual(found, base)
 
 
 def trace(slots):
@@ -119,7 +139,7 @@ class RasterGateTests(unittest.TestCase):
     def run_gate(self, output, compiled, scenario="raster-tables"):
         rootless = [hashlib.sha256(data).hexdigest()
                     for data in (raster_fixture.vertex(), raster_fixture.pixel(), raster_fixture.sampler_pixel(),
-                                 raster_fixture.mesh_sampler_pixel())]
+                                 raster_fixture.mesh_sampler_pixel(), raster_fixture.rootless_sampler_pixel())]
         mesh_key = hashlib.sha256(raster_fixture.mesh()).hexdigest()
         with TemporaryDirectory() as prefix:
             sources = Path(prefix) / SOURCE_CACHE
@@ -130,7 +150,7 @@ class RasterGateTests(unittest.TestCase):
             kept = sources / "title.cso"
             for path in (*stale, kept):
                 path.write_bytes(b"")
-            env = {"WINEPREFIX": prefix, "TUXBOX_RASTER_ROOT_FALLBACK": "1", "TUXBOX_LOG": "stderr"}
+            env = {"WINEPREFIX": prefix, "TUXBOX_RASTER_ROOT_FALLBACK": "1", "TUXBOX_LOG": "stderr", "TUXBOX_NULL_PIPELINES": "1"}
             seen = {}
 
             @contextmanager
@@ -150,14 +170,8 @@ class RasterGateTests(unittest.TestCase):
                                "problem": log_check, "mesh": mesh_cso.exists()}
                 return {}
 
-            def run_tool(command, **_):
-                # The mesh program's desktop translation, compiled into the prepared cache.
-                seen["mesh_command"] = [str(part) for part in command]
-                Path(command[command.index("-Fo") + 1]).write_bytes(b"")
-
             with mock.patch("project_tuxbox.runtime_shaders.shader_session", session), \
-                    mock.patch("project_tuxbox.shader_prep.compiler_tools", lambda: ("xshader", "dxc", "dxv")), \
-                    mock.patch("project_tuxbox.shader_prep.run_tool", run_tool):
+                    mock.patch("project_tuxbox.shader_prep.run_tool", side_effect=AssertionError("desktop mesh preparation is forbidden")):
                 lanes_raster_tables(SimpleNamespace(env=env), check, ["--adapter", "10de:2c02"], "10de:2c02", ())
             seen["calls"] = list(calls)
             seen.update(calls[f"lanes-{scenario}"])
@@ -169,11 +183,14 @@ class RasterGateTests(unittest.TestCase):
 
     def test_reflected_draw_passes_and_cleans_its_entries(self):
         seen, _ = self.run_gate(self.TRACE, ["a" * 64, "b" * 64])
-        self.assertEqual(seen["calls"], ["lanes-raster-tables", "lanes-raster-samplers", "lanes-mesh-samplers", "lanes-mesh-sampler-single"])
+        self.assertEqual(seen["calls"], ["lanes-raster-tables", "lanes-lane-spill-interp", "lanes-raster-samplers", "lanes-mesh-samplers", "lanes-mesh-sampler-single",
+                                         "lanes-mesh-sampler-rootless", "lanes-raster-heap-stride"])
         self.assertEqual(seen["arguments"][:2], ["--selftest", "raster-tables"])
         self.assertEqual(seen["stale"], [False, False])
         self.assertNotIn("TUXBOX_RASTER_ROOT_FALLBACK", seen["env"])
         self.assertEqual(seen["env"]["TUXBOX_TRACE_RASTER_ROOTS"], "1")
+        self.assertEqual(seen["env"]["TUXBOX_NULL_PIPELINES"], "0")
+        self.assertEqual(seen["env_after"]["TUXBOX_NULL_PIPELINES"], "1")
         self.assertIsNone(seen["problem"])
         self.assertEqual(seen["left"], ["title.cso"])
         self.assertEqual(seen["env_after"]["TUXBOX_RASTER_ROOT_FALLBACK"], "1")
@@ -200,28 +217,55 @@ class RasterGateTests(unittest.TestCase):
         # The two-table trace names another pipeline.
         self.assertIn("did not create", self.run_gate(self.TRACE, [], "raster-samplers")[0]["problem"])
 
-    def test_mesh_draw_prepares_its_mesh_and_needs_the_mesh_pipeline(self):
+    def test_mesh_draw_requires_both_runtime_translations(self):
+        mesh, pixel = "a"*64, "b"*64
         mesh_trace = ("created Xbox mesh pipeline (680-byte stream, amplification=false)\n"
-                      f"created raster pipeline with {verify_module.MESH_SAMPLER_SLOTS} reflected FSSM descriptor slots\n")
-        seen, rootless = self.run_gate(mesh_trace, [], "mesh-samplers")
+                      f"created raster pipeline with {verify_module.MESH_SAMPLER_SLOTS} reflected FSSM descriptor slots\n"
+                      f"prepared mesh shader loaded, source SHA-256 {mesh}\n"
+                      f"prepared pixel shader loaded, source SHA-256 {pixel}\n")
+        seen, rootless = self.run_gate(mesh_trace, [mesh, pixel], "mesh-samplers")
         self.assertEqual(seen["arguments"][:2], ["--selftest", "mesh-samplers"])
         self.assertIsNone(seen["problem"])
-        # Only this scenario has the prepared mesh translation, and it is removed after.
-        self.assertEqual(seen["mesh"], True)
-        self.assertEqual(seen["calls"], ["lanes-raster-tables", "lanes-raster-samplers", "lanes-mesh-samplers", "lanes-mesh-sampler-single"])
-        self.assertEqual(seen["mesh_command"][1:5], ["-T", "ms_6_5", "-E", "main"])
-        self.assertTrue(seen["mesh_command"][-1].endswith("examples/lanes/mesh_samplers.hlsl"))
+        self.assertFalse(seen["mesh"])
+        self.assertEqual(seen["calls"], ["lanes-raster-tables", "lanes-lane-spill-interp", "lanes-raster-samplers", "lanes-mesh-samplers", "lanes-mesh-sampler-single",
+                                         "lanes-mesh-sampler-rootless", "lanes-raster-heap-stride"])
         self.assertEqual(seen["left"], ["title.cso"])
-        # No mesh pipeline, a stand-in, or the pixel program's root-less translation fail.
         self.assertIn("mesh pipeline", self.run_gate(trace(1), [], "mesh-samplers")[0]["problem"])
         self.assertIn("stand-in", self.run_gate(mesh_trace + "substituted null raster stream pipeline\n", [],
                                                 "mesh-samplers")[0]["problem"])
         self.assertIn("without its root", self.run_gate(mesh_trace, [rootless[3]], "mesh-samplers")[0]["problem"])
+        self.assertIn("missing worker receipt for loaded mesh", self.run_gate(mesh_trace, [pixel], "mesh-samplers")[0]["problem"])
+        self.assertIn("missing worker receipt for loaded pixel", self.run_gate(mesh_trace, [mesh], "mesh-samplers")[0]["problem"])
+        seen, _ = self.run_gate(mesh_trace, [mesh, pixel], "mesh-sampler-single")
+        self.assertIsNone(seen["problem"])
+        self.assertFalse(seen["mesh"])
+        # The root with no static samplers runs the same gate, with both stages translated.
+        seen, _ = self.run_gate(mesh_trace, [mesh, pixel], "mesh-sampler-rootless")
+        self.assertEqual(seen["arguments"][:2], ["--selftest", "mesh-sampler-rootless"])
+        self.assertFalse(seen["mesh"])
+        self.assertIsNone(seen["problem"])
+        self.assertIn("stand-in", self.run_gate(mesh_trace + "substituted null raster stream pipeline\n", [],
+                                                "mesh-sampler-rootless")[0]["problem"])
+        self.assertIn("without its root", self.run_gate(mesh_trace, [rootless[4]],
+                                                        "mesh-sampler-rootless")[0]["problem"])
+
+    def test_heap_stride_draw_pages_the_heap_and_needs_the_table(self):
+        bound = "bound paged resource descriptor stride table at graphics root slot 1\n"
+        seen, _ = self.run_gate(bound, ["a" * 64], "raster-heap-stride")
+        self.assertEqual(seen["arguments"][:2], ["--selftest", "raster-heap-stride"])
+        self.assertEqual(seen["env"]["TUXBOX_DESCRIPTOR_HEAP_LIMIT"], "64")
+        self.assertNotIn("TUXBOX_DESCRIPTOR_HEAP_LIMIT", seen["env_after"])
+        self.assertIsNone(seen["problem"])
+        self.assertIn("did not bind", self.run_gate("", ["a" * 64], "raster-heap-stride")[0]["problem"])
+        self.assertIn("translated nothing", self.run_gate(bound, [], "raster-heap-stride")[0]["problem"])
+        key = hashlib.sha256(raster_fixture.heap_stride_vertex()).hexdigest()
+        self.assertIn("without its root", self.run_gate(bound, [key], "raster-heap-stride")[0]["problem"])
 
     def test_scenario_runs_only_under_the_worker(self):
         self.assertNotIn("raster-tables", LANES_SCENARIOS)
         self.assertNotIn("raster-samplers", LANES_SCENARIOS)
         self.assertNotIn("mesh-samplers", LANES_SCENARIOS)
+        self.assertNotIn("raster-heap-stride", LANES_SCENARIOS)
         self.assertIn("lanes-raster-tables", BASE_SUITES)
 
 

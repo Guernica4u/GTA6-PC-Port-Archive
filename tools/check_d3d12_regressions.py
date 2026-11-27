@@ -5,17 +5,28 @@ The supplied build artifacts must come from the intended revision. The
 source Proton prefix is copied and never modified. Logs remain local.
 """
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 from tempfile import TemporaryDirectory
+from threading import Lock
 from time import monotonic
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from project_tuxbox.jobs import check_jobs  # noqa: E402
+# The launcher builds its Vulkan layer on first use; one case at a time.
+LAYER_BUILD = Lock()
 
 CASES = {
     "root-cbv-window": ("d3d12-root-cbv-window", (), "d3d12-root-cbv-window", ("words=120/120","window=65536","offsets=0,256,65280,65536,65792")),
+    "root-cbv-offsets": ("d3d12-root-cbv-window", ("--offsets",), "d3d12-root-cbv-offsets", ("offsets=17/17","step=16","words=408/408")),
     "tables": ("d3d12-tables", (), "d3d12-tables", ("words=16/16", "placed-srv=16/16")),
     "heaps": ("d3d12-heaps", (), "d3d12-heaps", ("words=256/256", "volume=45/45")),
     "alias-deferred": ("d3d12-copy-resource", ("--alias-deferred",), "d3d12-alias-deferred", ("overlaps=2", "old=verified", "refreshed=verified", "no_cpu_wait=1")),
@@ -35,7 +46,10 @@ CASES = {
     "null-usage": ("d3d12-null-usage", (), "d3d12-null-usage", ("words=64/64", "recorded=64", "valid=2")),
     "null-disabled": ("d3d12-null-usage", ("--reject",), "d3d12-null-disabled", ("rejected=1", "valid=1")),
 }
-DEFAULT = tuple(name for name in CASES if name not in ("root-cbv-window", "alias-deferred", "copy-resource", "indirect-scarlett", "mesh", "buffer-import", "buffer-import-reject", "buffer-layout", "buffer-remap", "buffer-unmap-alive", "buffer-unmap-released"))
+DEFAULT = tuple(name for name in CASES if name not in ("root-cbv-window", "root-cbv-offsets", "alias-deferred", "copy-resource", "indirect-scarlett", "mesh", "buffer-import", "buffer-import-reject", "buffer-layout", "buffer-remap", "buffer-unmap-alive", "buffer-unmap-released"))
+# These run with the constant-buffer settings `tuxbox.py run` gives a game. The
+# other cases keep vkd3d-proton's defaults.
+LAUNCHER_CBV = ("root-cbv-offsets",)
 DIGEST = hashlib.sha256(bytes.fromhex("78563412efcdab90")).hexdigest()
 
 
@@ -49,6 +63,23 @@ def imports(records):
     which say how an import was found. What was imported, retried or replaced
     by a stand-in stays."""
     return [record for record in records if not record[0].startswith(("page_", "span_"))]
+
+
+def launcher_cbv(proton, executable):
+    """The variables `tuxbox.py run` adds so 16-byte constant-buffer offsets read
+    correctly, taken from the launcher's own code so the control follows it.
+
+    The root CBV case needs both the layer and force_raw_va_cbv on NVIDIA. An
+    RTX 5090 read 5 of 17 offsets with vkd3d-proton's defaults and with either alone.
+    """
+    sys.path.insert(0, str(ROOT))
+    from project_tuxbox.console_cbv import configure_console_cbv
+
+    # The provider beside the guest is the build under test, wherever it was built.
+    before = dict(os.environ, PROTONPATH=str(proton), TUXBOX_REFERENCE_CBV="1")
+    env = dict(before)
+    configure_console_cbv("proton", env, executable, lambda message: None)
+    return {key: value for key, value in env.items() if before.get(key) != value}
 
 
 def validate(case, adapter, status, output):
@@ -183,8 +214,7 @@ def main(argv=None):
         ap.error("missing build, Proton or compiler artifact")
     fingerprints={k:sha(p) for k,p in artifacts.items()}
     a.work.mkdir(parents=True)
-    rows=[]
-    for case in selected:
+    def run_case(case):
         start=monotonic()
         name,extra,_,_=CASES[case]
         with TemporaryDirectory(dir=a.work,prefix=case+"-") as temp:
@@ -204,6 +234,14 @@ def main(argv=None):
                  "TUXBOX_NULL_PIPELINES":"1" if case=="null-usage" else "0",
                  "TUXBOX_REQUIRE_BUFFER_IMPORT":"1" if case.startswith("buffer-") else "0",
                  "TUXBOX_TRACE_BUFFER_BACKING":"1" if case.startswith("buffer-") or case=="root-cbv-window" else "0"}
+            settings,failure={},None
+            if case in LAUNCHER_CBV:
+                try:
+                    with LAYER_BUILD:
+                        settings=launcher_cbv(a.proton.resolve(),trial/(name+".exe"))
+                    env.update(settings)
+                except (OSError,subprocess.CalledProcessError) as error:
+                    failure=f"constant-buffer setup failed: {error}"
             cmd=["bwrap","--die-with-parent","--unshare-pid","--unshare-net","--ro-bind","/","/",
                  "--dev-bind","/dev","/dev","--proc","/proc","--tmpfs","/tmp","--bind",str(trial),str(trial),
                  "--unsetenv","WAYLAND_DISPLAY","--chdir",str(trial)]
@@ -214,16 +252,30 @@ def main(argv=None):
             log=a.work/(case+".log")
             with log.open("xb") as stream:
                 try:
-                    q=subprocess.run(cmd,stdout=stream,stderr=subprocess.STDOUT,timeout=55)
-                    status=q.returncode
+                    if failure:
+                        # Running without the settings would test another configuration.
+                        stream.write(failure.encode()+b"\n")
+                        status=1
+                    else:
+                        q=subprocess.run(cmd,stdout=stream,stderr=subprocess.STDOUT,timeout=55)
+                        status=q.returncode
                 except subprocess.TimeoutExpired:
                     status=124
             # Logs are local only; the JSON receipt contains a fixed case
             # name, exit status and the known fixture's synthetic PASS line.
             ok,receipt=validate(case,a.adapter,status,log.read_text(errors="replace"))
-            rows.append(dict(case=case,passed=ok,exit=status,seconds=round(monotonic()-start,3),receipt=receipt,
-                             null_fallback_enabled=case=="null-usage"))
-            print(case,"PASS" if ok else "FAIL",flush=True)
+            row=dict(case=case,passed=ok,exit=status,seconds=round(monotonic()-start,3),receipt=receipt,
+                     null_fallback_enabled=case=="null-usage")
+            if case in LAUNCHER_CBV:
+                # The names say which route ran. Paths stay out of the receipt.
+                row["launcher_cbv"]={k:settings.get(k,"") for k in ("VKD3D_CONFIG","VK_INSTANCE_LAYERS","VKD3D_DISABLE_EXTENSIONS")}
+            return row,failure
+    rows=[]
+    # Each case runs in its own sandbox with a copied prefix and its own X server.
+    with ThreadPoolExecutor(check_jobs()) as pool:
+        for row,failure in pool.map(run_case,selected):
+            rows.append(row)
+            print(row["case"],"PASS" if row["passed"] else "FAIL",*([failure] if failure else []),flush=True)
     unchanged=fingerprints=={k:sha(p) for k,p in artifacts.items()}
     report=dict(schema=1,scope="Synthetic D3D12 provider controls; not retail execution",
                 adapter=a.adapter.lower(),proton=(a.proton/"version").read_text().strip(),

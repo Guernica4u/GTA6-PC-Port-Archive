@@ -132,7 +132,7 @@ def main():
         for kind, inst in [("clamp", "v_sad_u8 v10, v4, v5, v6 clamp"),
                            ("scalar_source", "v_sad_u32 v10, s4, v5, v6"),
                            ("carry_destination", "v_mad_i64_i32 v[14:15], vcc_lo, v4, v5, v[6:7]"),
-                           ("masked_sad", "v_msad_u8 v10, v4, v5, v6")]:
+                           ("masked_sad_clamp", "v_msad_u8 v10, v4, v5, v6 clamp")]:
             bad = translate(a.emitter, assemble([inst, "s_endpgm"], a.llvm_mc))
             if bad.returncode != 65:
                 raise ValueError(f"unexpected acceptance {inst}")

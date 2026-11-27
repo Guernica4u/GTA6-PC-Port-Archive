@@ -407,6 +407,13 @@ fn adopt_bundle(parent_state: &mut Recording, bundle: &Recording) -> Result<(), 
     for range in &bundle.sampled_heaps {
         super::descriptors::include_range(&mut parent_state.sampled_heaps, range.clone());
     }
+    parent_state
+        .read_heaps
+        .try_reserve(bundle.read_heaps.len())
+        .map_err(|_| E_OUTOFMEMORY)?;
+    for range in &bundle.read_heaps {
+        super::descriptors::include_range(&mut parent_state.read_heaps, range.clone());
+    }
     for arena in &bundle.indexed_arenas {
         if parent_state.indexed_arenas.iter().any(|used| std::sync::Arc::ptr_eq(used, arena)) {
             continue;

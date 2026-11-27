@@ -44,23 +44,26 @@ impl SceneLocation {
 
 #[derive(PartialEq)]
 pub(super) struct SceneCheck {
-    location: SceneLocation,
-    pub(super) scene: (ID3D12Resource, u64),
+    locations: Vec<SceneLocation>,
+    /// One native scene per private scene register, in register order.
+    pub(super) scenes: Vec<(ID3D12Resource, u64)>,
     pub(super) geometry: Option<[(ID3D12Resource, u64); 2]>,
 }
 
 impl SceneCheck {
     pub(super) fn recheck_on_submit(&self) -> bool {
-        matches!(self.location, SceneLocation::Table(_)) || self.geometry.is_some()
+        self.locations.iter().any(|l| matches!(l, SceneLocation::Table(_))) || self.geometry.is_some()
     }
 
     pub(super) fn validate(&self, list: &super::List) -> Result<()> {
         let owner = list.parent.as_ref().ok_or(E_INVALIDARG)?;
-        if unsafe { self.location.resolve(owner)? } != self.scene {
-            return Err(E_INVALIDARG.into());
+        for (location, scene) in self.locations.iter().zip(&self.scenes) {
+            if unsafe { location.resolve(owner)? } != *scene {
+                return Err(E_INVALIDARG.into());
+            }
         }
         if let Some(geometry) = &self.geometry
-            && unsafe { crate::device::blas::inline_geometry(owner, self.scene.1)? } != *geometry
+            && unsafe { crate::device::blas::inline_geometry(owner, self.scenes[0].1)? } != *geometry
         {
             return Err(E_INVALIDARG.into());
         }
@@ -69,7 +72,8 @@ impl SceneCheck {
 }
 
 pub(super) enum Pipeline {
-    Regular(ID3D12PipelineState, Option<SceneRoot>, Option<Arc<ComputeTable>>, Option<Arc<ComputeTable>>, Option<[u32; 3]>, Option<ID3D12RootSignature>),
+    /// The last field is `PipelineData::image_writes`.
+    Regular(ID3D12PipelineState, Option<SceneRoot>, Option<Arc<ComputeTable>>, Option<Arc<ComputeTable>>, Option<[u32; 3]>, Option<ID3D12RootSignature>, Option<Arc<[(u32, u32)]>>),
     Ray(ID3D12StateObject),
 }
 
@@ -109,7 +113,7 @@ pub(super) enum Argument {
 
 impl From<&GuestPipeline> for Pipeline {
     fn from(p: &GuestPipeline) -> Self {
-        Self::Regular(p.native.clone(), p.state.scene_root.clone(), p.state.reflected.clone(), p.state.raster_table.clone(), p.state.compute_threads, p.state.sampler_root.clone())
+        Self::Regular(p.native.clone(), p.state.scene_root.clone(), p.state.reflected.clone(), p.state.raster_table.clone(), p.state.compute_threads, p.state.sampler_root.clone(), p.state.image_writes.clone())
     }
 }
 
@@ -249,16 +253,36 @@ impl Bindings {
 
     pub(super) fn compute_threads(&self) -> Option<[u32; 3]> {
         match self.pipeline.as_ref() {
-            Some(Pipeline::Regular(_, _, _, _, threads, _)) => *threads,
+            Some(Pipeline::Regular(_, _, _, _, threads, ..)) => *threads,
             _ => None,
         }
     }
 
     pub(super) fn reflected_table<const COMPUTE: bool>(&self) -> Option<&ComputeTable> {
         match &self.pipeline {
-            Some(Pipeline::Regular(_, _, compute, raster, _, _)) => if COMPUTE { compute.as_deref() } else { raster.as_deref() },
+            Some(Pipeline::Regular(_, _, compute, raster, ..)) => if COMPUTE { compute.as_deref() } else { raster.as_deref() },
             _ => None,
         }
+    }
+
+    /// The view handles the bound pipeline can write an image through, when
+    /// they are all known table descriptors resident in `heap`. `None` when
+    /// the pipeline may write any texture it picks from the whole heap.
+    fn written_views(
+        &self, table: &ComputeTable, heap: &super::descriptors::ResourceHeap,
+        bases: &[Option<D3D12_GPU_DESCRIPTOR_HANDLE>],
+    ) -> Option<Vec<std::ops::Range<usize>>> {
+        let Some(Pipeline::Regular(.., Some(slots))) = &self.pipeline else { return None };
+        slots.iter().map(|&(guest, slot)| {
+            // The table is resident at its own parameter, or at an appended
+            // parameter that binds the same guest table with another length.
+            let host = (0..table.lengths.len()).find(|&host| {
+                let bound = table.mirrors.iter().find(|(mirror, _)| *mirror as usize == host)
+                    .map_or(host as u32, |&(_, guest)| guest);
+                bound == guest && slot < table.lengths[host] && bases.get(host).is_some_and(Option::is_some)
+            })?;
+            heap.table(bases[host]?.ptr, &(slot..slot + 1))
+        }).collect()
     }
 
     pub(super) fn with_reflected_table<const COMPUTE: bool>(
@@ -266,7 +290,9 @@ impl Bindings {
         arena: Option<&Arc<crate::device::descriptor_paging::Arena>>,
         leases: &mut crate::device::descriptor_paging::DescriptorLeases,
         heap: Option<&super::descriptors::ResourceHeap>, reads: &mut Vec<std::ops::Range<usize>>,
-        resources: &crate::device::MediaResources, dispatch: impl FnOnce(),
+        heap_reads: &mut Vec<std::ops::Range<usize>>,
+        resources: &crate::device::MediaResources,
+        scene: Option<(&SceneRoot, &[u64], Option<[u64; 2]>)>, dispatch: impl FnOnce(),
     ) -> Result<()> {
         let layout = if COMPUTE { &self.layout } else { &self.graphics_layout };
         if !layout.as_ref().is_some_and(|l| l.matches(&table.original)) {
@@ -286,14 +312,20 @@ impl Bindings {
             });
         }
         let heap = heap.ok_or(E_INVALIDARG)?;
+        // A program that picks views from the whole heap can write any
+        // writable texture in it, unless every image store it has goes
+        // through a known table descriptor. Then the rest of the heap is only
+        // read, and only the textures at those descriptors need publishing.
+        let written = self.written_views(table, heap, bases);
+        let whole_heap = if written.is_some() { &mut *heap_reads } else { &mut *reads };
         let index_map = if let Some(binding) = table.index_map {
             // Global indices originate in shader data. Any resident SRV can
             // sample placed textures and needs the usual pre-submit upload.
-            super::descriptors::include_range(reads, heap.cpu.clone());
+            super::descriptors::include_range(whole_heap, heap.cpu.clone());
             Some((binding.slot, heap.index_map(guest, arena.map(Arc::as_ref), resources)?))
         } else {
             if table.layout.direct_resources {
-                super::descriptors::include_range(reads, heap.cpu.clone());
+                super::descriptors::include_range(whole_heap, heap.cpu.clone());
             }
             for (slot, range) in &table.accessed_views {
                 let base = bases[*slot].ok_or(E_INVALIDARG)?;
@@ -301,6 +333,9 @@ impl Bindings {
             }
             None
         };
+        for range in written.into_iter().flatten() {
+            super::descriptors::include_range(reads, range);
+        }
         // Only paged heaps keep strides; a program that needs them cannot run on another.
         let strides = match table.heap_strides {
             Some(slot) => Some((slot, heap.stride_table(arena.ok_or(E_INVALIDARG)?, resources)?)),
@@ -308,10 +343,19 @@ impl Bindings {
         };
         unsafe {
             if COMPUTE {
-                list.SetComputeRootSignature(&table.native);
+                // A ray-query program's scene root is the reflected root with
+                // its private scene SRVs appended.
+                list.SetComputeRootSignature(scene.map_or(&table.native, |(root, ..)| &root.native));
                 // Changing root signatures invalidates the native arguments. Replay
                 // constants and descriptors, then substitute each reflected table.
                 self.apply_compute_args(list, bases);
+                if let Some((root, scenes, geometry)) = scene {
+                    let mut slot = root.appended;
+                    for &va in scenes.iter().chain(geometry.iter().flatten()) {
+                        list.SetComputeRootShaderResourceView(slot, va);
+                        slot += 1;
+                    }
+                }
                 if let Some((slot, address)) = strides {
                     list.SetComputeRootShaderResourceView(slot, address);
                 }
@@ -340,6 +384,15 @@ impl Bindings {
                         list.SetGraphicsRootDescriptorTable(host, base);
                     }
                 }
+                if let Some((slot, address)) = strides {
+                    list.SetGraphicsRootShaderResourceView(slot, address);
+                    static STRIDES_IDENTITY: std::sync::Once = std::sync::Once::new();
+                    static STRIDES_PAGED: std::sync::Once = std::sync::Once::new();
+                    let (site, kind) = if arena.is_some() { (&STRIDES_PAGED, "paged") } else { (&STRIDES_IDENTITY, "identity") };
+                    crate::diagnostics::log_once(site, || {
+                        format!("bound {kind} resource descriptor stride table at graphics root slot {slot}")
+                    });
+                }
                 if let Some((slot, address)) = index_map {
                     list.SetGraphicsRootShaderResourceView(slot, address);
                     static IDENTITY: std::sync::Once = std::sync::Once::new();
@@ -360,7 +413,7 @@ impl Bindings {
 
     pub(super) fn scene_root(&self) -> Option<&SceneRoot> {
         match self.pipeline.as_ref() {
-            Some(Pipeline::Regular(_, root, _, _, _, _)) => root.as_ref(),
+            Some(Pipeline::Regular(_, root, ..)) => root.as_ref(),
             _ => None,
         }
     }
@@ -375,26 +428,31 @@ impl Bindings {
             return Err(E_INVALIDARG.into());
         }
         let owner = list.parent.as_ref().ok_or(E_INVALIDARG)?;
-        let location = match scene.source {
-            SceneSource::Table { slot, offset } => {
-                SceneLocation::Table(self.table_entry(slot, offset)?)
-            }
-            SceneSource::RootSrv(slot) => {
-                let Some(Argument::Buffer(BufferView::Srv(address))) = self.compute_args.get(&slot) else {
-                    return Err(E_INVALIDARG.into());
-                };
-                SceneLocation::Address(*address)
-            }
-        };
-        let backing = unsafe { location.resolve(owner)? };
-        let geometry = if scene.program.triangle_geometry {
-            Some(unsafe { crate::device::blas::inline_geometry(owner, backing.1)? })
-        } else {
-            None
+        let mut locations = Vec::with_capacity(scene.sources.len());
+        let mut scenes = Vec::with_capacity(scene.sources.len());
+        for source in scene.sources.iter() {
+            let location = match *source {
+                SceneSource::Table { slot, offset } => {
+                    SceneLocation::Table(self.table_entry(slot, offset)?)
+                }
+                SceneSource::RootSrv(slot) => {
+                    let Some(Argument::Buffer(BufferView::Srv(address))) = self.compute_args.get(&slot) else {
+                        return Err(E_INVALIDARG.into());
+                    };
+                    SceneLocation::Address(*address)
+                }
+            };
+            scenes.push(unsafe { location.resolve(owner)? });
+            locations.push(location);
+        }
+        let geometry = match (scene.program.triangle_geometry, scenes.as_slice()) {
+            (false, _) => None,
+            (true, [only]) => Some(unsafe { crate::device::blas::inline_geometry(owner, only.1)? }),
+            (true, _) => return Err(E_INVALIDARG.into()),
         };
         Ok(SceneCheck {
-            location,
-            scene: backing,
+            locations,
+            scenes,
             geometry,
         })
     }
@@ -515,7 +573,7 @@ impl Bindings {
 
     pub(super) fn sampler_root(&self) -> Option<&ID3D12RootSignature> {
         match self.pipeline.as_ref() {
-            Some(Pipeline::Regular(.., root)) => root.as_ref(),
+            Some(Pipeline::Regular(.., root, _)) => root.as_ref(),
             _ => None,
         }
     }
@@ -541,17 +599,19 @@ impl Bindings {
         &self,
         host: &ID3D12GraphicsCommandList,
         root: &SceneRoot,
-        va: u64,
+        scenes: &[u64],
         geometry: Option<[u64; 2]>,
         dispatch: impl FnOnce(),
     ) {
         unsafe {
             host.SetComputeRootSignature(&root.native);
             self.apply_compute_args(host, &[]);
-            host.SetComputeRootShaderResourceView(root.appended, va);
-            if let Some([instances, normals]) = geometry {
-                host.SetComputeRootShaderResourceView(root.appended + 1, instances);
-                host.SetComputeRootShaderResourceView(root.appended + 2, normals);
+            // Private root SRVs follow the title's parameters: scenes in
+            // register order, then the geometry tables of a single scene.
+            let mut slot = root.appended;
+            for &va in scenes.iter().chain(geometry.iter().flatten()) {
+                host.SetComputeRootShaderResourceView(slot, va);
+                slot += 1;
             }
             dispatch();
             host.SetComputeRootSignature(self.compute.as_ref());
