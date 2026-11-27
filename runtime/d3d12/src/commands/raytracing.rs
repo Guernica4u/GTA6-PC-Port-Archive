@@ -317,8 +317,16 @@ pub(super) unsafe extern "system" fn postbuild(
                 .scene_commands
                 .push(SceneCommand::Source { guest, native });
         }
+        let mut output = *desc;
+        output.DestBuffer = super::build_raytracing::guest_addresses::native(
+            &state,
+            owner,
+            desc.DestBuffer,
+            u64::from(count).saturating_mul(8),
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        )?;
         state.record_write(desc.DestBuffer, u64::from(count).saturating_mul(8));
-        unsafe { host.EmitRaytracingAccelerationStructurePostbuildInfo(desc, &patched) };
+        unsafe { host.EmitRaytracingAccelerationStructurePostbuildInfo(&output, &patched) };
         Ok(())
     })();
     if let Err(error) = result {

@@ -34,7 +34,7 @@ SUITES = (*BASE_SUITES, "d3d12-mesh", *OPTIONAL_PROVIDERS)
 LANES_SCENARIOS = ("labels", "cross-queue", "compute-frame", "skipped-command", "copy-memory", "shared-texture",
                    "indirect-dispatch", "gpu-indirect-dispatch", "gpu-indirect-order",
                    "dispatch-wait", "direct-copy-wait", "texture-readback", "texture-publication",
-                   "ray-tracing-builder", "thread-dimensions",
+                   "ray-tracing-builder", "ray-tracing-guest-memory", "thread-dimensions",
                    "descriptor-reclaim", "unwritten-descriptors")
 
 
@@ -1097,7 +1097,7 @@ def verify(host, output, adapter, selected=None, samples=1):
                       providers={"lanes/xmem.dll": memory_symbols, "lanes/GameInput.dll": ("#1",),
                                  "lanes/d3d12_xs.dll": ("D3D12XboxCreateDevice",)},
                       config="lanes/MicrosoftGame.config", device_factory="xbox",
-                      dependencies=("lanes/XboxBvhBuilder.dll",) if scenario == "ray-tracing-builder" else ())
+                      dependencies=("lanes/XboxBvhBuilder.dll",) if scenario.startswith("ray-tracing-") else ())
             if saved_limit is None:
                 host.env.pop("TUXBOX_DESCRIPTOR_HEAP_LIMIT", None)
             else:
@@ -1238,6 +1238,7 @@ GATE_LABELS = {
     "lanes-selftest-texture-publication": "GPU texture writes published to title memory, leaving padding, closed pages and memory past the texture alone",
     "lanes-benchmark": "Lanes frame, submission, fence handover, copy and pipeline timings",
     "lanes-selftest-ray-tracing-builder": "Single, copied and batched builds through XboxBvhBuilder",
+    "lanes-selftest-ray-tracing-guest-memory": "A structure, its copy and a scene built in title memory that no resource names",
     "lanes-selftest-thread-dimensions": "Slot 80 thread-dimension dispatch converted using the bound PSO group size",
     "lanes-selftest-descriptor-reclaim": "Shader-visible descriptor slot reclamation across completed, in-flight, ClearState, and OOM lists",
     "lanes-selftest-unwritten-descriptors": "A descriptor table with slots the title never wrote, in a heap whose title memory held leftover bytes",
