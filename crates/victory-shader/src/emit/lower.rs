@@ -882,7 +882,9 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
     };
     let sections: Vec<_> = (0..p.blocks.len()).map(|b| super::wave::sections(p, b)).collect();
     let order = crate::ir::reverse_postorder(&p.blocks);
-    let pass = |kind: &mut HashMap<Value, Wave>, firsts: &mut HashSet<Value>, check: bool| -> Result<(), (usize, Why)> {
+    // guarded writes over a wave-dependent value: the block and guard they were written under
+    type Stale = HashMap<Value, (usize, crate::structure::Bool)>;
+    let pass = |kind: &mut HashMap<Value, Wave>, firsts: &mut HashSet<Value>, stale: &mut Stale, check: bool| -> Result<(), (usize, Why)> {
         for &b in &order {
             let block = &p.blocks[b];
             for phi in &block.phis {
@@ -929,7 +931,21 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
                 if name.starts_with("s_cbranch") {
                     continue; // with the block's exit, below
                 }
-                let (k, reserved) = match step(inst, kind, firsts) {
+                // Values `stale` under this very guard in this block: the lanes that run it
+                // are the ones that wrote them, so they read only the new value.
+                let guard = st.guards[b][i];
+                let fresh: Vec<(Value, Wave)> = match guard {
+                    Some(g) => inst
+                        .reads
+                        .iter()
+                        .filter(|&&(_, v)| stale.get(&v) == Some(&(b, g)))
+                        .filter_map(|&(_, v)| kind.remove(&v).map(|k| (v, k)))
+                        .collect(),
+                    None => Vec::new(),
+                };
+                let stepped = step(inst, kind, firsts);
+                kind.extend(fresh);
+                let (k, reserved) = match stepped {
                     Ok(r) => r,
                     Err(why) if check => return Err((inst.machine.offset, why)),
                     Err(_) => (Wave::Mixed, false),
@@ -946,7 +962,6 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
                 if check && effect && !reserved && first_mask(firsts, inst.read(Reg::S(EXEC))) {
                     return Err((inst.machine.offset, EFFECT));
                 }
-                let guarded = st.guards[b][i].is_some();
                 for &(r, w) in &inst.writes {
                     let mut kw = match r {
                         // "some lane is counted" keeps the count's kind; any other SCC is one bit of data
@@ -955,13 +970,18 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
                         }
                         _ => k,
                     };
-                    // a guarded write leaves the old value in the lanes outside EXEC
-                    if guarded
+                    // a guarded write leaves the old value in the lanes outside EXEC: the
+                    // value is mixed, but not to a later read under the same guard
+                    if let Some(g) = guard
                         && matches!(r, Reg::V(_))
                         && kw == Wave::Plain
-                        && matches!(of(kind, inst.read(r)), Wave::First | Wave::Total(_) | Wave::Prefix)
+                        && inst.read(r).is_some_and(|old| {
+                            stale.contains_key(&old)
+                                || matches!(of(kind, Some(old)), Wave::First | Wave::Total(_) | Wave::Prefix)
+                        })
                     {
                         kw = Wave::Mixed;
+                        stale.insert(w, (b, g));
                     }
                     put(kind, w, kw);
                 }
@@ -985,12 +1005,13 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
     };
     let mut kind: HashMap<Value, Wave> = HashMap::new();
     let mut firsts: HashSet<Value> = HashSet::new();
+    let mut stale: Stale = HashMap::new();
     // to a fixpoint (values carried around loops), then once more to say what is wrong
     let mut settled = false;
     for _ in 0..16 {
-        let before = (kind.clone(), firsts.len());
-        pass(&mut kind, &mut firsts, false)?;
-        if (&before.0, before.1) == (&kind, firsts.len()) {
+        let before = (kind.clone(), firsts.len(), stale.clone());
+        pass(&mut kind, &mut firsts, &mut stale, false)?;
+        if (&before.0, before.1, &before.2) == (&kind, firsts.len(), &stale) {
             settled = true;
             break;
         }
@@ -998,7 +1019,7 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
     if !settled {
         return Err((0, MIXED));
     }
-    pass(&mut kind, &mut firsts, true)
+    pass(&mut kind, &mut firsts, &mut stale, true)
 }
 
 /// The mode of a group barrier the translation adds (host waves meeting):
