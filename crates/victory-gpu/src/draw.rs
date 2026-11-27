@@ -2190,9 +2190,10 @@ mod group_limit_tests {
 mod indirect_tests {
     use super::*;
     use crate::object::slot;
+    use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 
     #[test]
-    fn rejected_indexed_rectangle_leaves_the_inline_pipeline_cache_invalidated() {
+    fn ordinary_draw_rebinds_the_pipeline_after_a_rejected_indexed_rectangle() {
         let Some(host) = crate::host::host() else {
             eprintln!("skipped inline indirect state test: no host D3D12 device");
             return;
@@ -2203,7 +2204,8 @@ mod indirect_tests {
         state.set_pipeline(pipeline);
         state.set_topology(&list, RECTANGLES);
         assert!(state.prepare(&list, false));
-        assert_ne!(state.host_pipeline, 0);
+        let graphics_pipeline = state.host_pipeline;
+        assert_ne!(graphics_pipeline, 0);
         let graphics_root = state.host_roots[0];
 
         // A zero-work indexed argument still records the inline clamp, then
@@ -2212,17 +2214,23 @@ mod indirect_tests {
         let (bytes, _) = crate::resource::buffer_bytes(arguments).unwrap();
         // SAFETY: this buffer owns a writable 20-byte indexed argument.
         unsafe { bytes.write_bytes(0, 20) };
-        let ran = state.execute_indirect(&list, (1, 20, 1), bytes as u64, None);
-        list.close();
-        let release = |object| slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
-        assert_eq!(release(arguments), 0);
-        assert_eq!(release(pipeline), 0);
-
-        assert!(!ran);
+        assert!(!state.execute_indirect(&list, (1, 20, 1), bytes as u64, None));
         assert_eq!(
             state.host_pipeline, 0,
             "the clamp replaced the graphics PSO"
         );
         assert_eq!(state.host_roots[0], graphics_root);
+
+        state.set_topology(&list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST.0 as u32);
+        // Record an ordinary draw on the same list without submitting GPU work.
+        assert!(!list.worked());
+        state.draw(&list, 0, 1, 0, 0);
+        assert!(list.worked());
+        assert_eq!(state.host_pipeline, graphics_pipeline);
+
+        list.close();
+        let release = |object| slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+        assert_eq!(release(arguments), 0);
+        assert_eq!(release(pipeline), 0);
     }
 }
