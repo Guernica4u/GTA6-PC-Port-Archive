@@ -72,3 +72,18 @@ fn scalar_load_beside_the_elected_lane_is_not_a_use() {
     assert!(verify_lane_election(&mut program(load("s_buffer_load_dword", 7, 8, 0x7d)), 1, false).is_err());
     assert!(verify_lane_election(&mut program(load("s_load_dwordx4", 4, 12, 0x7d)), 1, false).is_err());
 }
+
+#[test]
+fn lane_spill_padding_is_not_a_use_of_the_elected_lane() {
+    // `v_writelane_b32 v86, s2, 0` decodes its unused third source field as s0.
+    let program = |value: Opnd, lane: Opnd| vec![
+        op("v_mbcnt_lo_u32_b32", Enc::Vop3, vec![Opnd::Vgpr(7)], vec![Opnd::ConstInt(-1), Opnd::ConstInt(0)], 0),
+        op("s_ff1_i32_b32", Enc::Sop1, vec![Opnd::Sgpr(0)], vec![Opnd::ExecLo], 4),
+        op("v_writelane_b32", Enc::Vop3, vec![Opnd::Vgpr(86)], vec![value, lane, Opnd::Sgpr(0)], 8),
+        op("v_cmpx_eq_i32", Enc::Vopc, vec![Opnd::VccLo], vec![Opnd::Sgpr(0), Opnd::Vgpr(7)], 16),
+    ];
+    assert!(verify_lane_election(&mut program(Opnd::Sgpr(2), Opnd::ConstInt(0)), 1, false).is_ok());
+    // Spilling the elected lane, or writing the lane it names, does use it.
+    assert!(verify_lane_election(&mut program(Opnd::Sgpr(0), Opnd::ConstInt(0)), 1, false).is_err());
+    assert!(verify_lane_election(&mut program(Opnd::Sgpr(2), Opnd::Sgpr(0)), 1, false).is_err());
+}

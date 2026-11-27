@@ -153,7 +153,7 @@ pub(in crate::hlsl) fn verify_lane_election(insns: &mut [Insn], ff1: usize, stra
     let targets = branch_targets(insns);
     // Two-source VOP3 forms decode an unused third source; ignore it.
     let sources = |ins: &Insn| {
-        let two = ins.mnemonic.starts_with("v_cmp_") || ins.mnemonic.starts_with("v_mbcnt_");
+        let two = ins.mnemonic.starts_with("v_cmp_") || ins.mnemonic.starts_with("v_mbcnt_") || ins.mnemonic == "v_writelane_b32";
         ins.src.iter().take(if two { 2 } else { usize::MAX }).cloned().collect::<Vec<_>>()
     };
     let cmp = (ff1 + 1..insns.len())
