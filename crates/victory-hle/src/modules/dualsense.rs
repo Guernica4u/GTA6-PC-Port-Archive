@@ -50,10 +50,12 @@ const RIGHT_SHOULDER: u32 = 0x800;
 const LEFT_STICK: u32 = 0x1000;
 const RIGHT_STICK: u32 = 0x2000;
 
-/// Sony's vendor id and the DualSense / DualSense Edge product ids.
+/// Sony's vendor id and the pads read here: DualSense, DualSense Edge and
+/// DualShock 4 (v1, v2). A DS4's report declares the same usages in the same
+/// button order, so the parser below reads it unchanged; Sunshine's ViGEmBus
+/// pad for a PlayStation client is a DS4 v1 (0x05c4).
 const SONY: u16 = 0x054c;
-const DUALSENSE: u16 = 0x0ce6;
-const DUALSENSE_EDGE: u16 = 0x0df2;
+const PRODUCTS: [u16; 4] = [0x0ce6, 0x0df2, 0x05c4, 0x09cc];
 
 const GENERIC_READ: u32 = 0x8000_0000;
 
@@ -174,10 +176,7 @@ fn open_pad() -> Option<Pad> {
         attributes.Size = std::mem::size_of::<HIDD_ATTRIBUTES>() as u32;
         // SAFETY: a live HID handle and room for the attributes.
         let known = unsafe { HidD_GetAttributes(handle, &mut attributes) };
-        if known
-            && attributes.VendorID == SONY
-            && (attributes.ProductID == DUALSENSE || attributes.ProductID == DUALSENSE_EDGE)
-        {
+        if known && attributes.VendorID == SONY && PRODUCTS.contains(&attributes.ProductID) {
             let mut preparsed: isize = 0;
             // SAFETY: a live HID handle and room for the pointer.
             if !unsafe { HidD_GetPreparsedData(handle, &mut preparsed) } {
@@ -489,8 +488,27 @@ mod tests {
             println!("  {}", String::from_utf16_lossy(path));
         }
         match open_pad() {
-            Some(pad) => println!("opened a DualSense: report length {}", pad.input_len),
-            None => println!("no DualSense opened"),
+            Some(pad) => {
+                println!("opened a Sony pad: report length {}", pad.input_len);
+                let mut buf = vec![0u8; pad.input_len.max(78)];
+                let mut read = 0u32;
+                // SAFETY: a live handle and a buffer of its report length.
+                // Blocks until the pad sends a report.
+                unsafe {
+                    ReadFile(
+                        pad.handle,
+                        buf.as_mut_ptr().cast(),
+                        buf.len() as u32,
+                        &mut read,
+                        std::ptr::null_mut(),
+                    )
+                };
+                println!(
+                    "first report: {:?}",
+                    parse(pad.preparsed, &buf[..read as usize])
+                );
+            }
+            None => println!("no Sony pad opened"),
         }
     }
 }
