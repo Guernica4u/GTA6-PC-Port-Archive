@@ -26,7 +26,11 @@ The program is lowered in the per-lane form (`structure`): no EXEC, lane
 masks are per-lane booleans, and a branch on a wave-wide mask test becomes
 a branch on the lane's own bit. Scalar code runs in each half on its own;
 a scalar is the same in both halves while everything it is computed from
-is.
+is. On the console a scalar is the wave's: after a branch or a loop only
+some lanes take, every lane holds what the last block the wave ran left,
+also a lane that skipped it. The per-lane form gives each lane its own
+path's value instead, so in halves such a region runs wave-wide where a
+scalar it leaves is read after it (Level 3, below).
 
 ## What each operation needs
 
@@ -50,7 +54,7 @@ group does (`lower::wide`), so the halves meet there.
 | `v_readlane_b32` of a value the same in every lane of the console wave, written where every lane runs | that value | the lane's own | 1 |
 | `v_readlane_b32`, any other | every lane gets lane L's value | the half holding lane L gives it (`Lower::across`) | 2, 3 |
 | `v_readfirstlane_b32` of a value the same in every lane of the console wave (`halves::lane_uniform`), or a waterfall loop's descriptor read | that value | exact | 1 |
-| `v_readfirstlane_b32`, any other | the first lane in EXEC of 64 | each half's first lane in EXEC and whether it has one, traded: the low half's if any (`Lower::first_lane`) | 2, 3 |
+| `v_readfirstlane_b32`, any other | the first lane in EXEC of 64 | each half's first lane in EXEC and whether it has one, traded: the low half's if any (`Lower::first_lane`); a program with no other cross-lane read runs in halves for it (`halves::first_across`) | 2, 3 |
 | A lane mask read as data (`s_bcnt1_i32_b64`, `s_ff1_i32_b64`, 64-bit compares, masks stored) | 64 bits | each half's ballot is one dword of it, traded (`Lower::mask_halves`) | 2, 3 |
 | Whole-wave sections (reductions, prefix sums) | over 64 lanes | each half's part, traded and combined, low half first (`Lower::reduce_halves`) | 2, 3 |
 | A value a whole-wave section leaves whose lanes hold different things (each half's sum in some, the wave's in others), read after it | each lane's own | where every thread meets, in a group of whole console waves, the section runs step by step, its lane reads across the halves traded (`halves::Literal`); main keeps such a value as zero in lanes a later masked write leaves, and refuses it in halves elsewhere | 2 |
@@ -137,9 +141,11 @@ regions. Two cases are lowered, tried in this order after Level 2:
   VGPR write keeps the old value elsewhere, memory is accessed by those
   lanes only, ballots, first lanes and DPP source lanes see only them), the
   phis of the region and of its join pick, lane by lane, the value along
-  the edge the lane came by, a whole-wave section the simulation cannot
-  follow runs step by step over the block's lanes, and every block of the
-  region is one where
+  the edge the lane came by (a scalar's is the console wave's: what the
+  last of those edges' blocks that some lane of the wave ran left, the
+  halves trading whether they ran it, `Lower::wide_fold`), a whole-wave
+  section the simulation cannot follow runs step by step over the block's
+  lanes, and every block of the region is one where
   every thread meets, so the halves trade and order LDS there. A lane read
   of a lane outside the block gives its old value, as on the console. A
   lane that gets to an end is in no block after it, and every thread ends
@@ -153,18 +159,21 @@ regions. Two cases are lowered, tried in this order after Level 2:
   edge out of the loop is out of it from then on, and after the loop the
   edge's lanes are all that left along it. What a lane holds stays as it
   left it: VGPR writes are guarded, and every other value a block of the
-  loop defines (scalars, compare bits, what whole-wave sections leave,
-  ballots) is kept per lane from the last round the lane ran the block, as
-  each lane holds it in the per-lane form. Past the iteration limit
+  loop defines (compare bits, what whole-wave sections leave, ballots) is
+  kept per lane from the last round the lane ran the block, as each lane
+  holds it in the per-lane form; a scalar, in every lane, from the last
+  round some lane of the wave ran the block. Past the iteration limit
   (`LOOP_LIMIT`) the loop ends for every thread, and a lane still going
   round is in no block of the region after it.
 - Only a region with no scalar code with effects beyond its values and
   loops entered at their headers runs wave-wide. Regions run wave-wide only
-  where an
-  attempt at lowering was refused for want of a meeting: a program that
-  needs none is lowered as before, and one that does pays two barriers per
-  exchange inside its regions (and per round of a loop) and a select per
-  write there.
+  where an attempt at lowering was refused for want of a meeting, or where
+  a join reads a scalar whose value differs by the way a lane came
+  (`Lower::scalar_join`; should the attempt that runs such regions
+  wave-wide fail, the one before stands): a program that needs none is
+  lowered as before, and one that does pays two barriers per exchange
+  inside its regions (and per round of a loop, and per join or loop block
+  whose scalars are the wave's) and a select per write there.
 
 ## Two console lanes per host lane
 
@@ -252,7 +261,11 @@ round (the halves going round different numbers of times) with first
 lanes, masks and LDS inside, and a first lane read after such a loop;
 regions a whole-group branch goes around or into, a section run step by
 step whose uneven lanes are kept (also in a block run wave-wide), a 16-bit
-sum, and the lane permutes.
+sum, and the lane permutes; and the scalars branches and loops leave: a
+first-lane read in a branch of each of Lyrnc's masks (lanes of one half,
+of both, one lane, none), stored inside the branch and by every lane after
+the join, and the scalars a loop leaves read by every lane, the one that
+never entered it too (after pickles976's lane-loop consumers).
 `emit::halves_random_tests` runs random wave64 programs (cross-lane steps
 at the top level, in branches one inside another and in loops each lane
 leaves in its own round, LDS, scalar branches, lanes that end partway,
