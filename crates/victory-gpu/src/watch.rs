@@ -63,6 +63,7 @@ impl Journal {
     /// Page `page` was found written by asking `now`: the parts in `parts`
     /// (a bit each). The asking that found it written before (0: none).
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
+        bump_write_blocks(page / (BLOCK / PAGE), page / (BLOCK / PAGE) + 1);
         let before = self.written.insert(page, now).unwrap_or(0);
         if parts == WHOLE || !parts_on() {
             self.parts.remove(&page);
@@ -195,6 +196,45 @@ static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
     ahead_asked: 0,
     kept: false,
 });
+
+const WRITE_BLOCKS: usize = 1 << 16; // 4 GiB / 64 KiB
+static BLOCK_WRITE_GEN: [std::sync::atomic::AtomicU64; WRITE_BLOCKS] = [const { std::sync::atomic::AtomicU64::new(1) }; WRITE_BLOCKS];
+static ASK_END_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn kept() -> bool {
+    KEPT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[inline]
+fn bump_write_blocks(first: usize, last: usize) {
+    let to = last.min(WRITE_BLOCKS);
+    for g in &BLOCK_WRITE_GEN[first.min(to)..to] {
+        g.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Monotonic write-generation signature for `[from, to)` across 64 KiB blocks
+/// below 4 GiB, plus the current `ask_once_end` generation (`None` if `>= 4 GiB`
+/// or wider than `4 MiB`).
+pub(crate) fn block_write_sig(from: usize, to: usize) -> Option<(u64, u64)> {
+    if from >= to {
+        return Some((0, ASK_END_GEN.load(std::sync::atomic::Ordering::Acquire)));
+    }
+    if to.saturating_sub(from) > (4 << 20) {
+        return None;
+    }
+    let first = from / BLOCK;
+    let last = to.div_ceil(BLOCK);
+    if last > WRITE_BLOCKS {
+        return None;
+    }
+    let mut sum = 0u64;
+    for g in &BLOCK_WRITE_GEN[first..last] {
+        sum = sum.wrapping_add(g.load(std::sync::atomic::Ordering::Acquire));
+    }
+    Some((sum, ASK_END_GEN.load(std::sync::atomic::Ordering::Acquire)))
+}
 
 fn journal() -> std::sync::RwLockReadGuard<'static, Journal> {
     if let Ok(j) = JOURNAL.try_read() {
@@ -372,6 +412,9 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    if kept() || ranges.len() < 2 {
+        return;
+    }
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
         // Not view memory known by its bits: the kernel would refuse the
@@ -650,12 +693,15 @@ fn ask_rest(ranges: &[(usize, usize)]) {
         j.note(page, parts, now);
     }
     j.kept = !ahead.is_empty();
+    KEPT.store(j.kept, std::sync::atomic::Ordering::Release);
     j.ahead = joined_pages(ahead);
 }
 
 /// The submission's one asking stands no longer: its refreshes are done,
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {
+    KEPT.store(false, std::sync::atomic::Ordering::Release);
+    ASK_END_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
     let mut j = journal_mut();
     if j.kept {
         j.kept = false;
@@ -667,6 +713,9 @@ pub(crate) fn ask_once_end() {
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
+    if len != 0 {
+        bump_write_blocks(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    }
     let mut j = journal_mut();
     if !j.kept || len == 0 {
         return;
@@ -1235,8 +1284,10 @@ fn open_unlocked(block: usize) -> bool {
     for &other in &others {
         TOLD.set(other);
         BESIDE.set(other);
+        bump_write_blocks(other, other + 1);
     }
     BESIDE.set(block);
+    bump_write_blocks(block, block + 1);
     for &other in &others {
         PUBLISHED.clear(other);
     }
@@ -1379,6 +1430,7 @@ pub(crate) fn put_beside(block: usize, weight: u32, put: impl FnOnce(usize)) -> 
     count.fetch_add(weight, Relaxed);
     for view in shown.iter().filter(|&&view| view != 0) {
         BESIDE.set(view / BLOCK);
+        bump_write_blocks(view / BLOCK, view / BLOCK + 1);
     }
     for view in shown.iter().filter(|&&view| view != 0) {
         PUBLISHED.clear(view / BLOCK);
@@ -1538,7 +1590,7 @@ pub(crate) fn guarded(start: usize, end: usize) -> bool {
 
 /// Whether nothing of `[start, end)` can have been written since an asking
 /// noted it in the journal ([`PUBLISHED`]).
-fn published(start: usize, end: usize) -> bool {
+pub(crate) fn published(start: usize, end: usize) -> bool {
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     // (In this order: who puts something in beside a guard sets the one bit,
     // then clears the other, which an asking that is publishing the block may
@@ -2504,6 +2556,7 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
             }
         }
         PROTECTED.clear(block);
+        bump_write_blocks(block, block + 1);
     }
     #[cfg(feature = "diagnostics")]
     if !blocks.is_empty() {
@@ -2516,7 +2569,7 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
-    crate::demand::fulfill_range(at, len);
+    crate::demand::fulfill_range(at, len, false);
     // The length is the title's (`fread`'s size times count, saturated).
     let last = at.saturating_add(len).div_ceil(BLOCK);
     if !light() || PROTECTED.any(at / BLOCK, last) {
@@ -2544,7 +2597,7 @@ pub struct KernelWrite(usize, usize);
 /// write fail (the kernel does not fault into our handler): a read cut
 /// short, which the title takes for what the file holds.
 pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
-    crate::demand::fulfill_range(at, len);
+    crate::demand::fulfill_range(at, len, true);
     // The kernel's write does not fault into the handler.
     materialize(at, len);
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
@@ -2632,6 +2685,7 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     }
     let mode = page_writes();
     let end = at.saturating_add(len);
+    bump_write_blocks(at / BLOCK, end.div_ceil(BLOCK));
     if pages {
         WRITTEN[0].fetch_add(1, Relaxed);
         WRITTEN[1].fetch_add(len as u64, Relaxed);
@@ -2950,6 +3004,7 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
         g.clean.remove(block);
         PUBLISHED.clear(block);
         PROTECTED.clear(block);
+        bump_write_blocks(block, block + 1);
     }
 }
 
@@ -2959,6 +3014,7 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
     crate::demand::forget(at, len);
+    bump_write_blocks(at / BLOCK, if len != 0 { at.saturating_add(len).div_ceil(BLOCK) } else { at / BLOCK + 1 });
     crate::shadow::write_combined_freed(at, len);
     let mut g = guards();
     let first = at / BLOCK;

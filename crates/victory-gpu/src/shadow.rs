@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -62,6 +62,15 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
+    /// Lock-free mirror of `!pending.is_empty()` (`0` when empty).
+    pending_len: AtomicU32,
+    /// Lock-free clean-range memoization for `fast_nothing_new`:
+    /// `(clean_from..clean_to)` verified clean against `watch::block_write_sig`.
+    clean_from: AtomicU64,
+    clean_to: AtomicU64,
+    clean_sig: AtomicU64,
+    clean_ask_end: AtomicU64,
+    clean_busy: std::sync::atomic::AtomicBool,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -3467,6 +3476,9 @@ impl Shadow {
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        if self.place.is_some() {
+            return;
+        }
         let len = len.min(self.start + self.len - address);
         list.defer_refresh(self, address as usize, len as usize);
     }
@@ -3495,6 +3507,12 @@ impl Shadow {
             parts_taken: Mutex::default(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
+            pending_len: std::sync::atomic::AtomicU32::new(0),
+            clean_from: AtomicU64::new(0),
+            clean_to: AtomicU64::new(0),
+            clean_sig: AtomicU64::new(0),
+            clean_ask_end: AtomicU64::new(0),
+            clean_busy: std::sync::atomic::AtomicBool::new(false),
             flights: Mutex::default(),
             before: Mutex::default(),
             merging: RwLock::default(),
@@ -3607,6 +3625,8 @@ impl Shadow {
         // lists).
         if self.card.is_some() {
             pending.push(range);
+            self.pending_len.store(pending.len() as u32, Ordering::Release);
+            self.clean_sig.store(0, Ordering::Release);
             return;
         }
         // The parts no declared range holds yet: their bytes are taken now,
@@ -3631,6 +3651,8 @@ impl Shadow {
             parts = rest;
         }
         pending.push(range);
+        self.pending_len.store(pending.len() as u32, Ordering::Release);
+        self.clean_sig.store(0, Ordering::Release);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
@@ -3920,6 +3942,7 @@ impl Shadow {
         } else {
             pending.retain(|r| !ranges.contains(r));
         }
+        self.pending_len.store(pending.len() as u32, Ordering::Release);
         if !pending.is_empty() || self.card.is_some() {
             return;
         }
@@ -3962,6 +3985,9 @@ impl Shadow {
     /// The copy's bytes at offsets `[from, to)` change: a kept snapshot is
     /// not current there any more.
     fn changed(&self, from: usize, to: usize) {
+        if from < to {
+            self.clean_sig.store(0, Ordering::Release);
+        }
         if !keeps() || from >= to {
             return;
         }
@@ -3977,12 +4003,15 @@ impl Shadow {
     /// Whether shaders of a submission not yet copied back may be writing
     /// the copy.
     pub(crate) fn writes_pending(&self) -> bool {
-        !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        self.pending_len.load(Ordering::Acquire) != 0
     }
 
     /// Whether one of those submissions may be writing in title memory
     /// `[from, to)`.
     pub(crate) fn writes_pending_in(&self, from: usize, to: usize) -> bool {
+        if self.pending_len.load(Ordering::Acquire) == 0 {
+            return false;
+        }
         self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
     }
 
@@ -3998,6 +4027,9 @@ impl Shadow {
     /// (`crate::host::late`): the ranges are those of flights in the air,
     /// which are then settled before this refresh.
     pub(crate) fn stale_under_writes(&self, address: usize, len: usize) -> bool {
+        if self.pending_len.load(Ordering::Acquire) == 0 {
+            return false;
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -4252,38 +4284,146 @@ impl Shadow {
         if from >= to {
             return 0;
         }
-        let mut busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .copied()
-            .filter(|&(a, e)| a < to && e > from)
-            .collect();
-        if !busy.is_empty() {
-            // Around ranges shaders are writing: the gaps, each as below
-            // (in the world most submissions have such ranges; copying the
-            // gaps whole cost ~1 s per frame).
-            busy.sort_unstable();
-            let (mut at, mut bytes) = (from, 0);
-            for (a, e) in busy {
-                if a > at {
-                    bytes += self.update_free(at, a);
+        if self.pending_len.load(Ordering::Acquire) != 0 {
+            let mut busy: Vec<(usize, usize)> = self
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .copied()
+                .filter(|&(a, e)| a < to && e > from)
+                .collect();
+            if !busy.is_empty() {
+                // Around ranges shaders are writing: the gaps, each as below
+                // (in the world most submissions have such ranges; copying the
+                // gaps whole cost ~1 s per frame).
+                busy.sort_unstable();
+                let (mut at, mut bytes) = (from, 0);
+                for (a, e) in busy {
+                    if a > at {
+                        bytes += self.update_free(at, a);
+                    }
+                    at = at.max(e);
                 }
-                at = at.max(e);
+                if at < to {
+                    bytes += self.update_free(at, to);
+                }
+                return bytes;
             }
-            if at < to {
-                bytes += self.update_free(at, to);
-            }
-            return bytes;
         }
         self.update_free(from, to)
+    }
+
+    fn was_copied_before(&self, address: usize, len: usize) -> bool {
+        if self.place.is_some() {
+            return true;
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), address.saturating_add(len).min(end));
+        if from >= to {
+            return false;
+        }
+        let cf = self.clean_from.load(Ordering::Relaxed) as usize;
+        let ct = self.clean_to.load(Ordering::Relaxed) as usize;
+        if self.clean_sig.load(Ordering::Relaxed) != 0 && cf <= from && to <= ct {
+            return true;
+        }
+        let base = start / PAGE;
+        let (first, last) = (from / PAGE - base, to.div_ceil(PAGE) - base);
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        copied.get(first..last).is_some_and(|slice| slice.iter().all(|&at| at != 0))
+    }
+
+    /// Lock-free fast check for [`Shadow::nothing_new`]: returns `true` only
+    /// when `[address, address + len)` lies inside the memoized clean span
+    /// and no writes occurred in any overlapping 64 KiB block since then.
+    pub(crate) fn fast_nothing_new(&self, address: usize, len: usize) -> bool {
+        if self.place.is_some() {
+            return true;
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), address.saturating_add(len).min(end));
+        if from >= to {
+            return true;
+        }
+        let watched = self.watched.load(Ordering::Relaxed);
+        if !matches!(watched, 1 | GUARDED) || self.pending_len.load(Ordering::Acquire) != 0 {
+            return false;
+        }
+        let cs = self.clean_sig.load(Ordering::Acquire);
+        if cs == 0 {
+            return false;
+        }
+        let cf = self.clean_from.load(Ordering::Relaxed) as usize;
+        let ct = self.clean_to.load(Ordering::Relaxed) as usize;
+        if from < cf || to > ct {
+            return false;
+        }
+        let Some((sig, ask_end)) = crate::watch::block_write_sig(cf, ct) else {
+            return false;
+        };
+        if sig != cs || self.clean_sig.load(Ordering::Acquire) != cs {
+            return false;
+        }
+        (watched == GUARDED && crate::watch::published(from, to))
+            || ask_end == self.clean_ask_end.load(Ordering::Relaxed)
+    }
+
+    fn stamp_clean(&self, from: usize, to: usize, sig: u64, ask_end: u64) {
+        if self
+            .clean_busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let prev_sig = self.clean_sig.load(Ordering::Relaxed);
+        self.clean_sig.store(0, Ordering::Release);
+        let (mut new_from, mut new_to, mut new_sig, mut new_ask_end) = (from, to, sig, ask_end);
+        if prev_sig != 0 {
+            let cf = self.clean_from.load(Ordering::Relaxed) as usize;
+            let ct = self.clean_to.load(Ordering::Relaxed) as usize;
+            let ca = self.clean_ask_end.load(Ordering::Relaxed);
+            // Merge contiguous/overlapping clean spans only when the previous
+            // span is still verified clean with the same write state.
+            if from <= ct
+                && to >= cf
+                && (cf < from || ct > to)
+                && crate::watch::block_write_sig(cf, ct) == Some((prev_sig, ca))
+            {
+                let u_from = cf.min(from);
+                let u_to = ct.max(to);
+                if let Some((u_sig, u_ask)) = crate::watch::block_write_sig(u_from, u_to)
+                    && (u_ask == ca || self.watched.load(Ordering::Relaxed) == GUARDED && crate::watch::published(cf, ct))
+                {
+                    (new_from, new_to, new_sig, new_ask_end) = (u_from, u_to, u_sig, u_ask);
+                }
+            }
+        }
+        self.clean_from.store(new_from as u64, Ordering::Release);
+        self.clean_to.store(new_to as u64, Ordering::Release);
+        self.clean_ask_end.store(new_ask_end, Ordering::Release);
+        self.clean_sig.store(new_sig, Ordering::Release);
+        self.clean_busy.store(false, Ordering::Release);
     }
 
     /// Whether [`Shadow::update`] of `[address, address + len)` would copy
     /// nothing, and knows it without asking anything
     /// (`crate::watch::nothing_new`). `false` if it would have to ask.
     pub(crate) fn nothing_new(&self, address: usize, len: usize) -> bool {
+        if self.fast_nothing_new(address, len) {
+            #[cfg(feature = "diagnostics")]
+            {
+                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+                let (from, to) = (address.max(start), address.saturating_add(len).min(end));
+                if from < to {
+                    use crate::copystat::{C, add};
+                    add(C::Checked, (to - from) as u64);
+                    add(C::Unchanged, (to - from) as u64);
+                }
+            }
+            return true;
+        }
         if self.place.is_some() {
             return true;
         }
@@ -4296,13 +4436,20 @@ impl Shadow {
             return false;
         }
         // Around ranges shaders are writing the refresh asks gap by gap.
-        if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
+        let pending = self.pending_len.load(Ordering::Acquire) != 0;
+        if pending && self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
             return false;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let ranged = self.ranged(from, to);
         let parts = self.parts_taken.lock().unwrap_or_else(|e| e.into_inner());
         let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, &parts, ranged);
+        drop((copied, parts));
+        if same && !pending {
+            if let Some((sig, ask_end)) = crate::watch::block_write_sig(from, to) {
+                self.stamp_clean(from, to, sig, ask_end);
+            }
+        }
         #[cfg(feature = "diagnostics")]
         if same {
             use crate::copystat::{C, add};
@@ -4327,7 +4474,13 @@ impl Shadow {
                 // (A range whose blocks rest after a write has no guard now.)
                 let guarded = crate::watch::guarded(from, to) || self.watched.load(Ordering::Relaxed) == GUARDED;
                 self.watched.store(if guarded { GUARDED } else { 1 }, Ordering::Relaxed);
+                let clean_after = (self.pending_len.load(Ordering::Acquire) == 0)
+                    .then(|| crate::watch::block_write_sig(from, to))
+                    .flatten();
                 let copied = self.copy_stale(from, to, now, &written);
+                if let Some((sig, ask_end)) = clean_after {
+                    self.stamp_clean(from, to, sig, ask_end);
+                }
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {
@@ -4484,6 +4637,7 @@ impl Shadow {
 
     /// What shaders wrote in `[from, to)` (offsets) was put into title memory.
     fn note_landing(&self, from: usize, to: usize) {
+        self.clean_sig.store(0, Ordering::Release);
         let first = self.start as usize / KERNEL_PAGE;
         let pages = (self.start as usize + from) / KERNEL_PAGE - first..(self.start as usize + to).div_ceil(KERNEL_PAGE) - first;
         let mut bits = self.landings.lock().unwrap_or_else(|e| e.into_inner());
@@ -5485,21 +5639,37 @@ pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
     buffers_read().range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end).and_then(|(_, e)| e.shadow.clone())
 }
 
-/// Whether `[address, address + len)` lies inside a title buffer that lives
-/// (or would live) in the card's memory (`carded`).
-pub(crate) fn in_card_buffer(address: u64, len: u64) -> bool {
+/// Whether `[address, address + len)` should stay in the card's memory
+/// (`carded`) rather than streaming directly in place (`port::stream_bytes`):
+/// true for unmaterialized/static carded buffers, false for dynamic ranges
+/// already seen once by the shadow and dirtied again by CPU writes without
+/// pending shader writes.
+pub(crate) fn in_card_static(address: u64, len: u64) -> bool {
     let Some(end) = address.checked_add(len.max(1)) else {
         return false;
     };
-    let map = buffers_read();
-    let Some((k, e)) = map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end) else {
-        return false;
+    let shadow = {
+        let map = buffers_read();
+        let Some((k, e)) = map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end) else {
+            return false;
+        };
+        if let Some(shadow) = &e.shadow {
+            shadow.clone()
+        } else {
+            let size = (e.end - k.0).next_multiple_of(1 << 16);
+            return cards() && (size >= card_limits().0 || card_all());
+        }
     };
-    if let Some(shadow) = &e.shadow {
-        return shadow.carded();
+    if !shadow.carded() {
+        return false;
     }
-    let size = (e.end - k.0).next_multiple_of(1 << 16);
-    cards() && (size >= card_limits().0 || card_all())
+    if shadow.was_copied_before(address as usize, len as usize)
+        && !shadow.nothing_new(address as usize, len as usize)
+        && !shadow.writes_pending_in(address as usize, end as usize)
+    {
+        return false;
+    }
+    true
 }
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {

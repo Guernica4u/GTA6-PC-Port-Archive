@@ -3425,13 +3425,14 @@ impl<'a> Lower<'a> {
         if let Some(g) = guard {
             missing = self.s.m.bin(c, Bin::And, missing, g);
         }
-        let places = k(self, MEMORY_FAULTS - 1);
+        let mask = k(self, MEMORY_FAULTS - 1);
         let faults = self.s.root_uav_handle(SLOT_FAULTS);
         let noting = self.begin_guarded(Some(missing));
         let c = self.cur;
-        let place = self.s.m.bin(c, Bin::URem, page, places);
+        let masked = self.s.m.bin(c, Bin::And, page, mask);
         let one = k(self, 1);
-        let place = self.s.m.bin(c, Bin::Add, place, one);
+        let zero_slot = self.s.m.cmp(c, pred::EQ, masked, zero);
+        let place = self.s.m.select(c, zero_slot, one, masked);
         let k2 = k(self, 2);
         let place = self.s.m.bin(c, Bin::Shl, place, k2);
         let void = self.s.t.void;
@@ -3455,9 +3456,9 @@ impl<'a> Lower<'a> {
         };
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
-        // The builder's threads read what others of the dispatch wrote (a
-        // refit climbs from children to parents): globally coherent.
-        let coherent = if crate::spill::is_spilled(self.x.native) { 0x4000 } else { 0 };
+        // The builder's stores write through to L2; its loads hit L1 and
+        // reload at the fences around its atomics.
+        let coherent = if store && crate::spill::is_spilled(self.x.native) { 0x4000 } else { 0 };
         let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000 | coherent, 0));
         let k64k = k(self, 0xFFFF);
         let within = self.s.m.bin(c, Bin::And, lo, k64k);

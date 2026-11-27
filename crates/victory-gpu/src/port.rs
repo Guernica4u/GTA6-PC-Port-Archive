@@ -269,8 +269,9 @@ pub(crate) fn stream_bytes(address: u64, len: u64) -> Option<(ID3D12Resource, u6
     if end > LOW {
         return None;
     }
-    // Constraint 2: keep VRAM-resident (`carded`) geometry on the card.
-    if crate::shadow::in_card_buffer(address, len) {
+    // Constraint 2: keep static VRAM-resident (`carded`) geometry on the card,
+    // while letting repeatedly CPU-written dynamic streams (`<= 64 KiB`) read in place.
+    if crate::shadow::in_card_static(address, len) {
         return None;
     }
     let (whole, start) = region_holding(address, end)?;

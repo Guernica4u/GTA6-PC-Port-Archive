@@ -8912,16 +8912,19 @@ impl Batch {
         // once a frame: on the threads, below.)
         const FEW: usize = 256;
         let light = crate::watch::light();
-        if light && self.refreshes.len() <= FEW {
+        if light {
             let started = std::time::Instant::now();
             let all = self.refreshes.len();
-            self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            self.refreshes.retain(|(shadow, from, to)| !shadow.fast_nothing_new(*from, *to - *from));
+            if self.refreshes.len() <= FEW {
+                self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            }
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
         }
         // One write-watch asking for the copies that lie close together,
-        // not one per copy.
-        let ahead = self.refreshes.len() > 1;
+        // not one per copy (`ask_once` already covers the submission when `kept`).
+        let ahead = self.refreshes.len() > 1 && !crate::watch::kept();
         if ahead {
             let started = std::time::Instant::now();
             let ranges: Vec<(usize, usize)> = self
@@ -9082,7 +9085,7 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         }
         if info.State == MEM_COMMIT
             && info.Protect == PAGE_NOACCESS
-            && crate::demand::fulfill_range(at as usize, n)
+            && crate::demand::fulfill_range(at as usize, n, false)
         {
             continue;
         }

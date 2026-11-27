@@ -34,12 +34,17 @@ static CPU_READ: [AtomicU64; WORDS] = [const { AtomicU64::new(0) }; WORDS];
 static GUARDED: [AtomicU64; WORDS] = [const { AtomicU64::new(0) }; WORDS];
 static PINNED: [AtomicU32; MAX_BLOCKS] = [const { AtomicU32::new(0) }; MAX_BLOCKS];
 
-static STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+static STATS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 const DEFERRED_PIECES: usize = 0;
 const DEFERRED_BYTES: usize = 1;
 const FAULTS: usize = 2;
 const FAULT_BYTES: usize = 3;
 const KNOWN_READ_BLOCKS: usize = 4;
+const TITLE_FAULTS: usize = 5;
+const SAFECOPY_FAULTS: usize = 6;
+const PIN_FULFILLS: usize = 7;
+const WRITE_FULFILLS: usize = 8;
+const KERNEL_FULFILLS: usize = 9;
 
 #[derive(Clone)]
 struct ParkedPiece {
@@ -140,8 +145,8 @@ pub(crate) fn pin_range(at: usize, len: usize) -> Pin {
     }
     if has_any(&GUARDED, from, to) {
         for b in from..to {
-            if has_bit(&GUARDED, b) {
-                fulfill_block(b, true);
+            if has_bit(&GUARDED, b) && fulfill_block(b, false) {
+                STATS[PIN_FULFILLS].fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -294,12 +299,16 @@ pub(crate) fn on_fault(at: usize, permanent: bool) -> bool {
         .as_ref()
         .and_then(|a| a.get(&block).copied())
         .unwrap_or(block);
-    fulfill_block(canonical, permanent)
+    let ok = fulfill_block(canonical, permanent);
+    if ok {
+        STATS[if permanent { TITLE_FAULTS } else { SAFECOPY_FAULTS }].fetch_add(1, Ordering::Relaxed);
+    }
+    ok
 }
 
 /// Fulfills any demand-guarded blocks overlapping `[at, at + len)`.
 /// Returns `true` if at least one guarded block was fulfilled.
-pub(crate) fn fulfill_range(at: usize, len: usize) -> bool {
+pub(crate) fn fulfill_range(at: usize, len: usize, permanent: bool) -> bool {
     if !on() || len == 0 {
         return false;
     }
@@ -317,7 +326,10 @@ pub(crate) fn fulfill_range(at: usize, len: usize) -> bool {
                 .as_ref()
                 .and_then(|a| a.get(&block).copied())
                 .unwrap_or(block);
-            did |= fulfill_block(canonical, true);
+            if fulfill_block(canonical, permanent) {
+                STATS[if permanent { KERNEL_FULFILLS } else { WRITE_FULFILLS }].fetch_add(1, Ordering::Relaxed);
+                did = true;
+            }
         }
     }
     did
@@ -484,17 +496,27 @@ pub(crate) fn log(frames: f64) {
     let bytes = STATS[DEFERRED_BYTES].swap(0, Ordering::Relaxed) as f64 / frames;
     let faults = STATS[FAULTS].swap(0, Ordering::Relaxed) as f64 / frames;
     let fault_bytes = STATS[FAULT_BYTES].swap(0, Ordering::Relaxed) as f64 / frames;
+    let title_f = STATS[TITLE_FAULTS].swap(0, Ordering::Relaxed) as f64 / frames;
+    let safe_f = STATS[SAFECOPY_FAULTS].swap(0, Ordering::Relaxed) as f64 / frames;
+    let pin_f = STATS[PIN_FULFILLS].swap(0, Ordering::Relaxed) as f64 / frames;
+    let write_f = STATS[WRITE_FULFILLS].swap(0, Ordering::Relaxed) as f64 / frames;
+    let kern_f = STATS[KERNEL_FULFILLS].swap(0, Ordering::Relaxed) as f64 / frames;
     let known = STATS[KNOWN_READ_BLOCKS].load(Ordering::Relaxed);
     if pieces == 0.0 && faults == 0.0 && known == 0 {
         return;
     }
     tracing::info!(
-        "demand landing (VICTORY_DEMAND_LAND={}): per frame {:.1} C2 pieces deferred ({:.1} KB), {:.2} CPU demand faults ({:.1} KB), {} blocks known CPU-read",
+        "demand landing (VICTORY_DEMAND_LAND={}): per frame {:.1} C2 pieces deferred ({:.1} KB), {:.2} demand fulfills ({:.1} KB: title {:.2}, safecopy {:.2}, pin {:.2}, write {:.2}, kernel {:.2}), {} blocks known CPU-read",
         u8::from(on()),
         pieces,
         bytes / 1024.0,
         faults,
         fault_bytes / 1024.0,
+        title_f,
+        safe_f,
+        pin_f,
+        write_f,
+        kern_f,
         known,
     );
 }
