@@ -6,6 +6,8 @@ forever. Retention keeps the caches worth hopping back to and removes the rest.
 """
 import os
 from pathlib import Path
+import subprocess
+import sys
 from tempfile import TemporaryDirectory
 from time import time
 import unittest
@@ -90,6 +92,17 @@ class RuntimeCacheRetention(unittest.TestCase):
 
         self.assertIs(mark_in_use(current), first)
         self.assertTrue(locked_by_another_launcher(current))
+
+    def test_two_launchers_of_one_build_share_its_cache(self):
+        current = self.cache("current", time())
+        self.addCleanup(os.close, mark_in_use(current))
+        other = ("import sys; from project_tuxbox.runtime_shaders import mark_in_use; "
+                 "mark_in_use(sys.argv[1])")
+
+        run = subprocess.run([sys.executable, "-c", other, str(current)], capture_output=True,
+                             text=True, timeout=30, cwd=Path(__file__).resolve().parents[1])
+
+        self.assertEqual(run.returncode, 0, run.stderr)
 
     def test_directory_time_orders_caches_without_a_marker(self):
         now = time()

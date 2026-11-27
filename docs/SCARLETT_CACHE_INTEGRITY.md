@@ -47,13 +47,12 @@ not the older cache: deleting the directory would have hidden it for one
 run and brought it back at the next branch hop.
 
 Keep the running build's cache and the two most recently used others.
-The launcher claims its cache with an flock on `in-use` in the
-fingerprint directory for the life of the process, and retention never
-removes a cache another process holds, so two branches can compile at
-once and the next launch trims what is left. Prelaunch preparation and
-the live worker run in one process and ask for the same cache twice; a
-process cannot take the same flock through two descriptors, so the
-second request reuses the first claim. `last-used` records when each
+The launcher claims its cache with a shared flock on `in-use` in the
+fingerprint directory for the life of the process, so launchers of one
+build use it together. Retention never removes a cache another process
+holds, so two branches can compile at once and the next launch trims
+what is left. Prelaunch preparation and the live worker run in one
+process and share one claim. `last-used` records when each
 cache ran, because rewriting a file inside a directory moves that
 directory's timestamp as well; a cache from before the marker sorts by
 its directory time. A directory that cannot be removed fails that one

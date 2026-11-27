@@ -588,9 +588,10 @@ def mark_in_use(cache):
     """Hold `cache` against retention until this process closes the handle.
 
     Returns the handle. The launcher keeps it for the life of the worker, so a
-    second branch cannot evict a cache that is still compiling. Prelaunch
-    preparation and the live worker run in one process and ask twice: a process
-    cannot take the same flock through two descriptors, so reuse the claim.
+    second branch cannot evict a cache that is still compiling. The claim is
+    shared: launchers of one build use its cache together, and only retention
+    asks for it exclusively. Prelaunch preparation and the live worker run in
+    one process and ask twice, so reuse the claim.
     """
     import fcntl
     directory = Path(cache)
@@ -600,7 +601,8 @@ def mark_in_use(cache):
     handle = os.open(directory / IN_USE_FILE,
                      os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
-        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Blocks only while another launcher's retention probes this cache.
+        fcntl.flock(handle, fcntl.LOCK_SH)
     except OSError:
         os.close(handle)
         raise
