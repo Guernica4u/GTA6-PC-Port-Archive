@@ -2852,7 +2852,12 @@ const WHY_FENCE: usize = 10;
 /// bottom-of-pipe write; fence signals set behind flights.
 /// Then: the settles for title memory read, by what read it (a buffer
 /// copy, a fill of upload memory, a texture).
-static LATE_STATS: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atomic::AtomicU64::new(0) }; 18];
+static LATE_STATS: [std::sync::atomic::AtomicU64; 20] = [const { std::sync::atomic::AtomicU64::new(0) }; 20];
+/// [`LATE_STATS`] 18 and 19: settles for title memory read by a step that reads the
+/// destination of a copy at its place ([`place::reads`]), and by a refresh, host step or plane
+/// reading the destination of a copy done on the card ([`card_steps::copied_read`]).
+const READ_PLACED: usize = 18;
+const READ_REFRESH: usize = 19;
 
 /// Since the last frame-rate line: the microseconds settles waited for the
 /// card, by why they settled (the `WHY_` places).
@@ -2904,7 +2909,12 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
         }
         (line.written.clone(), card_steps::copies(&line))
     };
-    blocked_by(&written, runs, true).or_else(|| card_steps::copied_read(&copies, runs).then_some(WHY_READ))
+    blocked_by(&written, runs, true).or_else(|| {
+        card_steps::copied_read(&copies, runs).then(|| {
+            LATE_STATS[READ_REFRESH].fetch_add(1, Ordering::Relaxed);
+            WHY_READ
+        })
+    })
 }
 
 /// Whether a small fill of upload memory, or copy of a title buffer, goes on without waiting for
@@ -3081,10 +3091,18 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     if written.is_empty() {
         return None;
     }
-    // Destinations of copies at their place, if a step reads them.
+    // Destinations of copies at their place that stand ahead of the step looked
+    // at, if the step reads them: the copy's bytes are not in title memory when
+    // the flights are not waited for (steps ahead of the copy read what was there).
     let mut placed: Vec<(usize, usize)> = Vec::new();
     for list in runs {
         for step in &list.deferred().copies {
+            if !placed.is_empty() && place::reads(step, &placed) {
+                if count {
+                    LATE_STATS[READ_PLACED].fetch_add(1, Ordering::Relaxed);
+                }
+                return Some(WHY_READ);
+            }
             match step {
                 &Step::Copy(dst, src, len) => {
                     if let Some(_read) = copy_blocked(written, dst, src, len) {
@@ -3148,7 +3166,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
             }
         }
     }
-    (!placed.is_empty() && place::read_by(runs, placed)).then_some(WHY_READ)
+    None
 }
 
 /// With flights in the air, after the submission's write-watch asking:
@@ -3744,7 +3762,8 @@ fn late_line(frames: f64) {
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
          settled for: a synchronous submission or present {:.1}, the card had run them {:.1}, a wait for a memory value {:.1}, \
          title memory changed under shader writes {:.1}, title memory read {:.1} (by a buffer copy {:.1}, a fill of upload memory {:.1}, \
-         a texture {:.1}), a step of ours {:.1}, {} lists in the air {:.1}, \
+         a texture {:.1}, a step that reads where a copy at its place writes {:.1}, a refresh or host read of where a copy done on the card writes {:.1}), \
+         a step of ours {:.1}, {} lists in the air {:.1}, \
          bottom-of-pipe writes (VICTORY_LATE_WAIT_WRITES=0) {:.1}, a blocking fence wait {:.1}; \
          {:.1} waits for memory values met by a flight's bottom-of-pipe write, {:.1} fence signals set behind flights",
         s[0],
@@ -3759,6 +3778,8 @@ fn late_line(frames: f64) {
         s[15],
         s[16],
         s[17],
+        s[READ_PLACED],
+        s[READ_REFRESH],
         s[WHY_RUN],
         late_most(),
         s[WHY_MOST],

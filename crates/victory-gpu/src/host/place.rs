@@ -109,22 +109,23 @@ pub(super) enum Waits {
     Yes,
 }
 
-/// Whether a step of `runs` reads one of `ranges` on the CPU.
-pub(super) fn read_by(runs: &[&HostList], mut ranges: Vec<(usize, usize)>) -> bool {
-    join_ranges(&mut ranges, []);
-    runs.iter().any(|list| {
-        list.deferred().copies.iter().any(|step| match step {
-            &Step::Copy(_, src, len) | &Step::Fill(_, src, len, _) => touches(&ranges, src, src + len),
-            Step::Texture(staging) => {
-                let (at, len) = staging.memory();
-                touches(&ranges, at, at + len)
-            }
-            &Step::Plane((at, len), _) => touches(&ranges, at, at.saturating_add(len)),
-            Step::Host(_, (from, to)) => touches(&ranges, *from, *to),
-            Step::Placed(p) => p.from.is_some() && touches(&ranges, p.src, p.src + p.len),
-            _ => false,
-        })
-    })
+/// Whether `step` reads, on the CPU at submission, one of `ranges` (the
+/// destinations of copies at their place that stand ahead of it in the
+/// submission: a step that stands before such a copy never sees its bytes,
+/// with the flights waited for or not, so it is not in their way).
+pub(super) fn reads(step: &Step, ranges: &[(usize, usize)]) -> bool {
+    let meets = |from: usize, to: usize| from < to && ranges.iter().any(|r| r.0 < to && from < r.1);
+    match step {
+        &Step::Copy(_, src, len) | &Step::Fill(_, src, len, _) => meets(src, src.saturating_add(len)),
+        Step::Texture(staging) => {
+            let (at, len) = staging.memory();
+            meets(at, at.saturating_add(len))
+        }
+        &Step::Plane((at, len), _) => meets(at, at.saturating_add(len)),
+        &Step::Host(_, (from, to)) => meets(from, to),
+        Step::Placed(p) => p.from.is_some() && meets(p.src, p.src.saturating_add(p.len)),
+        _ => false,
+    }
 }
 
 /// Everything recorded so far is done, and seen, before what follows.
