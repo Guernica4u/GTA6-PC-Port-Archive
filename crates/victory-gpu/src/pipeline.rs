@@ -294,7 +294,10 @@ fn load_skip_hashes(value: &str) -> Vec<String> {
     let trimmed = value.trim();
     if let Some(path) = trimmed.strip_prefix('@') {
         match std::fs::read_to_string(path.trim()) {
-            Ok(contents) => parse_skip_hashes(&contents),
+            Ok(contents) => {
+                let text = contents.strip_prefix('\u{feff}').unwrap_or(&contents);
+                parse_skip_hashes(text)
+            }
             Err(error) => {
                 tracing::warn!(path = path.trim(), %error, "failed to read VICTORY_SKIP_PIPELINES file");
                 Vec::new()
@@ -737,19 +740,19 @@ mod tests {
     #[cfg(feature = "diagnostics")]
     #[test]
     fn skip_hashes_reads_at_file_with_commas_and_lines() {
-        let path = std::env::temp_dir().join(format!("victory_skip_{}.txt", std::process::id()));
-        std::fs::write(
-            &path,
-            "0123456789ABCDEF\n  0011223344556677, invalid\nAABBCCDDEEFF0011\n",
-        )
-        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pipeline hashes.txt");
         let arg = format!("@{}", path.display());
-        let hashes = super::load_skip_hashes(&arg);
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(
-            hashes,
-            ["0123456789abcdef", "0011223344556677", "aabbccddeeff0011"]
-        );
+        let lines = "0123456789ABCDEF\r\n  0011223344556677, invalid\r\nAABBCCDDEEFF0011\r\n";
+        for prefix in ["", "\u{feff}"] {
+            std::fs::write(&path, format!("{prefix}{lines}")).unwrap();
+            assert_eq!(
+                super::load_skip_hashes(&arg),
+                ["0123456789abcdef", "0011223344556677", "aabbccddeeff0011"],
+                "UTF-8 BOM present: {}",
+                !prefix.is_empty()
+            );
+        }
     }
 
     #[cfg(feature = "diagnostics")]
