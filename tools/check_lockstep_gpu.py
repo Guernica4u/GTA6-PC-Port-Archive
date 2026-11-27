@@ -4,12 +4,13 @@
 Each synthetic wave32 program branches on a lane mask, then runs a reduction
 behind a mask branch, which the translator can only express by branching with
 the whole wave. One program also runs as a ray tracing resolve shader, whose
-interleaved loops go through the block dispatcher, and another exchanges lanes
-in that mode. Others count the lanes of a mask, find its first, retire lanes
-with a write to EXEC, and read the lane a mask elects. Two more read a lane
-inside a loop that lanes leave at different times: a sum for each distinct key,
-and a read of lanes that have already left. The reference models the console:
-one program counter per wave,
+interleaved loops go through the block dispatcher, and once with only an EXEC
+guard before its reduction, which the dispatcher keeps as a decision of the
+wave too. Another exchanges lanes in the resolve mode. Others count the lanes
+of a mask, find its first, retire lanes with a write to EXEC, and read the lane
+a mask elects. Two more read a lane inside a loop that lanes leave at different
+times: a sum for each distinct key, and a read of lanes that have already left.
+The reference models the console: one program counter per wave,
 shared scalar registers and per-lane vector writes under EXEC. Only the
 translator's input and output are instrumented. No game data is needed.
 """
@@ -141,18 +142,20 @@ LANE_READ_BODIES = {
 }
 
 
-def program(body, resolve=False):
+def program(body, resolve=False, guarded=False):
     """Assembler lines and branch positions of one complete program."""
     if body in LANE_READ_BODIES.values():
         return ["s_mov_b32 s12, exec_lo", *body, "s_mov_b32 exec_lo, s12", "s_endpgm"]
+    # No active lane skips the reduction. A branch on VCC around it is what the
+    # targeted guards refuse. One on EXEC they accept as a vote of the wave,
+    # which only a program without interleaved loops keeps.
+    skip = ([branch("s_cbranch_execz", "end")] if guarded
+            else ["v_cmp_eq_u32_e32 vcc_lo, v1, v1", branch("s_cbranch_vccz", "end")])
     return [
         "s_mov_b32 s12, exec_lo",
         # The resolve mode is selected by a compare into an odd scalar register.
         *(["v_cmp_eq_u32_e64 s31, 0, v1"] if resolve else []), *body, "s_mov_b32 exec_lo, s12",
-        # No active lane skips the reduction. A branch on VCC around it is what
-        # the targeted guards refuse.
-        "v_cmp_eq_u32_e32 vcc_lo, v1, v1", branch("s_cbranch_vccz", "end"),
-        ("words", REDUCTION), label("end"), "s_endpgm",
+        *skip, ("words", REDUCTION), label("end"), "s_endpgm",
     ]
 
 
@@ -327,8 +330,9 @@ def main(argv=None):
         expected, shaders = {}, {}
         bodies = BODIES | LANE_READ_BODIES
         for name, body, resolve in [*((name, name, False) for name in bodies), ("resolve", "dispatch", True),
-                                    ("swizzle", "swizzle", True)]:
-            words = words_of(program(SWIZZLES if body == "swizzle" else bodies[body], resolve), args.llvm_mc)
+                                    ("guarded", "dispatch", False), ("swizzle", "swizzle", True)]:
+            lines = SWIZZLES if body == "swizzle" else bodies[body]
+            words = words_of(program(lines, resolve, name == "guarded"), args.llvm_mc)
             emitted = subprocess.check_output(
                 [args.emitter.resolve(), *(["resolve"] if resolve else []), str(WIDTH),
                  *(f"{word:08x}" for word in words)], text=True, timeout=30)
@@ -345,7 +349,7 @@ def main(argv=None):
                 seed, expected[label_] = seed_and_expected(body, mask, values)
                 (trial / f"{label_}.seed").write_bytes(seed)
                 (trial / f"{label_}.cso").hardlink_to(blob)
-        if not (shaders["dispatch"]["dispatched"] and shaders["resolve"]["dispatched"]):
+        if not all(shaders[name]["dispatched"] for name in ("dispatch", "resolve", "guarded")):
             raise ValueError("the interleaved fixture must use the block dispatcher")
         (trial / "cases.txt").write_text("".join(f"{name} 0 uint 1\n" for name in expected))
         exe, status, fields = run_gpu_guest(

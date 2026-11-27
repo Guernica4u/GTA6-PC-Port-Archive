@@ -380,3 +380,21 @@ fn the_lane_a_mask_elects_is_read_from_the_wave() {
     assert!(!hlsl.contains("GroupMemoryBarrierWithGroupSync"), "{hlsl}");
     assert!(hlsl.contains("!WaveActiveAnyTrue((vcc_lo & 1u) != 0u)"), "{hlsl}");
 }
+
+#[test]
+fn a_guarded_reduction_behind_interleaved_loops_branches_with_the_wave() {
+    // Two loops that share their bodies, a restore of EXEC and an EXECZ guard before the reduction.
+    let loops = [0xbe8c037e, 0x7d8200ff, 0x000003e8, 0x80148114, 0xbf860001, 0x80158115, 0xbe8a3c6a, 0xbf880001,
+        0x4a141481, 0xbefe030a, 0x80168116, 0xbf0a8314, 0xbf85fff6, 0xbf0a8616, 0xbf85fff5, 0xbefe030c];
+    let words = [&loops[..], &[0xbf880011], &REDUCTION[..], &[0xbf810000]].concat();
+    let hlsl = translated(&words).unwrap();
+    assert!(hlsl.contains("tb_pc"), "{hlsl}");
+    assert!(hlsl.contains("(!WaveActiveAnyTrue((exec_lo & 1u) != 0u)) ? "), "{hlsl}");
+    assert!(hlsl.contains("(!WaveActiveAnyTrue((vcc_lo & 1u) != 0u)) ? "), "{hlsl}");
+    // Without the loops the guard's own vote is kept, and the other branches stay each lane's.
+    let straight = [&[0xbe8c037eu32, 0x7d8200ff, 0x000003e8, 0xbf860001, 0x80158115, 0xbf880011][..], &REDUCTION[..],
+        &[0xbf810000]].concat();
+    let hlsl = translated(&straight).unwrap();
+    assert!(hlsl.contains("(vcc_lo & 1u) == 0u"), "{hlsl}");
+    assert!(hlsl.contains("!WaveActiveAnyTrue((exec_lo & 1u) != 0u)"), "{hlsl}");
+}

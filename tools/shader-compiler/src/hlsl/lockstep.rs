@@ -60,6 +60,24 @@ pub(super) fn lower_lane_reads(group: [u32; 3], insns: &mut [Insn]) -> Result<()
     Ok(())
 }
 
+/// The block dispatcher runs each invocation through its own blocks, so a vote
+/// that a reduction's guard needs may not find the whole wave there.
+pub(super) const DISPATCHED_VOTE: &str = "wave reduction EXECZ vote in a block-dispatched program";
+
+thread_local!(static INSTEAD_OF_GUARDS: Cell<bool> = const { Cell::new(false) });
+
+/// Whether this translation branches with the whole wave where a guard would vote.
+pub(super) fn instead_of_guards() -> bool { INSTEAD_OF_GUARDS.with(Cell::get) }
+
+/// Translate with every branch a decision of the whole wave, which the block
+/// dispatcher keeps, instead of the votes of single guards, which it cannot.
+pub(super) fn without_guards<T>(run: impl FnOnce() -> T) -> T {
+    INSTEAD_OF_GUARDS.with(|c| c.set(true));
+    let result = run();
+    INSTEAD_OF_GUARDS.with(|c| c.set(false));
+    result
+}
+
 /// What a scalar register holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Class {
