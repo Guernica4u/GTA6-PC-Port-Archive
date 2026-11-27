@@ -210,6 +210,35 @@ SCALAR = {
     "s_addc_u32": (2, lambda a, b: ((a + b + 1) & M, int(a + b + 1 > M))),
     "s_subb_u32": (2, lambda a, b: ((a - b - 1) & M, int(b + 1 > a))),
 }
+M64 = (1 << 64) - 1
+
+
+def s64(value):
+    return value - (1 << 64) if value >> 63 else value
+
+
+def flagged(value):
+    return value & M64, int(value & M64 != 0)
+
+
+# 64-bit scalar instructions: model of X, Y and the entry SCC, returning the
+# result and SCC, or None for an SCC left alone. A shift takes Y's low word.
+PAIRS = {
+    "s_and_b64": lambda x, y, scc: flagged(x & y),
+    "s_or_b64": lambda x, y, scc: flagged(x | y),
+    "s_xor_b64": lambda x, y, scc: flagged(x ^ y),
+    "s_andn2_b64": lambda x, y, scc: flagged(x & ~y),
+    "s_orn2_b64": lambda x, y, scc: flagged(x | ~y),
+    "s_nand_b64": lambda x, y, scc: flagged(~(x & y)),
+    "s_nor_b64": lambda x, y, scc: flagged(~(x | y)),
+    "s_xnor_b64": lambda x, y, scc: flagged(~(x ^ y)),
+    "s_lshl_b64": lambda x, y, scc: flagged(x << (y & 63)),
+    "s_lshr_b64": lambda x, y, scc: flagged(x >> (y & 63)),
+    "s_ashr_i64": lambda x, y, scc: flagged(s64(x) >> (y & 63)),
+    "s_cselect_b64": lambda x, y, scc: (x if scc else y, None),
+    "s_cmp_eq_u64": lambda x, y, scc: int(x == y),
+    "s_cmp_lg_u64": lambda x, y, scc: int(x != y),
+}
 OUTPUTS = 8
 
 INFINITY = float("inf")
@@ -419,11 +448,21 @@ def multiply_add(a, b, c):
     return Float(fused(a, b, c), also=(to_bits(product + to_float(c)),))
 
 
+def separate(a, b, c, legacy=False):
+    """A product rounded, then a sum rounded, as the RDNA 1 multiply-adds do. A
+    host may fuse the two, so the fused result passes as well."""
+    if legacy and (not a & 0x7fffffff or not b & 0x7fffffff):
+        return Float(to_bits(0.0 + to_float(c)), any_zero=True)
+    product = to_float(to_bits(to_float(a) * to_float(b)))
+    return Float(to_bits(product + to_float(c)), also=(fused(a, b, c),))
+
+
 TRIG_ERROR = 2.0 ** -20
 # The manual gives these 1 ULP on the console, and both hosts measured stay within it.
 APPROXIMATE = 1
-# NVIDIA's log2 was 11 ULP out for inputs just below 1; RADV's was within 1.
+# NVIDIA's log2 was 11 ULP out for inputs just below 1, and its exp2 2 ULP; RADV's were within 1.
 LOGARITHM = 16
+EXPONENTIAL = 4
 ADDEND = 0x40490fdb
 
 # name: (source count, model returning a word or an expected `Float`)
@@ -442,7 +481,7 @@ FLOATS = {
     "v_rsq_f32": (1, arithmetic(lambda a, b, c: 1 / math.sqrt(a) if a > 0 else
                                 (math.copysign(INFINITY, a) if a == 0 else float("nan")), ulps=APPROXIMATE)),
     "v_rcp_iflag_f32": (1, arithmetic(lambda a, b, c: 1 / a if a else math.copysign(INFINITY, a), ulps=1)),
-    "v_exp_f32": (1, arithmetic(lambda a, b, c: power_of_two(a), ulps=APPROXIMATE)),
+    "v_exp_f32": (1, arithmetic(lambda a, b, c: power_of_two(a), ulps=EXPONENTIAL)),
     "v_log_f32": (1, arithmetic(lambda a, b, c: log_two(a), ulps=LOGARITHM)),
     # The destination is the third source.
     "v_fmac_f32": (3, multiply_add),
@@ -468,6 +507,16 @@ FLOATS = {
     "v_cvt_flr_i32_f32": (1, to_integer(math.floor, -2**31, 2**31 - 1)),
     "v_cvt_rpi_i32_f32": (1, to_integer(lambda v: math.floor(v + 0.5), -2**31, 2**31 - 1)),
 }
+# RDNA 1 instructions the console also runs. The assembler needs its own target for them.
+LEGACY = {
+    "v_mad_f32": (3, separate),
+    "v_mad_legacy_f32": (3, lambda a, b, c: separate(a, b, c, legacy=True)),
+    "v_mac_f32": (3, separate),
+    "v_mac_legacy_f32": (3, lambda a, b, c: separate(a, b, c, legacy=True)),
+    "v_madak_f32": (2, lambda a, b, c: separate(a, b, ADDEND)),
+    "v_madmk_f32": (2, lambda a, b, c: separate(a, ADDEND, b)),
+}
+FLOATS.update(LEGACY)
 FLOAT_EDGE = [0x00000000, 0x80000000, 0x3f800000, 0xbf800000, 0x3f000000, 0xbf000000, 0x3fc00000,
               0xc0200000, 0x4b000000, 0x4effffff, 0x4f000000, 0xcf000000, 0x4f800000, 0x7f7fffff,
               0xff7fffff, 0x7f800000, 0xff800000, 0x7fc00000, 0x00800000, 0x3effffff]
@@ -544,6 +593,9 @@ def is_float(name):
 
 def count(name):
     """Result words one instruction produces: scalar ones also report SCC."""
+    if name in PAIRS:
+        result = PAIRS[name](1, 1, 1)
+        return 1 if isinstance(result, int) else 2 if result[1] is None else 3
     if name in IN_PLACE:
         return 1
     if name in CONSTANT:
@@ -555,10 +607,26 @@ def count(name):
 
 def lines_for(name, destination):
     """Assembly leaving the instruction's results from `v{destination}` on."""
-    if name == "v_fmac_f32":
+    if name in ("v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32"):
         return [f"v_mov_b32_e32 v{destination}, v6", f"{name} v{destination}, v4, v5"]
-    if name == "v_fmaak_f32":
+    if name in ("v_fmaak_f32", "v_madak_f32"):
         return [f"{name} v{destination}, v4, v5, 0x{ADDEND:x}"]
+    if name == "v_madmk_f32":
+        return [f"{name} v{destination}, v4, 0x{ADDEND:x}, v5"]
+    if name in PAIRS:
+        compare, shift = name.startswith("s_cmp_"), "sh" in name
+        # X is s[20:21]. Y is s[22:23]; a comparison's shares X's high word so the two can be equal.
+        program = ["v_readfirstlane_b32 s20, v4", "v_readfirstlane_b32 s21, v5",
+                   f"v_readfirstlane_b32 s22, v{5 if compare else 6}", f"v_readfirstlane_b32 s23, v{5 if compare else 4}",
+                   # SCC from the inputs, so a select takes each side and a kept SCC is seen.
+                   "s_cmp_lt_u32 s20, s22"]
+        if compare:
+            return program + [f"{name} s[20:21], s[22:23]", "s_cselect_b32 s24, 1, 0",
+                              f"v_mov_b32_e32 v{destination}, s24"]
+        program += [f"{name} s[24:25], s[20:21], {'s22' if shift else 's[22:23]'}"]
+        if count(name) == 3:
+            program += ["s_cselect_b32 s26, 1, 0", f"v_mov_b32_e32 v{destination + 2}, s26"]
+        return program + [f"v_mov_b32_e32 v{destination}, s24", f"v_mov_b32_e32 v{destination + 1}, s25"]
     if name in EXEC_COMPARES or name in FLOAT_EXEC_COMPARES:
         # The write of 1 runs only where the comparison leaves the lane active.
         return [f"v_mov_b32_e32 v{destination}, 0", "s_mov_b32 s26, exec_lo", f"{name}_e32 v4, v5",
@@ -599,6 +667,15 @@ def results(name, values):
             return [table[name][1](*values)]
     if name in SCALAR_COMPARES:
         return [SCALAR_COMPARES[name][1](*values[:2])]
+    if name in PAIRS:
+        a, b, c = values
+        compare = name.startswith("s_cmp_")
+        low, high = (b, b) if compare else (c, a)
+        result = PAIRS[name](a | b << 32, low | high << 32, int(a < low))
+        if compare:
+            return [result]
+        value, flag = result
+        return [value & M, value >> 32] + ([] if flag is None else [flag])
     if name in CONSTANT_COMPARES:
         return [CONSTANT_COMPARES[name][1](values[0])]
     if name in CONSTANT or name in IN_PLACE:
@@ -617,11 +694,20 @@ def program(chunk):
     return out + ["s_endpgm"]
 
 
+def kind(name):
+    """Float and integer instructions need different inputs, and RDNA 1 ones
+    another assembler target, so a shader holds one kind."""
+    return is_float(name), name in LEGACY
+
+
+def target(names):
+    return ("-mcpu=gfx1013",) if any(name in LEGACY for name in names) else ()
+
+
 def chunks_of(names):
     chunk, used = [], 0
-    # Float and integer instructions need different inputs, so a shader holds one kind.
-    for name in sorted(names, key=is_float):
-        if used + count(name) > OUTPUTS or (chunk and is_float(name) != is_float(chunk[0])):
+    for name in sorted(names, key=kind):
+        if used + count(name) > OUTPUTS or (chunk and kind(name) != kind(chunk[0])):
             yield chunk
             chunk, used = [], 0
         chunk.append(name)
@@ -635,7 +721,7 @@ def probe(names, emitter, llvm_mc):
     supported, refused = [], {}
     for name in names:
         try:
-            words = assemble(program([name]), llvm_mc)
+            words = assemble(program([name]), llvm_mc, *target([name]))
         except (ValueError, subprocess.CalledProcessError) as error:
             refused[name] = f"not assembled: {str(error)[:120]}"
             continue
@@ -664,7 +750,7 @@ def main():
         ap.error("choose a fresh receipt")
     a.work.mkdir(parents=True, exist_ok=False)
     rng = random.Random(0x414c5531)
-    every = [*OPERATIONS, *SCALAR, *IN_PLACE, *CONSTANT, *CONSTANT_COMPARES, *COMPARES, *SCALAR_COMPARES,
+    every = [*OPERATIONS, *SCALAR, *PAIRS, *IN_PLACE, *CONSTANT, *CONSTANT_COMPARES, *COMPARES, *SCALAR_COMPARES,
              *EXEC_COMPARES, *FLOATS, *FLOAT_COMPARES,
              *FLOAT_EXEC_COMPARES]
     supported, refused = probe(every, a.emitter, a.llvm_mc)
@@ -676,7 +762,7 @@ def main():
         (trial / "context.h").write_text((guest.parent / "context.h").read_text().replace(
             '"../compute_buffers.h"', '"' + str(ROOT / "tools/reference/compute_buffers.h") + '"'))
         for number, chunk in enumerate(chunks_of(supported)):
-            got = translate(a.emitter, assemble(program(chunk), a.llvm_mc))
+            got = translate(a.emitter, assemble(program(chunk), a.llvm_mc, *target(chunk)))
             got.check_returncode()
             outputs = sum(count(name) for name in chunk)
             shader = trial / f"alu{number:02}.hlsl"
