@@ -794,11 +794,9 @@ impl Tracked {
                                 let quiet = g.quiet_takes.entry(p).or_insert(0);
                                 *quiet = quiet.saturating_add(1);
                                 if *quiet >= COOL_TAKES {
-                                    remove_watched(&mut g, p, Some(&self.changed));
-                                    if whole_page {
-                                        whole.push(p);
-                                        cooled.push(p);
-                                    }
+                                    // The poll covered the whole page, even for a clipped take.
+                                    whole.push(p);
+                                    cooled.push(p);
                                 }
                             }
                         }
@@ -831,7 +829,7 @@ impl Tracked {
             #[cfg(feature = "diagnostics")]
             drop(asked);
             whole.retain(|p| !unguarded.contains(p));
-            for page in protect_noting(&mut g, &whole, &mut unmapped) {
+            for page in protect_noting(&mut g, &whole, &cooled, &mut unmapped) {
                 changed.remove(&page);
                 self.changed.taken(page);
             }
@@ -859,6 +857,10 @@ impl Tracked {
                         Err(()) => poll_write_watch(p).unwrap_or(true),
                     };
                     if dirty {
+                        // A clipped copy cannot acknowledge the rest of a late write.
+                        if !is_whole(p) {
+                            changed.insert(p);
+                        }
                         if let Some(holders) = g.holders.get(&p) {
                             for c in holders {
                                 if !Arc::ptr_eq(c, &self.changed) {
@@ -869,6 +871,11 @@ impl Tracked {
                             }
                         }
                         pages.push(p);
+                    }
+                    // A busy or otherwise unguardable page still needs hardware polling.
+                    // Publish the handoff only after delivering writes from the final poll.
+                    if g.protected.contains(&p) || unmapped.binary_search(&p).is_ok() {
+                        remove_watched(&mut g, p, Some(&self.changed));
                     }
                 }
             }
@@ -1033,12 +1040,13 @@ impl Tracked {
 /// now guarded or with nothing mapped (taken either way); a page that is
 /// mapped but cannot be guarded is left out (it stays changed).
 fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
-    protect_noting(g, pages, &mut Vec::new())
+    protect_noting(g, pages, &[], &mut Vec::new())
 }
 
 /// [`protect`], also listing in `unmapped` the pages taken because nothing
-/// is mapped there.
-fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usize>) -> Vec<usize> {
+/// is mapped there. Sorted hot pages in `cooling` need a real read-only guard
+/// while their write-watch stays active through the final poll.
+fn protect_noting(g: &mut Guards, pages: &[usize], cooling: &[usize], unmapped_pages: &mut Vec<usize>) -> Vec<usize> {
     #[cfg(feature = "diagnostics")]
     let counted = |calls: u64, pages: u64| {
         crate::copystat::add(crate::copystat::C::ProtectCalls, calls);
@@ -1067,8 +1075,16 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
         if g.busy.iter().any(|&(a, b)| (a..b).contains(&p)) {
             continue;
         }
-        if g.protected.contains(&p) || g.watched.contains(&p) {
+        if g.protected.contains(&p) {
             taken.push(p);
+            continue;
+        }
+        if g.watched.contains(&p) {
+            if cooling.binary_search(&p).is_ok() {
+                to_guard.push(p);
+            } else {
+                taken.push(p);
+            }
             continue;
         }
         if can_watch(g, p) && promote_watched(g, p) {
@@ -2230,6 +2246,78 @@ pub(crate) mod tests {
             total_update.as_secs_f64() * 1e3 / f64::from(FRAMES),
         );
         crate::shadow::unregister(p, p as u64);
+        free(p);
+    }
+
+    #[test]
+    fn quiet_partial_refresh_preserves_the_next_write() {
+        for quiet_len in [PAGE, 4] {
+            let p = pool(1);
+            let t = track_copy(p, PAGE, true).expect("write-watched pool");
+            assert_eq!(t.take(p, p + PAGE), [(p, p + PAGE)]);
+            for value in 1..=u32::from(HOT_THRESHOLD) + 1 {
+                // SAFETY: aligned word in our allocation.
+                unsafe { (p as *mut u32).write_volatile(value) };
+                assert_eq!(t.take(p, p + PAGE), [(p, p + PAGE)]);
+            }
+            assert!(!t.clean(), "the page was promoted to write-watch");
+            for _ in 0..COOL_TAKES {
+                assert!(t.take(p, p + quiet_len).is_empty());
+            }
+            assert!(
+                t.clean(),
+                "the quiet tracker should return to its clean fast path"
+            );
+            let end_word = p + PAGE - 4;
+            // SAFETY: last aligned word in the same allocation.
+            unsafe { (end_word as *mut u32).write_volatile(99) };
+            assert_eq!(
+                t.take(end_word, p + PAGE),
+                [(end_word, p + PAGE)],
+                "a write after quiet {quiet_len}-byte refreshes must reach the next copy"
+            );
+            assert_eq!(
+                t.take(p, p + PAGE),
+                [(p, p + PAGE)],
+                "partial take leaves the rest pending"
+            );
+            assert!(t.take(p, p + PAGE).is_empty());
+            drop(t);
+            free(p);
+        }
+    }
+
+    #[test]
+    fn hot_page_stays_visible_to_both_holders_while_a_writer_is_open() {
+        let p = pool(1);
+        let a = track_copy(p, PAGE, true).unwrap();
+        let b = track_copy(p, PAGE, true).unwrap();
+        a.take(p, p + PAGE);
+        b.take(p, p + PAGE);
+        for value in 1..=u32::from(HOT_THRESHOLD) + 1 {
+            // SAFETY: aligned word in our live pool.
+            unsafe { (p as *mut u32).write_volatile(value) };
+            a.take(p, p + PAGE);
+        }
+        assert!(guards().watched.contains(&(p / PAGE)));
+        let writer = writing(p, PAGE);
+        a.take(p, p + PAGE);
+        b.take(p, p + PAGE);
+        for _ in 0..COOL_TAKES {
+            a.take(p, p + 4);
+        }
+        let end_word = p + PAGE - 4;
+        // SAFETY: last aligned word in the page held open by the writer.
+        unsafe { (end_word as *mut u32).write_volatile(99) };
+        for t in [&a, &b] {
+            assert_eq!(t.take(end_word, p + PAGE), [(end_word, p + PAGE)]);
+        }
+        drop(writer);
+        for t in [&a, &b] {
+            assert_eq!(t.take(p, p + PAGE), [(p, p + PAGE)]);
+            assert!(t.take(p, p + PAGE).is_empty());
+        }
+        drop((a, b));
         free(p);
     }
 }
