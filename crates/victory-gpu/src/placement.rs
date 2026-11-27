@@ -49,7 +49,11 @@ struct Heaps {
     /// (an `AddRef`/`Release` pair each), so it waits for [`REAP_EVERY`]
     /// of them instead of running per texture.
     since_reap: usize,
-    /// Reaps run, for the test that places into a heap with room.
+    /// Reaps run. Test-only, and it earns its place in a production struct:
+    /// [`place`] works on the global [`HEAPS`], so a test that drives that
+    /// entry cannot hold a `Heaps` of its own — this count is the only way
+    /// to see whether the entry reaped. Compiled out of production builds,
+    /// where nothing reads it.
     #[cfg(test)]
     reaps: u64,
 }
@@ -236,7 +240,9 @@ pub(crate) fn unplace(p: Placement) {
 }
 
 /// The texture at `p` is let go of: its range is free again once nothing
-/// else holds `resource` (checked at the next placements and passes).
+/// else holds `resource`, which a reap finds out. Ranges given back wait
+/// for [`REAP_EVERY`] of them instead of taking a reap each; [`free_bytes`]
+/// and [`stats`] still reap every time they are asked.
 pub(crate) fn free(resource: ID3D12Resource, p: Placement) {
     let mut heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(h) = heaps.as_mut() {
@@ -429,5 +435,55 @@ mod tests {
         heaps.heaps[0].free.clear();
         assert!(heaps.reserved(ALIGN, ALIGN).is_none(), "no room left");
         assert_eq!(heaps.reaps, reaps + 1, "no room: one reap, then a new heap");
+    }
+
+    /// Reaps run on the global [`HEAPS`], which [`place`] and its tests
+    /// share.
+    fn global_reaps() -> u64 {
+        HEAPS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map_or(0, |h| h.reaps)
+    }
+
+    /// A placement into a heap with room reaps nothing, through [`place`]:
+    /// the entry a texture goes through, so a reap put back in there counts
+    /// (the tests above drive the helpers and would not see it).
+    #[test]
+    fn the_place_entry_into_a_heap_with_room_does_not_reap() {
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 256,
+            Height: 256,
+            DepthOrArraySize: 1,
+            MipLevels: 9,
+            Format: DXGI_FORMAT_BC1_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        assert!(fits(&host.device, &desc), "a texture that goes into a heap");
+        // The first placement reaps, no heap holding a range yet, and makes
+        // the heap the next one takes room in.
+        let (_, a) = place(&host.device, &desc).expect("a placement");
+        // Other tests place textures on the same global heaps, and a reap of
+        // theirs can land between these two reads as well: only a count that
+        // moved every time is the one `place` paid.
+        for _ in 0..3 {
+            let reaps = global_reaps();
+            let (_, b) = place(&host.device, &desc).expect("a placement");
+            assert_ne!(b, a, "a range of its own, not the first one again");
+            if global_reaps() == reaps {
+                return;
+            }
+        }
+        panic!("a placement into a heap with room reaped the pending ranges");
     }
 }
