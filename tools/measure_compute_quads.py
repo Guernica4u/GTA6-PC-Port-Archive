@@ -107,7 +107,13 @@ def main(argv=None):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--adapter", required=True)
     args = parser.parse_args(argv)
+    from check_translator_gpu import select_adapter
     from frosty_gpu_guest import run_gpu_guest
+    # The guest opens the default adapter, so expose only the one asked for.
+    device = select_adapter(args.adapter)
+    if not device:
+        parser.error(f"vulkaninfo lists no device {args.adapter}")
+    print(f"adapter {args.adapter.lower()}: {device}", flush=True)
     work = args.work.resolve()
     work.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(dir=work) as tmp:
@@ -139,7 +145,7 @@ def main(argv=None):
             flat = struct.unpack(f"<{count}I", data)
             results[name] = describe(x, y, [flat[t * WORDS:(t + 1) * WORDS] for t in range(GROUPS * x * y)])
     report = dict(scope="Measured placement of compute threads in waves and quads; no expected result",
-                  adapter=fields.get("adapter"), wanted_adapter=args.adapter, guest_exit=status,
+                  adapter=fields.get("adapter"), wanted_adapter=args.adapter.lower(), guest_exit=status,
                   refused_by_dxc=refused_by_dxc, cases=results)
     if fields.get("error"):
         report["error"] = fields["error"]
@@ -159,7 +165,10 @@ def main(argv=None):
     for name, why in refused_by_dxc.items():
         print(f"{name}: DXC refused it ({why[0]})")
     print(f"full report: {args.output}")
-    return 0 if status == 0 and fields.get("adapter") == args.adapter else 1
+    if fields.get("adapter") != args.adapter.lower():
+        print(f"WRONG ADAPTER: asked for {args.adapter}, the guest ran on {fields.get('adapter')}")
+        return 1
+    return 0 if status == 0 else 1
 
 
 if __name__ == "__main__":
