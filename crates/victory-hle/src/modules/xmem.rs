@@ -702,25 +702,60 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
 
 /// Copies `data` into physical pages, from `offset` bytes into the first,
 /// whether or not they are mapped anywhere (DirectStorage destinations).
-/// One view per run of consecutive pages, not one per page: each view
-/// costs a map, a commit and an unmap (which flushes every core's TLB).
 /// False if a page is unknown or the host fails.
 pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> bool {
-    let Some(runs) = runs(pages, offset, data.len()) else {
-        return false;
-    };
-    let (mut within, mut done) = (offset % PAGE, 0);
+    fill_physical(pages, offset, data.len(), |at, out| {
+        out.copy_from_slice(&data[at..at + out.len()]);
+        Ok::<(), std::convert::Infallible>(())
+    })
+    .is_some()
+}
+
+/// Fills bytes `[offset, offset + len)` of physical pages in place,
+/// whether or not they are mapped anywhere: `fill(at, out)` writes bytes
+/// `[at, at + out.len())` of the data into `out`, once per run of
+/// consecutive slices of one section, in order. A copy needs no buffer
+/// this way, even when the pages are consecutive pages of one allocation
+/// that span several sections. One view per run, not one per page: each
+/// view costs a map, a commit and an unmap (which flushes every core's
+/// TLB). `None` if a page is unknown (nothing written) or the host fails
+/// (the runs before it written); otherwise the first error `fill` returns,
+/// if any. Either way nothing outside the bytes is written, and a failure
+/// leaves the bytes undefined, as the console does for a failed request.
+pub(crate) fn fill_physical<E>(
+    pages: &[usize],
+    offset: usize,
+    len: usize,
+    mut fill: impl FnMut(usize, &mut [u8]) -> Result<(), E>,
+) -> Option<Result<(), E>> {
+    let runs = runs(pages, offset, len)?;
+    let (mut within, mut done, mut result) = (offset % PAGE, 0, Some(Ok(())));
     for (slice, n) in &runs {
+        #[cfg(test)]
+        if tests::view_fails() {
+            result = None;
+            break;
+        }
         let Some(mut view) = View::map(slice, *n) else {
-            return false;
+            result = None;
+            break;
         };
-        let k = (n * PAGE - within).min(data.len() - done);
-        view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
+        let k = (n * PAGE - within).min(len - done);
+        if let Err(error) = fill(done, &mut view.bytes()[within..within + k]) {
+            result = Some(Err(error));
+            break;
+        }
         (within, done) = (0, done + k);
     }
-    // Where the pages show once written (see `PageWindow`).
-    report_written(&shown_at(pages.get(offset / PAGE..(offset + data.len()).div_ceil(PAGE)).unwrap_or(&[])));
-    true
+    // Where the pages show once written (see `PageWindow`), even partly.
+    if done > 0 || matches!(result, Some(Err(_))) {
+        report_written(&shown_at(
+            pages
+                .get(offset / PAGE..(offset + len).div_ceil(PAGE))
+                .unwrap_or(&[]),
+        ));
+    }
+    result
 }
 
 /// Bytes `[offset, offset + len)` of physical pages, writable in place
@@ -1160,7 +1195,7 @@ pub(crate) fn module() -> HleModule {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn query(address: *const c_void) -> BasicInformation {
@@ -1543,8 +1578,30 @@ mod tests {
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
     }
 
+    thread_local! {
+        /// How many views `fill_physical` maps on this thread before one
+        /// fails, as the host's could, and how many fail then.
+        pub(crate) static VIEW_FAILS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((usize::MAX, 0)) };
+    }
+
+    /// Whether the next view `fill_physical` maps fails (`VIEW_FAILS`;
+    /// `usize::MAX` views first: none fails).
+    pub(super) fn view_fails() -> bool {
+        VIEW_FAILS.with(|cell| match cell.get() {
+            (usize::MAX, _) | (0, 0) => false,
+            (0, fails) => {
+                cell.set((0, fails - 1));
+                true
+            }
+            (left, fails) => {
+                cell.set((left - 1, fails));
+                false
+            }
+        })
+    }
+
     /// `n` pages of one new allocation, in sections of at most `per` pages.
-    fn allocate_in(n: usize, per: usize) -> Vec<usize> {
+    pub(crate) fn allocate_in(n: usize, per: usize) -> Vec<usize> {
         let sections = make_sections(n, per).expect("allocated");
         let mut pages = Vec::new();
         number_pages(n, per, sections, |index, number| {
