@@ -29,9 +29,10 @@ fn host_dll() -> PathBuf {
 /// lock on the main one while tests run), in the outer one's scratch folder
 /// for tests, so that it follows `CARGO_TARGET_DIR` like the rest of the
 /// build. `VICTORY_HLE_PROBE` names a fixture built beforehand instead, for
-/// runners that cannot start cargo (tests under Wine).
+/// runners that cannot start cargo (tests under Wine); set but empty, it
+/// names nothing and the fixture is built as usual.
 fn build_probe() -> PathBuf {
-    if let Some(prebuilt) = std::env::var_os("VICTORY_HLE_PROBE") {
+    if let Some(prebuilt) = std::env::var_os("VICTORY_HLE_PROBE").filter(|p| !p.is_empty()) {
         return prebuilt.into();
     }
     let manifest = workspace_root().join("tests/fixtures/hle-probe/Cargo.toml");
