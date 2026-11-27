@@ -11,7 +11,8 @@
 //! LDS), compute lane by lane in branches only some lanes take (where they
 //! may also read across lanes and write LDS, one inside another or not),
 //! go round loops each lane leaves after its own number of rounds (reading
-//! across lanes inside), and take branches on a scalar compare. They are integer only, set every
+//! across lanes inside), take branches on a scalar compare, and may end
+//! some lanes partway. They are integer only, set every
 //! register before reading it, read only LDS that is written, read only
 //! lanes that run (the one-wave64 form reads another as the host does,
 //! which D3D leaves undefined), and run in whole console waves of 1-D
@@ -93,6 +94,7 @@ fn program(seed: u64) -> Program {
         same: [false; 9],
         lanes: [0, 64],
         in_loop: false,
+        ended: None,
     };
     g.w.push(0x3420_0085); // v_lshlrev_b32 v16, 5, v0
     g.init(&STATE);
@@ -101,6 +103,9 @@ fn program(seed: u64) -> Program {
     }
     for (slot, &reg) in STATE.iter().enumerate() {
         g.w.extend(store(reg, 4 * slot as u32));
+    }
+    if let Some(at) = g.ended {
+        g.w[at] |= (g.w.len() - at - 1) as u32; // to s_endpgm
     }
     g.w.push(S_ENDPGM);
     Program {
@@ -137,6 +142,11 @@ struct Gen {
     /// (so no lane reads: the one-wave64 form reads a lane that left as the
     /// host does, which D3D leaves undefined).
     in_loop: bool,
+    /// Where some lanes left the program: the `s_cbranch_execz` that skips a
+    /// wave with none left to the end, its offset set at the end. After it,
+    /// no step reads a lane that may have left (permutes, swizzles,
+    /// whole-wave sections that enable every lane, LDS other threads wrote).
+    ended: Option<usize>,
 }
 
 impl Gen {
@@ -183,9 +193,11 @@ impl Gen {
     }
 
     fn step(&mut self) {
-        match self.r.below(18) {
+        let ended = self.ended.is_some();
+        match self.r.below(19) {
             0 | 1 => self.alu(),
             2 | 3 => self.dpp(),
+            4 | 5 if ended => self.alu(),
             4 => self.swizzle(),
             5 => self.bpermute(),
             6 => self.read_lane(),
@@ -194,9 +206,11 @@ impl Gen {
             9 | 10 => self.ballot(),
             11 | 12 => self.branch(0),
             13 => self.uniform(),
-            14 | 15 if self.lds => self.lds_step(),
+            14 | 15 if self.lds && !ended => self.lds_step(),
             14 | 15 => self.alu(),
             16 => self.lane_loop(),
+            17 => self.early_end(),
+            _ if ended => self.alu(),
             _ => self.section(),
         }
     }
@@ -367,10 +381,12 @@ impl Gen {
         };
         for _ in 0..1 + self.r.below(3) {
             match self.r.below(10) {
-                0 if self.lds_written => self.lds_write(),
+                0 if self.lds_written && self.ended.is_none() => self.lds_write(),
                 1 => self.ballot(),
                 2 => self.first_lane(),
-                3 if self.lds_written && self.threads == 64 => self.lds_read(),
+                3 if self.lds_written && self.threads == 64 && self.ended.is_none() => {
+                    self.lds_read()
+                }
                 4 if !self.in_loop => self.read_lane(),
                 5 => self.dpp(),
                 6 if depth == 0 => self.branch(1),
@@ -407,8 +423,10 @@ impl Gen {
                 0 => self.ballot(),
                 1 => self.first_lane(),
                 2 => self.dpp(),
-                3 if self.lds_written => self.lds_write(),
-                4 if self.lds_written && self.threads == 64 => self.lds_read(),
+                3 if self.lds_written && self.ended.is_none() => self.lds_write(),
+                4 if self.lds_written && self.threads == 64 && self.ended.is_none() => {
+                    self.lds_read()
+                }
                 5 if outside => self.branch(1),
                 _ => self.alu(),
             }
@@ -422,6 +440,26 @@ impl Gen {
         let back = top as i32 - (self.w.len() as i32 + 1);
         self.w.push(0xBF89_0000 | (back as u32 & 0xFFFF)); // s_cbranch_execnz to the top
         self.w.push(0xBEFE_041A); // s_mov_b64 exec, s[26:27]
+    }
+
+    /// The console lanes below a random one, or from one, leave the program:
+    /// EXEC loses them, and a wave with none left skips to the end. Once a
+    /// program; the lanes left are those lane reads may name.
+    fn early_end(&mut self) {
+        if self.ended.is_some() {
+            return self.alu();
+        }
+        let (from, lanes) = (self.r.below(2) == 0, 1 + self.r.below(63));
+        // v_cmp_le_u32 (from) or v_cmp_gt_u32 (below) vcc, lanes, v10
+        let op: u32 = if from { 0xC3 } else { 0xC4 };
+        self.w.extend([
+            vop2(10, 0x1B, k(63), 0), // v_and_b32 v10, 63, v0
+            0x7C00_0000 | op << 17 | 10 << 9 | k(lanes) as u32,
+            0x8AFE_6A7E, // s_andn2_b64 exec, exec, vcc
+            0xBF88_0000, // s_cbranch_execz to the end (set there)
+        ]);
+        self.ended = Some(self.w.len() - 1);
+        self.lanes = if from { [0, lanes] } else { [lanes, 64] };
     }
 
     /// A read of the LDS dword of another thread of the console wave.

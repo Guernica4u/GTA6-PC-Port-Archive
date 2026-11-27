@@ -120,8 +120,9 @@ regions. Two cases are lowered, tried in this order after Level 2:
   inside.
 - **Wave-wide** (`lower::wide`). Otherwise the region runs wave-wide: the
   blocks not every thread meets at, joined by their edges, entered from
-  one block and left to one (or, where such a set is not, the region of
-  one branch in it). Every thread runs every block of it in order, each
+  one block and left to one, or holding the program's ends (or, where such
+  a set is neither, the region of one branch in it). Every thread runs
+  every block of it in order, each
   block after those its forward edges come from and a loop's blocks
   together, and each block acts only in its own lanes, those along its
   edges in. Each vector instruction's guard takes in the block's lanes (a
@@ -130,23 +131,26 @@ regions. Two cases are lowered, tried in this order after Level 2:
   phis of the region and of its join pick, lane by lane, the value along
   the edge the lane came by, and every block of the region is one where
   every thread meets, so the halves trade and order LDS there. A lane read
-  of a lane outside the block gives its old value, as on the console.
+  of a lane outside the block gives its old value, as on the console. A
+  lane that gets to an end is in no block after it, and every thread ends
+  together at the region's last block.
 - A loop of such a region runs as the console's wave runs it: every
-  thread goes round while any lane of the group does, which the halves
-  trade at the end of each round (two barriers). The header's lanes are
+  thread goes round while any lane of the group does, which every half of
+  the group tells the others at the end of each round (two barriers; in a
+  group of several console waves, a wave whose lanes have all left goes
+  round with none, which changes nothing it holds). The header's lanes are
   those entering, then those taking an edge back; a lane leaving along an
   edge out of the loop is out of it from then on, and after the loop the
   edge's lanes are all that left along it. What a lane holds stays as it
   left it: VGPR writes are guarded, and every other value a block of the
   loop defines (scalars, compare bits, what whole-wave sections leave,
   ballots) is kept per lane from the last round the lane ran the block, as
-  each lane holds it in the per-lane form. A loop that reaches the
-  iteration limit (`LOOP_LIMIT`) ends the whole group, so no lane stores
-  past it.
-- Only a region with no end, no scalar code with effects beyond its values
-  and loops entered at their headers runs wave-wide, its loops only in a
-  group of one console wave (each console wave of a larger group would go
-  round its own number of times). Regions run wave-wide only where an
+  each lane holds it in the per-lane form. Past the iteration limit
+  (`LOOP_LIMIT`) the loop ends for every thread, and a lane still going
+  round is in no block of the region after it.
+- Only a region with no scalar code with effects beyond its values and
+  loops entered at their headers runs wave-wide. Regions run wave-wide only
+  where an
   attempt at lowering was refused for want of a meeting: a program that
   needs none is lowered as before, and one that does pays two barriers per
   exchange inside its regions (and per round of a loop) and a select per
@@ -192,10 +196,12 @@ that 735 compute programs share):
 | regions only one half runs | 2,485 |
 | wave-wide regions | 2,542 |
 | wave-wide loops | 2,650 |
+| regions to the program's end, loops of larger groups | 2,697 |
 
-Still refused in halves: 33 masks, 21 one-wave LDS regions, 13 first lanes
-and 3 reductions, in a region that holds an early end, a loop in a group of
-several console waves, or two ways in; 6 tiled group shapes and 2 16-bit
+Still refused in halves: 9 first lanes, 6 one-wave LDS regions, 4 masks
+and 2 reductions, in a region not entered from one block and left to one
+(nor one of its branches' regions); 2 programs whose LDS leaves no room for
+the trades' 16 bytes per console wave; 6 tiled group shapes and 2 16-bit
 sums.
 
 Before Levels 2 and 3, a local build that recorded every cross-half site
@@ -234,8 +240,9 @@ round (the halves going round different numbers of times) with first
 lanes, masks and LDS inside, and a first lane read after such a loop.
 `emit::halves_random_tests` runs random wave64 programs (cross-lane steps
 at the top level, in branches one inside another and in loops each lane
-leaves in its own round, LDS, scalar branches) in halves and as one wave64
-on an adapter that runs 64-lane waves, lane by lane.
+leaves in its own round, LDS, scalar branches, lanes that end partway) in
+halves and as one wave64 on an adapter that runs 64-lane waves, lane by
+lane.
 
 ## Open pull requests in this area
 

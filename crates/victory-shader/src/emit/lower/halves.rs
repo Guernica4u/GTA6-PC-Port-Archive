@@ -275,7 +275,7 @@ impl Lower<'_> {
     /// a half without threads (in a group that ends inside a console wave's
     /// low half) gives the identity. A barrier one half skips hangs the GPU
     /// (D3D12 leaves it undefined; NVIDIA waits for every thread).
-    pub(super) fn trade(&mut self, at: usize, words: &[(V, u32)]) -> Result<Vec<(V, V)>, Why> {
+    fn trade(&mut self, at: usize, words: &[(V, u32)]) -> Result<Vec<(V, V)>, Why> {
         debug_assert!(words.len() <= WORDS as usize);
         let slots = self.slots()?;
         let f = self.relabelled_flat();
@@ -547,6 +547,39 @@ impl Lower<'_> {
             self.exchange.pending = None;
         }
         self.exchange.pending = Some(writes || self.exchange.pending == Some(true));
+    }
+
+    /// Whether `word` (each half's, the same in every lane of its host wave)
+    /// is non-zero in any half of the group, in DXIL block `at` of an IR
+    /// block every thread of the group meets at: in a group of one console
+    /// wave the halves trade ([`Lower::trade`]); in one of several, every
+    /// half stores its word, a group barrier, every lane reads the word of
+    /// every half that has threads, and a second barrier.
+    pub(super) fn group_any(&mut self, at: usize, word: V) -> Result<V, Why> {
+        let group = self.s.threads.map_or(64, |t| t.iter().product::<u32>());
+        let zero = self.s.m.i32(0);
+        if group <= 64 {
+            let (low, high) = self.trade(at, &[(word, 0)])?[0];
+            let both = self.s.m.bin(at, Bin::Or, low, high);
+            return Ok(self.s.m.cmp(at, pred::NE, both, zero));
+        }
+        let slots = self.slots()?;
+        let f = self.relabelled_flat();
+        let (k5, kw) = (self.s.m.i32(5), self.s.m.i32(WORDS));
+        let own = self.s.m.bin(at, Bin::LShr, f, k5);
+        let own = self.s.m.bin(at, Bin::Mul, own, kw);
+        let p = self.s.m.element(at, slots, own);
+        self.s.m.store(at, p, word);
+        self.group_barrier(at);
+        let mut any = zero;
+        for h in 0..group.div_ceil(HALF) {
+            let slot = self.s.m.i32(h * WORDS);
+            let p = self.s.m.element(at, slots, slot);
+            let w = self.s.m.load(at, p);
+            any = self.s.m.bin(at, Bin::Or, any, w);
+        }
+        self.group_barrier(at);
+        Ok(self.s.m.cmp(at, pred::NE, any, zero))
     }
 
     /// A group barrier ordering group-shared memory
