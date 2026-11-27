@@ -176,7 +176,12 @@ pub fn read_frame_spanning(
     let mut cursor = Cursor { data: head, pos: start };
     let mut got = 0;
     while got < bits && cursor.pos < head_bits {
-        let bit = cursor.bit()?;
+        // The cursor can land past the last packet of the head input: a
+        // packet of another stream skips to the next one, which lives in
+        // the tail. Stop gathering here and use the continuation instead.
+        let Some(bit) = cursor.bit() else {
+            break;
+        };
         out[got / 8] |= (bit as u8) << (7 - got % 8);
         got += 1;
     }
@@ -1962,5 +1967,85 @@ mod tests {
             );
             assert!(errors == 0 && snr > 40.0);
         }
+    }
+}
+
+#[cfg(test)]
+mod rolling_input_regression {
+    use super::*;
+
+    fn put(data: &mut [u8], at: usize, bits: u32, value: u32) {
+        for i in 0..bits as usize {
+            let mask = 1 << (7 - (at + i) % 8);
+            let byte = &mut data[(at + i) / 8];
+            *byte = (*byte & !mask) | (((value >> (bits as usize - 1 - i)) & 1) as u8 * mask);
+        }
+    }
+
+    #[test]
+    fn spanning_head_can_end_with_another_streams_packet() {
+        const BITS: usize = 31;
+        const START: usize = PACKET_BITS - 20;
+        const CONTINUATION: usize = BITS - 20;
+        let mut whole = vec![0u8; 3 * PACKET_BYTES];
+        // A0 starts one frame late in its payload, then skips B1.
+        put(
+            &mut whole,
+            0,
+            32,
+            (1 << 26) | (((START - HEADER_BITS) as u32) << 11) | 1,
+        );
+        whole[PACKET_BYTES..2 * PACKET_BYTES].fill(0xa5);
+        put(&mut whole, PACKET_BITS, 32, 1 << 26);
+        put(
+            &mut whole,
+            PACKET_BITS + HEADER_BITS,
+            LENGTH_BITS,
+            BITS as u32,
+        );
+        // A2 finishes that frame, then starts a new frame after eleven bits.
+        put(
+            &mut whole,
+            2 * PACKET_BITS,
+            32,
+            (1 << 26) | ((CONTINUATION as u32) << 11),
+        );
+        put(&mut whole, START, LENGTH_BITS, BITS as u32);
+        for i in LENGTH_BITS as usize..20 {
+            put(&mut whole, START + i, 1, (i & 1) as u32);
+        }
+        for i in 20..BITS {
+            put(
+                &mut whole,
+                2 * PACKET_BITS + HEADER_BITS + i - 20,
+                1,
+                (i & 1) as u32,
+            );
+        }
+        put(
+            &mut whole,
+            2 * PACKET_BITS + HEADER_BITS + CONTINUATION,
+            LENGTH_BITS,
+            BITS as u32,
+        );
+
+        let expected = read_frame(&whole, START).expect("unsplit frame");
+        assert_eq!(expected.bits, BITS);
+        assert_eq!(expected.data, [0, 63, 85, 84]);
+        assert_eq!(
+            expected.next,
+            Some(2 * PACKET_BITS + HEADER_BITS + CONTINUATION)
+        );
+
+        let head = &whole[..2 * PACKET_BYTES];
+        let tail = &whole[2 * PACKET_BYTES..];
+        let (actual, next) = read_frame_spanning(head, head.len() * 8, tail, START)
+            .expect("the frame continues after the interleaved packet");
+        assert_eq!(actual.bits, expected.bits);
+        assert_eq!(actual.start, START);
+        assert_eq!(actual.data, expected.data);
+        assert_eq!(next, HEADER_BITS + CONTINUATION);
+        assert_eq!(actual.next, Some(next));
+        assert_eq!(read_frame(tail, next).expect("next frame").bits, BITS);
     }
 }
