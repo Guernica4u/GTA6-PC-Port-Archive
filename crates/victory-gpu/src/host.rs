@@ -4502,9 +4502,11 @@ impl Host {
                         // asynchronous transfer. Keep shared staging on DIRECT.
                         if upq::on() && looks.is_none() {
                             let (source, used) = own.source();
-                            upload_slot = upq::send(self, &self.queue, source, used);
-                            if upload_slot.is_none() && used != 0 {
-                                upq::fallback();
+                            if upq::wants(used) {
+                                upload_slot = upq::send(self, &self.queue, source, used);
+                                if upload_slot.is_none() && used != 0 {
+                                    upq::fallback();
+                                }
                             }
                         }
                         own.record(self, list, &dirty, |shadow| looks.as_ref().is_some_and(|l| l.hold(shadow)),
