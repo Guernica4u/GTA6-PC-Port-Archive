@@ -629,6 +629,75 @@ mod tests {
         }
     }
 
+    #[test]
+    fn drain_waits_when_the_previous_submission_is_still_running_after_prewarm() {
+        use windows::Win32::Foundation::WAIT_OBJECT_0;
+
+        let Some(host) = host() else {
+            eprintln!("skipped: no host D3D12 device");
+            return;
+        };
+        let mut submitted = host.submitted.lock().unwrap();
+        host.drain_in_flight_locked(None::<fn()>);
+        assert!(!host.has_in_flight());
+        let target = *submitted + 1;
+        let written = std::cell::Cell::new(0u64);
+        let list = std::sync::Arc::new(host.new_list().unwrap());
+        list.defer_write(written.as_ptr().cast(), crate::queue::Written::Value(23), 8);
+        list.close();
+        let held_list = std::sync::Arc::downgrade(&list);
+        host.in_flight.lock().unwrap().push_back(InFlight {
+            fence: target,
+            submission: 0,
+            _early_copies: Vec::new(),
+            _plans: Vec::new(),
+            finish: Some(Finish { lists: vec![list], back: Vec::new() }),
+        });
+
+        let mut during_prewarm = None;
+        let mut wait_outcome = None;
+        host.drain_in_flight_with_wait(
+            Some(|| {
+                during_prewarm = Some((host.completed_fence() < target, written.get()));
+            }),
+            |event| {
+                let fence = host.fence.clone();
+                // The event is registered before this thread can signal the target.
+                // SAFETY: the signal is CPU-side and the submission lock is held.
+                let signal = std::thread::spawn(move || unsafe { fence.Signal(target) });
+                // SAFETY: this is the host event the drain registered for the target.
+                let waited = unsafe { WaitForSingleObject(event, 5000) };
+                let signaled = signal.join().unwrap();
+                if signaled.is_ok() {
+                    *submitted = target;
+                }
+                if waited != WAIT_OBJECT_0 {
+                    // SAFETY: consume any late signal before releasing the submission lock.
+                    unsafe { WaitForSingleObject(event, 0) };
+                }
+                wait_outcome = Some((waited, signaled));
+            },
+        );
+
+        // Remove the synthetic submission on a failed drain before its write target drops.
+        let pending = {
+            let mut in_flight = host.in_flight.lock().unwrap();
+            if in_flight.back().is_some_and(|entry| entry.fence == target) {
+                in_flight.pop_back()
+            } else {
+                None
+            }
+        };
+        drop(submitted);
+        assert_eq!(during_prewarm, Some((true, 0)));
+        let (waited, signaled) = wait_outcome.expect("the drain did not wait on the fence event");
+        signaled.unwrap();
+        assert_eq!(waited, WAIT_OBJECT_0);
+        assert!(pending.is_none());
+        assert_eq!(written.get(), 23);
+        assert!(held_list.upgrade().is_none());
+    }
+
     /// A list with no work before its waits, as the title's queues meet one
     /// another halfway: each write goes as soon as the waits before it are
     /// met, and work holds the later ones back.
@@ -1252,6 +1321,17 @@ impl Host {
     /// Finishes the previous async submission while `submitted` is held.
     /// Runs optional preparation only if there is still GPU work to overlap.
     fn drain_in_flight_locked(&self, prewarm: Option<impl FnOnce()>) {
+        self.drain_in_flight_with_wait(prewarm, |event| {
+            // SAFETY: the registered event is valid while `submitted` is held.
+            unsafe { WaitForSingleObject(event, INFINITE) };
+        });
+    }
+
+    fn drain_in_flight_with_wait(
+        &self,
+        prewarm: Option<impl FnOnce()>,
+        wait_for_event: impl FnOnce(HANDLE),
+    ) {
         let target = self
             .in_flight
             .lock()
@@ -1275,7 +1355,7 @@ impl Host {
                 if let Err(e) = self.fence.SetEventOnCompletion(target, self.event) {
                     tracing::warn!(error = %e, "host async drain failed");
                 } else {
-                    WaitForSingleObject(self.event, INFINITE);
+                    wait_for_event(self.event);
                 }
             }
             SUBMISSION_US[1].fetch_add(waited.elapsed().as_micros() as u64, Ordering::Relaxed);
