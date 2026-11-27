@@ -2695,6 +2695,7 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        crate::demand::drop_shadow(self.id);
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
@@ -4089,6 +4090,9 @@ impl Shadow {
             if stale.is_empty() {
                 continue;
             }
+            let pin_from = stale[0] * PAGE;
+            let pin_to = (stale[stale.len() - 1] + 1) * PAGE;
+            let _demand_pin = crate::demand::pin_range(pin_from, pin_to.saturating_sub(pin_from));
             // The lock of the copy's reference (the snapshot, or the
             // CPU's side of a copy in the card's memory), from before
             // title memory is read until the title's bytes are in: with
@@ -5479,6 +5483,23 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
 pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     buffers_read().range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end).and_then(|(_, e)| e.shadow.clone())
+}
+
+/// Whether `[address, address + len)` lies inside a title buffer that lives
+/// (or would live) in the card's memory (`carded`).
+pub(crate) fn in_card_buffer(address: u64, len: u64) -> bool {
+    let Some(end) = address.checked_add(len.max(1)) else {
+        return false;
+    };
+    let map = buffers_read();
+    let Some((k, e)) = map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end) else {
+        return false;
+    };
+    if let Some(shadow) = &e.shadow {
+        return shadow.carded();
+    }
+    let size = (e.end - k.0).next_multiple_of(1 << 16);
+    cards() && (size >= card_limits().0 || card_all())
 }
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {

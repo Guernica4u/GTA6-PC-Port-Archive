@@ -4925,15 +4925,20 @@ fn make_twinned(
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
-            let shadow = crate::shadow::find(address, u64::from(size))?;
-            let gpu = shadow.gpu(address);
-            if gpu % 256 != 0 {
-                once!(
-                    address = format_args!("{address:#x}"),
-                    "constant buffer not 256-byte aligned on the host"
-                );
-                return None;
-            }
+            let (gpu, buffer) = if let Some((buffer, gpu)) = crate::port::constants(address, u64::from(size)) {
+                (gpu, buffer)
+            } else {
+                let shadow = crate::shadow::find(address, u64::from(size))?;
+                let gpu = shadow.gpu(address);
+                if gpu % 256 != 0 {
+                    once!(
+                        address = format_args!("{address:#x}"),
+                        "constant buffer not 256-byte aligned on the host"
+                    );
+                    return None;
+                }
+                (gpu, shadow.buffer.clone())
+            };
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
                 SizeInBytes: constant_bytes(size),
@@ -4945,7 +4950,7 @@ fn make_twinned(
                     device.CreateConstantBufferView(Some(&desc), twin);
                 }
             }
-            Some(Some(shadow.buffer.clone()))
+            Some(Some(buffer))
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;

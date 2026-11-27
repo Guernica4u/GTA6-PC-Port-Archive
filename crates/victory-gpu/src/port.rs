@@ -158,7 +158,9 @@ const FILLS: usize = 13;
 const FILL_BYTES: usize = 14;
 const COPIES: usize = 15;
 const COPY_BYTES: usize = 16;
-static STATS: [AtomicU64; 17] = [const { AtomicU64::new(0) }; 17];
+const STREAM_READ: usize = 17;
+const STREAM_READ_BYTES: usize = 18;
+static STATS: [AtomicU64; 19] = [const { AtomicU64::new(0) }; 19];
 
 /// A constant buffer view of `len` bytes at title address `address`, read
 /// in place: the buffer to bind and hold (the caller's list and slot keep
@@ -199,6 +201,32 @@ pub(crate) fn constants(address: u64, len: u64) -> Option<(ID3D12Resource, u64)>
     }
     STATS[READ].fetch_add(1, Ordering::Relaxed);
     STATS[READ_BYTES].fetch_add(len.min(CONSTANTS_MOST), Ordering::Relaxed);
+    Some((whole, gpu))
+}
+
+/// Small (`<= 64 KiB`), CPU-written vertex/index window insideported memory
+/// that is neither written by shaders/copies nor inside a VRAM-resident
+/// (`carded`) buffer: the host resource and GPU address in place, or `None`.
+pub(crate) fn stream_bytes(address: u64, len: u64) -> Option<(ID3D12Resource, u64)> {
+    if len == 0 || len > CONSTANTS_MOST || address >= LOW {
+        return None;
+    }
+    let end = address.checked_add(len)?;
+    if end > LOW {
+        return None;
+    }
+    // Constraint 2: keep VRAM-resident (`carded`) geometry on the card.
+    if crate::shadow::in_card_buffer(address, len) {
+        return None;
+    }
+    let (whole, start) = region_holding(address, end)?;
+    if !written_by_no_shader(address, len) {
+        return None;
+    }
+    // SAFETY: a live buffer.
+    let gpu = unsafe { whole.GetGPUVirtualAddress() } + (address - start);
+    STATS[STREAM_READ].fetch_add(1, Ordering::Relaxed);
+    STATS[STREAM_READ_BYTES].fetch_add(len, Ordering::Relaxed);
     Some((whole, gpu))
 }
 
@@ -444,15 +472,20 @@ pub(crate) fn log(frames: f64) {
         return;
     }
     let per = |at: usize| taken[at - READ];
+    let stream_reads = per(STREAM_READ);
+    let stream_bytes = per(STREAM_READ_BYTES) / 1024.0;
     tracing::info!(
         "renderer port 1: {} regions of the title's graphics memory in place ({} MB); per frame: {:.0} constant views read in place ({:.1} KB: \
-         nothing refreshed, filled or waited for), not in place: {:.0} not 256-aligned, {:.0} on pages shaders write, {:.0} outside the regions; \
+         nothing refreshed, filled or waited for), {:.0} small stream views in place ({:.1} KB), not in place: {:.0} not 256-aligned, \
+         {:.0} on pages shaders write, {:.0} outside the regions; \
          on the CPU {:.0} fills read out of them ({:.1} KB), {:.1} buffer copies touching them ({:.1} KB); since the start not opened: \
          {} not one stretch of a section, {} not committed, {} no view, {} by the host, {} no buffer; {} regions forgotten (other pages mapped there)",
         s[OPENED],
         s[OPENED_BYTES] >> 20,
         per(READ),
         per(READ_BYTES) / 1024.0,
+        stream_reads,
+        stream_bytes,
         per(MISALIGNED),
         per(SHADERS),
         per(OUTSIDE),
@@ -481,6 +514,10 @@ mod tests {
         assert!(constants(0xffff_ff00, 0x1000).is_none());
         assert!(constants(0x3431_0000, 0).is_none());
         assert!(constants(u64::MAX - 255, 16).is_none());
+        assert!(stream_bytes(0xe1c80_0000, 64).is_none());
+        assert!(stream_bytes(0x3431_0000, 0).is_none());
+        assert!(stream_bytes(0x3431_0000, CONSTANTS_MOST + 1).is_none());
+        assert!(stream_bytes(0xffff_ffc0, 128).is_none());
     }
 
     /// A page a write on the card is bound for is the shaders' for good;

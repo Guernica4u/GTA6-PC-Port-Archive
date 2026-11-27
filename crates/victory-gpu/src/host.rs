@@ -843,9 +843,14 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
 static HOST: OnceLock<Option<Host>> = OnceLock::new();
 
 /// The host GPU if it is made already.
+pub(crate) fn existing() -> Option<&'static Host> {
+    HOST.get()?.as_ref()
+}
+
+/// The host GPU if it is made already.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn made_host() -> Option<&'static Host> {
-    HOST.get()?.as_ref()
+    existing()
 }
 
 /// The host GPU, created on first use; `None` without one (a run then
@@ -3874,6 +3879,7 @@ fn late_line(frames: f64) {
     }
     card_steps::log(frames);
     crate::port::log(frames);
+    crate::demand::log(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
@@ -4760,6 +4766,108 @@ impl Host {
         }
     }
 
+    /// Fetches `len` bytes from a carded resource at `offset` into `out`
+    /// synchronously for C2 demand landing (`crate::demand`).
+    pub(crate) fn demand_fetch(&self, src: &ID3D12Resource, offset: u64, len: usize, out: &mut Vec<u8>) -> bool {
+        struct DemandFetch {
+            list: Prelude,
+            queue: ID3D12CommandQueue,
+            fence: ID3D12Fence,
+            event: HANDLE,
+            sent: u64,
+            staging: Option<(ID3D12Resource, usize, u64)>,
+        }
+        // SAFETY: serialized behind `DEMAND_FETCH`; its D3D12 objects and event
+        // handle may move across threads under that mutex.
+        unsafe impl Send for DemandFetch {}
+        static DEMAND_FETCH: Mutex<Option<DemandFetch>> = Mutex::new(None);
+        if len == 0 {
+            out.clear();
+            return true;
+        }
+        let mut guard = DEMAND_FETCH.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            // SAFETY: creating dedicated copy/fallback objects on live `self.device`.
+            let created = unsafe {
+                (|| -> windows::core::Result<DemandFetch> {
+                    let copying = (|| -> windows::core::Result<(Prelude, ID3D12CommandQueue)> {
+                        let allocator: ID3D12CommandAllocator = self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
+                        let list: ID3D12GraphicsCommandList =
+                            self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
+                        list.Close()?;
+                        let queue: ID3D12CommandQueue = self.device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                            Type: D3D12_COMMAND_LIST_TYPE_COPY,
+                            Priority: D3D12_COMMAND_QUEUE_PRIORITY_HIGH.0,
+                            ..Default::default()
+                        })?;
+                        Ok(((allocator, list), queue))
+                    })();
+                    let (list, queue) = match copying {
+                        Ok(pair) => pair,
+                        Err(_) => {
+                            let Some(list) = self.make_prelude() else {
+                                return Err(windows::core::Error::from(windows::Win32::Foundation::E_FAIL));
+                            };
+                            (list, self.queue.clone())
+                        }
+                    };
+                    let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+                    let event = CreateEventW(None, false, false, None)?;
+                    let staging = self.shared_buffer(256 << 10).map(|(r, p)| (r, p as usize, 256 << 10));
+                    Ok(DemandFetch {
+                        list,
+                        queue,
+                        fence,
+                        event,
+                        sent: 0,
+                        staging,
+                    })
+                })()
+            };
+            let Ok(df) = created else {
+                return false;
+            };
+            *guard = Some(df);
+        }
+        let Some(df) = guard.as_mut() else {
+            return false;
+        };
+        let need = len as u64;
+        if df.staging.as_ref().is_none_or(|b| b.2 < need) {
+            let size = need.next_multiple_of(64 << 10);
+            df.staging = self.shared_buffer(size).map(|(r, p)| (r, p as usize, size));
+        }
+        let Some((staging, data, _)) = df.staging.clone() else {
+            return false;
+        };
+        df.sent += 1;
+        let sent = df.sent;
+        let (allocator, list) = &df.list;
+        // SAFETY: `df` is exclusively held and waited for `df.sent - 1`; live buffers.
+        let ok = unsafe {
+            (|| -> windows::core::Result<()> {
+                allocator.Reset()?;
+                list.Reset(allocator, None)?;
+                list.CopyBufferRegion(&staging, 0, src, offset, need);
+                list.Close()?;
+                let lists = [Some(list.cast::<ID3D12CommandList>()?)];
+                df.queue.ExecuteCommandLists(&lists);
+                df.queue.Signal(&df.fence, sent)?;
+                df.fence.SetEventOnCompletion(sent, df.event)?;
+                WaitForSingleObject(df.event, INFINITE);
+                Ok(())
+            })()
+        }
+        .is_ok();
+        if !ok {
+            return false;
+        }
+        out.resize(len, 0);
+        // SAFETY: staging buffer holds `len` bytes written by the completed copy.
+        unsafe { std::ptr::copy_nonoverlapping(data as *const u8, out.as_mut_ptr(), len) };
+        true
+    }
+
     /// The relay's own list, fence, event for [`Host::relay_card_back`].
     fn make_relay_fetch(&self) -> Option<RelayFetch> {
         // SAFETY: plain object creation.
@@ -4867,6 +4975,9 @@ impl Host {
                                 if land::skip_on() {
                                     continue;
                                 }
+                            }
+                            if crate::demand::park(&r.shadow, lo, hi, plan.sent_as) {
+                                continue;
                             }
                             if upcheck::on() {
                                 upcheck::fetched(r.shadow.id(), lo);
@@ -8968,6 +9079,12 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         if size != size_of_val(&info) || n == 0 {
             read_pieces(at, to, remaining);
             break;
+        }
+        if info.State == MEM_COMMIT
+            && info.Protect == PAGE_NOACCESS
+            && crate::demand::fulfill_range(at as usize, n)
+        {
+            continue;
         }
         if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
             #[cfg(feature = "diagnostics")]

@@ -2516,6 +2516,7 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    crate::demand::fulfill_range(at, len);
     // The length is the title's (`fread`'s size times count, saturated).
     let last = at.saturating_add(len).div_ceil(BLOCK);
     if !light() || PROTECTED.any(at / BLOCK, last) {
@@ -2543,6 +2544,7 @@ pub struct KernelWrite(usize, usize);
 /// write fail (the kernel does not fault into our handler): a read cut
 /// short, which the title takes for what the file holds.
 pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
+    crate::demand::fulfill_range(at, len);
     // The kernel's write does not fault into the handler.
     materialize(at, len);
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
@@ -2920,6 +2922,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// neither guarded nor writable) and a kernel read into it fail, so the
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    crate::demand::forget(at, len);
     crate::texback::remapped(at, len);
     open(&mut title_memory_changed(at, len), at, at.saturating_add(len));
 }
@@ -2930,6 +2933,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// before the unmapping would leave the address guarded, clean and known by
 /// its bits ([`PUBLISHED`]) with no view behind it.
 pub fn title_memory_unmapping(at: usize, len: usize) {
+    crate::demand::forget(at, len);
     crate::texback::remapped(at, len);
     let mut g = title_memory_changed(at, len);
     if CHANGING.get().0 && len != 0 {
@@ -2954,6 +2958,7 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    crate::demand::forget(at, len);
     crate::shadow::write_combined_freed(at, len);
     let mut g = guards();
     let first = at / BLOCK;
@@ -3183,6 +3188,15 @@ pub(crate) fn install() {
                 Some(soft) => (soft.fault)(r.ExceptionInformation[1], r.ExceptionAddress as usize),
                 None => materialize(r.ExceptionInformation[1], 1),
             }
+        {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        // C2 demand landing: a block parked on the card (`PAGE_NOACCESS`) is
+        // fetched and landed before the title's (or `safecopy`'s) access
+        // proceeds.
+        if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+            && r.NumberParameters >= 2
+            && crate::demand::on_fault(r.ExceptionInformation[1], ours.is_none())
         {
             return EXCEPTION_CONTINUE_EXECUTION;
         }

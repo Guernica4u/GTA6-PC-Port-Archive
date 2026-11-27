@@ -57,7 +57,7 @@ fn threads() -> usize {
 }
 
 /// Whether views of the title's pages are written through one of ours.
-fn beside_on() -> bool {
+pub(crate) fn beside_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_BESIDE").is_none_or(|v| v != "0"))
 }

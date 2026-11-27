@@ -57,7 +57,7 @@ pub(crate) fn on() -> bool {
 
 /// Every this many declarations of a tight key are full.
 fn verify_every() -> u32 {
-    16
+    256
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -113,52 +113,56 @@ impl Foot {
     }
 
     /// Lock-free read path for keys already in `Tight` or `Wide`.
-    fn declare_read(&self, len: u64, every: u32) -> Option<(u64, u64, bool)> {
+    fn declare_read(&self, len: u64, every: u32) -> Option<(u64, u64, bool, Option<(u64, u64)>)> {
         match self.mode {
-            Mode::Wide => Some((0, len, false)),
+            Mode::Wide => Some((0, len, false, None)),
             Mode::Learn => None,
             Mode::Tight => {
+                let tight = Some((self.lo, self.hi));
                 let next = self.since_full.fetch_add(1, Ordering::Relaxed) + 1;
                 if next >= every {
                     self.since_full.store(0, Ordering::Relaxed);
-                    return Some((0, len, true));
+                    return Some((0, len, true, tight));
                 }
                 let (from, to) = (self.lo.min(len), self.hi.min(len));
                 if to <= from {
-                    return Some((0, len, true));
+                    return Some((0, len, true, tight));
                 }
-                Some((from, to - from, false))
+                Some((from, to - from, false, tight))
             }
         }
     }
 
-    /// The range, from the root address, to declare of `len` bytes; and
-    /// whether the declaration is a full one (noted for landings).
-    fn declare(&mut self, len: u64, every: u32) -> (u64, u64, bool) {
+    /// The range, from the root address, to declare of `len` bytes;
+    /// whether the declaration is a full one (noted for landings); and the
+    /// key's learned footprint if already `Tight`.
+    fn declare(&mut self, len: u64, every: u32) -> (u64, u64, bool, Option<(u64, u64)>) {
         self.decls = self.decls.saturating_add(1);
         match self.mode {
-            Mode::Wide => (0, len, false),
+            Mode::Wide => (0, len, false, None),
             Mode::Learn => {
                 if self.seen >= OBSERVE && self.decls >= MIN_DECLS && self.lo < self.hi {
                     self.lo = (self.lo & !(BLOCK - 1)).saturating_sub(MARGIN);
                     self.hi = self.hi.div_ceil(BLOCK) * BLOCK + MARGIN;
                     self.mode = Mode::Tight;
                     self.since_full.store(0, Ordering::Relaxed);
+                    return (0, len, true, Some((self.lo, self.hi)));
                 }
-                (0, len, true)
+                (0, len, true, None)
             }
             Mode::Tight => {
+                let tight = Some((self.lo, self.hi));
                 let next = self.since_full.fetch_add(1, Ordering::Relaxed) + 1;
                 if next >= every {
                     self.since_full.store(0, Ordering::Relaxed);
-                    return (0, len, true);
+                    return (0, len, true, tight);
                 }
                 let (from, to) = (self.lo.min(len), self.hi.min(len));
                 if to <= from {
                     // Nothing of the footprint inside the range: full.
-                    return (0, len, true);
+                    return (0, len, true, tight);
                 }
-                (from, to - from, false)
+                (from, to - from, false, tight)
             }
         }
     }
@@ -171,6 +175,12 @@ struct Decl {
     at: Instant,
 }
 
+#[derive(Default)]
+struct CopyDecls {
+    full: Vec<Decl>,
+    tight: Vec<Decl>,
+}
+
 /// Footprints by key, in [`SHARDS`] parts by key, and noted declarations by
 /// copy, in as many parts by copy: one lock for all was taken by every
 /// draw or dispatch with a root UAV it writes, on every thread that
@@ -180,7 +190,7 @@ struct Decl {
 const SHARDS: usize = 16;
 
 type Keys = HashMap<(usize, u32), Foot>;
-type Decls = HashMap<u64, Vec<Decl>>;
+type Decls = HashMap<u64, CopyDecls>;
 
 static KEYS: [RwLock<Option<Keys>>; SHARDS] = [const { RwLock::new(None) }; SHARDS];
 static DECLS: [Mutex<Option<Decls>>; SHARDS] = [const { Mutex::new(None) }; SHARDS];
@@ -203,6 +213,18 @@ fn decls_of(id: u64) -> std::sync::MutexGuard<'static, Option<Decls>> {
     DECLS[spread(id)].lock().unwrap_or_else(|e| e.into_inner())
 }
 
+fn push_decl(list: &mut Vec<Decl>, key: (usize, u32), from: u64, to: u64, now: Instant) {
+    if let Some(i) = list.iter().rev().take(8).position(|d| d.key == key && d.from == from && d.to == to) {
+        let at = list.len() - 1 - i;
+        list[at].at = now;
+        return;
+    }
+    if list.len() >= KEEP {
+        list.remove(0);
+    }
+    list.push(Decl { key, from, to, at: now });
+}
+
 /// What `Draw::root_uav` declares of a root UAV at `address` in copy `id`
 /// (title memory from `start`), whose range is `len` bytes: the offset from
 /// `address` and the length. (0, len) unless the key is learned.
@@ -216,7 +238,7 @@ pub(crate) fn declare(pipeline: usize, param: u32, id: u64, start: u64, address:
         let guard = keys_read(key);
         guard.as_ref().and_then(|k| k.get(&key)).and_then(|foot| foot.declare_read(len, every))
     };
-    let (from, n, full) = match fast {
+    let (from, n, full, tight) = match fast {
         Some(res) => res,
         None => keys_write(key)
             .get_or_insert_with(Default::default)
@@ -224,23 +246,20 @@ pub(crate) fn declare(pipeline: usize, param: u32, id: u64, start: u64, address:
             .or_insert_with(Foot::new)
             .declare(len, every),
     };
-    if full {
+    if full || tight.is_some() {
         let base = address.saturating_sub(start);
         let now = Instant::now();
         let mut decls = decls_of(id);
-        let list = decls.get_or_insert_with(Default::default).entry(id).or_default();
-        let same = list.iter().rev().take(8).position(|d| d.key == key && d.from == base && d.to == base + len);
-        match same {
-            Some(i) => {
-                let at = list.len() - 1 - i;
-                list[at].at = now;
+        let entry = decls.get_or_insert_with(Default::default).entry(id).or_default();
+        if let Some((t_from, t_to)) = tight {
+            let c_from = base.saturating_add(t_from);
+            let c_to = base.saturating_add(t_to).min(base.saturating_add(len));
+            if c_from < c_to {
+                push_decl(&mut entry.tight, key, c_from, c_to, now);
             }
-            None => {
-                if list.len() >= KEEP {
-                    list.remove(0);
-                }
-                list.push(Decl { key, from: base, to: base + len, at: now });
-            }
+        }
+        if full {
+            push_decl(&mut entry.full, key, base, base.saturating_add(len), now);
         }
     }
     (from, n)
@@ -253,21 +272,31 @@ pub(crate) fn landed(id: u64, from: usize, to: usize) {
     }
     let (from, to) = (from as u64, to as u64);
     // The noted declarations it lands in, in their order: the key and the
-    // range relative to the declaration.
-    let hits: Vec<((usize, u32), u64, u64)> = {
+    // range relative to the declaration. Landings already inside an active
+    // tight pipeline's learned footprint do not falsely widen another tight
+    // pipeline verifying over the same shared heap.
+    let (hits, explained): (Vec<((usize, u32), u64, u64)>, bool) = {
         let mut decls = decls_of(id);
-        let Some(list) = decls.as_mut().and_then(|d| d.get_mut(&id)) else {
+        let Some(entry) = decls.as_mut().and_then(|d| d.get_mut(&id)) else {
             return;
         };
         let now = Instant::now();
-        list.retain(|d| now.duration_since(d.at) < EXPIRE);
-        list.iter()
+        entry.full.retain(|d| now.duration_since(d.at) < EXPIRE);
+        entry.tight.retain(|d| now.duration_since(d.at) < EXPIRE);
+        let explained = entry.tight.iter().any(|t| from >= t.from && to <= t.to);
+        let hits = entry
+            .full
+            .iter()
             .filter(|d| from < d.to && to > d.from)
             .map(|d| (d.key, from.max(d.from) - d.from, to.min(d.to) - d.from))
-            .collect()
+            .collect();
+        (hits, explained)
     };
     for (key, a, b) in hits {
-        let widened = keys_write(key).as_mut().and_then(|k| k.get_mut(&key)).is_some_and(|foot| foot.landed(a, b));
+        let widened = keys_write(key)
+            .as_mut()
+            .and_then(|k| k.get_mut(&key))
+            .is_some_and(|foot| !(foot.mode == Mode::Tight && explained) && foot.landed(a, b));
         if widened {
             tracing::warn!(
                 pipeline = format_args!("{:#x}", key.0),
@@ -289,14 +318,19 @@ mod tests {
         let mut f = Foot::new();
         let len = 100 * BLOCK;
         // Learning: whole, noted.
-        for _ in 0..MIN_DECLS {
-            assert_eq!(f.declare(len, 4), (0, len, true));
+        for i in 0..MIN_DECLS {
+            let res = f.declare(len, 4);
+            assert_eq!((res.0, res.1, res.2), (0, len, true));
+            if i + 1 < MIN_DECLS {
+                assert_eq!(res.3, None);
+            }
             f.landed(10 * BLOCK + 5, 11 * BLOCK);
         }
         // The declaration that finds it learned is still whole.
         assert_eq!(f.mode, Mode::Tight);
-        let (from, n, full) = f.declare(len, 4);
+        let (from, n, full, tight) = f.declare(len, 4);
         assert!(!full);
+        assert_eq!(tight, Some((6 * BLOCK, 15 * BLOCK)));
         assert_eq!(from, 6 * BLOCK);
         assert_eq!(from + n, 15 * BLOCK);
         // Every fourth is whole.
@@ -306,15 +340,42 @@ mod tests {
         // Inside: kept. Outside: wide for good.
         assert!(!f.landed(7 * BLOCK, 8 * BLOCK));
         assert!(f.landed(50 * BLOCK, 51 * BLOCK));
-        assert_eq!(f.declare(len, 4), (0, len, false));
+        assert_eq!(f.declare(len, 4), (0, len, false, None));
     }
 
     #[test]
     fn never_tight_without_landings() {
         let mut f = Foot::new();
         for _ in 0..1000 {
-            assert_eq!(f.declare(BLOCK, 4), (0, BLOCK, true));
+            assert_eq!(f.declare(BLOCK, 4), (0, BLOCK, true, None));
         }
         assert_eq!(f.mode, Mode::Learn);
+    }
+
+    #[test]
+    fn tight_key_not_widened_by_other_tight_key_on_shared_copy() {
+        let copy_id = 0xdead_beef_u64;
+        let len = 100 * BLOCK;
+        let key_a = (0xaaaa_1000, 0);
+        let key_b = (0xbbbb_2000, 0);
+        // Train A at [2..3) * BLOCK and B at [60..61) * BLOCK on separate copies first,
+        // then run both against `copy_id` (shared 100 * BLOCK heap).
+        let id_a = copy_id + 1;
+        let id_b = copy_id + 2;
+        for _ in 0..MIN_DECLS {
+            let _ = declare(key_a.0, key_a.1, id_a, 0, 0, len);
+            landed(id_a, (2 * BLOCK) as usize, (3 * BLOCK) as usize);
+            let _ = declare(key_b.0, key_b.1, id_b, 0, 0, len);
+            landed(id_b, (60 * BLOCK) as usize, (61 * BLOCK) as usize);
+        }
+        // Now both A and B declare on shared `copy_id`; run 256+ declarations so A verifies.
+        for _ in 0..=verify_every() + 2 {
+            let _ = declare(key_a.0, key_a.1, copy_id, 0, 0, len);
+            let _ = declare(key_b.0, key_b.1, copy_id, 0, 0, len);
+        }
+        // B lands in its own learned footprint while A's verification is active on `copy_id`.
+        landed(copy_id, (60 * BLOCK) as usize, (61 * BLOCK) as usize);
+        let (from_a, n_a) = declare(key_a.0, key_a.1, copy_id, 0, 0, len);
+        assert!(n_a < len, "pipeline A must stay tight when B lands in B's footprint (got {from_a}..{})", from_a + n_a);
     }
 }

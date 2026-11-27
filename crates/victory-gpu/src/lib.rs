@@ -32,6 +32,8 @@ mod tight;
 mod faultbook;
 #[cfg(windows)]
 mod cores;
+#[cfg(windows)]
+mod demand;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]

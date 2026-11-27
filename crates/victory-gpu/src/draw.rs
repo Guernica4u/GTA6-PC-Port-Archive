@@ -1835,6 +1835,15 @@ impl State {
             if v.address == 0 || v.size == 0 {
                 continue;
             }
+            if let Some((buffer, gpu)) = crate::port::stream_bytes(v.address, u64::from(v.size)) {
+                list.keep(&buffer);
+                *view = D3D12_VERTEX_BUFFER_VIEW {
+                    BufferLocation: gpu,
+                    SizeInBytes: v.size,
+                    StrideInBytes: v.stride,
+                };
+                continue;
+            }
             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
                 continue;
             };
@@ -1853,13 +1862,22 @@ impl State {
         }
         if indexed {
             let v = self.index;
-            let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
-                return false;
+            let (gpu, size) = if let Some((buffer, gpu)) = crate::port::stream_bytes(v.address, u64::from(v.size)) {
+                list.keep(&buffer);
+                (gpu, v.size)
+            } else {
+                let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+                    return false;
+                };
+                shadow.refresh(list, v.address, u64::from(v.size));
+                (
+                    shadow.gpu(v.address),
+                    v.size.min(u32::try_from(shadow.left(v.address)).unwrap_or(u32::MAX)),
+                )
             };
-            shadow.refresh(list, v.address, u64::from(v.size));
             let view = D3D12_INDEX_BUFFER_VIEW {
-                BufferLocation: shadow.gpu(v.address),
-                SizeInBytes: v.size.min(u32::try_from(shadow.left(v.address)).unwrap_or(u32::MAX)),
+                BufferLocation: gpu,
+                SizeInBytes: size,
                 Format: DXGI_FORMAT(v.format as i32),
             };
             // SAFETY: an open list; the view names a live host buffer.
