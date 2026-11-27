@@ -1150,6 +1150,13 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
             .and_then(|v| v.parse::<u64>().ok())
             .map_or(u64::MAX, |mb| mb << 20)
     });
+    // Constants no shader writes, in the title's graphics heap: read where
+    // the title wrote them (`crate::port`), with nothing refreshed, filled
+    // or waited for. The list holds the buffer.
+    if !srv && let Some((buffer, gpu)) = crate::port::constants(address, 1 << 16) {
+        list.keep(&buffer);
+        return Some(gpu);
+    }
     let shadow = crate::shadow::find(address, 1)?;
     let len = shadow
         .left(address)
@@ -4703,6 +4710,16 @@ impl State {
                 let used = group.entry(k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        // In the title's graphics heap and written by no
+                        // shader: the slot shows the title's bytes
+                        // themselves (`crate::port`); the slot and the list
+                        // hold the buffer. Else a fill of upload memory at
+                        // submission, as before.
+                        if let Some((buffer, gpu)) = crate::port::constants(address, u64::from(size)) {
+                            list.keep(&buffer);
+                            host.constant_at(index, &buffer, gpu, size);
+                            continue;
+                        }
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
                             host.make_null(index);
                             continue;

@@ -45,9 +45,6 @@ const SETTINGS: &[(&str, &str)] = &[
     ("VICTORY_UPLOAD_AHEAD", "1"),
     ("VICTORY_SHOW_AFTER", "1"),
     ("VICTORY_MAP_THREADS", "1"),
-    // Shader writes into big write-combined copies stay on the card
-    ("VICTORY_WC_NO_BACK", "1"),
-    ("VICTORY_WC_NO_BACK_MIN_KB", "1024"),
     // The title's page-mapping copies kept without Windows views
     ("VICTORY_SOFT_VIEWS", "copies"),
     // Textures

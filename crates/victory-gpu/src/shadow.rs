@@ -2152,8 +2152,11 @@ fn is_write_combined(start: u64, len: u64) -> bool {
 
 /// Whether what shaders write into copies in the card's memory of
 /// write-combined title memory stays on the card and is not compared,
-/// fetched and merged into title memory (`VICTORY_WC_NO_BACK=1`; off by
-/// default: an experiment).
+/// fetched and merged into title memory. Always, for copies of
+/// [`wc_no_back_min`] and more (the switch `VICTORY_WC_NO_BACK` is gone: the
+/// launcher had set it in every run since run xd-wcnoback). In the unified
+/// memory model (docs/performance/UNIFIED_MEMORY_ARCHITECTURE.md) this is the
+/// class "written by the card, never read by the CPU": its home is the card.
 ///
 /// The write-back of shader writes (`Shadow::gpu_writes`: hashes after
 /// sends, compare passes after the lists, fetches of the pieces that differ
@@ -2176,20 +2179,17 @@ fn is_write_combined(start: u64, len: u64) -> bool {
 /// - Another host copy of the same bytes (a texture placed there) does not
 ///   see what shaders wrote through title memory.
 fn wc_no_back() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WC_NO_BACK").is_some_and(|v| v == "1"))
+    true
 }
 
 /// The smallest copy whose shader writes [`wc_no_back`] leaves on the card,
-/// in bytes (`VICTORY_WC_NO_BACK_MIN_KB`, 0 unset: all). With every copy
-/// left, the 4070 SUPER's cutscenes went near black (run xd-wcnoback,
-/// 2026-11-26: small results the title reads back, such as exposure, came
-/// back stale) while most of the saving is in a few ranges of hundreds of MB.
+/// in bytes: 1 MiB (the launcher's `VICTORY_WC_NO_BACK_MIN_KB=1024`, now the
+/// code's; the switch is gone). With every copy left, the 4070 SUPER's
+/// cutscenes went near black (run xd-wcnoback, 2026-11-26: small results the
+/// title reads back, such as exposure, came back stale) while most of the
+/// saving is in a few ranges of hundreds of MB.
 fn wc_no_back_min() -> u64 {
-    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MIN.get_or_init(|| {
-        std::env::var("VICTORY_WC_NO_BACK_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) * 1024
-    })
+    1 << 20
 }
 
 /// Bytes shaders were declared to write in write-combined copies and that
@@ -5527,12 +5527,10 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
         let big = cards() && (size >= card_limits().0 || card_all());
-        // Renderer port 1 (`crate::port`, `VICTORY_PORT_CONSTANTS=1`): the
-        // title's 32-bit graphics heap in place, big or not.
-        if let Some(placed) = crate::port::place_for(key.0, len, false) {
-            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
-            return entry.shadow.clone();
-        }
+        // (Title memory in place for constants that no shader writes is
+        // `crate::port`'s, per access, not a buffer's copy: the copy here
+        // stays the home of every other access, in the card's memory for
+        // the big ones. docs/performance/UNIFIED_MEMORY_ARCHITECTURE.md.)
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
@@ -5865,7 +5863,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
-    if let Some(placed) = crate::port::place_for(start, len, true).or_else(|| crate::inplace::place_for(start, len, true)) {
+    if let Some(placed) = crate::inplace::place_for(start, len, true) {
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
