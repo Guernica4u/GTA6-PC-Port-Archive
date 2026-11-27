@@ -233,6 +233,17 @@ pub(crate) fn tables_done(lists: &[This]) {
     }
 }
 
+/// A thin recording's last reference went away. A submission that took its
+/// host lists also took their state via `detach_parts`.
+#[cfg(windows)]
+fn discard_thin_state(this: This) {
+    // SAFETY: the recording's private list is idle until it goes into BACKS.
+    let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+    list.earlier.clear();
+    list.gate.clear();
+    list.state.get_mut().unwrap_or_else(|e| e.into_inner()).tables_done();
+}
+
 /// The host list behind a title list, if there is a host GPU, for a call
 /// that records into it: counted as a title call, which records an
 /// indirect execution held back first ([`crate::host::HostList::title_call`]).

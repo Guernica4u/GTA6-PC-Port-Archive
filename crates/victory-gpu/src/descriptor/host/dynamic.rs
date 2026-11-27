@@ -8,12 +8,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 pub(super) struct Slots {
     state: Mutex<State>,
+    retired: Mutex<VecDeque<(u64, Vec<Range<u32>>)>>,
 }
 
 struct State {
     by_start: BTreeMap<u32, u32>,
     by_size: BTreeSet<(u32, u32)>,
-    retired: VecDeque<(u64, Vec<Range<u32>>)>,
     free: u32,
 }
 
@@ -31,7 +31,6 @@ impl Slots {
         let mut state = State {
             by_start: BTreeMap::new(),
             by_size: BTreeSet::new(),
-            retired: VecDeque::new(),
             free: capacity,
         };
         if capacity != 0 {
@@ -39,6 +38,7 @@ impl Slots {
         }
         Self {
             state: Mutex::new(state),
+            retired: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -49,13 +49,18 @@ impl Slots {
     pub(super) fn take(&self, count: u32, completed: Option<u64>) -> Take {
         let mut state = self.state();
         if let Some(completed) = completed {
-            state.reclaim(completed);
+            self.reclaim_in(&mut state, completed);
         }
         let Some(&(length, first)) = state.by_size.range((count, 0)..).next() else {
             return Take::Short {
                 free: state.free,
                 largest: state.by_size.last().map_or(0, |&(length, _)| length),
-                fence: state.retired.front().map(|&(fence, _)| fence),
+                fence: self
+                    .retired
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .front()
+                    .map(|&(fence, _)| fence),
             };
         };
         state.erase(first, length);
@@ -67,7 +72,22 @@ impl Slots {
     }
 
     pub(super) fn reclaim(&self, completed: u64) {
-        self.state().reclaim(completed);
+        self.reclaim_in(&mut self.state(), completed);
+    }
+
+    fn reclaim_in(&self, state: &mut State, completed: u64) {
+        // Keep the free ranges locked until this batch is visible to allocators.
+        // The submitter can append while the interval trees are being updated.
+        let gone = {
+            let mut retired = self.retired.lock().unwrap_or_else(|e| e.into_inner());
+            let count = retired.partition_point(|(fence, _)| *fence <= completed);
+            retired.drain(..count).collect::<Vec<_>>()
+        };
+        for (_, ranges) in gone {
+            for range in ranges {
+                state.give(range);
+            }
+        }
     }
 
     #[cfg(feature = "diagnostics")]
@@ -81,19 +101,6 @@ impl Slots {
 }
 
 impl State {
-    fn reclaim(&mut self, completed: u64) {
-        while self
-            .retired
-            .front()
-            .is_some_and(|(fence, _)| *fence <= completed)
-        {
-            let (_, ranges) = self.retired.pop_front().unwrap();
-            for range in ranges {
-                self.give(range);
-            }
-        }
-    }
-
     fn insert(&mut self, first: u32, length: u32) {
         self.by_start.insert(first, length);
         self.by_size.insert((length, first));
@@ -149,12 +156,10 @@ impl Tables {
     }
 
     pub(crate) fn submitted(mut self, fence: u64) {
-        let mut state = self.slots.state();
+        let mut retired = self.slots.retired.lock().unwrap_or_else(|e| e.into_inner());
         // Submissions register their ranges under the host submission lock.
-        debug_assert!(state.retired.back().is_none_or(|(last, _)| *last <= fence));
-        state
-            .retired
-            .push_back((fence, std::mem::take(&mut self.ranges)));
+        debug_assert!(retired.back().is_none_or(|(last, _)| *last <= fence));
+        retired.push_back((fence, std::mem::take(&mut self.ranges)));
     }
 }
 
@@ -172,6 +177,26 @@ impl Drop for Tables {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publishing_a_fence_does_not_lock_the_allocator() {
+        let slots = Arc::new(Slots::new(1));
+        assert!(matches!(slots.take(1, None), Take::Slot(0)));
+        let mut recording = Vec::new();
+        Tables::keep(&mut recording, &slots, 0..1);
+        std::thread::scope(|scope| {
+            let tree = slots.state();
+            let (sent, wait) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                recording.pop().unwrap().submitted(3);
+                sent.send(()).unwrap();
+            });
+            wait.recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            drop(tree);
+        });
+        assert!(matches!(slots.take(1, Some(3)), Take::Slot(0)));
+    }
 
     #[test]
     fn reuses_only_completed_tables_without_waiting_for_newer_submissions() {

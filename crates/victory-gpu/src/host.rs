@@ -9698,11 +9698,14 @@ impl Batch {
         let _flush = crate::timeline::span("refreshes of copies");
         let started = std::time::Instant::now();
         let before = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed));
-        // Those known to copy nothing are said so here, unless they are very
-        // many: then beside the others.
+        // With a standing write-watch answer there is no second kernel ask
+        // to plan. Check the known-clean spans in the same worker jobs that
+        // perform the updates, instead of walking them on the submitter first.
         const FEW: usize = 256;
         let mut spans = spans;
-        if crate::watch::light() {
+        let light = crate::watch::light();
+        let check_on_workers = light && spans.len() > FEW && crate::watch::kept();
+        if light && !check_on_workers {
             let all = spans.len();
             let kept = &mut self.kept;
             spans.retain(|(shadow, from, to)| {
@@ -9727,6 +9730,9 @@ impl Batch {
         // them one at a time makes the workers contend on two counters.
         const GROUP: usize = 8;
         let group = if many { GROUP } else { 1 };
+        thread_local! {
+            static FRONT_KEPT: std::cell::RefCell<crate::watch::KeptView> = Default::default();
+        }
         crate::shadow::wide_each(spans.len().div_ceil(group) + due.len(), move |i| {
             // The textures first: they are the longer pieces.
             let Some(i) = i.checked_sub(due.len()) else {
@@ -9735,13 +9741,19 @@ impl Batch {
             };
             let from_index = i * group;
             let mut clean = 0;
-            for (shadow, from, to) in &spans[from_index..(from_index + group).min(spans.len())] {
-                if many && shadow.nothing_new(*from, *to - *from) {
-                    clean += 1;
-                } else {
-                    Self::update(shadow, *from, *to);
+            FRONT_KEPT.with_borrow_mut(|kept| {
+                for (shadow, from, to) in &spans[from_index..(from_index + group).min(spans.len())] {
+                    let len = *to - *from;
+                    let known = check_on_workers && shadow.fast_nothing_new_known(*from, len, |a, b| {
+                        crate::watch::kept_covers_cached(kept, a, b)
+                    });
+                    if known || (many && shadow.nothing_new(*from, len)) {
+                        clean += 1;
+                    } else {
+                        Self::update(shadow, *from, *to);
+                    }
                 }
-            }
+            });
             if clean != 0 {
                 FLUSHES[2].fetch_add(clean, Ordering::Relaxed);
             }
