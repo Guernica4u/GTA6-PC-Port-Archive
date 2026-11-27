@@ -1378,16 +1378,20 @@ impl SlabPool {
 
     fn recycle(&mut self, slab: UploadSlab, max_idle: usize) {
         if self.idle.len() < max_idle {
-            let touched = slab.used.swap(0, std::sync::atomic::Ordering::Relaxed).min(UPLOAD_SLAB_BYTES);
-            if touched > 0 {
-                // SAFETY: exclusive ownership of the slab; zeroing restores the
-                // zeroed contract of `allocate_upload` before reuse.
-                unsafe { std::ptr::write_bytes(slab.at as *mut u8, 0, touched) };
-                crate::watch::title_memory_remapped(slab.at, touched);
-            }
             self.idle.push(slab);
         }
         // Else `slab` drops here and releases its VirtualAlloc2 region.
+    }
+}
+
+#[cfg(windows)]
+fn reset_slab_for_reuse(slab: &UploadSlab) {
+    let touched = slab.used.swap(0, std::sync::atomic::Ordering::Relaxed).min(UPLOAD_SLAB_BYTES);
+    if touched > 0 {
+        // SAFETY: exclusive ownership of the slab; zeroing restores the
+        // zeroed contract of `allocate_upload` before reuse.
+        unsafe { std::ptr::write_bytes(slab.at as *mut u8, 0, touched) };
+        crate::watch::title_memory_remapped(slab.at, touched);
     }
 }
 
@@ -1418,7 +1422,10 @@ impl Drop for SlabHandle {
         };
         if let Ok(slab) = std::sync::Arc::try_unwrap(arc) {
             let max_idle = upload_slab_max_idle();
-            SLAB_POOL.lock().unwrap_or_else(|e| e.into_inner()).recycle(slab, max_idle);
+            if max_idle > 0 {
+                reset_slab_for_reuse(&slab);
+                SLAB_POOL.lock().unwrap_or_else(|e| e.into_inner()).recycle(slab, max_idle);
+            }
         }
     }
 }
@@ -1435,7 +1442,9 @@ enum Upload {
 impl Upload {
     #[cfg(windows)]
     fn alloc(size: usize, align: usize) -> Option<(*mut u8, Upload)> {
-        if upload_slab_enabled() && size <= UPLOAD_SLAB_MAX_ALLOC && align <= UPLOAD_SLAB_BYTES {
+        // `VirtualAlloc2` slabs are 64 KiB aligned, so `align <= 64 KiB` guarantees
+        // carving at cursor 0 never fails and never wastes a popped idle slab.
+        if upload_slab_enabled() && size <= UPLOAD_SLAB_MAX_ALLOC && align <= (64 << 10) {
             let mut pool = SLAB_POOL.lock().unwrap_or_else(|e| e.into_inner());
             if let Some((ptr, slab)) = pool.alloc(size, align) {
                 return Some((ptr, Upload::Slab(SlabHandle(Some(slab)))));
@@ -2235,6 +2244,7 @@ mod tests {
         drop(s2);
         drop(s3);
         let unwrapped = std::sync::Arc::try_unwrap(s1).expect("first slab exclusively owned");
+        reset_slab_for_reuse(&unwrapped);
         pool.recycle(unwrapped, 1);
         assert_eq!(pool.idle.len(), 1);
         assert_eq!(pool.idle[0].at, first_base);
