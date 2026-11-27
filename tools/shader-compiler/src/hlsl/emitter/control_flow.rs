@@ -1,5 +1,6 @@
 //! Structured branches and loops, and the block dispatcher.
 use super::*;
+use crate::hlsl::coverage;
 
 impl<'a> Emitter<'a> {
     /// Control flow.
@@ -13,6 +14,12 @@ impl<'a> Emitter<'a> {
     ///   Loops must be properly nested, have one back-edge per header, and must not be
     ///   entered from outside except through the header — otherwise `Err`.
     pub(in crate::hlsl) fn emit_body(&mut self, is_ps: bool) -> Result<(), String> {
+        self.emit_program(is_ps)?;
+        coverage::record(&self.insns);
+        Ok(())
+    }
+
+    fn emit_program(&mut self, is_ps: bool) -> Result<(), String> {
         let mut off2idx: HashMap<usize, usize> = self.insns.iter().enumerate().map(|(i, x)| (x.offset, i)).collect();
         // A branch to the address just past the last instruction leaves the program (same as
         // reaching the final s_endpgm).

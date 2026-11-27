@@ -129,6 +129,7 @@ mod descriptor_size;
 use sampler_heap::DirectSampler;
 mod reflection_probe;
 mod wave_scan;
+mod coverage;
 use packed_root::{PackedRoot, RootAbi};
 
 pub struct Translated {
