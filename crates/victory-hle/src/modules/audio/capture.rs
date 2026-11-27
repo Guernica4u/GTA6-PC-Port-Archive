@@ -12,6 +12,7 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use windows::Win32::Foundation::WAIT_OBJECT_0;
 use windows::Win32::Media::Audio::{
     AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
     AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_LOOPBACK,
@@ -23,7 +24,6 @@ use windows::Win32::Media::Audio::{
     VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, WAVE_FORMAT_PCM, WAVEFORMATEX,
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
-use windows::Win32::Foundation::WAIT_OBJECT_0;
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_SYNCHRONIZE, Sleep, WaitForSingleObject,
 };
@@ -183,36 +183,72 @@ fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         client.Start()?;
         tracing::info!(path = %path.display(), "recording the title's audio");
 
+        const MAX_FRAMES: u64 = (u32::MAX as u64 - 36) / FRAME_BYTES as u64;
+        const SILENCE_CHUNK: [u8; 4096] = [0u8; 4096];
+
+        let mut write_silence = |file: &mut File, frames: u64| -> std::io::Result<()> {
+            let mut bytes = frames * FRAME_BYTES as u64;
+            while bytes > 0 {
+                let n = bytes.min(SILENCE_CHUNK.len() as u64) as usize;
+                file.write_all(&SILENCE_CHUNK[..n])?;
+                bytes -= n as u64;
+            }
+            Ok(())
+        };
+
         let (mut written, mut first) = (0u64, None);
         let mut patched = Instant::now();
-        loop {
+        let res = 'capture: loop {
             std::thread::sleep(Duration::from_millis(10));
             let ended = WaitForSingleObject(target, 0) == WAIT_OBJECT_0;
             while capture.GetNextPacketSize()? > 0 {
                 let (mut data, mut frames, mut flags, mut qpc) = (std::ptr::null_mut(), 0, 0, 0);
-                capture.GetBuffer(&mut data, &mut frames, &mut flags, None, Some(&mut qpc))?;
+                if let Err(e) =
+                    capture.GetBuffer(&mut data, &mut frames, &mut flags, None, Some(&mut qpc))
+                {
+                    break 'capture Err(e.into());
+                }
                 // Where this packet belongs, from its time stamp (100 ns).
-                let at = (qpc - *first.get_or_insert(qpc)) * u64::from(RATE) / 10_000_000;
+                let qpc_delta = u128::from(qpc.saturating_sub(*first.get_or_insert(qpc)));
+                let at = ((qpc_delta * u128::from(RATE)) / 10_000_000) as u64;
+                let at = at.min(MAX_FRAMES);
+
                 if at > written + u64::from(RATE / 500) {
                     tracing::debug!(
                         ms = (at - written) * 1000 / u64::from(RATE),
                         "audio capture: nothing played"
                     );
-                    let silence = vec![0u8; (at - written) as usize * FRAME_BYTES];
-                    file.write_all(&silence)?;
+                    if let Err(e) = write_silence(&mut file, at - written) {
+                        let _ = capture.ReleaseBuffer(frames);
+                        break 'capture Err(e.into());
+                    }
                     written = at;
                 }
-                let bytes = frames as usize * FRAME_BYTES;
-                if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 {
-                    file.write_all(&vec![0u8; bytes])?;
-                } else {
-                    file.write_all(std::slice::from_raw_parts(data, bytes))?;
+
+                let writable = u64::from(frames).min(MAX_FRAMES.saturating_sub(written));
+                if writable > 0 {
+                    let bytes = writable as usize * FRAME_BYTES;
+                    let write_res = if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 {
+                        write_silence(&mut file, writable)
+                    } else {
+                        file.write_all(std::slice::from_raw_parts(data, bytes))
+                    };
+                    if let Err(e) = write_res {
+                        let _ = capture.ReleaseBuffer(frames);
+                        break 'capture Err(e.into());
+                    }
+                    written += writable;
                 }
+
                 if flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0 && written > 0 {
                     tracing::debug!("audio capture: discontinuity");
                 }
-                written += u64::from(frames);
                 capture.ReleaseBuffer(frames)?;
+
+                if written >= MAX_FRAMES {
+                    tracing::warn!("audio capture: reached 4 GiB WAV limit, stopping");
+                    break 'capture Ok(());
+                }
             }
             if ended || patched.elapsed() >= Duration::from_secs(1) {
                 // Valid sizes at any time: runs end by being killed.
@@ -222,8 +258,14 @@ fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 patched = Instant::now();
             }
             if ended {
-                return Ok(());
+                break Ok(());
             }
-        }
+        };
+
+        let _ = client.Stop();
+        let _ = windows::Win32::Foundation::CloseHandle(target);
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&header(written))?;
+        res
     }
 }
