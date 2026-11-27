@@ -10,7 +10,7 @@ import subprocess
 from tempfile import TemporaryDirectory
 from time import monotonic
 
-from . import dxil_store
+from . import dxil_store, persistent_dxc
 from .inspect import digest
 from .prep_progress import PrepPhase, desktop_progress, report_progress
 from .runtime_shaders import REQUEST_PATTERNS, ShaderRefused, compile_request, snapshot_compiler_cache
@@ -113,21 +113,26 @@ def prepare_scarlett(executable, host):
     # Use the runtime toolchain and cache so the guest can load both translations
     # and deterministic refusals directly, including requests with a pipeline root.
     env = {"TUXBOX_SHADER_PREP_UI": "1", **host.env}
-    with desktop_progress("ProjectScarlett", env) as progress, TemporaryDirectory(prefix="tuxbox-prep-") as tmp:
+    jobs = prep_jobs(host.env)
+    # The live session picks the same helper, so it finds the cache filled here.
+    helper = persistent_dxc.session_helper(host.env, lambda message: report_progress(None, message))
+    with desktop_progress("ProjectScarlett", env) as progress, TemporaryDirectory(prefix="tuxbox-prep-") as tmp, \
+            persistent_dxc.staged(helper, tmp, jobs, lambda message: report_progress(None, message)) as persistent:
         report_progress(progress, "Preparing ProjectScarlett shaders")
-        tools, cache = snapshot_compiler_cache(Path(tmp) / "xshader", cache_root)
+        pinned = {"dxc_helper": persistent.helper} if persistent is not None else {}
+        tools, cache = snapshot_compiler_cache(Path(tmp) / "xshader", cache_root, **pinned)
+        options = {"persistent": persistent} if persistent is not None else {}
         phase = PrepPhase(progress, "Previously used Xbox shaders", len(sources))
 
         def compile_one(source):
             try:
-                compiled = compile_request(source, source.stem, tools, cache, None)
+                compiled = compile_request(source, source.stem, tools, cache, None, **options)
                 return ("compiled" if compiled else "cached"), None, None, source.suffix, None
             except ShaderRefused as exc:
                 return "unsupported", None, refusal_bucket(exc), source.suffix, normalize_refusal(str(exc)) if exc.reason_known else None
             except (OSError, ValueError, subprocess.SubprocessError) as exc:
                 return "failed", f"{source.name}: {exc}", failure_bucket(exc), source.suffix, None
 
-        jobs = prep_jobs(host.env)
         workers = ThreadPoolExecutor(max_workers=jobs)
         try:
             for completed, result in enumerate(bounded_results(workers, compile_one, sources, jobs), 1):

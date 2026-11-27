@@ -17,7 +17,7 @@ from time import monotonic, sleep
 
 from .dxil_store import COMPUTE_FLAGS, VARIANTS, DxilStore, write_identity
 from .inspect import digest
-from .persistent_dxc import PersistentDxc
+from . import persistent_dxc
 from .shader_diagnostics import refusal_line
 from .shader_blob import MAX_SHADER_BYTES, bounded_shader, exact_marker
 from .shader_prep import SOURCE_CACHE, ToolFailure, compiler_tools, run_tool
@@ -26,6 +26,20 @@ from .shader_prep import SOURCE_CACHE, ToolFailure, compiler_tools, run_tool
 XSHADER_UNSUPPORTED_HLSL = 65
 # The emitter's one-line refusal reason kept beside an .unsupported marker.
 REASON_BYTES = 512
+# Each runtime cache is named after the compiler fingerprint, so every branch
+# build gets its own and switching back is a warm hit. Request keys carry no
+# translator version, so one build's output must never answer another's
+# request: the caches stay apart on purpose rather than being merged.
+#
+# Nothing removed a cache whose build was gone, so they accumulated (two branch
+# builds held 2.1 GB). Keep the running build's cache plus the two most
+# recently used others, and record in `last-used` when each one ran, because a
+# directory's own time also moves when a file inside it is rewritten.
+USED_FILE = "last-used"
+# Held open with an flock by the launcher using that cache, so retention cannot
+# remove a directory that is still compiling on another branch.
+IN_USE_FILE = "in-use"
+RUNTIME_CACHES_KEPT = 3
 SOURCE_KEY = r"[a-f0-9]{64}"
 STENCIL_KEY = SOURCE_KEY + r"_rt[0-7]"
 LINK_KEY = "_".join([SOURCE_KEY] * 3)
@@ -230,10 +244,25 @@ def validated_dxil(dxv, output, stage):
     return data
 
 
-def compile_dxil(dxc, dxv, target, hlsl, output, store, request, stage):
+def compile_dxil(dxc, dxv, target, hlsl, output, store, request, stage, *, persistent=None):
     """Compile HLSL for the requested stage and return fully validated DXIL bytes."""
     entry = [] if target == "lib_6_3" else ["-E", "main"]
     unoptimised = [dxc, "-T", target, *entry, "-O0", "-Fo", output, hlsl]
+
+    def optimised(flags, timeout):
+        """One optimised compile: by the session's DXC helper when it has one,
+        and by the command line when it hasn't or the helper's output fails."""
+        if persistent is not None and persistent.compile(dxc, hlsl, output, target, flags, timeout=timeout):
+            try:
+                return validated_dxil(dxv, output, stage)
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                persistent.report(f"Persistent DXC output rejected, using the CLI: {error}")
+                output.unlink(missing_ok=True)
+        run_tool([dxc, "-T", target, *entry, *flags, "-Fo", output, hlsl], timeout=timeout)
+        if not output.exists():
+            raise ValueError("compiler returned no DXIL output")
+        return validated_dxil(dxv, output, stage)
+
     # With lifetime markers, DXC can spend most of a compile in Jump Threading on
     # generated programs. Every profile but cs_6_6, which has its own variant
     # below, therefore starts without them at the default optimisation level,
@@ -252,11 +281,7 @@ def compile_dxil(dxc, dxv, target, hlsl, output, store, request, stage):
             return validated_dxil(dxv, output, stage)
         try:
             faster = () if target == "lib_6_3" else inlining_flags(dxc)
-            run_tool([dxc, "-T", target, *entry, "-disable-lifetime-markers", *faster,
-                      "-Fo", output, hlsl], timeout=15)
-            if not output.exists():
-                raise ValueError("compiler returned no DXIL output")
-            return validated_dxil(dxv, output, stage)
+            return optimised(("-disable-lifetime-markers", *faster), 15)
         except subprocess.TimeoutExpired:
             if store and not dispatched:
                 store.mark_slow(request, target)
@@ -278,11 +303,7 @@ def compile_dxil(dxc, dxv, target, hlsl, output, store, request, stage):
         # Output that fails with the experimental option is compiled without it.
         for extra in (faster, ()) if faster else ((),):
             try:
-                run_tool([dxc, "-T", target, *entry, *COMPUTE_FLAGS, *extra, "-Fo", output, hlsl],
-                         timeout=COMPUTE_TIMEOUT)
-                if not output.exists():
-                    raise ValueError("compiler returned no DXIL output")
-                return validated_dxil(dxv, output, stage)
+                return optimised((*COMPUTE_FLAGS, *extra), COMPUTE_TIMEOUT)
             except subprocess.TimeoutExpired:
                 if store:
                     store.mark_slow(request, target)
@@ -293,7 +314,7 @@ def compile_dxil(dxc, dxv, target, hlsl, output, store, request, stage):
         run_tool(unoptimised, timeout=o0_timeout(hlsl))
         return validated_dxil(dxv, output, stage)
     try:
-        run_tool([dxc, "-T", target, *entry, "-Fo", output, hlsl], timeout=15)
+        return optimised((), 15)
     except subprocess.TimeoutExpired:
         if store:
             store.mark_slow(request, target)
@@ -471,16 +492,8 @@ def compile_request(source, key, tools, cache, session, *, remember=None, persis
                 with lock:
                     data = reuse_content() if store else None
                     if data is None:
-                        if (persistent is not None and target == "cs_6_0"
-                                and not (store and store.is_slow(key, target))
-                                and persistent.compile(dxc, hlsl, output)):
-                            try:
-                                data = validated_dxil(dxv, output, target_stage)
-                            except (OSError, ValueError, subprocess.SubprocessError) as error:
-                                persistent.report(f"Persistent DXC output rejected, using the CLI: {error}")
-                                output.unlink(missing_ok=True)
-                        if data is None:
-                            data = compile_dxil(dxc, dxv, target, hlsl, output, store, key, target_stage)
+                        data = compile_dxil(dxc, dxv, target, hlsl, output, store, key, target_stage,
+                                            persistent=persistent)
                         if store:
                             store.save(content, data)
             stamp = work / "sha256"
@@ -505,16 +518,7 @@ def serve(session, stop, report, archive=None, jobs=1, *, dxc_helper=None):
     # Cargo can replace the release executable while another title is running.
     # Keep the executable we fingerprint private to this host worker.
     with TemporaryDirectory(prefix="tuxbox-xshader-") as tmp, request_notifications(session / "requests", stop) as (wait, wake):
-        pinned = None
-        if dxc_helper:
-            try:
-                helper = Path(tmp) / "dxc-worker"
-                shutil.copyfile(Path(dxc_helper).expanduser(), helper)
-                helper.chmod(0o700)
-                pinned = helper
-            except OSError as error:
-                report(f"Could not stage persistent DXC, using the CLI: {error}")
-        with PersistentDxc(pinned, jobs, report) if pinned else nullcontext() as persistent:
+        with persistent_dxc.staged(dxc_helper, tmp, jobs, report) as persistent:
             _serve_requests(session, stop, report, Path(tmp) / "xshader", wait, archive, jobs, persistent=persistent, wake=wake)
 
 
@@ -566,6 +570,106 @@ def request_notifications(directory, stop):
         os.close(fd)
 
 
+# Claims this process holds, by cache path; the handles stay open until it exits.
+_IN_USE = {}
+
+
+def mark_in_use(cache):
+    """Hold `cache` against retention until this process closes the handle.
+
+    Returns the handle. The launcher keeps it for the life of the worker, so a
+    second branch cannot evict a cache that is still compiling. The claim is
+    shared: launchers of one build use its cache together, and only retention
+    asks for it exclusively. Prelaunch preparation and the live worker run in
+    one process and ask twice, so reuse the claim.
+    """
+    import fcntl
+    directory = Path(cache)
+    key = str(directory.resolve())
+    if key in _IN_USE:
+        return _IN_USE[key]
+    handle = os.open(directory / IN_USE_FILE,
+                     os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        # Blocks only while another launcher's retention probes this cache.
+        fcntl.flock(handle, fcntl.LOCK_SH)
+    except OSError:
+        os.close(handle)
+        raise
+    _IN_USE[key] = handle
+    return handle
+
+
+def locked_by_another_launcher(cache):
+    """Whether another process holds `cache` open, or it cannot be told apart.
+
+    Probing with an flock rather than a marker file means a launcher that
+    crashed or was killed releases its claim when the kernel closes the file;
+    no stale claim outlives the process. This process's own claim also reads as
+    held, which is what retention wants: never remove a cache in use.
+    """
+    import fcntl
+    try:
+        handle = os.open(Path(cache) / IN_USE_FILE,
+                         os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError:
+        return True
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    finally:
+        os.close(handle)
+    return False
+
+
+def runtime_caches(runtime_root):
+    """The fingerprint directories under `runtime_root`, most recently used first.
+
+    A cache without a `last-used` marker is ordered by its directory time, so
+    caches written before the marker existed still sort sensibly. `last-used`
+    wins where it exists because rewriting files inside a directory moves that
+    directory's own timestamp whether the build ran or not.
+    """
+    def used(folder):
+        for path in (folder / USED_FILE, folder):
+            try:
+                return path.stat().st_mtime_ns
+            except OSError:
+                continue
+        return 0
+    folders = [path for path in Path(runtime_root).iterdir() if path.is_dir()]
+    return sorted(folders, key=used, reverse=True)
+
+
+def retain_runtime_caches(runtime_root, current, *, keep=RUNTIME_CACHES_KEPT):
+    """Keep `current` and the `keep - 1` most recently used sibling caches.
+
+    `current` is kept even when it is the oldest, so a long session never loses
+    the cache it is writing to. Returns the names of the directories removed. A
+    cache another launcher holds is skipped rather than evicted, so this can
+    keep more than `keep` while two branches compile at the same time; the next
+    launch with nothing running trims the remainder.
+    """
+    if keep < 1:
+        raise ValueError("keep must be at least 1")
+    current = Path(current)
+    # Record this build as the one that just ran. Its in-use claim is already
+    # held by the caller, so evicting the rest cannot touch it either way.
+    (current / USED_FILE).touch()
+    ordered = [path for path in runtime_caches(runtime_root) if path.name != current.name]
+    removed = []
+    for folder in ordered[keep - 1:]:
+        if locked_by_another_launcher(folder):
+            continue
+        try:
+            shutil.rmtree(folder)
+        except OSError:
+            continue  # A cache this run cannot remove is not worth a failed launch.
+        removed.append(folder.name)
+    return removed
+
+
 def snapshot_compiler_cache(xshader, cache_root, *, dxc_helper=None):
     """Pin the executable used for all requests under this toolchain fingerprint."""
     compiler, dxc, dxv = compiler_tools()
@@ -582,6 +686,11 @@ def snapshot_compiler_cache(xshader, cache_root, *, dxc_helper=None):
     cache = cache_root / "runtime" / fingerprint.hexdigest()
     cache.mkdir(parents=True, exist_ok=True)
     write_identity(cache, version, dxc, dxv)
+    # Claim this build's cache before evicting, so a concurrent launch on
+    # another branch cannot remove it while it compiles. Both steps also run
+    # during prelaunch preparation; the claim is shared with the live worker.
+    mark_in_use(cache)
+    retain_runtime_caches(cache.parent, cache)
     return tools, cache
 
 
@@ -775,7 +884,7 @@ def shader_session(cache, env, report, *, archive=None):
         (session / "requests").mkdir()
         env["TUXBOX_SHADER_SESSION"] = session.name
         stop = Event()
-        helper = env.get("TUXBOX_PERSISTENT_DXC")
+        helper = persistent_dxc.session_helper(env, report)
         options = {"dxc_helper": helper} if helper else {}
         worker = Thread(target=serve, args=(session, stop, report, archive, runtime_jobs(env, report)),
                         kwargs=options, name="shader-compiler", daemon=True)
