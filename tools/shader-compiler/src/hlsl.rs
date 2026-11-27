@@ -44,6 +44,9 @@ mod instruction_inventory;
 #[path = "tests/hlsl/buffer_loads.rs"]
 mod buffer_loads;
 #[cfg(test)]
+#[path = "tests/hlsl/image_ops.rs"]
+mod image_ops;
+#[cfg(test)]
 #[path = "tests/hlsl/raw_width.rs"]
 mod raw_width;
 #[cfg(test)]
