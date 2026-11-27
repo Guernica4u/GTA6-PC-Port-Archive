@@ -215,6 +215,8 @@ pub use rect::{rectangle_gs, right_angle};
 #[cfg(all(test, windows))]
 mod mask_branch_repro;
 #[cfg(all(test, windows))]
+mod mask_branch_tests;
+#[cfg(all(test, windows))]
 mod memory_tests;
 mod sampler;
 #[cfg(all(test, windows))]

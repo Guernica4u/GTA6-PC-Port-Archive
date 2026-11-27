@@ -472,6 +472,11 @@ pub struct Structured {
     /// A pixel's discards, by block and instruction: the lanes (EXEC there)
     /// the instruction takes out of the live mask, which here stay in it.
     pub discards: HashMap<(usize, usize), Bool>,
+    /// SCC values of mask operations nothing but a branch reads (the mask
+    /// itself is dead): "some lane is set", the same in every lane of the
+    /// console's wave, not each lane's own bit. The lanes outside the mask
+    /// run the branch's arm too, so the arm is the wave's, not the lane's.
+    pub any_sccs: HashSet<Value>,
 }
 
 impl Structured {
@@ -539,6 +544,10 @@ struct Lanes<'a> {
     /// For branches: SCC of a mask operation ("some lane is set") as the
     /// lane's own bit.
     scc_lane: Map<Value, Bool>,
+    /// SCC values only branches read, of mask operations whose result
+    /// nothing reads ([`Structured::any_sccs`]), and those found so far.
+    branch_only: HashSet<Value>,
+    any_sccs: HashSet<Value>,
     /// Joins resolved to a constant, to check once all edges are known.
     joins: Vec<Join>,
     /// Per block: what a lane knows on entry, over forward edges only.
@@ -611,6 +620,8 @@ impl<'a> Lanes<'a> {
             masks: Map::default(),
             other: Map::default(),
             scc_lane: Map::default(),
+            branch_only: HashSet::new(),
+            any_sccs: HashSet::new(),
             joins: Vec::new(),
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
@@ -628,6 +639,7 @@ impl<'a> Lanes<'a> {
                 l.kills.insert(*def);
             }
         }
+        l.branch_only = l.branch_only_sccs();
         for inst in blocks.iter().flat_map(|b| &b.insts) {
             if let Fields::Valu(v) = &inst.fields
                 && inst.name() == "v_readlane_b32"
@@ -641,6 +653,64 @@ impl<'a> Lanes<'a> {
             }
         }
         Ok(l)
+    }
+
+    /// The SCC values of bitwise mask operations (not writing EXEC) that
+    /// only `s_cbranch_scc0/1` read, whose result nothing reads: such a
+    /// branch tests whether any bit of the result is set, for the whole
+    /// wave. A mask that is used (as EXEC in the arm, say) keeps the lane's
+    /// own bit, which the lanes outside it agree with there.
+    fn branch_only_sccs(&self) -> HashSet<Value> {
+        let mut reads: Map<Value, (u32, u32)> = Map::default();
+        for block in &self.p.blocks {
+            for phi in &block.phis {
+                for &a in &phi.args {
+                    reads.entry(a).or_default().0 += 1;
+                }
+            }
+            for inst in &block.insts {
+                let branch = inst.name().starts_with("s_cbranch_scc");
+                for &(r, v) in &inst.reads {
+                    let n = reads.entry(v).or_default();
+                    n.0 += 1;
+                    n.1 += u32::from(branch && r == Reg::Scc);
+                }
+            }
+        }
+        const BITWISE: [&str; 9] = [
+            "and", "or", "xor", "andn2", "orn2", "nand", "nor", "xnor", "not",
+        ];
+        let width = if self.p.wave64 { "_b64" } else { "_b32" };
+        let mut found = HashSet::new();
+        for (b, block) in self.p.blocks.iter().enumerate() {
+            for (i, inst) in block.insts.iter().enumerate() {
+                let Fields::Sop { .. } = inst.fields else {
+                    continue;
+                };
+                let bitwise = inst
+                    .name()
+                    .strip_prefix("s_")
+                    .and_then(|n| n.strip_suffix(width))
+                    .is_some_and(|op| BITWISE.contains(&op));
+                let Some(scc) = inst.write(Reg::Scc) else {
+                    continue;
+                };
+                let (all, branches) = reads.get(&scc).copied().unwrap_or_default();
+                if bitwise
+                    && inst.write(Reg::S(EXEC)).is_none()
+                    && branches > 0
+                    && all == branches
+                    && !self.kills.contains(&(b, i))
+                    && inst
+                        .writes
+                        .iter()
+                        .all(|&(r, v)| r == Reg::Scc || !reads.contains_key(&v))
+                {
+                    found.insert(scc);
+                }
+            }
+        }
+        found
     }
 
     /// What lane `lane` of VGPR value `v` holds when `v_writelane_b32` put
@@ -689,6 +759,7 @@ impl<'a> Lanes<'a> {
         self.masks.clear();
         self.other.clear();
         self.scc_lane.clear();
+        self.any_sccs.clear();
         self.joins.clear();
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
@@ -882,6 +953,7 @@ impl<'a> Lanes<'a> {
                 .collect(),
             paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
             active: self.active,
+            any_sccs: self.any_sccs,
             restored: self.restored.into_iter().collect(),
             discards: self
                 .kills
@@ -1201,7 +1273,11 @@ impl<'a> Lanes<'a> {
                         }
                     }
                     if let (Some(scc), Some(m)) = (inst.write(Reg::Scc), r.scc) {
-                        self.scc_lane.insert(scc, m);
+                        if self.branch_only.contains(&scc) {
+                            self.any_sccs.insert(scc);
+                        } else {
+                            self.scc_lane.insert(scc, m);
+                        }
                     }
                 }
                 // `s_cmp_eq/lg` of a mask: "no lane differs" per lane.

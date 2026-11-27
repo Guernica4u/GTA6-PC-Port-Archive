@@ -8,9 +8,13 @@ use crate::native::{
 };
 
 #[derive(Clone, Copy, Debug)]
-enum Program {
+pub(super) enum Program {
     DxcReference,
     Branch,
+    /// [`Program::Branch`] on `s_cbranch_scc1`.
+    BranchScc1,
+    /// [`Program::Branch`] with the mask also copied to another register.
+    BranchMaskRead,
     StoreOnScc0,
     StoreOnScc1,
 }
@@ -63,12 +67,49 @@ fn native_of(body: &[u32], wave64: bool, threads: u32) -> NativeProgram {
     }
 }
 
-fn program(kind: Program, lanes: u32) -> NativeProgram {
+pub(super) fn program(kind: Program, lanes: u32) -> NativeProgram {
     let wave64 = lanes == 64;
     let save = if wave64 { 0xbe8c_246a } else { 0xbe8c_3c6a }; // s_and_saveexec_b64/b32 s12, vcc
     let mask = if wave64 { 0x8792_7e6a } else { 0x8712_7e6a }; // s_and_b64/b32 s18, vcc, exec
     let restore = if wave64 { 0xbefe_040c } else { 0xbefe_030c }; // s_mov_b64/b32 exec, s12
     let body = match kind {
+        Program::BranchScc1 => vec![
+            0xbf8c_0000, // s_waitcnt 0
+            0x7d88_0000, // v_cmp_gt_u32 vcc, s0, v0  (lane < active count)
+            save,
+            0xbf88_0009, // s_cbranch_execz to the restore
+            0x7d84_0001, // v_cmp_eq_u32 vcc, s1, v0  (lane == selected)
+            mask,
+            0xbf85_0002, // s_cbranch_scc1 to the value 2
+            0x7e04_0281, // v_mov_b32 v2, 1
+            0xbf82_0001, // s_branch to the common store
+            0x7e04_0282, // v_mov_b32 v2, 2
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xe070_1000,
+            0x8002_0201, // buffer_store_dword v2 at v1
+            restore,
+        ],
+        Program::BranchMaskRead => {
+            // s_mov_b32 / s_mov_b64 s20, s18: the mask is read as well.
+            let copy = 0xbe80_0000 | 20 << 16 | (if wave64 { 4 } else { 3 }) << 8 | 18;
+            vec![
+                0xbf8c_0000,
+                0x7d88_0000,
+                save,
+                0xbf88_000a, // s_cbranch_execz to the restore
+                0x7d84_0001,
+                mask,
+                copy,
+                0xbf84_0002, // s_cbranch_scc0 to the value 1
+                0x7e04_0282,
+                0xbf82_0001,
+                0x7e04_0281,
+                0x3402_0082,
+                0xe070_1000,
+                0x8002_0201,
+                restore,
+            ]
+        }
         Program::Branch => vec![
             0xbf8c_0000, // s_waitcnt 0
             0x7d88_0000, // v_cmp_gt_u32 vcc, s0, v0  (lane < active count)
