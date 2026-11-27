@@ -2417,6 +2417,9 @@ struct Deferred {
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
     indirect_readable: usize,
+    /// The buffer of ours that constants read behind copies at their place
+    /// go into, and the bytes of it used ([`HostList::placed_constants`]).
+    constants: Option<(ID3D12Resource, u64)>,
 }
 
 impl Deferred {
@@ -3843,11 +3846,12 @@ fn late_line(frames: f64) {
     if place::on() {
         let t: Vec<f64> = place::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
-            "title buffer copies at their place in the lists, per frame (VICTORY_COPIES_IN_PLACE): {:.1} of {:.1} KB, {:.1} of them out              of what shaders wrote; {:.2} copies into textures out of what shaders wrote",
+            "title buffer copies at their place in the lists, per frame (VICTORY_COPIES_IN_PLACE): {:.1} of {:.1} KB, {:.1} of them out              of what shaders wrote; {:.2} copies into textures out of what shaders wrote; {:.1} constants read on the card behind them",
             t[0],
             t[1] / 1024.0,
             t[2],
             t[3],
+            t[4],
         );
     }
     card_steps::log(frames);
@@ -7257,6 +7261,10 @@ impl HostList {
     /// memory at `src` as of the list's submission: one fill for every ask
     /// until the list next writes title memory.
     pub(crate) fn fill_scratch(&self, src: *const u8, len: u64) -> Option<u64> {
+        // Behind a copy at its place: read on the card, not waited for.
+        if let Some((_, gpu)) = self.placed_constants(src as usize, len as usize) {
+            return Some(gpu);
+        }
         let key = (src as usize, len as usize);
         let known = self.deferred().filled.get(&key).copied();
         if known.is_some() {
@@ -7271,6 +7279,10 @@ impl HostList {
     /// As [`HostList::defer_fill`], for upload memory that only `slot` (a
     /// title heap's address, and the slot) shows.
     pub(crate) fn defer_constants(&self, dst: *mut u8, src: *const u8, len: usize, slot: (usize, u32)) {
+        // Behind a copy at its place: read on the card, not waited for.
+        if self.place_constants_slot(src as usize, len, slot) {
+            return;
+        }
         self.deferred()
             .copies
             .push(Step::Fill(dst as usize, src as usize, len, Some(card_steps::FillTo::Slot(slot.0, slot.1))));

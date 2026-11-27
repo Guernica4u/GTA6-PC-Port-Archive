@@ -238,3 +238,13 @@ overlay. No env switches added. Log lines to check:
   `converted cache: decoded DirectStorage outputs kept on disk`;
 - `textures uploaded ahead of the lists` (turned down count) and the queue line `textures picked by index, the queue`
   (peak should drop well under 26k on the second run), time from `core_restofworld.rpf` open to queue < 500.
+
+### perf/read-wait, step 2: constants behind a copy at its place read on the card (NOT COMPILED, UNMEASURED)
+
+Measured with step 1 (play-20261127-104020-14256.log, chase): "title memory read 0.8", all of it "a step that reads where a copy at its place writes", 18.6 ms/frame waiting. The readers really stand behind the copy. Most likely they are constant-buffer fills: the ring copy of a few hundred bytes a frame, then draws whose constants read it (`draw.rs` table CBVs -> `defer_constants`, misaligned root CBVs -> `fill_scratch`). With the copy's source or destination under flights' declared writes, `Placed::prepare(free=false)` leaves title memory alone, so a CPU fill behind it would read old bytes and must wait.
+
+Change (`host/place.rs`, `host.rs`): `place_copy` notes its destination (this frame and the one before). `defer_constants` and `fill_scratch` check whether the constants overlap a noted destination. If they do, `HostList::placed_constants` records at this place in the list a refresh of the range, then a copy out of the host copy that shaders write into a 256-aligned piece of a per-list buffer of ours (1 MiB, then readable as constants). It does not record a CPU fill. A root view gets that address. A table slot is pointed at it when the list is submitted (a host step, `PointSlot`), after the draw pointed it at upload memory. The read is now in queue order, after the copy and every flight ahead of it, so no step reads the destination on the CPU and `blocked_by` has nothing to wait for. The value is the card's: what the copy and every write ahead of it left there. That is the same thing every buffer view and aligned root CBV of the heap reads already. Title memory is not written; the landing is unchanged.
+
+Counter: "N constants read on the card behind them" on the line "title buffer copies at their place". Watch "a step that reads where a copy at its place writes" (should fall to ~0) and "title memory changed under shader writes" (WHY_STALE). The refresh of a range under declared writes can be settled there instead.
+
+Not covered: readers that are textures, title buffer copies done at submission, or host reads of the destination. They still wait, and the counter would stay above 0.
