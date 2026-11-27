@@ -1105,6 +1105,7 @@ def main():
         ap.add_argument("--" + n, type=Path, required=True)
     ap.add_argument("--adapter", required=True)
     ap.add_argument("--rounds", type=int, default=8, help=f"dispatches per shader, {GROUPS} inputs each")
+    ap.add_argument("--only", action="append", help="check only this instruction (repeatable)")
     a = ap.parse_args()
     if a.output.exists():
         ap.error("choose a fresh receipt")
@@ -1113,6 +1114,11 @@ def main():
     every = [*OPERATIONS, *SCALAR, *GROUP_MEMORY, *SEQUENCES, *PAIRS, *IN_PLACE, *CONSTANT, *CONSTANT_COMPARES, *COMPARES, *SCALAR_COMPARES,
              *EXEC_COMPARES, *HALF, *PACKED, *HALF_COMPARES, *HALF_EXEC_COMPARES, *FLOATS, *FLOAT_COMPARES,
              *FLOAT_EXEC_COMPARES]
+    if a.only:
+        unknown = sorted(set(a.only) - set(every))
+        if unknown:
+            ap.error(f"not in this check: {', '.join(unknown)}")
+        every = [name for name in every if name in a.only]
     supported, refused = probe(every, a.emitter, a.llvm_mc)
     expected, chunks = {}, {}
     with TemporaryDirectory(dir=a.work) as td:
