@@ -78,12 +78,18 @@ pub(super) fn can_sync_wave64_lds(p: &Program, x: &Parts) -> bool {
                 return false;
             }
             // A scalar or SMEM instruction reading a lane mask (`x.st.masks` or
-            // `x.st.highs`) can materialize a `waveActiveBallot` word that
+            // `x.st.highs`) as data (not a pure lane-mask operation writing a
+            // tracked mask SGPR) can materialize a `waveActiveBallot` word that
             // differs between Wave64 and two Wave32 waves, making downstream
             // `Atom::Uniform` branches diverge across the two Wave32s.
             let is_mask = |r| x.st.masks.contains_key(&r) || x.st.highs.contains_key(&r);
+            let writes_mask = matches!(inst.fields, Fields::Sop { .. })
+                && inst.writes.iter().any(|&(reg, w)| {
+                    matches!(reg, crate::ir::Reg::S(_)) && x.st.masks.contains_key(&w)
+                });
             if matches!(inst.fields, Fields::Sop { .. } | Fields::Smem { .. })
                 && inst.write(crate::ir::Reg::S(crate::ir::EXEC)).is_none()
+                && !writes_mask
                 && (inst.reads.iter().any(|&(_, r)| is_mask(r))
                     || inst.writes.iter().any(|&(reg, w)| {
                         matches!(reg, crate::ir::Reg::S(_)) && x.st.highs.contains_key(&w)

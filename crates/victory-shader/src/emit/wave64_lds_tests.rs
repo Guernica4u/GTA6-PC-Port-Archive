@@ -196,7 +196,7 @@ fn wave64_lds_64_threads_cndmask_data_keeps_wave_size_64() {
     let words = [
         0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
         0xBE94_046A, // s_mov_b64 s[20:21], vcc
-        0x0202_0314, // v_cndmask_b32 v1, s20, v1, vcc
+        0x0202_0214, // v_cndmask_b32 v1, s20, v1, vcc
         0xD834_0000, // ds_write_b32 v0, v1
         0x0000_0100,
         S_ENDPGM,
