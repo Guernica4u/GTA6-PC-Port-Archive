@@ -117,7 +117,7 @@ impl Transfer {
         }
         for change in changes {
             let mut state = lock(&change.texture.contents);
-            self.scratch = std::mem::replace(&mut state.previous[change.level], change.bytes);
+            self.scratch = state.store(change.level, change.bytes);
             state.uploaded = tick;
             state.readers.clear();
         }
