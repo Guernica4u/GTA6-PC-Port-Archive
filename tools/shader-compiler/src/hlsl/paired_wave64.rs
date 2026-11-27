@@ -152,6 +152,13 @@ pub(super) fn prologue(em: &Emitter<'_>, header: &mut String, group_register: us
     let _ = writeln!(header, "    s{} = gid.x; s{} = gid.y; s{} = gid.z;", g, g + 1, g + 2);
 }
 
+/// Whether the text after an identifier assigns to it (`=`, `+=`, `<<=` and the like, not `==`).
+fn assigns(after: &str) -> bool {
+    let after = after.trim_start();
+    !after.starts_with("==")
+        && ["=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="].iter().any(|op| after.starts_with(op))
+}
+
 fn is_vector_register(name: &str) -> bool {
     name.len() > 1 && name.starts_with('v') && name[1..].bytes().all(|b| b.is_ascii_digit())
 }
@@ -455,7 +462,9 @@ pub(super) fn emit(em: &mut Emitter<'_>, idx: usize, ins: &Insn, is_ps: bool, br
 
     let start = em.body.len();
     em.emit_insn_body(idx, ins, is_ps, br)?;
-    let code = em.body.split_off(start);
+    // The instruction is named once, above; each lane's copy carries code only.
+    let code: String = em.body.split_off(start).lines()
+        .filter(|line| !line.trim_start().starts_with("//")).flat_map(|line| [line, "\n"]).collect();
     if let Some((word, _)) = identifiers(&code).find(|(word, _)| {
         word.starts_with("Wave") || word.starts_with("Quad") || word.starts_with("tb_lane") || word.starts_with("tb_swizzle")
     }) {
@@ -502,21 +511,39 @@ pub(super) fn emit(em: &mut Emitter<'_>, idx: usize, ins: &Insn, is_ps: bool, br
             return Err(format!("paired wave64: {m} writes {word} outside a known mask"));
         }
     }
-    let vectors: BTreeSet<&str> = identifiers(&code).map(|(word, _)| word).filter(|w| is_vector_register(w)).collect();
-    let mut shadowed = read.clone();
+    let used: BTreeSet<&str> = identifiers(&code).map(|(word, _)| word).collect();
+    if used.is_empty() && written.is_empty() {
+        return Ok(());
+    }
+    let vectors: BTreeSet<&str> = used.iter().copied().filter(|w| is_vector_register(w)).collect();
+    // A register the code may change: assigned, or handed to a call that returns through it.
+    let returns = |line: &str| line.contains("Interlocked") || line.contains("GetDimensions") || line.contains("out ");
+    let changed: BTreeSet<&str> = identifiers(&code).filter(|(_, after)| assigns(after)).map(|(word, _)| word)
+        .chain(code.lines().filter(|line| returns(line)).flat_map(|line| identifiers(line).map(|(word, _)| word)))
+        .filter(|w| vectors.contains(w)).collect();
+    // A lane needs its bit of a mask only if the code names the mask.
+    let mut shadowed: Vec<[String; 2]> = read.iter().filter(|w| w.iter().any(|n| used.contains(n.as_str()))).cloned().collect();
     for words in &written {
         if !shadowed.contains(words) {
             shadowed.push(words.clone());
         }
     }
+    let exec = ["exec_lo".to_string(), "exec_hi".to_string()];
     em.line("{");
     if let Some(reads) = &moved {
         for line in reads {
             em.line(line);
         }
     }
-    for [low, high] in &shadowed {
-        em.line(&format!("uint tbx_{low} = {low}, tbx_{high} = {high};"));
+    for words @ [low, high] in &shadowed {
+        // A mask the instruction only writes starts clear and needs no copy.
+        if read.contains(words) {
+            em.line(&format!("uint tbx_{low} = {low}, tbx_{high} = {high};"));
+        }
+    }
+    if !written.is_empty() && !shadowed.contains(&exec) {
+        // Rebuilt masks keep to the lanes that were active.
+        em.line("uint tbx_exec_lo = exec_lo, tbx_exec_hi = exec_hi;");
     }
     for [low, _] in &written {
         em.line(&format!("bool tbm_{low}_0 = false, tbm_{low}_1 = false;"));
@@ -542,7 +569,7 @@ pub(super) fn emit(em: &mut Emitter<'_>, idx: usize, ins: &Insn, is_ps: bool, br
             em.line(&format!("uint {} = tbd_{lane};", name(&Opnd::Temp(MOVED))?));
         }
         em.body.push_str(&code);
-        for vector in &vectors {
+        for vector in &changed {
             em.line(&format!("{vector}__{lane} = {vector};"));
         }
         for [low, _] in &written {
