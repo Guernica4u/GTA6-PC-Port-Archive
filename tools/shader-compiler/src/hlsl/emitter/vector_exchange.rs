@@ -2,6 +2,21 @@
 use super::*;
 
 impl<'a> Emitter<'a> {
+    /// The host lane of the first invocation whose guest EXEC bit is set, or
+    /// 0xffffffff when there is none. A ballot, not `WaveActiveMin` over lane
+    /// indices: on an RTX 5090 that minimum, in a wave whose lanes disagree,
+    /// lost the device (Xid 109, CTX SWITCH TIMEOUT). The ballot's second word
+    /// holds lanes 32-63 of a 64-lane host wave.
+    pub(in crate::hlsl) fn first_active_lane(&mut self) -> String {
+        let t = self.tmp;
+        self.tmp += 1;
+        self.line(&format!("uint4 t{t}b = WaveActiveBallot((exec_lo & 1u) != 0u);"));
+        self.line(&format!(
+            "uint t{t} = t{t}b.x != 0u ? firstbitlow(t{t}b.x) : (t{t}b.y != 0u ? 32u + firstbitlow(t{t}b.y) : 0xffffffffu);"
+        ));
+        format!("t{t}")
+    }
+
     /// Broadcast the first active lane to a scalar register.
     pub(in crate::hlsl) fn emit_readfirstlane(&mut self, s: &[Opnd], d: Opnd) -> Result<(), String> {
         let value = r(&s[0])?;
@@ -19,11 +34,9 @@ impl<'a> Emitter<'a> {
         }
         // Scalar writes reach every invocation. Select the first lane whose guest
         // EXEC bit is set, even when the executing host wave also has masked lanes.
-        let t = self.tmp;
-        self.tmp += 1;
         self.line("#if __SHADER_TARGET_MAJOR >= 6");
-        self.line(&format!("uint t{t} = WaveActiveMin((exec_lo & 1u) ? WaveGetLaneIndex() : 0xffffffffu);"));
-        self.ws(&d, &format!("WaveReadLaneAt({value}, t{t} == 0xffffffffu ? 0u : t{t})"))?;
+        let t = self.first_active_lane();
+        self.ws(&d, &format!("WaveReadLaneAt({value}, {t} == 0xffffffffu ? 0u : {t})"))?;
         self.line("#else");
         self.ws(&d, &value)?;
         self.line("#endif");
