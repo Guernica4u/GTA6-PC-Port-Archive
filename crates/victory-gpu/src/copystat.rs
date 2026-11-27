@@ -104,19 +104,31 @@ pub(crate) enum C {
     /// Title threads writing a view into a shader-visible heap: time
     /// waiting for the heaps' lock (held by heap syncs and other writers).
     MirrorWaitUs,
-    /// The title's calls into its command lists that did work, the time
-    /// they took, and the time they waited for the list's own locks before
-    /// doing any (`list::with_state`): the recording side of a frame, which
-    /// nothing else on this line times.
+    /// The title's calls into its command lists that had a host list to
+    /// record into (`list::with_state`): the recording side of a frame,
+    /// which nothing else on this line times. A call with no host list (no
+    /// host GPU) does no work, and is not counted.
     Calls,
+    /// The time those calls took: their handlers, everything inside them
+    /// included. A handler that waits is billed here whole.
     CallUs,
-    CallWaitUs,
+    /// Of a call, the time before its handler ran: the list's own two
+    /// locks (the segment's host list, then the draw state). Not the
+    /// handler's time, so nothing that happens inside a handler (the
+    /// heaps' lock, for one) is in here.
+    CallLockWaitUs,
 }
 const COUNTERS: usize = 64;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
+}
+
+/// What a counter holds now (tests: a call's share of the line).
+#[cfg(test)]
+pub(crate) fn count(c: C) -> u64 {
+    COUNT[c as usize].load(Relaxed)
 }
 
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
@@ -242,7 +254,7 @@ pub(crate) fn log(frames: f64) {
          refresh batches, steps (each with the batch it flushes): refresh {:.1} ms, copy {:.1} ms, \
          work {:.1} ms, GPU writes {:.1} ms, textures {:.1} ms, heaps {:.1} ms, title memory {:.1} ms; \
          heap texture uploads {:.1} ms, state preludes {:.1} ms, heap slots the title copied {:.1} ms ({:.0} slots), title threads waiting to write views {:.1} ms; copying back compared {:.1} MB          in {:.1} ms; marked pages: {:.0} compared, {:.1} MB written back in {:.1} ms, {:.0} kept the title's, {:.0} saved; working set {:.0} MB, \
-         {:.0} hard faults; list calls {:.0} in {:.1} ms, {:.1} ms waiting for the list",
+         {:.0} hard faults; list calls {:.0}: {:.1} ms in their handlers, {:.1} ms waiting for the list's locks",
         c[C::Submissions as usize],
         c[C::Copies as usize],
         mb(c[C::CopyBytes as usize]),
@@ -313,7 +325,7 @@ pub(crate) fn log(frames: f64) {
         },
         c[C::Calls as usize],
         ms(c[C::CallUs as usize]),
-        ms(c[C::CallWaitUs as usize]),
+        ms(c[C::CallLockWaitUs as usize]),
     );
     let held: Vec<String> = crate::watch::held_times()
         .iter()
