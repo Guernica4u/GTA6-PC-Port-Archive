@@ -369,17 +369,7 @@ fn parse_exports(file: &PeFile64<'_>, image_base: u64) -> Result<Vec<ExportInfo>
             };
             let (rva, forward) = match e.target() {
                 // The generic iterator adds the image base to a 32-bit RVA.
-                ReadTarget::Address { address } => {
-                    let rva = address
-                        .checked_sub(image_base)
-                        .and_then(|a| u32::try_from(a).ok())
-                        .ok_or_else(|| {
-                            PeError::Malformed(format!(
-                                "export address {address:#x} outside image_base {image_base:#x}"
-                            ))
-                        })?;
-                    (Some(rva), None)
-                }
+                ReadTarget::Address { address } => (Some(va_to_rva(address, image_base)?), None),
                 ReadTarget::Reexport { library, name } => {
                     let symbol = match name {
                         NameOrOrdinal::Name(name) => utf8(name),
@@ -725,5 +715,25 @@ mod tests {
             .map(|e| (e.name.as_deref(), e.ordinal, e.rva))
             .collect();
         assert_eq!(exports, [(Some("alpha"), 1, Some(0x1200))]);
+    }
+
+    #[test]
+    fn va_to_rva_rejects_an_address_below_the_image_base() {
+        const BASE: u64 = 0x1_8000_0000;
+        assert_eq!(va_to_rva(BASE + 0x1200, BASE).unwrap(), 0x1200);
+        assert_eq!(
+            va_to_rva(BASE, BASE).unwrap(),
+            0,
+            "the base itself is RVA 0"
+        );
+        assert!(
+            va_to_rva(0x1200, BASE).is_err(),
+            "below the base has no RVA"
+        );
+        assert!(va_to_rva(u64::MAX, BASE).is_err());
+        assert!(
+            va_to_rva(BASE + 0x1_0000_0000, BASE).is_err(),
+            "an RVA past u32 is refused rather than truncated"
+        );
     }
 }
