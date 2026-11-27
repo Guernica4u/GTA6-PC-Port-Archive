@@ -17,6 +17,11 @@
 //! shortcut: the budget (half a second of waiting per title frame) is a
 //! guess; a pass the title runs only once and whose pipeline takes longer
 //! is lost.
+//!
+//! `VICTORY_PSO_WORKERS` (`1..=64`) overrides the number of background compile
+//! workers, and `VICTORY_PSO_PRIORITY` (`below` or `normal`) overrides their
+//! thread priority. Both are read once when the workers start; the defaults
+//! (half the logical processors clamped to 2..=8, and `below`) are unchanged.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -254,17 +259,53 @@ fn wait(p: &Pending, frame: u64) {
     WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
+/// Priority of the background pipeline workers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerPriority {
+    Below,
+    Normal,
+}
+
+/// Worker count from `VICTORY_PSO_WORKERS`, with the default and bounds the
+/// queue already uses.
+fn worker_count(raw: Option<&str>, logical: usize) -> usize {
+    fn default(logical: usize) -> usize {
+        (logical / 2).clamp(2, 8)
+    }
+    match raw {
+        None => default(logical),
+        Some(raw) => match raw.trim().parse::<usize>() {
+            Ok(n) if (1..=64).contains(&n) => n,
+            _ => default(logical),
+        },
+    }
+}
+
+/// Worker priority from `VICTORY_PSO_PRIORITY`, defaulting to below normal.
+fn worker_priority(raw: Option<&str>) -> WorkerPriority {
+    match raw.map(str::trim) {
+        Some("normal") => WorkerPriority::Normal,
+        _ => WorkerPriority::Below,
+    }
+}
+
 /// Pipelines for the workers: those draws wait for, then those started
 /// early.
 static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 2]>, Condvar) =
     (Mutex::new([VecDeque::new(), VecDeque::new()]), Condvar::new());
 
-/// Hands `p` to the workers (half the logical processors, 2 to 8), started
-/// on first use.
+/// Hands `p` to the workers (half the logical processors, 2 to 8, unless
+/// overridden), started on first use.
 fn queue(p: Arc<Pending>, now: bool) {
     static WORKERS: OnceLock<usize> = OnceLock::new();
     let workers = *WORKERS.get_or_init(|| {
-        let n = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let logical = std::thread::available_parallelism().map_or(2, |n| n.get());
+        let n = worker_count(
+            std::env::var("VICTORY_PSO_WORKERS").ok().as_deref(),
+            logical,
+        );
+        let priority = worker_priority(std::env::var("VICTORY_PSO_PRIORITY").ok().as_deref());
+        tracing::info!(workers = n, ?priority, "host pipeline workers");
         (0..n)
             .filter(|i| {
                 let spawned = std::thread::Builder::new()
@@ -293,11 +334,17 @@ fn queue(p: Arc<Pending>, now: bool) {
 /// A worker: makes queued pipelines, those draws wait for first, and saves
 /// the cache when idle (first uses of pipelines made before).
 fn work() {
-    // Below the title's own threads (loading, recording).
+    // Below the title's own threads by default, unless a run asks for normal
+    // priority to shorten warm-up compile hitches.
     // SAFETY: a plain call on our own thread.
     unsafe {
         use windows::Win32::System::Threading::*;
-        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        let priority = worker_priority(std::env::var("VICTORY_PSO_PRIORITY").ok().as_deref());
+        let priority = match priority {
+            WorkerPriority::Below => THREAD_PRIORITY_BELOW_NORMAL,
+            WorkerPriority::Normal => THREAD_PRIORITY_NORMAL,
+        };
+        let _ = SetThreadPriority(GetCurrentThread(), priority);
     }
     let (lock, work) = &QUEUES;
     loop {
@@ -431,5 +478,27 @@ mod tests {
         assert!(matches!(cold.made.get(), Some(None)));
         assert!(matches!(warm.made.get(), Some(None)));
         assert!(shader.translated.get().is_none());
+    }
+
+    #[test]
+    fn worker_count_parsing_keeps_the_default_bounds() {
+        assert_eq!(worker_count(None, 4), 2);
+        assert_eq!(worker_count(None, 20), 8);
+        assert_eq!(worker_count(Some(""), 20), 8);
+        assert_eq!(worker_count(Some("abc"), 20), 8);
+        assert_eq!(worker_count(Some("0"), 20), 8);
+        assert_eq!(worker_count(Some("65"), 20), 8);
+        assert_eq!(worker_count(Some(" 3 "), 20), 3);
+        assert_eq!(worker_count(Some("1"), 4), 1);
+        assert_eq!(worker_count(Some("64"), 4), 64);
+    }
+
+    #[test]
+    fn worker_priority_defaults_to_below_normal() {
+        assert_eq!(worker_priority(None), WorkerPriority::Below);
+        assert_eq!(worker_priority(Some("")), WorkerPriority::Below);
+        assert_eq!(worker_priority(Some("abc")), WorkerPriority::Below);
+        assert_eq!(worker_priority(Some(" BELOW ")), WorkerPriority::Below);
+        assert_eq!(worker_priority(Some(" normal ")), WorkerPriority::Normal);
     }
 }
