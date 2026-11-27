@@ -24,12 +24,14 @@ the device after 8 to 13 minutes, or ran with whole sets of textures (characters
 
 | | |
 |---|---|
-| CPU | Ryzen 5 7600 (6 cores, 12 threads, Zen 4) |
-| GPU | GeForce RTX 4060, **8 GB** (resizable BAR on: BAR1 8192 MiB), driver 621.40, HAGS on |
-| RAM | **16 GB** (15.6 GB usable) |
-| Disks | NVMe system SSD, SATA QLC SSD for the game files |
-| Screen | 1920x1080 |
-| OS | Windows 11 24H2 |
+| CPU | AMD Ryzen 5 7600 (6 cores, 12 threads, Zen 4, AVX-512) |
+| GPU | NVIDIA GeForce RTX 4060, **8 GB** GDDR6 (budget given to the process: 7.0-7.2 GB), driver 621.40, resizable BAR on (BAR1 8192 MiB), hardware-accelerated GPU scheduling on |
+| RAM | **16 GB** (15.6 GB usable; shared GPU segment capped at ~7.8 GB) |
+| Storage | 240 GB NVMe SSD (system, and the paging file from run J' on); 1 TB SATA QLC SSD (the dump, and the paging file before J') |
+| Paging file | before J': 8 GB system-managed on the NVMe + 16-32 GB on the SATA SSD; from J': 24-40 GB on the NVMe only |
+| Screen | 1920x1080, 240 Hz |
+| OS | Windows 11 (24H2, build 26100) |
+| Toolchain | Rust 1.98.1 (pinned), Visual Studio 2026 Build Tools |
 
 Frame rates are the layer's own count: the `N fps, M ms/frame (...), D draws/frame` line it logs every few
 seconds, taken only where `D > 2000` (in the world, not menus or loading screens), and given as the median and
@@ -89,8 +91,8 @@ goes to the VRAM, frame generation needs VRAM that textures want), which is why 
 ### 2. DLSS Performance
 
 `-Dlss performance`. With the VRAM freed by the steps below the card was 77-97 % busy; Performance instead of
-Quality, with the BAR windows of step 3, took the same scenes from 20.5 to 23 fps rendered (+12 %, without frame
-generation).
+Quality, with the BAR windows of step 3, took the same scenes from a median of 20.7 to 23.3 fps rendered (+13 %,
+without frame generation).
 
 ### 3. Title windows in BAR memory: `VICTORY_WINDOWS_BAR_MB=1024`
 
@@ -123,7 +125,8 @@ dynamic descriptor slots ran out (`no free dynamic descriptor slots`) as submiss
 faulted (access violation in `nvwgf2umx.dll`).
 
 With the pool off (run H), the holes are gone (`0 MB free in texture blocks`), VRAM in use dropped from 7.2 to
-5.9 GB in the same play, and it stayed under the budget. No frame rate cost was measurable.
+5.9 GB in the same play, and it stayed under the budget. The median frame rate did not drop (22.8 fps against 19.1
+for run G).
 
 Suggested fix in the code: give back the free part of partly used blocks under budget pressure, or turn the pool
 off on cards under 10 GB.
@@ -180,22 +183,24 @@ Borderless full screen (`scripts\fullscreen.ps1`) is started by the launcher.
 
 ## Every run, in order
 
-All on Series S. "FG" is frame generation 2x. fps are rendered frames (shown = twice that with FG).
+All on Series S. "FG" is frame generation 2x. fps are rendered frames, 10th percentile / median / 90th percentile
+of the run's world lines (method above); with FG twice as many are shown. The 10th percentile includes scene loads
+and paging, which is why it moves the most. Runs that end in a fault are counted up to it.
 
-| Run | Settings (beyond the repo's) | Rendered fps | Memory | Outcome |
+| Run | Settings (beyond the repo's) | Rendered fps p10 / median / p90 | Memory | Outcome |
 |---|---|---|---|---|
-| 0 | DLSS Quality, FG (repo launcher defaults, line 80 %) | ~28, very uneven | VRAM full, textures waiting | characters drawn without heads |
-| A | DLSS Quality, no FG | median 20.5 | under budget | heads back: the cause was VRAM |
-| B | DLSS Performance, BAR 1 GB, placed order | median 23.0 (+12 %) | textures waiting at the 90 % line | stable over 5 min |
-| C | B + FG, line 65 % | 20.3 / ~40 shown | over budget at 2 min | 2,500+ DLSS `out of VRAM`, old frames shown |
-| D | FG, BAR off, line 60 % | 20.8 / ~42 shown | 1.75 GB stuck in the target reserve; shared segment full at 13 min | 43,000 `E_OUTOFMEMORY`, device lost |
-| E | FG, BAR 1 GB, targets 1536, line 75 % | - | 7.2 GB in use vs 6.97 GB budget at 2 min | DLSS `out of VRAM`: BAR windows and FG compete |
-| F | no FG, BAR 1 GB, targets 1536, line 90 % | 20-28, then 8 | 7.7 GB vs 7.0 budget at 6-8 min (1.2-1.7 GB of pool holes) | descriptor slots exhausted, driver fault at 8 min |
-| G | F + line 75 % | 19-35 | 7.24 GB, at the budget | no crash in 14 min, 12,000 textures waiting in new areas |
-| H | G + pool off | 23-41 | 5.9-6.1 GB (holes gone); shared segment full once at 8 min, recovered | no crash in 11 min, 20,000 textures waiting (line too low without FG) |
-| I | H + FG + skip 1 level >= 1024 | 19-26 | 5.3-5.6 GB | no error in 10 min, textures too soft |
-| **J** | **H + FG + skip 1 level >= 2048, line 82 %** | **p10 11.7, median 21.4, p90 24.7** | **5.7 GB of 7.03, flat** | **no error in 8 min, all textures in** |
-| J' | J, paging file on NVMe | p10 16.4, median 20.5, p90 23.6 | same | no error; dips 40 % shallower |
+| 0 | DLSS Quality, FG (repo launcher defaults, line 80 %) | 3.4 / 14.0 / 14.0 | VRAM full, textures waiting | characters drawn without heads |
+| A | DLSS Quality, no FG | 3.5 / 20.7 / 26.8 | under budget | heads back: the cause was VRAM |
+| B | DLSS Performance, BAR 1 GB, placed order | 3.6 / 23.3 / 26.8 | textures waiting at the 90 % line | stable over 5 min, median +13 % |
+| C | B + FG, line 65 % | 16.4 / 20.3 / 22.1 | over budget at 2 min | 2,500+ DLSS `out of VRAM`, old frames shown |
+| D | FG, BAR off, line 60 % | 11.1 / 19.2 / 23.6 | 1.75 GB stuck in the target reserve; shared segment full at 13 min | 43,000 `E_OUTOFMEMORY`, device lost |
+| E | FG, BAR 1 GB, targets 1536, line 75 % | 16.8 / 20.3 / 22.9 | 7.2 GB in use vs 6.97 GB budget at 2 min | DLSS `out of VRAM`: BAR windows and FG compete |
+| F | no FG, BAR 1 GB, targets 1536, line 90 % | 11.9 / 22.9 / 31.6 | 7.7 GB vs 7.0 budget at 6-8 min (1.2-1.7 GB of pool holes) | 8 fps, descriptor slots exhausted, driver fault at 8 min |
+| G | F + line 75 % | 11.1 / 19.1 / 29.9 | 7.24 GB, at the budget | no crash in 14 min, 12,000 textures waiting in new areas |
+| H | G + pool off | 7.7 / 22.8 / 31.1 | 5.9-6.1 GB (holes gone); shared segment full once at 8 min, recovered | no crash in 11 min, 20,000 textures waiting (line too low without FG) |
+| I | H + FG + skip 1 level >= 1024 | 7.3 / 20.1 / 21.9 | 5.3-5.6 GB | no error in 10 min, textures too soft |
+| **J** | **H + FG + skip 1 level >= 2048, line 82 %** | **11.7 / 21.4 / 24.7** | **5.7 GB of 7.03, flat** | **no error in 8 min, all textures in** |
+| J' | J, paging file on NVMe | 16.4 / 20.5 / 23.6 | same | no error; dips 40 % shallower |
 
 ## The launcher and its options
 
