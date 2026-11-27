@@ -23,7 +23,7 @@ HLSL is how we get there today. It stays for as long as it is the best route, an
 | Recorded compute shaders that translate, 32-lane hosts | 6,075 of 7,683 |
 | Instructions the decoder names | 1,085, in 1,398 encodings ([inventory](INSTRUCTIONS.md)) |
 | Instructions the recorded shaders use | 372 |
-| Of those, run by a GPU check | 260 |
+| Of those, run by a GPU check | 333 |
 | Encodings with no translation | 210, and 186 more unproven: no recorded shader uses them |
 | Recorded shaders executed and compared with a reference | none |
 | Share of translate-and-compile time spent in DXC | nearly all; the translator itself averages about 30 ms a shader |
@@ -42,7 +42,7 @@ Nothing later is safe without this.
 | ID | Task | Done when |
 | --- | --- | --- |
 | T1 | **Done: [INSTRUCTIONS.md](INSTRUCTIONS.md).** Instruction inventory. Generate a table of every RDNA 2 instruction from AMD's published instruction set reference: decoded, translated, run by a GPU check, used by recorded shaders. Generate it from code and check it in CI, as `RESULTS.md` is generated from evidence | The table is in `docs/`, and CI fails when it is stale |
-| T2 | **GPU checks for used instructions.** Add the 112 used instructions that still have no check, [most used first](INSTRUCTIONS.md#used-without-a-gpu-check). The assembled checks (`tools/check_basic_alu_gpu.py` and its siblings) take one line and a reference model per instruction. Start with `v_mul_legacy_f32`, `v_fmac_f32`, `v_rsq_f32`, `v_cos_f32`, `v_sin_f32`, `v_fract_f32`, the `v_cvt_f32_ubyte` family and the float `v_cmpx` family | Every instruction recorded shaders use is run on AMD and NVIDIA |
+| T2 | **GPU checks for used instructions.** Add the 39 used instructions that still have no check, [most used first](INSTRUCTIONS.md#used-without-a-gpu-check). The assembled checks (`tools/check_basic_alu_gpu.py` and its siblings) take one line and a reference model per instruction. Start with `v_mul_legacy_f32`, `v_fmac_f32`, `v_rsq_f32`, `v_cos_f32`, `v_sin_f32`, `v_fract_f32`, the `v_cvt_f32_ubyte` family and the float `v_cmpx` family | Every instruction recorded shaders use is run on AMD and NVIDIA |
 | T3 | **Operand forms and lane states.** A check that holds an instruction doesn't cover every form. For each family, cover literal and register operands, SDWA and DPP modifiers, and lanes outside EXEC | The inventory shows forms, not only names |
 | T4 | **Run real shaders.** Execute recorded compute shaders with generated inputs and bound resources, and compare outputs: before and after a change, and between an AMD and an NVIDIA card. Add it to the harness as a stage. Graphics stages follow | A change that alters a real shader's results fails the harness |
 | T5 | **A console reference.** Where an RDNA 2 desktop card is available, run the same instructions natively through its Vulkan driver and compare. It is the closest thing to the console we can measure | One documented, repeatable comparison |
