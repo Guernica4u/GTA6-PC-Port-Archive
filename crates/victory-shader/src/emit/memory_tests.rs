@@ -1128,7 +1128,7 @@ fn wave_coalesced_marks_equal_per_lane_marks_on_the_gpu() {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let mut ran = 0;
+    let (mut ran, mut wave_skipped) = (0, false);
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
@@ -1136,6 +1136,7 @@ fn wave_coalesced_marks_equal_per_lane_marks_on_the_gpu() {
         };
         if !host.target().runs(32) {
             eprintln!("{label}: no 32-lane waves; skipped");
+            wave_skipped = true;
             continue;
         }
         let mut results = Vec::new();
@@ -1217,5 +1218,8 @@ fn wave_coalesced_marks_equal_per_lane_marks_on_the_gpu() {
         eprintln!("{label}: coalesced marks and results equal the per-lane ones");
         ran += 1;
     }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+    assert!(
+        ran > 0 || wave_skipped,
+        "neither hardware nor WARP SM 6.6 device available"
+    );
 }
