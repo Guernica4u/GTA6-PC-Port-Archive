@@ -2086,4 +2086,46 @@ mod barycentric_tests {
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
     }
+
+    /// NEW-120: P0 (`v_interp_mov_f32 p0`) of a row the program also
+    /// interpolates. The row's element is constant, P0 its provoking
+    /// vertex, and the interpolation weighs the vertices with
+    /// `SV_Barycentrics`: P0 before or after the pair, on the same channel
+    /// or another.
+    #[test]
+    fn p0_beside_an_interpolation_of_the_row() {
+        const P1_X: u32 = 0xC808_0000; // v_interp_p1_f32 v2, v0, attr0.x
+        const P2_X: u32 = 0xC809_0001; // v_interp_p2_f32 v2, v1, attr0.x
+        for (p0, label) in [
+            (0xC812_0002, "same channel"),    // v_interp_mov_f32 v4, p0, attr0.x
+            (0xC812_0102, "another channel"), // v_interp_mov_f32 v4, p0, attr0.y
+        ] {
+            let [e0, e1] = exp_mrt0(2);
+            for (words, order) in [
+                ([P1_X, P2_X, p0, v_add_f32(2, 2, 4), e0, e1, S_ENDPGM], "after"),
+                ([p0, P1_X, P2_X, v_add_f32(2, 2, 4), e0, e1, S_ENDPGM], "before"),
+            ] {
+                let shader = pixel(&words, PERSP_CENTER)
+                    .unwrap_or_else(|e| panic!("{label}, P0 {order}: {e:?}"));
+                let (features, inputs) = parts(&shader);
+                assert_ne!(features & 0x2_0000, 0, "{label}, P0 {order}");
+                assert_eq!(inputs.iter().filter(|e| e.kind == 28).count(), 1);
+                assert_eq!(texcoord_mode(&shader), 1, "{label}, P0 {order}");
+                validate(&shader);
+            }
+        }
+    }
+
+    /// P0 alone stays a plain flat read: no barycentrics.
+    #[test]
+    fn p0_alone_declares_no_barycentrics() {
+        let [e0, e1] = exp_mrt0(4);
+        let words = [0xC812_0002, e0, e1, S_ENDPGM]; // v_interp_mov_f32 v4, p0, attr0.x
+        let shader = pixel(&words, PERSP_CENTER).unwrap();
+        let (features, inputs) = parts(&shader);
+        assert_eq!(features & 0x2_0000, 0);
+        assert!(inputs.iter().all(|e| e.kind != 28), "{inputs:?}");
+        assert_eq!(texcoord_mode(&shader), 1);
+        validate(&shader);
+    }
 }
