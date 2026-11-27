@@ -1,8 +1,8 @@
 //! Random GFX10 programs through the whole translation: SSA and
 //! structurisation with bounded relative moves (`range`), resource
 //! tracking, I/O and DXIL emission. Each program translates or is refused
-//! with a reason, and a program that translates translates to the same
-//! bytes again. Half the programs are made with write marks (odd seeds),
+//! with a reason, and every third one is translated again, from scratch, to
+//! the same result. Half the programs are made with write marks (odd seeds),
 //! as the title's pipelines are, half without.
 //!
 //! The title translates its shaders when it creates pipelines, in its own
@@ -22,9 +22,9 @@
 //! ([`Shape`]):
 //!
 //! * compute (45%), 32 or 64 lanes, group and thread ids, LDS;
-//! * pixel (25%): interpolation of one input element starting at any
-//!   channel, in f32 or completed in f16, a 16-bit input; the colour, and
-//!   depth and stencil;
+//! * pixel (25%), 32 or 64 lanes: interpolation of one input element
+//!   starting at any channel, in f32 or completed in f16, a 16-bit input;
+//!   the colour, and depth and stencil;
 //! * vertex (15%), 32 or 64 lanes: the attribute from v4; a parameter
 //!   (16-bit, or two 16-bit rows per dword), the position and clip
 //!   distances;
@@ -33,7 +33,18 @@
 //!   from the first lane; per-vertex and per-primitive parameters, the
 //!   primitive (a valid triangle or random indices) and the position.
 //!
-//! Each stage translates about 2-13% of its programs (compute most).
+//! Now and then a body item is divergent control flow as the console's
+//! compiler emits it, nested up to three deep around random bodies, its
+//! masks in SGPRs no random instruction writes ([`construct`]): `if`
+//! (`s_and_saveexec`, `s_cbranch_execz`, `s_or exec`), `if`-`else`
+//! (`s_xor`, `s_or_saveexec`), a loop the lanes leave one by one (`s_or`
+//! of the exits, `s_andn2 exec`, `s_cbranch_execnz`), a waterfall loop over
+//! a VGPR's values (`v_readfirstlane`, `v_cmp_eq`), an `if` on `v_cmpx`,
+//! and a pixel program's discard (`s_andn2` of the killed lanes, then
+//! `s_cbranch_scc0` to an `exp null` kill block), in 32- and 64-lane
+//! masks.
+//!
+//! Each stage translates about 4-10% of its programs (compute most).
 //!
 //! `VICTORY_RANDOM_PROGRAMS=<n>` sets how many programs run (4,096 by
 //! default, a few seconds in a debug build) and `VICTORY_RANDOM_SEED=<s>`
@@ -68,6 +79,11 @@ const SCC: u32 = 253;
 const LITERAL: u32 = 255;
 /// A branch whose offset is filled in once every instruction's place is known.
 const BRANCH_PENDING: u32 = 0xDEAD;
+/// `s_cbranch_scc0` to the pixel program's kill block, set once the block
+/// is placed after the end.
+const TO_KILL: u32 = 0xBF84_DEAE;
+/// `exp null off, off, off, off done vm`: a killed pixel's only output.
+const EXP_NULL_DONE: [u32; 2] = [0xF800_1890, 0x0000_0000];
 
 /// xorshift64, seeded through splitmix64 so neighbouring seeds diverge;
 /// with the program's first user SGPR.
@@ -76,6 +92,9 @@ struct Rng {
     /// The SGPR of user-data dword 0 ([`HwStage::user_sgpr`]): 0, or 8 for
     /// a mesh program. The registers below are counted from it.
     base: u32,
+    /// The program's lane count (sizes its lane masks) and stage.
+    wave64: bool,
+    stage: HwStage,
 }
 
 impl Rng {
@@ -86,6 +105,8 @@ impl Rng {
         Rng {
             state: (z ^ (z >> 31)) | 1,
             base: 0,
+            wave64: false,
+            stage: HwStage::Cs,
         }
     }
 
@@ -120,8 +141,14 @@ impl Rng {
         u32::from(t[self.below(t.len() as u32) as usize].0)
     }
 
+    /// A VGPR: in a pixel program mostly past v0-v1, the barycentrics
+    /// (read directly, refused), which [`interpolation`] reads.
     fn vgpr(&mut self) -> u32 {
-        self.below(16)
+        if self.stage == HwStage::Ps && self.percent(90) {
+            2 + self.below(14)
+        } else {
+            self.below(16)
+        }
     }
 
     /// An SGPR to write: mostly s24-s39, clear of the root parameters
@@ -209,7 +236,7 @@ fn interpolation(r: &mut Rng) -> Vec<u32> {
     let vintrp = |dst: u32, op: u32, attr: u32, chan: u32, src: u32| {
         0xC800_0000 | dst << 18 | op << 16 | attr << 10 | chan << 8 | src
     };
-    let (dst, attr, chan) = (r.vgpr(), u32::from(r.percent(5)), r.below(4));
+    let (dst, attr, chan) = (r.vgpr(), u32::from(r.percent(2)), r.below(4));
     match r.below(100) {
         // v_interp_p1_f32 dst, v0; v_interp_p2_f32 dst, v1
         0..55 => vec![vintrp(dst, 0, attr, chan, 0), vintrp(dst, 1, attr, chan, 1)],
@@ -226,6 +253,182 @@ fn interpolation(r: &mut Rng) -> Vec<u32> {
         70..80 => vec![vintrp(dst, 2, attr, chan, r.below(3))],
         _ => vec![vintrp(dst, r.below(3), attr, chan, r.below(4))],
     }
+}
+
+/// The opcode of `name` in `encoding`'s table.
+fn opcode(encoding: Encoding, name: &str) -> u32 {
+    let t = gfx10::opcodes(encoding);
+    let found = t.iter().find(|e| e.1 == name);
+    u32::from(found.unwrap_or_else(|| panic!("no opcode {name}")).0)
+}
+
+/// The lane-mask form of a scalar opcode: `name` with `_b64` in a wave of
+/// 64 lanes, `_b32` in one of 32.
+fn mask_op(encoding: Encoding, name: &str, wave64: bool) -> u32 {
+    opcode(
+        encoding,
+        &format!("{name}_b{}", if wave64 { 64 } else { 32 }),
+    )
+}
+
+/// SOP1 `name sdst, ssrc0` on lane masks.
+fn mask1(r: &Rng, name: &str, sdst: u32, ssrc0: u32) -> u32 {
+    0xBE80_0000 | sdst << 16 | mask_op(Encoding::Sop1, name, r.wave64) << 8 | ssrc0
+}
+
+/// SOP2 `name sdst, ssrc0, ssrc1` on lane masks.
+fn mask2(r: &Rng, name: &str, sdst: u32, ssrc0: u32, ssrc1: u32) -> u32 {
+    0x8000_0000 | mask_op(Encoding::Sop2, name, r.wave64) << 23 | sdst << 16 | ssrc1 << 8 | ssrc0
+}
+
+/// SOPP `name` with a branch offset in dwords from the next instruction.
+fn branch(name: &str, offset: usize, back: bool) -> u32 {
+    let offset = if back {
+        -(offset as i32)
+    } else {
+        offset as i32
+    };
+    0xBF80_0000 | opcode(Encoding::Sopp, name) << 16 | offset as u32 & 0xFFFF
+}
+
+/// A per-lane condition: a VOPC compare of 32-bit integers or floats into
+/// VCC, or with `cmpx` into EXEC.
+fn compare(r: &mut Rng, cmpx: bool) -> Vec<u32> {
+    let prefix = if cmpx { "v_cmpx_" } else { "v_cmp_" };
+    let ops: Vec<u32> = gfx10::opcodes(Encoding::Vopc)
+        .iter()
+        .filter(|(_, n)| {
+            n.starts_with(prefix)
+                && !n.contains("class")
+                && ["_u32", "_i32", "_f32"].iter().any(|t| n.ends_with(t))
+        })
+        .map(|&(op, _)| u32::from(op))
+        .collect();
+    let op = ops[r.below(ops.len() as u32) as usize];
+    let mut lit = None;
+    let mut words = vec![0x7C00_0000 | op << 17 | r.vgpr() << 9 | r.vsrc(&mut lit)];
+    words.extend(lit);
+    words
+}
+
+/// A body of one to four items at nesting `depth`.
+fn block(r: &mut Rng, depth: u32) -> Vec<u32> {
+    (0..1 + r.below(4)).flat_map(|_| item(r, depth)).collect()
+}
+
+/// A body item at nesting `depth`: now and then a construct of divergent
+/// control flow, else one instruction. Inside a construct no instruction
+/// is a random branch: those get their offset at the top level only.
+fn item(r: &mut Rng, depth: u32) -> Vec<u32> {
+    if depth < 3 && r.percent(if depth == 0 { 10 } else { 15 }) {
+        return construct(r, depth);
+    }
+    loop {
+        let stage = r.stage;
+        let words = instruction(r, stage);
+        if depth == 0 || !(words[0] >> 23 == 0x17F && words[0] & 0xFFFF == BRANCH_PENDING) {
+            return words;
+        }
+    }
+}
+
+/// Divergent control flow as the console's compiler emits it, around
+/// random bodies: `if`, `if`-`else`, a loop the lanes leave one by one, a
+/// waterfall loop over a VGPR's values, an `if` on `v_cmpx`, and in a
+/// pixel program a discard. Its masks are kept in SGPRs from s48 (6 per
+/// nesting level), which no random instruction writes.
+fn construct(r: &mut Rng, depth: u32) -> Vec<u32> {
+    let level = r.s(48 + 6 * depth);
+    // The saved mask, a second mask (register pairs in wave64), a scalar.
+    let (save, other, scalar) = (level, level + 2, level + 4);
+    let kinds = if r.stage == HwStage::Ps { 6 } else { 5 };
+    let mut w = Vec::new();
+    match r.below(kinds) {
+        // if: v_cmp; s_and_saveexec save, vcc; s_cbranch_execz end; body;
+        // end: s_or exec, exec, save
+        0 => {
+            w.extend(compare(r, false));
+            w.push(mask1(r, "s_and_saveexec", save, VCC));
+            let body = block(r, depth + 1);
+            w.push(branch("s_cbranch_execz", body.len(), false));
+            w.extend(body);
+            w.push(mask2(r, "s_or", EXEC, EXEC, save));
+        }
+        // if-else: then lanes in exec, the others in save; at the else,
+        // s_or_saveexec save, save takes all and keeps the then lanes, the
+        // s_xor leaves the else lanes.
+        1 => {
+            w.extend(compare(r, false));
+            w.push(mask1(r, "s_and_saveexec", save, VCC));
+            w.push(mask2(r, "s_xor", save, EXEC, save));
+            let then = block(r, depth + 1);
+            w.push(branch("s_cbranch_execz", then.len(), false));
+            w.extend(then);
+            w.push(mask1(r, "s_or_saveexec", save, save));
+            w.push(mask2(r, "s_xor", EXEC, EXEC, save));
+            let other_arm = block(r, depth + 1);
+            w.push(branch("s_cbranch_execz", other_arm.len(), false));
+            w.extend(other_arm);
+            w.push(mask2(r, "s_or", EXEC, EXEC, save));
+        }
+        // A loop each lane leaves when its condition holds: s_mov done, 0;
+        // top: body; v_cmp; s_or done, vcc, done; s_andn2 exec, exec, done;
+        // s_cbranch_execnz top; s_or exec, exec, done
+        2 => {
+            w.push(mask1(r, "s_mov", other, 0x80));
+            let body = block(r, depth + 1);
+            let cond = compare(r, false);
+            let back = body.len() + cond.len() + 3;
+            w.extend(body);
+            w.extend(cond);
+            w.push(mask2(r, "s_or", other, VCC, other));
+            w.push(mask2(r, "s_andn2", EXEC, EXEC, other));
+            w.push(branch("s_cbranch_execnz", back, true));
+            w.push(mask2(r, "s_or", EXEC, EXEC, other));
+        }
+        // A waterfall loop: each pass takes the first lane's value of a VGPR
+        // as a scalar and runs the body with the lanes that hold it.
+        3 => {
+            let v = r.vgpr();
+            w.push(mask1(r, "s_mov", save, EXEC));
+            let body = block(r, depth + 1);
+            let back = body.len() + 6;
+            w.push(
+                0x7E00_0000
+                    | scalar << 17
+                    | opcode(Encoding::Vop1, "v_readfirstlane_b32") << 9
+                    | (256 + v),
+            );
+            w.push(0x7C00_0000 | opcode(Encoding::Vopc, "v_cmp_eq_u32") << 17 | v << 9 | scalar);
+            w.push(mask1(r, "s_and_saveexec", other, VCC));
+            let k = r.vgpr();
+            w.push(opcode(Encoding::Vop2, "v_add_nc_u32") << 25 | k << 17 | k << 9 | scalar);
+            w.extend(body);
+            w.push(mask2(r, "s_xor", EXEC, EXEC, other));
+            w.push(branch("s_cbranch_execnz", back, true));
+            w.push(mask1(r, "s_mov", EXEC, save));
+        }
+        // if on v_cmpx: s_mov save, exec; v_cmpx; s_cbranch_execz end; body;
+        // end: s_mov exec, save
+        4 => {
+            w.push(mask1(r, "s_mov", save, EXEC));
+            w.extend(compare(r, true));
+            let body = block(r, depth + 1);
+            w.push(branch("s_cbranch_execz", body.len(), false));
+            w.extend(body);
+            w.push(mask1(r, "s_mov", EXEC, save));
+        }
+        // A pixel's discard: the lanes v_cmpx leaves in exec are killed;
+        // with none left alive, to the kill block (`exp null`).
+        _ => {
+            w.push(mask1(r, "s_mov", save, EXEC));
+            w.extend(compare(r, true));
+            w.push(mask2(r, "s_andn2", save, save, EXEC));
+            w.push(TO_KILL);
+            w.push(mask1(r, "s_mov", EXEC, save));
+        }
+    }
+    w
 }
 
 /// One instruction: its words, a pending branch's offset still unset.
@@ -472,8 +675,9 @@ fn program(seed: u64) -> NativeProgram {
     let wave64 = match stage {
         HwStage::Cs | HwStage::Ms => r.percent(30),
         HwStage::Vs => r.percent(50),
-        _ => false,
+        _ => r.percent(25),
     };
+    (r.wave64, r.stage) = (wave64, stage);
     let base = r.base;
     let s = |n| base + n;
     let mut words = vec![
@@ -495,9 +699,7 @@ fn program(seed: u64) -> NativeProgram {
         words.push(0x7E00_0000 | group << 17 | 0x02 << 9 | (256 + 5)); // v_readfirstlane_b32
         words.push(0x7E00_0000 | 5 << 17 | 0x01 << 9 | group); // v_mov_b32 v5, group
     }
-    let body: Vec<Vec<u32>> = (0..2 + r.below(30))
-        .map(|_| instruction(&mut r, stage))
-        .collect();
+    let body: Vec<Vec<u32>> = (0..2 + r.below(30)).map(|_| item(&mut r, 0)).collect();
     // Where each instruction starts, and the end of the body.
     let mut starts = Vec::with_capacity(body.len() + 1);
     let mut at = words.len();
@@ -518,11 +720,12 @@ fn program(seed: u64) -> NativeProgram {
     let shape = shape(seed);
     let (vertex_param, primitive_param) = (shape.vertex_param, shape.primitive_param);
     match stage {
+        // Past v0-v1, the barycentrics.
         HwStage::Ps if shape.depth => {
-            words.extend([0xF800_100F, 0x0302_0100]); // exp mrt0 v0, v1, v2, v3 vm
-            words.extend([0xF800_1883, 0x0000_0504]); // exp mrtz v4, v5, off, off done vm
+            words.extend([0xF800_100F, 0x0504_0302]); // exp mrt0 v2, v3, v4, v5 vm
+            words.extend([0xF800_1883, 0x0000_0706]); // exp mrtz v6, v7, off, off done vm
         }
-        HwStage::Ps => words.extend([0xF800_180F, 0x0302_0100]), // exp mrt0 v0, v1, v2, v3 done vm
+        HwStage::Ps => words.extend([0xF800_180F, 0x0504_0302]), // exp mrt0 v2, v3, v4, v5 done vm
         HwStage::Cs => {
             // buffer_store_dword v0, off, s[8:11], 0
             words.extend([0xE070_0000, 0x80 << 24 | (s(8) / 4) << 16]);
@@ -551,6 +754,19 @@ fn program(seed: u64) -> NativeProgram {
         }
     }
     words.push(S_ENDPGM);
+    // A discard's kill block, after the end.
+    let kill = words.len();
+    let mut killed = false;
+    for (at, w) in words.iter_mut().enumerate() {
+        if *w == TO_KILL {
+            *w = branch("s_cbranch_scc0", kill - at - 1, false);
+            killed = true;
+        }
+    }
+    if killed {
+        words.extend(EXP_NULL_DONE);
+        words.push(S_ENDPGM);
+    }
 
     let param = |root, sgprs, user_data, slot| RootParam {
         root,
@@ -590,8 +806,20 @@ fn program(seed: u64) -> NativeProgram {
                 pack2: false,
                 row2: 0,
             }],
-            // PERSP_CENTER, PERSP_SAMPLE, LINEAR_CENTER, or several.
-            input_addr: [1 << 1, 1, 1 << 4, 0x7F][r.below(4) as usize],
+            // PERSP_CENTER, PERSP_SAMPLE or LINEAR_CENTER (in v0-v1), now
+            // and then all seven barycentric kinds (v0-v14).
+            input_addr: [
+                1 << 1,
+                1,
+                1 << 4,
+                1 << 1,
+                1,
+                1 << 4,
+                1 << 1,
+                1,
+                1 << 4,
+                0x7F,
+            ][r.below(10) as usize],
             // Depth and stencil export enables, POPS (not read by the
             // translation today).
             db_shader_control: [0, 3, 1 << 16][r.below(3) as usize],
@@ -833,8 +1061,24 @@ fn random_programs_translate_or_are_refused_the_same_way_every_time() {
             view_marks: seed % 2 == 1,
         };
         let once = || std::panic::catch_unwind(|| translate(&native, &c, options));
-        let why = match (once(), once()) {
-            (Ok(a), Ok(b)) if a == b => {
+        let first = once();
+        // Every third program again, from scratch (with and without write
+        // marks among them): the result must not depend on hash or
+        // allocation order.
+        let again = (seed % 3 == 0).then(once);
+        let why = match (first, again) {
+            (Err(panic), _) | (_, Some(Err(panic))) => {
+                let message = panic
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                    .unwrap_or("(no message)");
+                format!("panics: {message}")
+            }
+            (Ok(a), Some(Ok(b))) if a != b => {
+                format!("translates differently: {a:?} then {b:?}")
+            }
+            (Ok(a), _) => {
                 let at = match stages.iter().position(|s| s.0 == native.stage) {
                     Some(at) => at,
                     None => {
@@ -845,15 +1089,6 @@ fn random_programs_translate_or_are_refused_the_same_way_every_time() {
                 stages[at].1 += 1;
                 stages[at].2 += u64::from(matches!(a, Outcome::Translated(_)));
                 continue;
-            }
-            (Ok(a), Ok(b)) => format!("translates differently: {a:?} then {b:?}"),
-            (Err(panic), _) | (_, Err(panic)) => {
-                let message = panic
-                    .downcast_ref::<String>()
-                    .map(String::as_str)
-                    .or_else(|| panic.downcast_ref::<&str>().copied())
-                    .unwrap_or("(no message)");
-                format!("panics: {message}")
             }
         };
         if failed.is_empty() {
