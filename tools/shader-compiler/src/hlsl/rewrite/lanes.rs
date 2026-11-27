@@ -197,6 +197,32 @@ fn active_srcs(ins: &Insn) -> &[Opnd] {
     }
 }
 
+/// Whether every path from the lane read at `read` writes SGPR `lane` or ends
+/// the program before anything else reads it. A computed jump, or a branch to no
+/// instruction, counts as a read.
+fn index_dead_after(insns: &[Insn], read: usize, lane: u8) -> bool {
+    let index: HashMap<i64, usize> = insns.iter().enumerate().map(|(i, x)| (x.offset as i64, i)).collect();
+    let mut seen = BTreeSet::new();
+    let mut work = vec![read + 1];
+    while let Some(mut at) = work.pop() {
+        loop {
+            if !seen.insert(at) { break; }
+            let Some(op) = insns.get(at) else { return false };
+            if at != read && active_srcs(op).contains(&Opnd::Sgpr(lane)) { return false; }
+            if op.dst.contains(&Opnd::Sgpr(lane)) || op.mnemonic == "s_endpgm" { break; }
+            if matches!(op.mnemonic.as_str(), "s_setpc_b64" | "s_swappc_b64" | "s_call_b64") { return false; }
+            if op.enc == Enc::Sopp && op.mnemonic.contains("branch") {
+                if Emitter::branch_cond(op.op).is_none() { return false; }
+                let Some(&to) = index.get(&(op.offset as i64 + 4 + 4 * op.aux.imm)) else { return false };
+                work.push(to);
+                if op.op == 2 { break; }
+            }
+            at += 1;
+        }
+    }
+    true
+}
+
 /// A pixel is a wave of its own, so the first lane of a mask that covers it is its own.
 /// `s_ff1` names that lane for `v_readlane`; anything else that uses the lane is left alone.
 /// The election may be far before the read, and a branch may follow it once the read has
@@ -229,6 +255,7 @@ pub(in crate::hlsl) fn lower_first_lane_reads(insns: &mut [Insn]) {
         let exec_written = (first + 1..i).any(|j| {
             insns[j].dst.iter().any(|o| matches!(o, Opnd::ExecLo | Opnd::ExecHi))
                 || insns[j].mnemonic.starts_with("v_cmpx")
+                || insns[j].mnemonic.contains("saveexec")
                 || insns[j].mnemonic.contains("wrexec")
         });
         if entered || exec_written { continue; }
@@ -236,20 +263,8 @@ pub(in crate::hlsl) fn lower_first_lane_reads(insns: &mut [Insn]) {
         let Some(&(Opnd::Vgpr(result) | Opnd::Sgpr(result))) = insns[i].dst.first() else { continue };
         let reads = |j: usize| j != i && active_srcs(&insns[j]).contains(&Opnd::Sgpr(lane));
         if (first + 1..i).any(reads) { continue; }
-        if result != lane {
-            // The rewrite replaces the election in the lane register with 0, so
-            // the index must be dead afterwards. A branch does not read it; a
-            // later write retires it.
-            let mut live = true;
-            for j in i + 1..insns.len() {
-                if reads(j) { break; }
-                if insns[j].dst.contains(&Opnd::Sgpr(lane)) || insns[j].mnemonic == "s_endpgm" {
-                    live = false;
-                    break;
-                }
-            }
-            if live { continue; }
-        }
+        // The rewrite replaces the election in the lane register with 0.
+        if result != lane && !index_dead_after(insns, i, lane) { continue; }
         insns[first].mnemonic = "s_mov_b32".into();
         insns[first].op = 3;
         insns[first].src = vec![Opnd::ConstInt(0)];

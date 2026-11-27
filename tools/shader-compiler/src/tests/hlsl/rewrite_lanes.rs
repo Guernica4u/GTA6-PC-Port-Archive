@@ -127,3 +127,28 @@ fn first_lane_read_stays_put_while_the_index_is_still_live() {
     assert_eq!(ops[1].mnemonic, "s_ff1_i32_b64");
     assert_eq!(ops[2].mnemonic, "v_readlane_b32");
 }
+
+#[test]
+fn first_lane_read_stays_put_when_a_branch_reaches_a_use_of_the_index() {
+    // The branch skips `s_mov_b32 s0, 0`; its target adds 1 to the elected index.
+    let words = [0xbe80_047eu32, 0xbe80_1400, 0xd760_0012, 0x0000_012b, 0xbf85_0001,
+        0xbe80_0380, 0x8001_8100, 0xbf81_0000];
+    let mut skipped = disassemble(&words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>());
+    lower_first_lane_reads(&mut skipped);
+    assert_eq!(skipped[2].mnemonic, "v_readlane_b32");
+    // With the use gone, both paths drop the index and the read is lowered.
+    let words = [0xbe80_047eu32, 0xbe80_1400, 0xd760_0012, 0x0000_012b, 0xbf85_0001,
+        0xbe80_0380, 0xbf80_0000, 0xbf81_0000];
+    let mut ops = disassemble(&words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>());
+    lower_first_lane_reads(&mut ops);
+    assert_eq!(ops[2].mnemonic, "v_readfirstlane_b32");
+}
+
+#[test]
+fn first_lane_read_stays_put_across_a_saveexec() {
+    // s_and_saveexec_b64 s[2:3], vcc narrows EXEC after the election.
+    let words = [0xbe80_047eu32, 0xbe80_1400, 0xbe82_246a, 0xd760_0012, 0x0000_012b, 0xbf81_0000];
+    let mut ops = disassemble(&words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>());
+    lower_first_lane_reads(&mut ops);
+    assert_eq!(ops[3].mnemonic, "v_readlane_b32");
+}
