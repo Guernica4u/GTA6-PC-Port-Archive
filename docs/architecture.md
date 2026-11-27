@@ -34,7 +34,7 @@ title's), so a run finds them under the names it gives them itself.
 
 | Crate | Role |
 |-------|------|
-| `victory-core` | config, asset-policy guard, logging |
+| `victory-core` | config, asset-policy guard, logging, the keyboard stand-in pad's keys |
 | `victory-pe` | read-only PE32+ and import-library analysis |
 | `victory-loader` | prepare, map, bind and start the title image |
 | `victory-hle` | console API implementations, host pass-through policy |
