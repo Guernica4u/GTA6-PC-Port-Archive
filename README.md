@@ -54,14 +54,14 @@
   and are not part of this program; say no and the game still runs, with its
   own upscaling and no frame generation.
 - Settings, saves, caches, logs and NVIDIA's and AMD's files are kept under
-  `%LOCALAPPDATA%\victory`. The one exception is on Windows 10. Its own Direct3D 12
-  stops at shader model 6.5, and the game's translated shaders need 6.6. Without
-  6.6 the game shows a black screen and closes within seconds. So the first start
-  there offers to fetch Microsoft's newer Direct3D 12 runtime (the D3D12 Agility
+  `%LOCALAPPDATA%\victory`. On Windows 10, the built-in Direct3D 12
+  may stop at shader model 6.5, and the game's translated shaders need 6.6.
+  In that case, Victory offers to fetch Microsoft's newer Direct3D 12 runtime (the D3D12 Agility
   SDK, `D3D12Core.dll`, about 22 MB from nuget.org). It goes into a `D3D12`
   folder beside `victory.exe`. `victory.exe get-d3d12` does the same by hand.
   The file is checked against Microsoft's signature and the tested SHA-256.
-  Windows 11 keeps using its own runtime.
+  If Direct3D returns `0x887E0003` and the local DLL is missing, Victory downloads
+  it automatically before starting the game. This can also happen on Windows 11.
 - You need Windows 10 or 11, 32 GB of RAM or more, an SSD and an NVIDIA
   GeForce RTX card with a recent driver. This repository and its releases
   contain no game files.
