@@ -727,6 +727,12 @@ fn memory_bench_steady_state() {
         grown.is_empty(),
         "memory grew in the steady state: {grown:#?}"
     );
+    // Lists whose submission has landed give their scratch chunks back then, not at their
+    // reset after the bury lag (`HostList::release_scratch`; `VICTORY_SCRATCH_AT_LANDING=0`: not).
+    if super::scratch_at_landing() {
+        let kept = value(&end, "host lists", "scratch the landed ones keep");
+        assert_eq!(kept, 0, "landed lists keep {kept} bytes of scratch");
+    }
 }
 
 /// Pressure: what idles while the PC has room is kept (five minutes with
