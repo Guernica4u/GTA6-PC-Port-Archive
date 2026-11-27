@@ -260,7 +260,9 @@ impl<'a> Lower<'a> {
                 let size = self.s.m.i32(64);
                 let byte = self.s.m.bin(self.cur, Bin::Add, byte, size);
                 let second = NodeAt::Buffer { handle, byte };
-                (self.bvh_node_words(second, None, 0, 12), self.s.m.int(1))
+                let i1t = self.s.m.int(1);
+                let one = self.s.m.int_const(i1t, 1);
+                (self.bvh_node_words(second, None, 0, 12), one)
             }
             NodeAt::Memory { handle, byte, low, high, mapped } => {
                 let head = self.cur;
@@ -380,6 +382,7 @@ impl<'a> Lower<'a> {
             .terminate(head, Term::CondBr(wide, wide_block, half_block));
         // 32-bit floats: 24 dwords from byte 16.
         self.cur = wide_block;
+        let k16 = self.s.m.i32(16);
         let mut words = self.bvh_node_words(at, None, 16, 12);
         let (second_words, second_mapped) = self.bvh_second_half_words(at);
         words.extend(second_words);
