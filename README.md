@@ -92,8 +92,8 @@ Run the title:
 cargo build --release -p victory
 $targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { '.\target' }
 $victory = Join-Path $targetDir 'release\victory.exe'
-& $victory translate --cache --pipelines <game dir>\shaders.rpf <game dir>\<the title's exe> <game dir>\XboxBvhBuilder.dll <game dir>\amd_fidelityfx_upscaler_xbox.dll
-& $victory run <game dir>\<the title's exe> --execute
+& $victory translate --cache --pipelines "<game dir>\shaders.rpf" "<game dir>\<the title's exe>" "<game dir>\XboxBvhBuilder.dll" "<game dir>\amd_fidelityfx_upscaler_xbox.dll"
+& $victory run "<game dir>\<the title's exe>" --execute
 ```
 
 The `translate --cache` step (minutes; again after a change of the shader
