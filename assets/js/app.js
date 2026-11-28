@@ -2,7 +2,7 @@ import { MILESTONES, GROUNDWORK, STABILITY, TRACKS, scoreEffort, overall, counts
 import { getLiveViewers, trackView } from './backend.js';
 import { coverHtml, articlePath, newsTime, byNewest } from './news-shared.js';
 import { fillPinned } from './pinned.js';
-import { initI18n, t, tr, locale } from './i18n.js';
+import { initI18n, t, tr, locale, loadContent } from './i18n.js';
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
@@ -67,6 +67,57 @@ const ICON = {
 };
 
 const state = { data: null, filter: 'all', sort: 'score' };
+// Translated content for the current language (see loadContent in i18n.js). Null in English.
+let content = null;
+// Short values from the tracker (approach, target, tool kind) that the overlay translates by value.
+const tv = (group, value) => content?.values?.[group]?.[value] ?? value;
+
+// Swaps in translated text where the overlay has it, and leaves every other field as the scout wrote it.
+function applyContent(data) {
+  if (!content) return;
+  for (const e of data.efforts || []) {
+    const c = content.efforts?.[e.id];
+    if (!c) continue;
+    if (c.summary) e.summary = c.summary;
+    if (c.highlights?.length) e.highlights = c.highlights;
+    if (c.blockers?.length) e.blockers = c.blockers;
+    if (c.nukedNote && e.nuked) e.nuked.note = c.nukedNote;
+  }
+  for (const x of data.tools || []) {
+    const c = content.tools?.[x.repo];
+    if (c?.desc) x.desc = c.desc;
+  }
+  for (const n of data.news || []) {
+    const c = content.news?.[n.id];
+    if (!c) continue;
+    if (c.title) n.title = c.title;
+    if (c.dek) n.dek = c.dek;
+    if (c.body?.length) n.body = c.body;
+  }
+}
+
+// The scout writes the change feed as English sentences. An overlay may ship templates for the shapes we
+// know; anything else, and anything new the templates don't cover yet, keeps the scout's wording.
+const CHANGE_RE = /^Scout spotted (.+?) \((?:(possible effort|tool), )?substance (\d+)\)\.$/;
+function changeText(c) {
+  const m = CHANGE_RE.exec(String(c.text || ''));
+  const tpl = content?.changes;
+  if (!m || !tpl) return c.text;
+  const key = m[2] === 'tool' ? 'tool' : m[2] === 'possible effort' ? 'effort' : 'repo';
+  const text = tpl[key];
+  return text ? text.replace(/\{repo\}/g, m[1]).replace(/\{n\}/g, m[3]) : c.text;
+}
+
+// The owner's pinned message is content too: the overlay may carry a translation of it.
+function localizePinned(p) {
+  const o = content?.pinned;
+  if (!p || !o) return p;
+  return {
+    ...p,
+    text: o.text || p.text,
+    cta: p.cta && o.cta ? { ...p.cta, ...o.cta } : p.cta,
+  };
+}
 
 async function main() {
   // The pinned message is optional: it loads alongside and never holds up or breaks the page.
@@ -79,12 +130,14 @@ async function main() {
   ]);
   const data = await res.json();
   state.data = data;
+  content = await loadContent();
+  applyContent(data);
   for (const e of data.efforts) Object.assign(e, { _s: scoreEffort(e) });
 
   renderMeta(data);
   renderHeroArt(data.site || {});
   startCountdown(data.exe || {});
-  pinned.then((p) => fillPinned($('#pinned'), p, { ago, when: (iso) => new Date(iso).toLocaleString(locale()) }));
+  pinned.then((p) => fillPinned($('#pinned'), localizePinned(p), { ago, when: (iso) => new Date(iso).toLocaleString(locale()) }));
   renderOverall(data);
   renderChanges(data.changes || []);
   renderFilterChips();
@@ -268,7 +321,7 @@ function drawMarkers(ranked, leader) {
       // Private builds float, with a lock badge; the tooltip names what they build on.
       const tip = priv
         ? `${msLabel(it.r.reached)} · ${t('private.markerTip', { names: (e.basedOn || []).map(effortName).join(', ') || '-' })}`
-        : `${msLabel(it.r.reached)} · ${e.approach || ''}`;
+        : `${msLabel(it.r.reached)} · ${tv('approach', e.approach) || ''}`;
       return `<a class="marker ${e === leader ? 'is-leader' : ''}${priv ? ' is-private' : ''}" href="#effort-${esc(e.id)}" style="left:${it.a}px;bottom:${H - avatarY - 32}px;--i:${i}"
                 data-tip-title="${esc(e.name)} · ${pct(it.r.score)}%" data-tip="${esc(tip)}">
                 <span class="mk-name">${esc(e.name)} · ${pct(it.r.score)}%</span>
@@ -329,7 +382,7 @@ function renderChanges(changes) {
   const items = [...changes].reverse().slice(0, 12);
   if (!items.length) { $('#changes').hidden = true; return; }
   const cls = { up: 'ck-up', down: 'ck-down', flag: 'ck-flag', new: 'ck-new', removed: 'ck-down', claim: 'ck-flag' };
-  list.innerHTML = items.map((c) => `<li><span class="ck ${cls[c.kind] || ''}"></span><time>${esc(new Date(`${c.date}T12:00:00Z`).toLocaleDateString(locale(), { day: 'numeric', month: 'short' }))}</time><span>${esc(c.text)}</span></li>`).join('');
+  list.innerHTML = items.map((c) => `<li><span class="ck ${cls[c.kind] || ''}"></span><time>${esc(new Date(`${c.date}T12:00:00Z`).toLocaleDateString(locale(), { day: 'numeric', month: 'short' }))}</time><span>${esc(changeText(c))}</span></li>`).join('');
 }
 
 /* ---------- Race ---------- */
@@ -405,16 +458,16 @@ function privateCard(e) {
       ${src ? `<img class="e-avatar" src="${esc(src)}" alt="" loading="lazy" data-hide-on-error>` : `<span class="pb-avatar" aria-hidden="true">${esc(e.name.slice(0, 2))}</span>`}
       <div class="e-title">
         <h3>${url ? `<a href="${esc(url)}">${esc(e.name)}</a>` : esc(e.name)}</h3>
-        <p class="e-by">${esc(e.byline || '')}</p>
+        <p class="e-by">${esc(tv('byline', e.byline) || '')}</p>
       </div>
       <div class="pb-stage"><b>${pct(e._s.score)}<span>%</span></b><small>${esc(t('private.notRanked', { stage: msLabel(e._s.reached) }))}</small></div>
     </div>
     <div class="tags">
       ${bases ? `<span class="tag tag-based">${t('private.basedOn', { names: bases })}</span>` : ''}
       ${gpuTags(e)}
-      ${e.evidence ? `<span class="tag tag-self" title="${esc(t('private.evidenceTitle'))}">${esc(t('private.evidence', { x: e.evidence }))}</span>` : ''}
+      ${e.evidence ? `<span class="tag tag-self" title="${esc(t('private.evidenceTitle'))}">${esc(t('private.evidence', { x: tv('evidence', e.evidence) }))}</span>` : ''}
       <span class="tag tag-stale">${esc(t('private.noCode'))}</span>
-      ${e.proof?.url ? `<a class="tag tag-proof" href="${esc(safeHttp(e.proof.url))}" target="_blank" rel="noopener nofollow" title="${esc(e.proof.url)}">${esc(e.proof.label || 'Watch')} ↗</a>` : ''}
+      ${e.proof?.url ? `<a class="tag tag-proof" href="${esc(safeHttp(e.proof.url))}" target="_blank" rel="noopener nofollow" title="${esc(e.proof.url)}">${esc(tv('proof', e.proof.label) || 'Watch')} ↗</a>` : ''}
     </div>
     <p class="e-summary">${esc(e.summary)}</p>
     <div class="pb-ladder">${ladderCells(e)}</div>
@@ -516,8 +569,8 @@ function effortCard(e, rank, open, overallRank = null) {
   const ticks = MILESTONES.slice(1, -1).map((m) => `<i style="left:${m.at}%"></i>`).join('');
   const stale = st.pushedAt && daysSince(st.pushedAt) > 3;
   const tags = [
-    e.approach && `<span class="tag">${esc(e.approach)}</span>`,
-    e.target && `<span class="tag ${isGtaSpecific(e) ? 'tag-gta' : ''}">${esc(e.target)}</span>`,
+    e.approach && `<span class="tag">${esc(tv('approach', e.approach))}</span>`,
+    e.target && `<span class="tag ${isGtaSpecific(e) ? 'tag-gta' : ''}">${esc(tv('target', e.target))}</span>`,
     gpuTags(e),
     e.verification === 'reproduced'
       ? `<span class="tag tag-ok">${esc(t('effort.reproduced'))}</span>`
@@ -530,7 +583,7 @@ function effortCard(e, rank, open, overallRank = null) {
     st.missing && `<span class="tag tag-stale">${esc(t('effort.gone'))}</span>`,
     st.dmca && `<a class="tag tag-stale" href="${esc(safeHttp(st.dmca.url))}" target="_blank" rel="noopener" title="${esc(t('effort.dmcaTitle'))}">${esc(t('effort.dmca', { date: st.dmca.date || '' }))}</a>`,
     // A recording that backs the entry up (owner-added), opened off-site.
-    e.proof?.url && `<a class="tag tag-proof" href="${esc(safeHttp(e.proof.url))}" target="_blank" rel="noopener nofollow" title="${esc(e.proof.url)}">${esc(e.proof.label || 'Watch')} ↗</a>`,
+    e.proof?.url && `<a class="tag tag-proof" href="${esc(safeHttp(e.proof.url))}" target="_blank" rel="noopener nofollow" title="${esc(e.proof.url)}">${esc(tv('proof', e.proof.label) || 'Watch')} ↗</a>`,
   ].filter(Boolean).join('');
   const gwRows = GROUNDWORK.map((g) => {
     const v = Math.max(0, Math.min(1, +(e.groundwork?.[g.key]) || 0));
@@ -549,7 +602,7 @@ function effortCard(e, rank, open, overallRank = null) {
         ${src ? `<img class="e-avatar" src="${esc(src)}" alt="" loading="lazy" data-hide-on-error>` : ''}
         <div class="e-title">
           <h3>${url ? `<a href="${esc(url)}"${external}>${esc(e.name)}</a>` : esc(e.name)}</h3>
-          <p class="e-by">${hasRepo(e) ? `${esc(e.repo)}${e.branch && !['main', 'master'].includes(e.branch) ? ` · ${esc(t('effort.branch', { b: e.branch }))}` : ''}` : esc(e.byline || '')}</p>
+          <p class="e-by">${hasRepo(e) ? `${esc(e.repo)}${e.branch && !['main', 'master'].includes(e.branch) ? ` · ${esc(t('effort.branch', { b: e.branch }))}` : ''}` : esc(tv('byline', e.byline) || '')}</p>
         </div>
         <div class="e-score"><b>${pct(s.score)}<span>%</span></b><small>${esc(msLabel(s.reached))}</small></div>
       </div>
@@ -599,7 +652,7 @@ function renderWatchlist(data) {
     rows.map((e) => `
     <div class="w-row" role="row" id="effort-${esc(e.id)}">
       <div class="w-name"><a href="${esc(repoUrl(e.repo, e.branch))}" target="_blank" rel="noopener">${esc(e.name)}</a><p>${esc(e.summary)}</p></div>
-      <span class="w-muted">${esc(e.approach)}${e.target && /gta|ps5/i.test(e.target) ? ` · ${esc(e.target)}` : ''}${e.gpu?.length ? `<span class="w-gpu">${gpuTags(e)}</span>` : ''}</span>
+      <span class="w-muted">${esc(tv('approach', e.approach))}${e.target && /gta|ps5/i.test(e.target) ? ` · ${esc(tv('target', e.target))}` : ''}${e.gpu?.length ? `<span class="w-gpu">${gpuTags(e)}</span>` : ''}</span>
       <div class="w-bar"><div class="bar-track"><div class="bar-fill" data-width="${e._s.score}"></div></div><b>${pct(e._s.score)}%</b></div>
       <span class="w-muted">★ ${fmtK(e.stats?.stars)}</span>
       <span class="w-muted">${esc(ago(e.stats?.pushedAt))}</span>
@@ -612,7 +665,7 @@ function renderTools(tools) {
   foldLabel($('#tools-toggle'), t('fold.tools', { n: tools.length }));
   $('#tools-list').innerHTML = tools.map((x) => `
     <a class="tool" href="${esc(repoUrl(x.repo))}" target="_blank" rel="noopener">
-      <span class="t-kind">${esc(x.kind)}</span>
+      <span class="t-kind">${esc(tv('kind', x.kind))}</span>
       <h3>${esc(x.name)}</h3>
       <p>${esc(x.desc)}</p>
       <span class="t-meta">★ ${fmtK(x.stats?.stars)} · ${esc(t('effort.pushed', { ago: ago(x.stats?.pushedAt) }))}</span>

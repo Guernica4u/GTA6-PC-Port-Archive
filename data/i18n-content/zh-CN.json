@@ -1,0 +1,974 @@
+{
+  "lang": "zh-CN",
+  "values": {
+    "approach": {
+      "Compatibility layer": "兼容层",
+      "Compatibility runtime": "兼容运行时",
+      "HLE emulator": "HLE 模拟器",
+      "Relinker + shader recompiler": "重链接器 + 着色器重编译",
+      "Static recompilation": "静态重编译",
+      "Relinker (PS5 route)": "重链接器（PS5 路线）",
+      "API bridge": "API 桥接",
+      "Relinker": "重链接器",
+      "Research probes": "研究性探测",
+      "Static recompilation (DX12)": "静态重编译（DX12）",
+      "Emulator": "模拟器"
+    },
+    "target": {
+      "GTA VI only": "仅 GTA VI",
+      "Any Xbox Series game": "任意 Xbox Series 游戏",
+      "GTA VI first": "GTA VI 优先",
+      "Any Xbox One or Series game": "任意 Xbox One / Series 游戏",
+      "PS5 build": "PS5 版本",
+      "GTA VI": "GTA VI",
+      "GTA VI (Xbox Series)": "GTA VI（Xbox Series）"
+    },
+    "kind": {
+      "Archive toolkit": "归档工具包",
+      "Coordination hub": "协作枢纽",
+      "Asset extractor": "资源提取器",
+      "Archive explorer": "归档浏览器",
+      "Texture codec": "纹理编解码器",
+      "RE toolkit": "逆向工具包",
+      "Texture tool": "纹理工具",
+      "Format notes": "格式笔记",
+      "Curated list": "精选列表",
+      "Asset explorer": "资源浏览器",
+      "World viewer": "世界查看器",
+      "Data decoder": "数据解码器",
+      "Audio extractor": "音频提取器",
+      "Format research": "格式研究",
+      "Front end": "前端",
+      "Test tools": "测试工具",
+      "Build inspector": "构建检查器"
+    },
+    "byline": {
+      "Removed by GitHub · was public, based on VIctory": "已被 GitHub 移除 · 曾是公开项目，基于 VIctory",
+      "Streamed on Rumble · code not public": "Rumble 直播 · 代码未公开",
+      "Working in private · built on JoshuuDev's victory-amd": "私下开发 · 基于 JoshuuDev 的 victory-amd",
+      "Streamed on Rumble · built on a VIctory fork (which one isn't known)": "Rumble 直播 · 基于某个 VIctory 分支（不确定是哪个）",
+      "Working in private · built on hyphennn's victory-fork": "私下开发 · 基于 hyphennn 的 victory-fork",
+      "Streamed on Rumble by Swaggely · built on hyphennn's victory-fork (formerly victory-gta6)": "经 Swaggely 在 Rumble 直播 · 基于 hyphennn 的 victory-fork（原 victory-gta6）",
+      "Private code · based on VIctory and XCL": "代码私有 · 基于 VIctory 和 XCL"
+    },
+    "evidence": {
+      "Verified by PortWatch": "经 PortWatch 验证",
+      "Rumble stream": "Rumble 直播",
+      "Confirmed by PortWatch": "经 PortWatch 确认",
+      "Live streams on Rumble": "Rumble 上的直播",
+      "Checked by PortWatch with the group": "PortWatch 与该团队共同核对"
+    },
+    "proof": {
+      "36-minute external playtest": "外部 36 分钟实测",
+      "Watch the first kill": "看第一次击杀",
+      "Video on Reddit": "Reddit 视频",
+      "Watch on Rumble": "在 Rumble 观看",
+      "Doomsday on X": "Doomsday 在 X",
+      "Watch video": "观看视频"
+    }
+  },
+  "changes": {
+    "effort": "侦察员发现 {repo}（可能是新项目，实质度 {n}）。",
+    "tool": "侦察员发现 {repo}（工具，实质度 {n}）。",
+    "repo": "侦察员发现 {repo}（实质度 {n}）。"
+  },
+  "pinned": {
+    "text": "**为什么最高分卡在 91.3%：现在拼的是画面，不是帧率。**\n\n帧率是最容易的部分。关掉光线追踪、用低分辨率渲染再超分，谁都能上 60。但在我们的标准里，超过 30 fps 不再加分，而糊成一片的低分辨率画面还要扣画面分。\n\n缺的是一张像主机版的画面：完整的光照、光线追踪、清晰的贴图。就像 DexNom 说的，接下来的路是把渲染修好。"
+  },
+  "efforts": {
+    "kelvaroq": {
+      "summary": "Kelvaroq 是构建在 VIctory 与 victory-fork 之上的公开 Rust 运行时，加入了渲染补丁和经过实测的提交路径优化，能把 GTA VI 跑过序章和第一个任务。",
+      "highlights": [
+        "GPL-3.0 公开源码，上游版本锁定，补丁序列有文档记录",
+        "序章可玩，约 10 fps，画面较重的场景 7-8 fps",
+        "外部一次 36 分钟的 RTX 4090 实测，跑到第一个任务且未崩溃"
+      ],
+      "blockers": [
+        "CPU 提交与同步仍是主要瓶颈",
+        "仍缺着色器管线，7% 绘制被丢弃，显存压力依然存在",
+        "只有单次会话的稳定性证据，双平台性能数据也有限"
+      ]
+    },
+    "victory-nvidia": {
+      "summary": "VIctory 的 NVIDIA 分支，跑在 readmet3xt-lab 的 foxhound 上，带 DLSS、帧生成和游戏内设置菜单。PortWatch 已实测验证：可玩程度接近榜首，不开帧生成约 20 fps，不崩溃。",
+      "highlights": [
+        "README 写明测试平台：GeForce RTX 5070 12 GB、Ryzen 7 9800X3D、64 GB 内存、Windows 11",
+        "不开帧生成 20 fps，无崩溃，经 PortWatch 验证；README 称开场 26-30 fps",
+        "DLSS 超分与帧生成，在 RTX 50 系上 2 到 6 倍，用游戏内 F1 菜单切换"
+      ],
+      "blockers": [
+        "默认不开光线追踪；开启后只有约 3 fps，画面还会错乱",
+        "有卡顿，首次运行编译着色器时最严重；帧生成需要 RTX 40 及以上",
+        "主体是 foxhound 的代码；发布的 exe 未签名、无法与源码比对，建议自行构建"
+      ]
+    },
+    "belobug": {
+      "summary": "Belobug 面向 AMD Radeon 的 VIctory 分支，可玩性很高：平均约 22 fps 且不崩溃，剧情进度评为 80%。其代码和 GitHub 账号已于 11 月 27 日因违反服务条款被 GitHub 移除，PortWatch 已确认。",
+      "highlights": [
+        "平台：AMD Radeon RX 9070 XT 16 GB、Ryzen 7 9800X3D、64 GB 内存、Windows 11",
+        "可玩性很高：平均约 22 fps 无崩溃，占用约 30 GB 内存和 12 GB 显存",
+        "开放世界有光照、贴图、行人、车辆、植被、水面和天空；画面评分仅次于 DexNom",
+        "项目方称光线追踪光照现已在 AMD 上跑通",
+        "能连续做任务；剧情进度评为 80%，与 CGBJ 持平",
+        "基于 VIctory 主线与上游 PR 构建"
+      ],
+      "blockers": [
+        "代码与 GitHub 账号已于 11 月 27 日因违反服务条款被移除，外部无人能测试",
+        "最后一份公开 README 报的是 5-7 fps，自称“还不能玩”",
+        "只在一台 AMD 机器上测过，NVIDIA 和 Intel 上尚无数据"
+      ],
+      "nukedNote": "仓库与 GitHub 账号已于 11 月 27 日因违反服务条款被 GitHub 移除，PortWatch 已确认。其进度仍计入我们的总体数字。"
+    },
+    "dexnom": {
+      "summary": "DexNom Runtime 是面向 AMD Radeon 的 VIctory 分支，在 Radeon RX 7900 XTX 上测试，基于 ZSlayerHQ 的 victory-world-runtime，自带着色器、纹理流送和显存方面的修复。PortWatch 见过它运行，光线追踪光照可用，是本榜第一个跑通该项的 AMD 构建。画面评分全榜最高，但光照和材质仍有问题；能连续做任务，约 3-4 fps（开光线追踪约 1 fps），极少崩溃。",
+      "highlights": [
+        "平台：AMD Radeon RX 7900 XTX、Windows x64",
+        "光线追踪光照可用，PortWatch 亲眼所见：本榜首个跑通该项的 AMD 构建",
+        "画面评分全榜最高；能连续做任务",
+        "测试归档中 25,758 个着色器翻译了 25,742 个；2,191 个顶点着色器全部通过微软 DXIL 校验（其自述）",
+        "可从源码构建，自带 Setup.cmd；无预编译下载；GPL-3.0"
+      ],
+      "blockers": [
+        "开光线追踪光照约 1 fps；不开时第一章城区室内 3.5-4 fps（其测试报告）",
+        "README 仍称光线追踪光照为实验性；测试报告发现室内光照不正确（门口过曝、物体发黑）",
+        "只测过一张 AMD 卡，尚未被他人复现"
+      ]
+    },
+    "zettrox": {
+      "summary": "ZETTROX 基于 VIctory 和 hyphennn 的 victory-fork，面向 NVIDIA 显卡。能从 Lucia 的序章玩到 Jason 的第一个任务《Gone Fishing》，PortWatch 在其中验证了 PC 上 GTA VI 的第一次开枪击杀。渲染仍然很差，约 2 fps，但可玩，且几乎不崩溃。",
+      "highlights": [
+        "从 Lucia 的序章玩到 Jason 的第一个任务《Gone Fishing》",
+        "PC 上 GTA VI 的第一次开枪击杀，经 PortWatch 验证",
+        "几乎不崩溃：README 记录连续 1 小时 30 分钟以上无崩溃",
+        "序章通关：本榜第一个走到该剧情节点的构建"
+      ],
+      "blockers": [
+        "渲染仍然很差：阴影里的一切都是黑的，明亮场景过曝",
+        "约 2 fps（README 写 1-3）",
+        "代码 11 月 25 日才公开，尚未被他人复现"
+      ],
+      "nukedNote": "GitHub 仓库和 Zettrox 账号于 11 月 25 日消失（17:26 UTC 起返回 404）。目前尚无公开的 DMCA 通知。"
+    },
+    "vitoriabr": {
+      "summary": "Uilian 的 VItoriaBr，基于 hyphennn 的 victory-fork，加入自己的 NVIDIA 适配，并在 YouTube 直播。直播中能跑到 Jason 的第一个任务《Gone Fishing》，渲染很差，最高 4 fps，很少崩溃。",
+      "highlights": [
+        "直播中跑到 Jason 的第一个任务《Gone Fishing》",
+        "直播中很少崩溃",
+        "在 NVIDIA RTX 5060 Ti 上，菜单、开场和存档 30 fps（README）"
+      ],
+      "blockers": [
+        "渲染很差，阴影区域一片黑",
+        "最高 4 fps",
+        "代码现在与 victory-fork 只差两处小改动"
+      ]
+    },
+    "avatarmanz": {
+      "summary": "AvatarManz 面向 AMD Radeon RX 7900 XTX 的 VIctory 分支，PortWatch 实测平均约 16 fps，且有声音。其代码和 GitHub 账号已于 11 月 27 日因违反服务条款被 GitHub 移除，与 Belobug 情况相同，PortWatch 已确认。",
+      "highlights": [
+        "平台：AMD Radeon RX 7900 XTX、Intel Core i9-12900K、64 GB 内存、Windows 11",
+        "游戏内平均约 16 fps，经 PortWatch 验证；README：序章室内 13-20 fps，第一个开船任务 19-22 fps，菜单 30 fps",
+        "单次会话 41 分钟无崩溃（README）；有声音",
+        "把 victory-fork、DexNom 和 Belobug 的成果汇入 VIctory，保留历史和署名；GPL-3.0-or-later"
+      ],
+      "blockers": [
+        "代码与 GitHub 账号已于 11 月 27 日因违反服务条款被移除，外部无人能测试",
+        "闹市追车掉到 6-10 fps，个别帧卡得更久；步行户外约 11-17 fps（README）",
+        "曾占用 40-46 GB 内存（建议 64 GB）；只在一台机器上测过，未被他人复现"
+      ],
+      "nukedNote": "仓库与 GitHub 账号已于 11 月 27 日因违反服务条款被 GitHub 移除，与 Belobug 相同，PortWatch 已确认。其进度仍计入我们的总体数字。"
+    },
+    "notnozy": {
+      "summary": "NotNozy 在 Rumble 的“GTA6 Modding Stream”里展示的私有构建，观感与 AvatarManz 的构建大致相同，项目方自称剧情进度 80%，运行在 AMD 显卡上。代码未公开，基于什么也不清楚。",
+      "highlights": [
+        "观感与 AvatarManz 的构建大致相同，那是本榜的领先者",
+        "项目方自称剧情进度 80%",
+        "运行在 AMD 显卡上"
+      ],
+      "blockers": [
+        "没有实测帧率、崩溃记录或测试机信息：数值沿用 AvatarManz 的构建，因为观感相近",
+        "代码私有，外部无人能测试或复现"
+      ]
+    },
+    "doomsday": {
+      "summary": "一个私密团队的构建，基于 JoshuuDev 的 victory-amd（VIctory 分支），经 PortWatch 验证。能带着光线追踪光照跑 GTA VI，约 3-5 fps，几乎不崩溃，项目方自称剧情进度 80%。游戏内手机渲染得非常好，地图菜单帧率更高。主要为 AMD 打造，在 NVIDIA 上也能跑，帧率更低。代码未公开。",
+      "highlights": [
+        "光线追踪光照下约 3-5 fps，经 PortWatch 验证",
+        "几乎不崩溃；项目方自称剧情进度 80%",
+        "游戏内手机渲染得非常好；地图菜单帧率更高",
+        "主要在 AMD 上跑，NVIDIA 上也能跑，帧率更低"
+      ],
+      "blockers": [
+        "光线追踪光照可用，但贴图不如 DexNom",
+        "约 3-5 fps",
+        "代码私有，外部无人能测试或复现"
+      ]
+    },
+    "darkworldhm": {
+      "summary": "darkworldhm 在 11 月 25 日 Rumble 直播里展示的构建，自由漫游约 12-15 fps，在 5 到 24 之间波动：本榜最高帧率。项目方自称剧情进度 80%，至今未崩溃。画面尚可，有些贴图或光线追踪的瑕疵。据称跑在 NVIDIA RTX 50 系显卡上。基于 VIctory，但不确定是哪个分支。代码未公开。",
+      "highlights": [
+        "自由漫游约 12-15 fps，最高 24：本榜最高帧率",
+        "项目方自称剧情进度 80%",
+        "目前未见崩溃"
+      ],
+      "blockers": [
+        "帧率在约 5 到 24 fps 之间波动",
+        "有些贴图或光线追踪瑕疵",
+        "代码私有，外部无人能测试或复现"
+      ]
+    },
+    "suri": {
+      "summary": "基于 hyphennn 的 victory-fork（VIctory 分支）的私有构建。PortWatch 确认了玩家在 Lucia 序章里走动，约 3 fps；项目方现自称剧情进度 80%。代码未公开。",
+      "highlights": [
+        "PortWatch 确认玩家能走动，约 3 fps",
+        "项目方自称剧情进度 80%"
+      ],
+      "blockers": [
+        "约 3 fps",
+        "PortWatch 只确认了序章；80% 剧情进度是项目方的说法",
+        "代码私有，外部无人能测试或复现"
+      ]
+    },
+    "omonkey": {
+      "summary": "一位全程在 Rumble 上直播开发过程的开发者，通过 Swaggely 的频道。GTA VI 的着色器已开始正常加载，玩家能在开场的监狱场景里缓慢走动，约 5 fps。无公开代码。",
+      "highlights": [
+        "GTA VI 的着色器已开始正常加载",
+        "玩家能在开场场景（Lucia 的监狱）里缓慢走动",
+        "全部开发过程都在 Rumble 直播"
+      ],
+      "blockers": [
+        "仍卡在开场的监狱场景",
+        "约 5 fps",
+        "没有公开代码或构建，直播之外无人能测试"
+      ],
+      "nukedNote": "11 月 25 日下线（项目方自述）。代码从未公开；直播所在的 Swaggely Rumble 频道在 18:18 UTC 仍可访问。"
+    },
+    "cgbj": {
+      "summary": "私有的 VIctory/XCL 构建，经 PortWatch 验证。项目方自评剧情进度 80%、画面 0.7、稳定性 0.85。8 GB 内存加 16 GB 显存下平均 25 fps。代码曾短暂公开，现已下线。",
+      "highlights": [
+        "项目方自评：剧情 80%、画面 0.7、稳定性 0.85",
+        "游戏内平均 25 fps"
+      ],
+      "blockers": [
+        "仍有轻微画面瑕疵",
+        "游戏内撑不住 30 fps；自报平均 25 fps",
+        "代码私有，团队之外无人能测试或复现"
+      ]
+    },
+    "victory-gta6": {
+      "summary": "hyphennn 的 VIctory 分支（原 victory-gta6），带有他自己的渲染和速度修复。在他的 Rumble 直播里，序章能带着光线追踪光照、精细贴图和头发跑起来，约 3 fps；README 仍写着阴影是黑的。自行报告。",
+      "highlights": [
+        "直播中序章有光线追踪光照、精细贴图和头发",
+        "README：首个游戏场景能渲染，HUD、暂停菜单和手柄输入可用",
+        "在 VIctory 之上自带 meshlet 剔除、描述符表和未翻译着色器的修复"
+      ],
+      "blockers": [
+        "直播中约 3 fps；README 现测第一间屋子 8-10 fps，靠可选开关",
+        "README 没跟上直播：仍写阴影是黑的、光线追踪还没点亮任何东西",
+        "只在一台 PC（RTX 4070）上测过，尚未被他人复现"
+      ]
+    },
+    "marvis": {
+      "summary": "Marvis 的 Rust 层原生运行 GTA VI。项目方称玩家已能实际操作游玩，但构建仍不稳定；README 仍写着不可玩，并报世界内约 1 fps。",
+      "highlights": [
+        "README：首次启动画面、开场视频、开始界面和存档都能 30 fps 运行",
+        "开场过场有贴图和光照，含头发、天空和景深",
+        "项目方称玩家已能实际操作游玩，但仍不稳定"
+      ],
+      "blockers": [
+        "约 1 fps；缺光线追踪阴影和间接光",
+        "只在一台机器（AMD RX 6700 XT）上测过，尚未被他人复现",
+        "README 仍写不可玩；新的可玩报告尚未被复现"
+      ]
+    },
+    "xcl": {
+      "summary": "Wine 风格的兼容层，原生执行游戏代码。主线分支上，多名测试者能让 GTA VI 越过菜单进入世界，但画面停在加载圈，随后被 GPU watchdog 终止。未经证实。",
+      "highlights": [
+        "多名测试者的运行都进入了 GTA VI 的世界：游戏自身状态显示“Game Running”，行人和车辆已生成",
+        "菜单 30 fps；越过菜单后能播放开场视频并流送世界",
+        "GTA VI 着色器包中全部 26,698 个 RDNA2 程序都转成 HLSL；样本可编译为 DXIL"
+      ],
+      "blockers": [
+        "README：未合并的 NVIDIA 分支能以约 5 fps 进入世界，但画面缺失一部分",
+        "游戏的 GPU watchdog 会在 3 到 14 分钟后终止每次运行，AMD 和 NVIDIA 都一样",
+        "世界加载时管线构建跟不上，BCPack 压缩的贴图尚未解码"
+      ]
+    },
+    "americas-recomp": {
+      "summary": "AnyPS5 的分支，用来测试 PS5 移植工具的 RDNA2 着色器重编译器能否处理这款 Xbox 游戏。11 月 23 日下线：仓库返回 404，其所有者账号仍活跃，也没有公开的 DMCA 通知。",
+      "highlights": [
+        "顶点着色器 100%、像素 99.97%、mesh 99.99%、计算 99.6% 都产出合法 SPIR-V",
+        "重编译后的着色器在 GPU 上与独立的 CPU 解释器逐位比对通过",
+        "xgameruntime 替代实现覆盖 398 个方法中的 388 个；611 个 DLL 导入全部解析"
+      ],
+      "blockers": [
+        "仓库自 11 月 23 日起从 GitHub 消失（HTTP 404）；其所有者账号仍活跃",
+        "尚未渲染出任何一帧",
+        "顶点布局、混合和描述符状态来自可执行文件"
+      ],
+      "nukedNote": "GitHub 仓库自 11 月 23 日约 22:00 UTC 起消失（HTTP 404）。其所有者账号仍活跃，也没有公开的 DMCA 通知，因此很可能是被删除或转为私有。"
+    },
+    "leonida": {
+      "summary": "专为 GTA VI 而做，作者也是 Hookshot 的作者。11 月 23 日下线：Discord 消失、GitHub 仓库被删、作者称已退出。最后的结果：exe 跑起来了，画面全黑。",
+      "highlights": [
+        "零售版 exe 在 Windows 和 Wine、AMD 和 NVIDIA 上连续运行最多 10 分钟不崩溃",
+        "游戏发出了绘制调用（一次运行 408,781 次），并向自己的窗口呈现帧",
+        "GTA VI 全部 26,503 个着色器翻译为 SPIR-V 并通过校验"
+      ],
+      "blockers": [
+        "已下线：GitHub 仓库被删、Discord 消失、作者抽身离开",
+        "Take-Two 的 DMCA（11 月 24 日）关停了全部 3,007 个 GitHub 分支；另有副本和一份冻结镜像",
+        "最后状态：呈现的每一帧都是黑的"
+      ],
+      "nukedNote": "Discord 消失、GitHub 仓库被删、作者于 11 月 23 日退出。11 月 24 日 Take-Two 的 DMCA 通知关停了其 3,007 个 GitHub 分支网络；另有单独上传的副本和一份冻结镜像留存。"
+    },
+    "xbox-emulator": {
+      "summary": "把导出的 Xbox Series 版本当作普通 Windows 进程来跑的 Rust 运行时，接续 TomBox 项目。它自称 Trackmania 的比赛约 60 fps 行驶、Terraria 能进入世界，Fortnite 能到大厅。自行报告。",
+      "highlights": [
+        "自称 Trackmania 比赛用键盘和手柄约 60 fps 行驶",
+        "自称 Terraria 以 60 fps 进入世界；Fortnite 能启动到大逃杀大厅",
+        "已分析 GTA VI 的 26,503 个着色器：抽 4,000 个样本可干净反汇编"
+      ],
+      "blockers": [
+        "GTA VI 顶点着色器只翻译了三分之一；mesh 着色器还需要可执行文件里的绑定数据",
+        "3D 场景仍有问题：视频和流送贴图发黑，光照通道偏暗",
+        "未运行 GTA VI：缺少可执行文件"
+      ]
+    },
+    "scarlettx": {
+      "summary": "净室实现的高层模拟器，模拟 Scarlett OS 与 GDK 运行时。它自称两款零售版 Xbox Series 游戏《Concept Destruction》和《Unicorn Overlord》已在 Windows 上可玩。",
+      "highlights": [
+        "《Concept Destruction》和《Unicorn Overlord》自称在硬件 GPU 上可玩",
+        "422 个已跟踪函数完成 281 个；《Concept Destruction》46 个启动里程碑完成 42 个",
+        "《Concept Destruction》里手柄输入、音频输出和存档都可用"
+      ],
+      "blockers": [
+        "RDNA2 着色器提升尚未开始（0%）。GTA VI 用的是主机预编译着色器",
+        "Xbox 统一内存和完整的 kernelx 还未动工",
+        "游戏结果均为自行报告，尚未被复现"
+      ]
+    },
+    "tuxbox": {
+      "summary": "面向解包后 Xbox Series 游戏的原生优先兼容层，主要在 Linux 上通过 Proton 测试。GTA VI 在剧情开场脚本里报出自身状态“Game Running”，约十分钟后崩溃，但选人提示之后没有任何画面。自行报告。",
+      "highlights": [
+        "一次录制的 GTA VI 运行进入剧情开场脚本（“Game Running”，第 10,146 帧）后崩溃",
+        "《The Matrix Awakens》在 Linux 测试中降设置跑到高速公路追逐和开放城市",
+        "自带一个小的测试游戏（Lanes），使用它自己的 Xbox 图形、内存和输入库"
+      ],
+      "blockers": [
+        "剧情开场那次运行的画面、输入和帧时间都未经核实；崩溃原因不明",
+        "捕获的 16,868 个 GTA VI 着色器请求中 12,087 个能编译；大型计算着色器要跑几分钟",
+        "Windows 支持仍在开发；结果尚未被复现"
+      ]
+    },
+    "openscarlett": {
+      "summary": "MIT 许可的 C++20 转换层，目标是 D3D12 和 Vulkan。它现称在某款未具名的零售游戏上清掉了 17 个启动卡点，但没有运行记录也没有画面，因此还没有 GTA VI 里程碑。",
+      "highlights": [
+        "六个未经修改的微软 Scarlett 示例能在 4K 下实时运行",
+        "自称 779 个 RDNA2 操作码中有 775 个已在真实 GPU 上校验",
+        "能跑一个自制 Freedoom 移植版，60 FPS；79 项自动化测试通过"
+      ],
+      "blockers": [
+        "没有零售游戏端到端跑通；Minecraft 和 Matrix Awakens 的推进仍在分支上",
+        "它的着色器语料是自己的，不是 GTA VI 的",
+        "状态百分比衡量的是它自己的清单，不是 GTA VI"
+      ]
+    },
+    "scarlett-layer": {
+      "summary": "加载器加一个注入式 hook DLL，把主机专属调用重定向到 Windows 垫片，自带 d3d12_xs 封装和着色器提升器。它自称 Terraria 的 GDK 版本能带音频渲染菜单；尚无实际玩法。",
+      "highlights": [
+        "自称 Terraria（解包 GDK 版本）启动到干净的菜单，且有音频",
+        "loader.exe 让游戏挂起启动、重写导入表并注入 hook DLL",
+        "微软桌面版 GDK 的 SimpleTriangle 示例能通过它启动、渲染并退出"
+      ],
+      "blockers": [
+        "还没有游戏可玩：Terraria 的输入和玩法是下一步",
+        "着色器提升器只在它自己的 255 个程序上测过，没测 GTA VI 的"
+      ]
+    },
+    "xbox2windows": {
+      "summary": "静态重编译研究，把 Xbox Series 的代码和着色器转成 Windows C++ 与 DXIL，贡献者超过 50 人。项目分享的录像显示 GTA VI 的菜单能跑，但不稳定。README 现在称一个改过的诊断 exe 能播放开场和设置文本；原版 exe 和菜单仍未验证。",
+      "highlights": [
+        "项目分享的录像显示 GTA VI 菜单在 PC 上运行，尽管不稳定",
+        "维护者的诊断运行中，主 exe 已进入 D3D12 管线创建",
+        "12,101 个 GTA VI 像素着色器中 851 个（7%）在 RTX 和 WARP 上与受控测试输出一致"
+      ],
+      "blockers": [
+        "开场和设置文本来自改过的诊断 exe；原版 exe 未经验证",
+        "到目前为止只有 865 个（共 26,503 个）着色器的输出被它自己的测试验证",
+        "测试只覆盖约四分之一的着色器指令形式"
+      ]
+    },
+    "anyxboxx": {
+      "summary": "法语项目原型：在 Unicorn 上模拟 GDK 运行时，另有 Wine 风格的原生模式，能跑小型 GDK 测试游戏。它的 GTA VI 结果（世界约 5 fps、过场动画、某贡献者称能玩前两个任务）来自 victory-fork 的代码，现已复制进仓库，因此不为其计入里程碑。",
+      "highlights": [
+        "Scarlett 包的全部 16 个 DLL 初始化完成，没有无法模拟的调用",
+        "能原生运行免费的 SimpleTriangle 和 SDL3 testgdk 游戏",
+        "借助 Leonida 的翻译器，包内 52 个光线追踪构建着色器翻译了 51 个"
+      ],
+      "blockers": [
+        "大部分 GPU 着色器翻译还没做",
+        "还没有零售游戏跑起来"
+      ]
+    },
+    "keylime": {
+      "summary": "从零写起的 C++20 运行时，Vulkan 图形加自己的 RDNA2 转 SPIR-V 翻译器。它自称 GTA VI 的开场和主菜单 30 fps，世界已加载进开场过场，但过场还画不出来。自行报告。",
+      "highlights": [
+        "README：GTA VI 原生启动，开场和主菜单锁定 30 fps",
+        "菜单之后世界加载进入开场过场，带音频",
+        "全部是自己的代码，不是 VIctory 或 XCL 的分支"
+      ],
+      "blockers": [
+        "开场过场的画面还画不出来；没有实际玩法",
+        "翻译器把不认识的指令变成空操作，所以着色器计数不算分",
+        "部分计算着色器写入的数据有误；游戏的 GPU watchdog 被挂起以维持运行"
+      ]
+    },
+    "xvalkyrie": {
+      "summary": "Wine 风格的 C++ 兼容层，面向 Xbox One 和 Series 游戏，原生执行代码、把 RDNA2 着色器转成 HLSL。它现在称 Minecraft Preview 和《Unicorn Overlord》已可玩，但 Minecraft 那条只描述了主菜单。未经证实。",
+      "highlights": [
+        "40 个能为 Series 构建的公开 GDK 示例全部能画出画面",
+        "着色器翻译器遇到不认识的指令会停下，而不是伪造结果",
+        "Xbox One 游戏能进入菜单和场景，手柄输入可用"
+      ],
+      "blockers": [
+        "尚无 GTA VI 运行报告，其着色器包也还没试过",
+        "还没有 mesh 或几何着色器；翻译不了的着色器画不出任何东西",
+        "其他零售 Series 游戏会提前停止或丢掉 D3D12 设备；结果未被他人复现"
+      ]
+    },
+    "gtavi-recomp": {
+      "summary": "通过 AnyPS5 针对 PS5 版本，且明确无法从泄露文件工作，因此游戏侧研究受阻。工作继续在 AnyPS5 本身推进。",
+      "highlights": [
+        "138 项路线图任务完成 75 项，多数继承自 AnyPS5"
+      ],
+      "blockers": [
+        "15 项任务被卡住，直到能合法研究 GTA VI 的文件"
+      ]
+    },
+    "anyxboxseries": {
+      "summary": "只做 GTA VI 的转换层，PE 映射器借自 Xbox2Windows，配一个早期标量着色器提升器，以及一个测试呈现和输入的示例游戏。",
+      "highlights": [
+        "示例游戏能在 RTX 5070 Ti Laptop 和 WARP 上呈现帧",
+        "PE 映射器能运行一个合成的测试可执行文件",
+        "能把部分 RDNA2 标量指令提升为 HLSL"
+      ],
+      "blockers": [
+        "GTA VI 在启动前就卡住：缺少可执行文件，也缺 API"
+      ]
+    },
+    "scarab": {
+      "summary": "发现主机版 d3d12_xs 与 PC D3D12 共用同一批 28 个接口 ID，因此标准调用可以直接转发，只需自己实现主机扩展部分。",
+      "highlights": [
+        "28 个共享的 D3D12 接口 ID 全部逐字节一致"
+      ],
+      "blockers": [
+        "还没有跑起任何游戏；内存与呈现适配器目前只是接口",
+        "着色器重编译在提取之后仍在进行"
+      ]
+    },
+    "anybox": {
+      "summary": "按 AnyPS5 的思路，把 GDK 可执行文件重链接到重新实现的系统库上。整条管线在一个测试游戏上已端到端跑通。",
+      "highlights": [
+        "重链接器、库构建和运行报告在一个测试游戏上可用"
+      ],
+      "blockers": [
+        "多数系统函数还是空壳；d3d12_x 只实现了已知 7 个导出中的 4 个",
+        "其 Vulkan 图形路径和着色器仓还没有游戏能渲染"
+      ]
+    },
+    "percyscarlett": {
+      "summary": "Rust 兼容层，带替代系统 DLL 和一个早期着色器重编译器。GTA VI 现在能跑到黑帧的帧循环，随后 GPU 挂起。其着色器路径仍用替代实现，阶段计数也与其他项目不一致。",
+      "highlights": [
+        "GTA VI 自身代码能跑到帧循环并完成首批呈现（黑帧）",
+        "README 称 Minecraft 的 Scarlett 版本能进入游戏内"
+      ],
+      "blockers": [
+        "GTA VI 几秒后就把 GPU 挂死（887a0006）；还看不到任何画面",
+        "它统计的着色器阶段数与 GTA VI 已知的分布不符",
+        "严格计数基于解码器，因此还看不出着色器真的能用"
+      ]
+    },
+    "grandtheftxbox": {
+      "summary": "计划面向 Series 和 One 游戏的 Wine 风格兼容层。目前处在里程碑 0 和 1 之间，自 11 月 20 日起没有动静。",
+      "highlights": [
+        "替代的 xgameruntime.dll 能运行一个 GDK 示例程序"
+      ],
+      "blockers": [
+        "还没有主机游戏跑起来；自 11 月 20 日起无活动"
+      ]
+    },
+    "scarlett-windows-compat": {
+      "summary": "净室测试程序，研究 Game Core 软件如何与 Windows 对接，覆盖加载、内存、呈现和输入，另有一个监视其他项目的雷达。",
+      "highlights": [
+        "可执行文件检查、内存、D3D12 和输入测试在 CI 中通过",
+        "从源码构建了另一个项目的加载器，并用它跑自己的测试程序"
+      ],
+      "blockers": [
+        "仅做研究；没有跑过任何 Xbox 游戏或主机着色器"
+      ]
+    },
+    "dedsec": {
+      "summary": "葡萄牙语的 GTA VI 移植，目标 DirectX 12，配 RDNA2 转 HLSL 的翻译器。多数文件与 Leonida 路径相同，其中 86 个完全一致，README 也未署名 Leonida。目前无法启动。",
+      "highlights": [
+        "能提取并反汇编 GTA VI 全部 26,503 个着色器",
+        "RDNA2 转 HLSL 翻译器自称覆盖全部 1,630 种指令形式"
+      ],
+      "blockers": [
+        "覆盖率按指令形式统计，而不是真正翻译的游戏着色器",
+        "README 称 FSR3 “已启用并测试”，但什么都还没跑起来",
+        "大体沿用 Leonida 的文件布局，自己做的部分难以分辨"
+      ]
+    },
+    "xbgtasix": {
+      "summary": "中文项目：把替代的 xgameruntime、xmem 和 d3d12_xs DLL 放到可执行文件旁边，另附有出处的归档、着色器和纹理格式研究笔记。",
+      "highlights": [
+        "15 步测试阶梯，从导入绑定一直到 DXR 光线追踪和真实资源渲染",
+        "17 篇研究笔记，涉及 RPF9 归档、着色器语料和纹理池",
+        "自称 GTA VI 的 16 个附属 DLL 都能在其替代实现上加载（此处未核实）"
+      ],
+      "blockers": [
+        "测试用的是它自己的程序；没有跑过任何 Xbox 游戏",
+        "还没有 RDNA2 着色器翻译"
+      ]
+    },
+    "seriesx-emulator": {
+      "summary": "C++ 模拟器，解释执行 x86-64 代码而不是原生运行，带启动器和七个 XGameRuntime 函数。只有它自己构建的程序能跑；它自称没有商业游戏可用。",
+      "highlights": [
+        "解码 1,153 条 RDNA2 指令中的 627 条，并在测试解释器上运行 43 条",
+        "状态页把每个 API 和指令归为空壳、部分实现或已验证"
+      ],
+      "blockers": [
+        "没有跑过任何 Xbox 游戏；GPU、内核和着色器翻译都还没有",
+        "解释器对现代主机游戏来说很可能太慢"
+      ]
+    },
+    "gta6-compat-layer": {
+      "summary": "C++ 兼容层，自带 PE 加载器和 Xbox 函数注册表。README 现在称 GTA VI 的 exe 能加载全部 587 个导入，并在 113 次启动中把初始化推进到管线创建；还没有画面。自行报告。",
+      "highlights": [
+        "自称 GTA VI 的 exe 加载完成，587 个导入全部解析，初始化成功",
+        "把它覆盖的每个 Xbox 函数标注为实现、空壳或缺失"
+      ],
+      "blockers": [
+        "还没有画面或菜单；运行停在缺失的 D3D12 命令列表函数处",
+        "着色器翻译器是新的，还没接入运行流程",
+        "自那次 GTA VI 运行后，基础工作未再对照代码复核"
+      ]
+    },
+    "xlaunchvi": {
+      "summary": "多人协作的 C++ 兼容层，含 PE 加载器、D3D12 后端，以及与 AMD 编译的测试着色器逐位一致的 RDNA2 翻译器。多数代码在未合并的 PR 里，没有跑过任何 Xbox 游戏。",
+      "highlights": [
+        "自称 12 个 AMD 编译的计算着色器与 CPU 结果逐位一致",
+        "翻译器对不支持的指令直接拒绝，而不是伪造",
+        "解码表对照 AMD 官方 RDNA2 指令规范校验过"
+      ],
+      "blockers": [
+        "没有跑过任何 Xbox 游戏；Matrix Awakens 的推进还停在诊断阶段",
+        "多数功能在未合并的 PR 里，主分支只有文档",
+        "只测过自己的着色器，不是 GTA VI 的；还没有主机纹理平铺"
+      ]
+    },
+    "openscarlett-ce": {
+      "summary": "AGPL 的 C++ 兼容层，与另一个 OpenScarlett 无关，把主机 DLL 换成 PC 版 Direct3D 12 并翻译主机 GPU 代码。它自称 Minecraft Preview 约 60 fps 可玩，另有一款未具名的新零售游戏能到开始界面。自行报告；在点明该游戏的文件之前不计 GTA VI 成绩。",
+      "highlights": [
+        "自称 Minecraft Preview 在 Windows 和 Linux 上约 60 fps 可玩，有录像",
+        "自称《The Matrix Awakens》能跑菜单和开场追逐，约 20 fps",
+        "着色器翻译器遇到不认识的指令会停下，而不是伪造"
+      ],
+      "blockers": [
+        "还没试过 GTA VI 的着色器；也还没有音频",
+        "光线追踪通道未验证：Matrix Awakens 有些场景渲染成黑色",
+        "那款新零售游戏的运行没有点明是 GTA VI 的文件，因此不计分"
+      ]
+    },
+    "port-of-the-americas": {
+      "summary": "Linux 兼容层，在打过补丁的 vkd3d-proton 上用 Proton 跑 GTA VI 自己的 exe，配替代的主机 DLL。仓库里有选人提示和加载界面的截图；世界画出来是黑的。着色器翻译依赖 Leonida 的成果。自行报告。",
+      "highlights": [
+        "仓库截图显示 GTA VI 在 Linux 上的选人提示和加载界面",
+        "自研的内存、运行时、DirectStorage、输入和音频替代 DLL",
+        "每次测试都有详细运行日志，附提交号和设置"
+      ],
+      "blockers": [
+        "世界加载起来了，但画出来是黑的",
+        "需要 Leonida 的着色器翻译，而那部分不在仓库里",
+        "只在一台 AMD 机器上测过"
+      ]
+    },
+    "five-star-recomp": {
+      "summary": "面向 GTA VI 的 C# 兼容层与工具包。它自称游戏能加载剧情模式，并以 30 fps 播放开场过场的字幕卡、对白和音效，但过场的 3D 世界还画不出来。自行报告，无录像。",
+      "highlights": [
+        "自称剧情模式加载成功，开场过场的字幕卡、对白和声音 30 fps",
+        "首次运行的界面用脚本模拟手柄输入通过；之后靠已保存的设置跳过",
+        "翻译器把不支持的指令标记为失败，而不是伪造"
+      ],
+      "blockers": [
+        "开场过场的 3D 世界还画不出来：没有世界也没有角色",
+        "剧情加载后的 GPU 挂起只是被限制，并未修复",
+        "仓库里没有截图或录像"
+      ]
+    },
+    "g6recomp": {
+      "summary": "为 GTA VI 做的、经过细致测试的 C++ 加载器与主机运行时重写，全部自己写。游戏的附属 DLL 已能在其上初始化；着色器目前只是解码，还没有图形层。",
+      "highlights": [
+        "自称 GTA VI 的附属 DLL 在其加载器下完成初始化",
+        "每次加载器改动都在原始 fixture DLL 上测试，并量化 Windows 行为",
+        "未实现的调用会以有文档的错误失败，而不是假装成功"
+      ],
+      "blockers": [
+        "还没有着色器翻译：工具只解码 RDNA2 代码",
+        "还没有图形层；第一帧是更后面的里程碑",
+        "未运行 GTA VI：缺少可执行文件"
+      ]
+    },
+    "gta6-boottest": {
+      "summary": "C 写的替代 DLL 加一个调试器框架，能在 Windows 上把 GTA VI 的 exe 跑进帧循环。它称第一个 UI 界面已在 PC GPU 上画出，但还没有录像。自行报告。",
+      "highlights": [
+        "GTA VI 的 exe 在其替代 DLL 下流送归档并进入帧循环",
+        "公开了详细报告，说明 exe 需要哪些主机 DLL 和调用"
+      ],
+      "blockers": [
+        "“第一个 UI 界面”的说法还没有截图或运行记录",
+        "着色器翻译器只覆盖某次运行记录到的着色器；输出未经核实",
+        "非常新，单人开发；只在一台 AMD PC 上测过"
+      ]
+    },
+    "palmetto": {
+      "summary": "Leonida 仓库转为私有后，由社区公开接续。它自称 GTA VI 的 exe 能连续运行 300 秒以上，执行绘制并向自己的窗口呈现，但每一帧读回来都是黑的。自行报告，仅一台 RTX 4090。",
+      "highlights": [
+        "承接 Leonida 的代码，保留历史与署名",
+        "GTA VI exe 的每个启动卡点都有记录，说明是什么解决的"
+      ],
+      "blockers": [
+        "还没有画面：呈现的帧是黑的，游戏的几何体没有产生任何片元",
+        "着色器计数依赖 spirv-val，而那并不能证明着色器真的能用",
+        "只在一台 RTX 4090 上测过"
+      ]
+    }
+  },
+  "tools": {
+    "lynxnathan/rage-tools-vi": {
+      "desc": "Python 写的 RPF9 工具包：从已校验的数据重建归档条目，解码音频和脚本结构。"
+    },
+    "fishingpvalues/gta6-pc-port-hub": {
+      "desc": "移植项目的共享笔记：包清单、着色器普查格式、常见卡点。"
+    },
+    "holdmysocks/SixNG": {
+      "desc": "命令行加桌面程序：把模型转成 glTF，从你自己的安装中导出贴图和地图数据。"
+    },
+    "rpatty-dev/PercyStar": {
+      "desc": "快速的 Rust RPF9 浏览器，带 Bink2 播放器和 ADAT Opus 音频解码。"
+    },
+    "breadbbbb/rpf9-explorer": {
+      "desc": "Windows 上的 RPF 浏览器，可预览模型、贴图、音频和视频。Leonida 基于它的解码器。"
+    },
+    "Ahmet-Dedeler/bcpack-rs": {
+      "desc": "净室实现的 Xbox BCPack 贴图解码器。BC1 已可用，BC7 进行中。"
+    },
+    "nullbrik/RageForge": {
+      "desc": "浏览和分析 RPF9 / TTPF 归档。"
+    },
+    "woreksami/ttpf-studio": {
+      "desc": "查看、导出并替换 .ttpf 贴图；支持 Bink 视频播放。"
+    },
+    "walkthestars/GTA6-Asset-Info": {
+      "desc": "RPF9、贴图、BCPack、模型和地图数据的格式笔记。"
+    },
+    "Ahmet-Dedeler/awesome-gta6-reverse-engineering": {
+      "desc": "持续更新的开源 GTA VI 逆向工具与兼容层清单。"
+    },
+    "HolyRoses/gta6-explorer": {
+      "desc": "只读的 Python 工具包：浏览你的包，提取贴图、音频、视频和着色器。"
+    },
+    "meetox80/6stars": {
+      "desc": "从零写的 macOS 引擎（Swift、Metal），用你自己的归档渲染地图、植被和天气。"
+    },
+    "Ahmet-Dedeler/rage9-re": {
+      "desc": "解码脚本与动画归档（PSO 数据、动画），可导出 glTF。"
+    },
+    "Albotterin/AWC_from_RPF9_Extractor": {
+      "desc": "从 RPF9 归档中提取音乐流（AWC）。"
+    },
+    "SentinelInteractive/0x52504639": {
+      "desc": "RPF9 格式笔记、目录清单和配套工具。"
+    },
+    "JoshRob297/rpf9-research": {
+      "desc": "西班牙语的 RPF9 头部、目录表和名称表逆向研究。"
+    },
+    "Librett0/vice-lens": {
+      "desc": "桌面浏览器，查看你自己副本里的地图、模型、动画、影片和音效。"
+    },
+    "batatinhafcbatatinha-pixel/xseriesrecomp": {
+      "desc": "把四个已追踪项目的快照打包进一个启动器；尚未用任何游戏测试过。"
+    },
+    "sub-north/xbox-hle-lab": {
+      "desc": "面向 XCL 的 GPU 探针、虚拟机脚本和补丁，用于在沙箱 VM 里测试。"
+    },
+    "kry-vex-gta/XBOX-Inspector": {
+      "desc": "Rust 桌面工具，只读地清点解包后的 Xbox Series 版本，并检查 RPF9 头部与开放数据区间。文档为俄语。"
+    },
+    "nineforge0/forge9": {
+      "desc": "Rust 的 RPF9 工具包：用你自己副本中的密钥查看、解包和重新打包归档。"
+    },
+    "TheoBIET/OpenVI": {
+      "desc": "OpenIV 风格的桌面浏览器，读取你自己安装里的 RPF9 归档；可查看模型和目录数据。"
+    }
+  },
+  "news": {
+    "2026-11-27-belobug-dmca": {
+      "title": "独家：GitHub 以违反服务条款为由移除 Belobug 的 GTA VI 构建",
+      "dek": "本榜评分最高那个构建的仓库和 GitHub 账号都已消失。PortWatch 已确认，GitHub 是以违反服务条款为由将其移除的。",
+      "body": [
+        "Belobug 的 GTA VI 构建已被从 GitHub 撤下。周五，Belobug/VIctory-Belobug-AMD 仓库及背后的 Belobug 账号同时停止加载，PortWatch 已确认 GitHub 是以违反服务条款为由将其移除。",
+        "它是此前最值得追赶的构建：在 Marvis 的 VIctory 基础上针对 AMD Radeon 卡做的分支，平均约 22 fps 且不崩溃，非常可玩，也是本榜剧情推进最远的项目之一。它有 4,000 多个星标和 1,200 个分支，以 91.3% 位居我们追踪的构建之首。",
+        "GitHub 没有公开说明它违反了哪一条规则。与会在公开日志里张贴的 DMCA 通知不同，依据服务条款的移除并不公布。若有更多信息，我们会更新本文。",
+        "本榜上 Belobug 的卡片现已标记为已下架，不再参与排名，于是 90% 的 VIctory-NVIDIA 领跑。它取得的进度仍然算数：我们的总体数字仍是 91.3%。别去找 Belobug 代码的副本：被移除仓库的分支同样可能被连坐，而非官方下载往往带毒。"
+      ]
+    },
+    "2026-11-26-multiplayer-running": {
+      "title": "独家：GTA VI 的多人模式已在 PC 上跑起来",
+      "dek": "TeK 的团队在 CGBJ 构建的私有分支上，做出了可用的玩家、车辆和邻近语音，稳定 25 到 30 fps。PortWatch 已确认视频为真。",
+      "body": [
+        "GTA VI 的多人模式已经在 PC 上跑起来了。周四晚间，TeK（@TeKGameR950）在 X 上发布了一段视频，展示该团队所称的可玩多人：玩家角色和车辆同时出现在世界里，并带邻近语音，你能听到身边的玩家。PortWatch 已确认视频真实。",
+        "它以稳定的 25 到 30 fps 运行。该构建是 CGBJ 版本的私有分支——那个基于 VIctory 和 XCL、单人平均 25 fps 的构建——而这个团队才刚开始做多人。",
+        "在此之前，我们追踪的每个构建都是单人：光是让 GTA VI 的剧情在 PC 上跑起来，就已经耗尽了所有人的力气。多人意味着多份游戏要就每个玩家和每辆车的位置达成一致，本榜此前的构建都没有做到这一点。",
+        "代码是私有的，团队之外暂时无人能试。它也不在我们的榜单上：我们对每个构建单独评分，而这个构建还没有自己的评分。"
+      ]
+    },
+    "2026-11-25-belobug-way-ahead": {
+      "title": "我们看过了 Belobug 的 AMD 构建，它遥遥领先",
+      "dek": "在一台全 AMD 的 PC 上，GTA VI 的开放世界已接近零售版，还能连续做任务。它只有约 3 fps，但本榜没有第二个构建是这个样子。",
+      "body": [
+        "我们看过了 Belobug 版 GTA VI 的实际运行，PortWatch 团队认为它远远领先于我们追踪的所有构建。开放世界是带光照渲染的，有贴图、行人、车辆、植被、水面和天空，看起来接近零售版，只是非常慢。它能连续做任务，且极少崩溃。",
+        "它直接以 77.4% 登上本榜第一，比今早之前领先的 ZETTROX（64.2%）高出 13 分以上。它的画面在我们尺度上评为 0.85，是我们给出过的最高分，剧情进度 0.5（“第一幕”）。次优的画面是 suri 的私有构建 0.8；ZETTROX 的把阴影里的一切都画成黑色，只有 0.3。",
+        "它面向 AMD Radeon，而此前领先的 ZETTROX 针对 NVIDIA 调优。Belobug 在 Radeon RX 9070 XT 16 GB、Ryzen 7 9800X3D、64 GB 内存、Windows 11 上运行。它是 Marvis 的 VIctory 分支，跟随主线并合入上游 PR，README 称其中不含 hyphennn 的 victory-fork 代码。Belobug 自己的修复包括：为游戏的光线追踪间接光做了替代实现（此前会让树叶变成洋红、室内场景变成色块）、修掉了车漆玻璃和皮肤上沿每个三角形出现的线条，并把一个重场景的 GPU 耗时从每帧 225 毫秒降到约 80 毫秒。",
+        "它并不快。README 写的是 3 到 5 fps，开车时约 3，也因此仍自称“还不能玩”。行驶中的车辆会有一部分掉队或被拉长，远处的树不画，明暗是平的，而且它需要约 22 GB 内存和超过 16 GB 卡的显存。目前只在一台 PC 上跑过，没人在 NVIDIA 或 Intel 上试过。",
+        "代码是公开的，仓库为 Belobug/VIctory-Belobug-AMD，沿用 VIctory 的 GPL-3.0 许可，所以有其他 AMD 卡的人可以试。它不含任何游戏文件：你需要自己的一份游戏。",
+        "更新，2026-11-27：GitHub 以违反服务条款为由移除了 Belobug 的仓库和账号，PortWatch 已确认。本榜上它的卡片现已标记为已下架。"
+      ]
+    },
+    "2026-11-25-zettrox-no-crashes": {
+      "title": "ZETTROX 的 GTA VI 构建至今看起来不会崩",
+      "dek": "从 Lucia 的序章到 Jason 的第一个任务，它一次都没崩过，还在慢慢走向自由漫游。它有些地方不一样。",
+      "body": [
+        "ZETTROX 的 GTA VI 构建至今没有崩溃。它已从 Lucia 的序章玩到 Jason 的第一个任务《Gone Fishing》，并在那里展示了 PC 上 GTA VI 的第一次开枪击杀，全程一次都没挂掉。其 README 记录单次会话超过一个半小时无崩溃。",
+        "在这么早的阶段很罕见。运行一款为其他硬件打造的游戏，通常意味着崩溃，而且经常崩。ZETTROX 是本榜唯一评分高于“偶尔崩溃”的构建：周三它的稳定性从 0.5 升到 0.8（“很少崩溃”），以 64.2% 排到第一。",
+        "它也在慢慢逼近自由漫游，也就是剧情放手、开放世界归你的那个点。这需要耐心：构建只有 1 到 3 fps，画面依旧很差，阴影里的一切都是黑的，明亮场景过曝。",
+        "它为何能一直不崩，目前还不清楚。和 Uilian 的 VItoriaBr 一样，它基于 VIctory 和 hyphennn 的 victory-fork，加上 ZETTROX 自己针对 NVIDIA 卡的工作，在 RTX 3050 上测试。与多数进展到这个程度的构建不同，它的代码是公开的（Zettrox/ztrx），任何人都能拿去和 victory-fork 比对，找出差异。"
+      ]
+    },
+    "2026-11-25-prologue-gone-fishing": {
+      "title": "多个 GTA VI 构建已通过 Lucia 序章，抵达 Jason 的第一个任务",
+      "dek": "私有构建现在能玩过开场进入《Gone Fishing》，尽管多数渲染仍然很差，车辆也基本不能用。",
+      "body": [
+        "多个 PC 版 GTA VI 私有构建现在能玩过 Lucia 的序章，继续进入 Jason 的第一个任务《Gone Fishing》。此前我们追踪的最远构建只到序章本身，所以这是目前有人报告过的最深剧情进度。",
+        "过程很粗糙。多数构建的世界渲染仍然很差，车辆大多数时候不能用：在 Gone Fishing 里，那条船常常无法操控。有些构建里，暂停菜单的地图能打开。",
+        "我们还说不出这些构建分别是谁的。走到这一步的人都在私下开发，其中多数似乎基于 hyphennn 的 victory-fork，也就是本榜头部项目背后那个 VIctory 的公开分支。他们自己的改动没有公开，所以别人无法测试。",
+        "“序章通过”是我们剧情赛道的第一步，但在确认是哪些构建做到之前，评分不会变。如果你的是其中之一，请在我们的 GitHub 上开 issue，附上录像或直播链接。"
+      ]
+    },
+    "2026-11-24-take-two-dmca-leonida-forks": {
+      "title": "Take-Two 首次针对 GTA VI 移植发出下架，Leonida 及 3,007 个分支被停用",
+      "dek": "GitHub 周二公布的一份 DMCA 通知指向 Leonida 仓库，并把处罚应用到了该项目的整个分支网络。",
+      "body": [
+        "Take-Two 已针对一个 GTA VI 移植项目提交了第一份 DMCA 通知。这份周二张贴在 GitHub 公开 DMCA 日志中的通知点名 ItsNotRexed 的 Leonida 仓库。由于分支网络超过 100 个仓库，且 Take-Two 主张这些分支与原始仓库同样侵权，GitHub 按整个网络处理：3,007 个仓库。在周一 Leonida 关停后幸存下来的贡献者分支，现在都显示 GitHub 的“不可用”页面。",
+        "发行方称 Leonida 是 GTA VI 的衍生作品，违反了 Rockstar 服务条款中禁止逆向工程的条款。它还指出，项目“自带文件”的说法具有误导性：从时间点看，用户必须自带的只能是那份泄露的 Xbox 版本。",
+        "通知只点名 Leonida。不是它在 GitHub 上分支的项目（例如 VIctory 和 XCL），以及作为新仓库上传的 Leonida 副本，目前仍在线。但同样的理由可以套用到其中任何一个。",
+        "Leonida 以“已下架”的状态留在本榜，作为记录。"
+      ]
+    },
+    "2026-11-24-new-progress-scale": {
+      "title": "PortWatch 的新尺度：可玩是一半，通关才是 100%",
+      "dek": "进入 GTA VI 现在只占标准的一半。另一半是能玩多远、画面多准确、跑得多快、能稳定多久。",
+      "body": [
+        "我们改变了 PortWatch 的评分方式。旧标准从打基础一路爬到“进入游戏”，再到 30 FPS 和“稳定”。很多人指出，这把两件不同的事混在了一起：让游戏跑起来，和让它玩得好。在一个漆黑的世界里以 5 fps 走动，并不等于在 PC 上玩 GTA VI 已经走完四分之三。",
+        "“进得去”现在是通往 50% 的阶梯。基础工作占前 10%。之后是 Exe 跑起来（10%）、第一帧（20%）、主菜单（30%）、进入世界（40%，剧情模式加载并渲染出世界，无论多残缺）、可游玩（50%，你能在其中操控角色）。",
+        "越过“可游玩”，四条并行的赛道填满另一半：剧情进度（35 分），从卡在开场到 100% 完成；画面（25 分），从全黑或花屏到与主机一致；性能（20 分），平均帧率除以 30；稳定性（20 分）。100% 现在意味着整个游戏可以通关，画面与主机相当，30 fps 或更高，且不崩溃。",
+        "所有项目都已重新评分，数字变低了。最靠前的构建现在刚过一半：hyphennn 的私有构建 59.4%、omonkey 的 57.9%、victory-gta6 57.3%、CGBJ 的 54.5%。VIctory 40%，已进入世界但还不能玩，XCL 35%。没有人退步：同样的成果，现在只占整个游戏更小的一部分。",
+        "历史曲线也已换算到新尺度。完整规则，以及剧情和画面的分档说明，见页面底部的评分章节。"
+      ]
+    },
+    "2026-11-24-omonkey-shaders-prison": {
+      "title": "omonkey 的构建里 GTA VI 着色器开始加载，全程在 Rumble 直播",
+      "dek": "玩家能在开场的监狱场景里缓慢走动，约 5 fps。所有工作都在别人的一个 Rumble 频道上直播。",
+      "body": [
+        "一位叫 omonkey 的开发者已让 GTA VI 在 PC 上运行，着色器开始正常加载。它约 5 fps，卡在开场场景 Lucia 的监狱里，但玩家能在其中缓慢移动。",
+        "这让他领先于我们追踪的所有项目。周二早些时候我们收录的 CGBJ 也能让玩家移动，但那是在黑屏上，其视频显示开场是平的色块、没有光照。",
+        "omonkey 把全部开发工作直播在 Rumble 上，但不在自己的频道。直播通过 Swaggely 发出，那是一个约 1,800 关注、属于另一个人的频道。两人为何这样合作，目前不清楚。",
+        "我们已把 omonkey 以 76% 收录进追踪站，处在我们“进入游戏”的阶段，排在第一位。因为全过程都是直播，我们确信它是真的。但我们没找到他的任何公开代码，所以在直播之外暂时无人能测试。",
+        "更新，20:10 UTC：omonkey 的构建基于 victory-gta6，即 fxceless 的 VIctory 公开分支，我们已把它以 74% 加入竞赛。现在竞赛只对拥有公开代码的项目排名，因此 omonkey 的私有构建列在下方、不计排名。以 76% 计，它仍领跑我们的总体进度数字，并作为该代码上的构建显示在 victory-gta6 的卡片里。"
+      ]
+    },
+    "2026-11-24-cgbj-in-game": {
+      "title": "独家：CGBJ 把 GTA VI 跑进了游戏世界，在无光的世界里行走和对话",
+      "dek": "CGBJ 基于 VIctory 和 XCL 的构建能让玩家走动并与 NPC 对话。其代码曾短暂公开，现已重新转为私有。",
+      "body": [
+        "一个叫 CGBJ 的团队已经把 GTA VI 跑进了 PC 上的游戏世界，玩家能在其中移动。用手柄可以走动、与 NPC 对话、打开游戏内菜单。PortWatch 已核实它进入了游戏内。此前还没有任何公开项目展示过玩家能移动。",
+        "离可玩还差得远，而且跑得非常慢。在玩家走动的那次运行里，画面是黑的。周二发在 X 上的一段 77 秒视频展示了更多：GTA VI 的开场场景是平的色块、没有光照，从车内到一条有 NPC 挥手的街道，还有一名警卫和一片监狱操场。",
+        "CGBJ 的构建基于 VIctory，也采用了 XCL 的部分成果。其代码为私有；2026-11-26 曾以 codec-d/cool_fox 短暂公开。",
+        "我们已把 CGBJ 以 72% 收录进追踪站，处在我们“进入游戏”的阶段，排在第一。这依据的是我们自己的核实：视频里并没有点名这个项目。",
+        "更新，2026-11-26：CGBJ 的仓库已公开，该条目现以 codec-d/cool_fox 参与公开竞赛。",
+        "更新，2026-11-26 稍晚：codec-d/cool_fox 仓库已下线，因此 CGBJ 再次按私有构建列出。"
+      ]
+    },
+    "2026-11-24-xcl-30fps-in-game": {
+      "title": "独家：XCL 称 GTA VI 在游戏内达到 30 fps，但不愿说明是否越过了菜单",
+      "dek": "团队担心被封，拒绝多说，却向我们一位成员暗示一切运行得非常好。更新：测试者的报告显示它已加载进世界。",
+      "body": [
+        "XCL 称 GTA VI 现已在游戏内以 30 fps 运行，但不愿说明是在哪里。被问到这是指它此前已到达的菜单，还是真正的游玩时，团队拒绝回答，称担心被封。私下里，它向我们社区的一位成员暗示，一切运行得非常好。",
+        "它的公开说明还没跟上。XCL 的 README 仍称该游戏是“一款较新的零售游戏”，能稳定 30 fps 到达菜单，尚未进入游玩。周二早些时候，项目合并了一项改动，在游戏窗口标题里显示实时帧率。",
+        "谨慎的气氛弥漫整个圈子。XCL 的 Discord 服务器严格封闭，聊天频道关闭；在周一晚间 Leonida 一小时内失去服务器、仓库和作者之后，成员们都怕被封。GTA 6 Modding 的 Discord 服务器现在也已被封。",
+        "更新，01:50 UTC：XCL GitHub 上的测试者现在报告，公开代码上 GTA VI 已越过菜单进入世界。游戏自身状态显示“Game Running”，但画面停在加载圈，GPU watchdog 会在几分钟内终止每次运行。有一份报告称游玩达到 28 到 30 fps，但没有截图。XCL 升至 62.5%，到“进入游戏”的一半。"
+      ]
+    },
+    "2026-11-24-tuxbox-first-frame-victory-world": {
+      "title": "TuxBox 画出 GTA VI 的第一个界面，VIctory 也摸到了世界",
+      "dek": "一夜之间，一个 Linux 优先的兼容层显示了 GTA VI 的选人提示，VIctory 报告游戏世界内出现了一张字幕卡，另有两个小项目让 GTA VI 的代码跑了起来。",
+      "body": [
+        "Leonida 的退出并没有让其他 GTA VI 移植慢下来。主要在 Linux 上通过 Proton 测试的兼容层 TuxBox 公布了一份运行记录，显示在 RTX 4070 Ti SUPER 上以 4K 显示游戏的选人提示。它还没向游戏发送任何输入，所以我们只算作第一帧，不算菜单。这让 TuxBox 从 25% 升到 40%。",
+        "与 XCL 并列在主菜单的 VIctory 现在称其运行已进入世界。第一个任务的字幕卡能渲染，但它背后的场景仍然漆黑，大约一到两秒一帧，项目还警告真实 GPU 可能会挂起。那不算可玩，所以 VIctory 仍停在 55%。",
+        "PercyScarlett 报告 GTA VI 能跑到黑帧的帧循环后 GPU 挂起；新项目 GTA6-BootTest 用替代 DLL 把它的 exe 推进到同一阶段。两者现在都处在“Exe 跑起来”。一如既往，这些都是项目自己的报告，没有一个被独立复现。"
+      ]
+    },
+    "2026-11-23-leonida-nuked": {
+      "title": "Leonida 被下架：GitHub 仓库被删、Discord 消失、作者退出",
+      "dek": "周一晚间不到一小时，最大的 GTA VI 移植项目失去了它的 Discord 服务器和 GitHub 仓库，作者表示将抽身离开。",
+      "body": [
+        "Leonida——星标最多的 GTA VI 移植项目，GitHub 星标超过 33,000——在周一晚间不到一小时内下线。它的 Discord 服务器约 23:07 UTC 停止解析。到 23:47，其 GitHub 仓库已消失。差不多同一时间，作者 NotRexed 在 X 上发了一句“我不干了，各位”，写道他不断遇到自己无法控制的问题，决定抽身，并感谢了 Discord 社区。",
+        "该仓库现在返回“未找到”，而不是 GitHub 在 DMCA 下架后显示的“不可用”页面；GitHub 的公开 DMCA 日志里也没有针对它的通知。这指向是所有者主动撤下而非 Take-Two 出手，当然只有他们自己说得清。当晚早些时候，仓库刚迁移到一个新组织 ProjectLeonida，其维护者关闭了数千个未合并的 PR 和 issue。",
+        "代码没有丢。贡献者的分支仍在 GitHub 上，其中包括那个汇总了启动修复的分支；NotRexed 自己的 Git 服务器上有一份 23:30 UTC 的镜像，只是已无法再同步。",
+        "我们已在追踪站上把 Leonida 标记为已下架。它作为记录留在榜单上，但不再计入排名。",
+        "更新，11 月 24 日：Take-Two 随后针对 Leonida 提交了 DMCA 通知，11 月 24 日张贴在 GitHub 日志中，GitHub 停用了该仓库整个 3,007 个分支的网络，包括下文链接的贡献者分支。以独立仓库上传的副本不属于该网络。"
+      ]
+    },
+    "2026-11-23-leonida-discord-down": {
+      "title": "Leonida 的 Discord 服务器消失，项目迁往新的 GitHub 账号",
+      "dek": "这个 179,000 人的服务器在周一深夜停止解析。成员说 Discord 封了它，但没人说明原因。更新：GitHub 仓库随后也被删除。",
+      "body": [
+        "Leonida 的 Discord 服务器周一深夜下线。23:06 UTC，其邀请链接还指向一个约 179,000 人的服务器，其中 74,000 人在线。一分钟内，Discord 就回复邀请和服务器均未知。成员说 Discord 封了它。Discord 和 Leonida 团队都没说明原因，从外部我们分不清是封禁还是删除。",
+        "起初代码未受影响。大约一小时前，仓库刚从作者的个人账号迁到一个新组织 ProjectLeonida（22:08 UTC 创建）。旧链接会重定向，服务器消失后 issue 仍在更新。差不多同一时间，维护者关闭了数千个未合并的 PR 和 issue，列表从近 4,900 条砍到约 200 条。",
+        "GitHub 的公开 DMCA 日志中没有针对该项目的通知。这次消失之前，GTA VI 社区已承受过其他压力：本月早些时候，GTA 6 Mapping Project 的 Discord 在没有任何说明的情况下消失；8 月，Take-Two 曾申请传票要求 Discord 提供泄密者身份，Discord 称并未收到。",
+        "更新，23:47 UTC：GitHub 仓库随后已被删除，作者称已退出。详见我们的后续报道。"
+      ]
+    },
+    "2026-11-23-marvis-menus-stream": {
+      "title": "独家：Marvis 直播 GTA VI 以约 15 fps 跑到菜单",
+      "dek": "他随后以 VIctory 之名公开了代码，但还没有别人复现这次运行。仔细看过直播的观众认为它很可能是真的。",
+      "body": [
+        "一位叫 Marvis 的开发者周一直播了 GTA VI 在 PC 上运行，一路跑到游戏菜单，约 15 fps。此前还没有公开项目展示到这个程度：Leonida、XCL 和 TuxBox 都能跑游戏自身的代码，但画面仍是黑的或空白。",
+        "周一深夜，他把代码以 VIctory 之名发布在 GitHub 上——一个在 Windows 上原生执行游戏自身代码的 Rust 层。其 README 比直播走得更远：启动画面、开场视频、开始界面和存档都能 30 fps 运行，加载还能进入开放世界，只是画面全黑，显卡几秒内就报错。",
+        "仔细看过直播的观众大多认为它是真的。要造一个假，得搭非常复杂的现场，很少有人觉得事情是这样。时间点也吻合：同一天，一位外部贡献者提交给 XCL 的未合并改动也称到达了最初的菜单。",
+        "VIctory 目前处在我们的“主菜单”阶段，55%。它的结果仍是他一个人的，来自一台配 AMD RX 6700 XT 的 PC；等其他人试过代码我们会更新条目，如果那次运行被证明是摆拍，我们会撤下它。"
+      ]
+    },
+    "2026-11-23-leonida-exe-runs": {
+      "title": "Leonida 让 GTA VI 的可执行文件跑了起来，但屏幕上还没有任何东西",
+      "dek": "贡献者的构建在空白窗口后运行游戏自身代码数分钟；其 Discord 里的帖子说今天还不可玩，也许明天可以。",
+      "body": [
+        "周一 Cyberleek 的可执行文件出现几小时后，Leonida 的贡献者开始通过项目的运行时跑它，并在一个共享 issue 里记录每次尝试。在叠加了约 25 个未合并 PR 的构建上，零售版可执行文件现在能在 Windows、Wine 和 Proton 上运行自身代码最长三分钟。它会建立图形设备、完成音频初始化、构建数万条图形管线，并打开一个窗口。",
+        "那个窗口一直是空白的。当前的拦路虎是游戏命令分配器上的一个主机专属调用，PC 层没有应答，所以帧永远完不成。启动修复一个都还没进入 Leonida 的主分支，贡献者称合并它们才是瓶颈。",
+        "Leonida Discord 服务器里的帖子说的是同一件事。文件放出后不久，有人说得今天不可玩，“但也许明天”。后来另一人说它“几乎能启动”，黑屏，音频会中断。我们无法核实时序，仓库里输入、存档和流送仍标为未开始。",
+        "Leonida 并不孤单。XCL 能跑一款零售游戏（其笔记以 GTA VI 的可执行文件指认），30 fps，黑屏；TuxBox 在 Proton 上也是同样的黑窗口。三者现在都处在我们的“Exe 跑起来”阶段，25%。没有一个画出过画面。"
+      ]
+    },
+    "2026-11-23-exe-readme": {
+      "title": "Cyberleek 的 README 把这次泄露说成抗议，并索要加密货币",
+      "dek": "一份据称随可执行文件发布的说明称，捐款用于一个秘密项目，并把每一笔代币交易都算作投票。这些都无法核实。",
+      "body": [
+        "11 月 23 日，可执行文件发布后不久，一份据称是 Cyberleek 归档中 README 的文本在 Reddit 上流传。我们自己没见过那份归档，无法确认这份说明的真伪。以下用我们的话概述它的全部内容。",
+        "它把泄露说成是对它所称的游戏业反消费者习气的反抗：给单人游戏加订阅、昂贵的特别版只解锁文件里本就有的内容、把授权当买断来卖。它自己的总结是：“敌人是手段，不是游戏。”它称玩家从不是目标，这也是结局和剧情被排除在泄露之外的原因；并称自 2026 年 8 月第一段片段以来，每次发布都是免费的。",
+        "接着语气转为挑衅。它声称数月的下架、传票和钱包追踪都没能阻止上传，并辩称金钱无法让任何保护变得牢不可破，法庭也收不回已经在网上扩散的东西。",
+        "然后是钱。说明称捐款用于一个项目，在拿出成果之前不会说明是什么，并称已有一些钱到账、支付了最初的几步。它说这个构建背后的技能去做别的、更安静的工作能赚更多，同时坚称这不是威胁。支持者只能改变这个项目成为主业的快慢，改变不了它的方向。它承诺未来无论有没有人付钱，发布都免费，但把每一笔捐款和每一次代币交易都算作投票。",
+        "它承认加密货币这一面招来愤怒，并辩护说这是唯一能在不暴露姓名的情况下转移资金的办法。结尾它把这个构建和可执行文件称为送给玩家的提前的圣诞礼物，距节日还有一个月。",
+        "更早的几次发布也与同一枚代币绑定，Decrypt 将这套做法描述为加密货币拉盘。说明里的任何内容都无法验证，买那枚代币也换不到任何可核实的东西。对竞赛而言没有任何变化：还没有项目启动 GTA VI。"
+      ]
+    },
+    "2026-11-23-exe-released": {
+      "title": "Cyberleek 称缺失的 GTA VI 可执行文件已发布，比自己的期限早了几个小时",
+      "dek": "泄密者在 15:36 CET 发布了消息。尚无人确认文件为真，也没有项目启动游戏。",
+      "body": [
+        "Cyberleek 于 11 月 23 日周一 15:36 CET（14:36 UTC）发帖称，其泄露的 Xbox Series 版 GTA VI 中缺失的那个可执行文件现已发布。这比泄密者自己设定的 18:00 CET 期限早了约两个半小时。帖子里称这次发布是免费的，并说把工作交给开源重编译和模拟项目。",
+        "我们没有下载或检查该文件，也不会给出链接。发稿时，没有任何媒体确认它是真的。帖子里还索要加密货币捐款，而 Cyberleek 此前就把发布与代币绑定过，所以围绕它的说法请谨慎对待。",
+        "准备好假货。泄露文件是传播恶意软件的便捷途径，而假的 GTA VI 下载在这次发布之前就已流行。不要运行从陌生人那里拿到的可执行文件，只用我们首页竞赛里链接的原始项目仓库。",
+        "对竞赛来说，这是发令枪：在此之前，没有任何项目能尝试启动 GTA VI。在有人展示它跑起来之前，追踪站不会有任何变化，而我们首页的倒计时现在改为从发布起正向计时。"
+      ]
+    },
+    "2026-11-22-anyps5-developer-x-suspended": {
+      "title": "AnyPS5 开发者的 X 账号被停用，没有证据表明索尼或 Rockstar 参与",
+      "dek": "停用是真的，但原因并未公开；而一个把责任归给这两家公司的账号，还在推广一枚代币。",
+      "body": [
+        "PS5 转 PC 工具 AnyPS5 的开发者 boykopovar 的 X 账号已被停用。我们 11 月 22 日在个人主页上看到了这条提示。它只笼统指向 X 的规则，既没说是哪一条，也没说是否有人投诉。",
+        "一个自称 AnyPS5 社区账号的账号称这是“再次被封”，并暗示索尼和 Rockstar 害怕这个项目。它没有提供任何证据表明这两家公司介入，我们也没找到相关报道或声明。此前的停用我们也无法证实。",
+        "AnyPS5 本身仍在线：当天晚些时候还有新代码进入其 GitHub 仓库。我们追踪的 americas-recomp 就是它的分支。这次停用不改变任何分数，也不代表 GTA VI 的运行有进展。",
+        "小心跟着这条消息一起传播的东西。作出该指控的账号在推广一枚以该项目命名的代币，并称开发者支持它。我们未能核实，也没在项目的 README 或开发者的公开 Telegram 频道里看到任何关于代币的提及。别把这次停用当成买入的理由。"
+      ]
+    },
+    "2026-11-22-xcl-takes-lead": {
+      "title": "XCL 首次在 PC 上跑通零售 Xbox 游戏后登顶",
+      "dek": "这个 Wine 风格兼容层称 Minecraft Preview 在 Windows 上完全可玩。GTA VI 仍然无法启动，因为缺少可执行文件。",
+      "body": [
+        "XCL 原生执行 Xbox Series 代码，并换上自己实现的主机系统库。11 月 22 日，其 README 开始称 Minecraft Preview 在 PC 上完全可玩，有世界、声音和手柄。Fortnite 和 XDefiant 能到达标题界面和菜单，在没有联网服务的情况下已走到最远。",
+        "它当天的提交历史与这一说法吻合：早上是 Fortnite 的启动画面，下午早些时候到 Minecraft 主菜单，傍晚是可玩版本。结果是自行报告的，还没有别人复现。",
+        "对 GTA VI 而言，XCL 称游戏着色器包中全部 26,698 个 GPU 程序都能转成 HLSL，抽样的也能为 PC 编译。端到端跑通另一款零售游戏，是这类兼容层能承载 GTA VI 的最强信号。XCL 的分数升至约 22%，超过 xbox-emulator。",
+        "其他项目方面，americas-recomp 现在翻译了几乎全部游戏着色器，Leonida 的加载器能把一个替代程序端到端跑通。所有项目仍在等同一个文件。"
+      ]
+    },
+    "2026-11-22-exe-deadline-time": {
+      "title": "缺失的 GTA VI 可执行文件定于周一 18:00 CET 发布，而投票要花钱",
+      "dek": "Cyberleek 的倒计时在 11 月 23 日 17:00 UTC 结束，其网站对投票收费；据称提前发布的代币目标已降到 600 万美元。",
+      "body": [
+        "Cyberleek 自己为被扣下的可执行文件设的倒计时在 11 月 23 日周一 18:00 CET（17:00 UTC）结束，RockstarINTEL 报道的期限相同。这比最初宣布的“周一”更精确，本页倒计时现在用的就是这个时间。",
+        "泄密者的网站把计时器和一个“接下来怎么办”的投票放在一起，投票要用加密货币付费。RockstarINTEL 还报道，提前发布的代币目标已降到 600 万美元——10 月还是 3,000 万，本周早些时候是 1,500 万。有报道称该代币市值约 140 万美元。",
+        "这些都未经证实。没有媒体确认该组织手上有一个能用的可执行文件，Decrypt 等媒体把倒计时描述为拉抬代币的手段。10 月该组织在目标未达成时结束了类似的活动。",
+        "如果真有文件出现，先来的会是假货。安全研究者已经发现带 Vidar 信息窃取程序的假“GTA VI 安装包”，以及数百个推送假启动器的域名。本站只在媒体确认后报道发布，并且永远不会给出链接。"
+      ]
+    },
+    "2026-11-22-copies": {
+      "title": "领先 GTA VI 项目的重传版本已在流传",
+      "dek": "首次运行时，我们的侦察员在其他账号下发现了三个 Leonida 的副本。其中一个改了名，配了一句含糊的描述。",
+      "body": [
+        "我们的侦察员周六晚首次运行。在十几个新仓库中，它发现三个根本不是新项目：它们是 Leonida 的重传版本，发布在毫不相关的账号下。Leonida 是星标最多的 GTA VI 移植项目。",
+        "两个沿用了原名。第三个改成了听起来像 GTA 的名字，只有一行描述，README 与 Leonida 的相似度达 97%。",
+        "重传本身未必恶意。很多人会镜像自己觉得有意思的代码。但复制来的仓库，是最容易把改过的构建脚本或假可执行文件塞进看起来可信的东西里的地方——而 Leonida 是靠双击一个批处理文件构建的。",
+        "从今天起，侦察员会把每个新仓库的 README 与我们追踪的项目比对，对高度相似的副本做标记而不是列出。未经审核的仓库不再从本站链接。如果你在跟进某个项目，只用竞赛里链接的原始仓库。"
+      ]
+    },
+    "2026-11-21-exe-deadline": {
+      "title": "Cyberleek 的 Xbox 版本已放出，唯独缺了让它运行的那个文件",
+      "dek": "泄密者称缺失的可执行文件将在 11 月 23 日周一发布，若其模因币市值达到 1,500 万美元则可能更早。",
+      "body": [
+        "Cyberleek——今年 GTA VI 影像泄露的幕后组织——称已通过种子放出约 209 GB 的 Xbox Series 版本，标为 1.0.2.1。游戏的主可执行文件不在其中。",
+        "按该组织的声明，可执行文件将在 11 月 23 日周一发布，不附加任何条件。它称如果其 CYBERLEEK 代币先达到 1,500 万美元市值，文件会立即放出。",
+        "没有媒体或安全研究者独立验证这些文件是真正的 GTA VI 构建，Rockstar 和 Take-Two 也未置评。本站追踪的项目称手上的包内容与预期相符，含 26,503 个着色器，但没有可执行文件，谁也无法启动。",
+        "Cyberleek 还预言 PC 玩家会在一周内模拟运行这个版本。正如 Gamereactor 指出的，目前并不存在可用的 Xbox Series X|S 模拟器。这个缺口，正是本页这些项目想补上的。"
+      ]
+    },
+    "2026-11-19-fake-downloads": {
+      "title": "所有“GTA VI PC 版”下载都是假的，有些还会清空你的账号",
+      "dek": "安全公司已追踪到数万次 GTA VI 恶意软件检出，暗网上还有现成的诈骗工具包在售。",
+      "body": [
+        "GTA VI 没有 PC 版。Rockstar 没有宣布过，也没有任何社区移植能跑起这款游戏。这并没挡住一波假安装包。",
+        "卡巴斯基自 6 月以来记录了 27,000 多次与 GTA VI 相关的恶意软件和不受欢迎软件检出。ESET 发现一个名为 gta6_installer.exe 的文件携带 Vidar 信息窃取程序。Cynet 分析了一个假下载，它安装的窃取程序会拿走已保存的密码、浏览器 Cookie、Steam 和 Roblox 登录信息以及加密钱包数据。",
+        "NordVPN 的研究人员还发现暗网上有一套约 200 美元（加密货币）的工具包在售，让技术不高明的骗子也能自己发起假 GTA VI 下载活动。",
+        "危险信号是一致的：要求你以管理员身份运行、让你点掉安全警告或把杀毒软件加入排除项，还有些要求用加密货币或礼品卡付款。随着 Cyberleek 声称的可执行文件定在周一，准备迎接一大批冒充它的文件。如果你已经运行过其中一个，请把电脑视为已被入侵，并用另一台设备修改密码。"
+      ]
+    },
+    "2026-11-18-take-two-dmca": {
+      "title": "Take-Two 在 GitHub 上打击 GTA V 移植，称“自带文件”不是挡箭牌",
+      "dek": "在 GTA VI 发售前一天提交的四份 DMCA 通知，下架了非官方 GTA V 移植以及数百个分支。",
+      "body": [
+        "11 月 18 日，也就是 GTA VI 发售前一天，Take-Two 向 GitHub 发出了四份针对非官方 GTA V 移植的 DMCA 下架通知。目标包括一个 iOS 和 macOS 移植、一个多平台运行时、一个 Android 移植，以及与某浏览器版本相关的仓库。",
+        "各方报道的规模不一。有统计称单个移植被停用 349 个分支，另一篇标题则称总数超过 600 个项目。GitHub 没有公布最终数字。",
+        "理由比数字更重要。四个项目中有三个不含游戏文件，并要求用户自备副本。Take-Two 的通知主张，这种安排并不能为“帮助他人在未经许可的情况下复制游戏”开脱。",
+        "本站追踪的每个 GTA VI 项目都带着同样的“使用你自己的副本”声明。开发者可以提交反通知来抗辩下架，这会迫使 GitHub 恢复代码，除非 Take-Two 起诉——2021 年 re3 和 reVC 项目就是这样。"
+      ]
+    },
+    "2026-11-16-kurtaj-plea": {
+      "title": "2022 年 GTA VI 黑客认罪，将于周一宣判",
+      "dek": "Arion Kurtaj 承认入侵 Rockstar 并发布了约 90 段开发影像。他的宣判日与 Cyberleek 的可执行文件期限是同一天。",
+      "body": [
+        "Arion Kurtaj——2022 年 9 月 GTA VI 早期开发影像泄露的黑客——于 11 月 16 日在伦敦 Woolwich Crown Court 认罪。他承认入侵 Rockstar Games 并把约 90 段影像放上网。",
+        "指控还涉及对其他公司的入侵。他将于 11 月 23 日周一在同一法院宣判，正是 Cyberleek 声称要为其泄露的 Xbox 版本发布缺失可执行文件的那一天。",
+        "两次泄露彼此无关。2022 年那次入侵暴露的是 Rockstar 内部未完成的影像；Cyberleek 2026 年的发布则自称是已发售游戏的完整主机版本。"
+      ]
+    }
+  }
+}

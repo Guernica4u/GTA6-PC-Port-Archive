@@ -175,6 +175,17 @@ h1, h2, h3, h4 { font-family: var(--display); letter-spacing: -.02em; margin: 0;
 .nav-links a { white-space: nowrap; }
 html:not([lang="en"]) .nav-links a { padding-inline: 9px; }
 @media (max-width: 1100px) { .nav-links ~ .nav-updated { display: none; } .nav-links ~ .lang-pick { margin-left: auto; } }
+/* Chinese (Simplified and Traditional): CJK faces after the Latin ones, and no negative tracking, which
+   crams Han characters together. :lang(zh) matches zh-CN and zh-TW. */
+html:lang(zh) {
+  --display: "Inter Tight", "Inter", system-ui, -apple-system, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Microsoft JhengHei", "Noto Sans SC", "Noto Sans TC", sans-serif;
+  --body: "Inter", system-ui, -apple-system, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Microsoft JhengHei", "Noto Sans SC", "Noto Sans TC", sans-serif;
+}
+html:lang(zh) h1, html:lang(zh) h2, html:lang(zh) h3, html:lang(zh) h4, html:lang(zh) p { letter-spacing: 0; }
+html:lang(zh) .kicker, html:lang(zh) .mini-title { letter-spacing: .04em; }
+html:lang(zh) .lang-btn { padding-inline: 10px 12px; }
+html:lang(zh) .lang-btn span { font-size: 12px; }
+html:lang(zh) .lang-menu { min-width: 200px; }
 .brand-mark circle:first-of-type { stroke: var(--soft-2); }
 .nav-updated::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 3px rgba(22, 163, 106, .18); }
 

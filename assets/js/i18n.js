@@ -6,6 +6,8 @@
 
 export const LANGS = [
   { code: 'en', name: 'English', short: 'EN' },
+  { code: 'zh-CN', name: '简体中文', short: '简中' },
+  { code: 'zh-TW', name: '繁體中文', short: '繁中' },
   { code: 'pt-BR', name: 'Português (Brasil)', short: 'PT' },
   { code: 'es', name: 'Español', short: 'ES' },
 ];
@@ -30,6 +32,8 @@ export function pickLang() {
   if (saved) return saved;
   for (const l of navigator.languages?.length ? navigator.languages : [navigator.language || 'en']) {
     const low = String(l).toLowerCase();
+    // Traditional script (Taiwan, Hong Kong, Macao) gets zh-TW; anything else in Chinese gets zh-CN.
+    if (low.startsWith('zh')) return /hant|-tw|-hk|-mo/.test(low) ? 'zh-TW' : 'zh-CN';
     if (low.startsWith('pt')) return 'pt-BR';
     if (low.startsWith('es')) return 'es';
     if (low.startsWith('en')) return 'en';
@@ -76,6 +80,18 @@ export function tr(key, english, vars) {
 // Counted strings: key_one for exactly 1, key_other otherwise (right for en, pt-BR and es).
 export function tn(key, n, vars) {
   return t(`${key}_${n === 1 ? 'one' : 'other'}`, { n, ...vars });
+}
+
+// Translated content: project summaries, tool notes and news articles live in data/tracker.json in
+// English, so a language may ship an overlay at data/i18n-content/<code>.json keyed by id. Anything an
+// overlay leaves out stays in English, which is what happens to everything the scout adds between
+// translation passes. Returns null in English and when a language has no overlay.
+export async function loadContent() {
+  if (lang === 'en') return null;
+  try {
+    const res = await fetch(new URL(`../../data/i18n-content/${lang}.json`, import.meta.url), { cache: 'no-cache' });
+    return res.ok ? await res.json() : null;
+  } catch { return null; }
 }
 
 // Static markup: data-i18n="key" sets the text; data-i18n-attr="title:key;aria-label:key2" sets attributes.
