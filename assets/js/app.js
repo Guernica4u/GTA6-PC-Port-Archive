@@ -127,6 +127,8 @@ function renderHeroArt(site) {
 const LIVE_REFRESH_MS = 5 * 60_000;
 function watchViewers() {
   const pill = $('#watching');
+  // The viewer pill is optional markup: skip the poll where it's left out of the page.
+  if (!pill) return;
   let last = 0;
   const refresh = async () => {
     if (document.hidden) return;
