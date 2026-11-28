@@ -353,13 +353,7 @@ fn reflected_root(
         (Program::Raster { .. }, _) if heap_indexed_tabled_root(&signature, strides) => {
             return append_index_map_only(device, original, &signature, node, strides);
         }
-        // A raster root that does not index the heap still names the slots it
-        // leaves out in the FSSM rows. Append them the way a compute root's are
-        // appended: every existing range keeps its table offset, so a stage
-        // translated against the guest root keeps its registers.
-        (Program::Raster { vertex, pixel }, _) => {
-            return append_missing_raster_ranges(device, original, vertex, pixel, &signature, node, strides);
-        }
+        _ => return Ok(TableLayout::Unsupported),
     };
     let Some(bindings) = bindings else {
         if let Program::Compute(shader) = program {
@@ -615,7 +609,7 @@ fn append_corroborated_ranges(
     if signature.version != 2 {
         return Ok(TableLayout::Unsupported);
     }
-    let extra = tuxbox_dxbc::compute_table::missing_root_descriptors(shader, signature, 5);
+    let extra = tuxbox_dxbc::compute_table::missing_root_descriptors(shader, signature);
     let append_map = heap_indexed_tabled_root(signature, strides);
     let append_strides =
         strides && root_dword_cost(signature).saturating_add(if append_map { 2 } else { 0 }) <= 62;
@@ -623,46 +617,6 @@ fn append_corroborated_ranges(
         return Ok(TableLayout::Unsupported);
     }
     append_ranges_and_map(device, original, &extra, signature, node, append_map, append_strides)
-}
-
-/// Append the FSSM slots a raster root leaves out, for both stages.
-///
-/// The arms above only rebuild a root with one leading table plus trailing root
-/// constants when the root indexes the resource heap directly. A root that does
-/// not still has its omitted slots named by the FSSM rows, and a table can carry
-/// the extra ranges without moving an existing one, since each is added at the
-/// table offset its descriptor already occupies. When every slot is covered the
-/// guest root stays, as before.
-fn append_missing_raster_ranges(
-    device: &ID3D12Device,
-    original: &RootSource,
-    vertex: &[u8],
-    pixel: &[u8],
-    signature: &tuxbox_dxbc::rootsig::RootSig,
-    node: u32,
-    strides: bool,
-) -> Result<TableLayout> {
-    if signature.version != 2 {
-        return Ok(TableLayout::Unsupported);
-    }
-    let mut extra = tuxbox_dxbc::compute_table::missing_root_descriptors(vertex, signature, 1);
-    extra.extend(tuxbox_dxbc::compute_table::missing_root_descriptors(pixel, signature, 0));
-    // Both stages read their tables from the same SGPRs, so they can name one
-    // slot differently. That slot has no single binding, so keep the guest root.
-    extra.sort_by_key(|binding| (binding.table, binding.slot));
-    for pair in extra.windows(2) {
-        let (first, second) = (&pair[0], &pair[1]);
-        if (first.table, first.slot) == (second.table, second.slot)
-            && (first.kind, first.register, first.space) != (second.kind, second.register, second.space)
-        {
-            return Ok(TableLayout::Unsupported);
-        }
-    }
-    extra.dedup_by_key(|binding| (binding.table, binding.slot));
-    if extra.is_empty() {
-        return Ok(TableLayout::Unsupported);
-    }
-    append_ranges_and_map(device, original, &extra, signature, node, false, strides)
 }
 
 /// Keep all finite guest descriptor tables as-is and append the resource heap
