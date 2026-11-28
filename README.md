@@ -1,14 +1,14 @@
 # AnyXboxX GitHub export
 
-Issues, pull requests and comments from `LooperSalty/AnyXboxX`, exported from the GitHub REST API on 2026-11-27.
+Issues, pull requests and comments from `LooperSalty/AnyXboxX`, exported from the GitHub REST API on 2026-11-28.
 
 Each file in `data/` is gzipped JSON Lines: one API object per line, unchanged.
 
 | File | Contents | Items |
 |---|---|---|
-| `issues_and_prs.jsonl.gz` | every issue and PR (title, body, labels, state, author) | 222 |
-| `pulls.jsonl.gz` | PR details (head and base branch, merge state) | 480 |
-| `issue_comments.jsonl.gz` | conversation comments on issues and PRs | 877 |
+| `issues_and_prs.jsonl.gz` | every issue and PR (title, body, labels, state, author) | 224 |
+| `pulls.jsonl.gz` | PR details (head and base branch, merge state) | 483 |
+| `issue_comments.jsonl.gz` | conversation comments on issues and PRs | 906 |
 | `review_comments.jsonl.gz` | inline code-review comments | 30 |
 | `labels.jsonl.gz` | labels | 17 |
 
