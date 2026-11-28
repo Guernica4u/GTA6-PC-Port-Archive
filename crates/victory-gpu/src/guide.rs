@@ -1,3 +1,4 @@
+#![allow(clippy::items_after_test_module)]
 //! The host's own ray-tracing structures for the programs that walk the
 //! title's (`VICTORY_RAY_GUIDE`, `victory_shader::emit::ray_guide_level`):
 //! where the layer calls [`core`], which does the work and names nothing of

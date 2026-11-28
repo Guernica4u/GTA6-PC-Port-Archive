@@ -324,9 +324,9 @@ mod tests {
             assert!(!wanted(0x3431_0000, 0x1000));
         }
         let low = |at: u64, len: u64| at.checked_add(len).is_some_and(|end| end <= LOW && len > 0);
-        assert!(low(0x34e1_0000, 0xae0_0000));
-        assert!(!low(0xffff_0000, 0x2_0000));
-        assert!(!low(0xe1c80_0000, 0x1000));
+        assert!(low(0x34e10000, 0xae00000));
+        assert!(!low(0xffff0000, 0x20000));
+        assert!(!low(0xe1c800000, 0x1000));
         assert!(!low(u64::MAX, 2));
     }
 

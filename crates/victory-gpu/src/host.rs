@@ -2825,6 +2825,7 @@ struct Flight {
 }
 
 /// One thing in the line of what waits for the card, in order.
+#[allow(clippy::large_enum_variant)]
 enum Late {
     Run(Flight),
     /// A bottom-of-pipe write of the flight before it: address, what, bytes.
@@ -3607,7 +3608,7 @@ pub(crate) mod slot_stats {
         }
         let per = |n: u64| n as f64 / frames;
         let sizes: Vec<String> = made.iter().map(|c| format!("{:.0}/{:.0}", per(c[0]), per(c[1]))).collect();
-        let at_refusal = |i: usize| if refused[0] == 0 { 0 } else { refused[i] / refused[0] };
+        let at_refusal = |i: usize| refused[i].checked_div(refused[0]).unwrap_or(0);
         tracing::info!(
             "dynamic descriptor slots taken per frame: {:.0} in {:.0} tables ({:.0} for draws, {:.0} for dispatches) and {:.0} \
              for root views; tables/slots by size 1, 2-8, 9-16, 17-32, 33-64, 65-128, 129 and more: {}; the list had the \
@@ -8672,6 +8673,7 @@ enum Touch {
     /// The copy is given to shaders.
     Write(usize),
     /// Title memory is written.
+    #[allow(dead_code)]
     Title,
     Nothing,
     /// Another part of the submission begins.
