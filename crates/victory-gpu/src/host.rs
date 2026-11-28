@@ -3019,16 +3019,17 @@ impl Presenter {
     /// the back buffer, which `list` holds in the `from` state.
     ///
     /// # Safety
-    /// The back buffer is in the `from` state on this list.
+    /// The back buffer is in the `from` state on this list. The return
+    /// value is its state after the readout.
     unsafe fn readout(
         &self,
         device: &ID3D12Device,
         list: &ID3D12GraphicsCommandList,
         back: &ID3D12Resource,
         from: D3D12_RESOURCE_STATES,
-    ) {
+    ) -> D3D12_RESOURCE_STATES {
         let (Some(heap), Some((fps, ms))) = (&self.readout_rtv, self.meter.shown) else {
-            return;
+            return from;
         };
         let text = format!("{fps:.1} FPS  {ms:.0} MS");
         // Dots that keep their share of the picture at any size.
@@ -3042,16 +3043,15 @@ impl Presenter {
             bottom: at.1 + h * dot,
         };
         if behind.right > self.width as i32 || behind.bottom > self.height as i32 {
-            return;
+            return from;
         }
         let marks = crate::readout::rects(&text, at, dot);
-        let moved = from != D3D12_RESOURCE_STATE_RENDER_TARGET;
         // SAFETY: this list owns the back buffer in the caller's state and all
         // rectangles fit within its RTV.
         unsafe {
             let view = heap.GetCPUDescriptorHandleForHeapStart();
             device.CreateRenderTargetView(back, None, view);
-            if moved {
+            if from != D3D12_RESOURCE_STATE_RENDER_TARGET {
                 list.ResourceBarrier(&[transition(
                     back,
                     from,
@@ -3060,14 +3060,8 @@ impl Presenter {
             }
             list.ClearRenderTargetView(view, &[0.0, 0.0, 0.0, 1.0], Some(&[behind]));
             list.ClearRenderTargetView(view, &[1.0, 0.9, 0.1, 1.0], Some(&marks));
-            if moved {
-                list.ResourceBarrier(&[transition(
-                    back,
-                    D3D12_RESOURCE_STATE_RENDER_TARGET,
-                    from,
-                )]);
-            }
         }
+        D3D12_RESOURCE_STATE_RENDER_TARGET
     }
 }
 
@@ -3389,7 +3383,7 @@ impl Host {
                     let _ = frame;
                     (None::<()>, None::<()>)
                 };
-                p.readout(
+                let displayed_state = p.readout(
                     &self.device,
                     list,
                     &back,
@@ -3401,7 +3395,7 @@ impl Host {
                 }
                 after.push(transition(
                     &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    displayed_state,
                     D3D12_RESOURCE_STATE_PRESENT,
                 ));
                 list.ResourceBarrier(&after);
@@ -3503,15 +3497,6 @@ impl Host {
                     );
                     list.DrawInstanced(3, 1, 0, 0);
                 }
-                // Over the composed planes, which the back buffer already
-                // holds: the series-s profile presents a scene plane and a
-                // 4K interface plane through this path.
-                p.readout(
-                    &self.device,
-                    list,
-                    &back,
-                    D3D12_RESOURCE_STATE_RENDER_TARGET,
-                );
                 #[cfg(feature = "diagnostics")]
                 let (capture, probe) = {
                     list.ResourceBarrier(&[transition(
@@ -3523,9 +3508,16 @@ impl Host {
                         .then(|| crate::capture::read_back(&self.device, list, &back))
                         .flatten();
                     let probe = crate::capture::probe(&self.device, list, &back);
-                    list.ResourceBarrier(&[transition(
+                    // Draw the host readout after inspecting the scene.
+                    let displayed_state = p.readout(
+                        &self.device,
+                        list,
                         &back,
                         D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    );
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        displayed_state,
                         D3D12_RESOURCE_STATE_PRESENT,
                     )]);
                     (capture, probe)
@@ -3533,9 +3525,15 @@ impl Host {
                 #[cfg(not(feature = "diagnostics"))]
                 let (capture, probe) = {
                     let _ = frame;
-                    list.ResourceBarrier(&[transition(
+                    let displayed_state = p.readout(
+                        &self.device,
+                        list,
                         &back,
                         D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    );
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        displayed_state,
                         D3D12_RESOURCE_STATE_PRESENT,
                     )]);
                     (None::<()>, None::<()>)
