@@ -7,6 +7,8 @@ use std::sync::{mpsc, Mutex};
 use std::time::Duration;
 
 pub(crate) struct Corpus {
+    directory: PathBuf,
+    expected: [usize; 2],
     graphics: Option<(PathBuf, usize)>,
     compute: Vec<(u64, PathBuf)>,
     windows: u32,
@@ -30,13 +32,13 @@ fn identity(path: &Path) -> Result<Option<[u8; 32]>, String> {
     Ok(Some(out))
 }
 
-pub(crate) fn discover(root: &Path) -> Result<Option<Corpus>, String> {
+fn metadata(root: &Path) -> Result<Option<(PathBuf, [usize; 2], u32, Option<[u8; 32]>)>, String> {
     let dir = root.join(".xcl").join("pso-corpus");
     if !dir.try_exists().map_err(|e| e.to_string())? { return Ok(None); }
     let marker = std::fs::read_to_string(dir.join("complete")).map_err(|e| format!("Incomplete pipeline corpus: {e}"))?;
     let expected = marker.split_whitespace().map(str::parse::<usize>).collect::<Result<Vec<_>, _>>()
         .map_err(|_| "Invalid pipeline corpus counts")?;
-    if expected.len() != 2 { return Err("Expected graphics and compute counts in the corpus marker".into()); }
+    let expected: [usize; 2] = expected.try_into().map_err(|_| "Expected graphics and compute counts in the corpus marker")?;
     let encoded = std::fs::read_to_string(dir.join("windows")).map_err(|e| e.to_string())?;
     let encoded = encoded.trim().parse::<u8>().map_err(|_| "Invalid corpus memory window count")?;
     let count = (encoded & 127) as usize;
@@ -45,6 +47,23 @@ pub(crate) fn discover(root: &Path) -> Result<Option<Corpus>, String> {
         return Err(format!("Invalid corpus memory window configuration {encoded}"));
     }
     let windows = count as u32 | if heap { recomp::HEAP_WINDOWS } else { 0 };
+    let identity = identity(&dir.join("identity"))?;
+    Ok(Some((dir, expected, windows, identity)))
+}
+
+pub(crate) fn summary(root: &Path) -> Result<Option<Corpus>, String> {
+    Ok(metadata(root)?.map(|(directory, expected, windows, identity)| Corpus {
+        directory,
+        expected,
+        graphics: None,
+        compute: Vec::new(),
+        windows,
+        identity,
+    }))
+}
+
+pub(crate) fn discover(root: &Path) -> Result<Option<Corpus>, String> {
+    let Some((dir, expected, windows, identity)) = metadata(root)? else { return Ok(None) };
     let path = dir.join("graphics.bin");
     let graphics = if path.try_exists().map_err(|e| e.to_string())? {
         if expected[0] == 0 { return Err("Unexpected graphics job in compute-only corpus".into()); }
@@ -73,23 +92,18 @@ pub(crate) fn discover(root: &Path) -> Result<Option<Corpus>, String> {
         return Err("Pipeline corpus is missing records. Restage before launching.".into());
     }
     if graphics.is_none() && compute.is_empty() { return Err("Published pipeline corpus is empty".into()); }
-    let identity = identity(&dir.join("identity"))?;
-    Ok(Some(Corpus { graphics, compute, windows, identity }))
+    Ok(Some(Corpus { directory: dir, expected, graphics, compute, windows, identity }))
 }
 
 impl Corpus {
     pub(crate) fn identity(&self) -> Option<[u8; 32]> { self.identity }
 
-    pub(crate) fn directory(&self) -> &Path {
-        self.graphics.as_ref().map(|(path, _)| path.parent().unwrap())
-            .or_else(|| self.compute.first().and_then(|(_, path)| path.parent()?.parent()))
-            .expect("a published corpus is not empty")
-    }
+    pub(crate) fn directory(&self) -> &Path { &self.directory }
 
     pub(crate) fn windows(&self) -> u32 { self.windows }
 
     pub(crate) fn counts(&self) -> (usize, usize) {
-        (self.graphics.as_ref().map_or(0, |(_, count)| *count), self.compute.len())
+        (self.expected[0], self.expected[1])
     }
 
     pub(super) fn graphics_path(&self) -> Option<&Path> {

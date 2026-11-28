@@ -292,6 +292,47 @@ void main() { output.Store(0, 42); }
     }
 
     #[test]
+    fn distinct_compute_pipelines_scale_and_remain_individually_loadable() {
+        const COUNT: usize = 32;
+        let Some((pipelines, _, root)) = fixture() else { return };
+        let library = NativeLibrary::empty(&pipelines.dev).expect("empty pipeline library");
+        let mut programs = Vec::with_capacity(COUNT);
+        let build_at = Instant::now();
+        for n in 0..COUNT {
+            let source = format!(r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer output : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {{ output.Store(0, {n}); }}
+"#);
+            let dxil = recomp::dxc::compile(&source, "main", "cs_6_6", &[]).expect("DXC compile");
+            let desc = compute_desc(&dxil, &root);
+            let pso = unsafe { pipelines.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) }
+                .expect("distinct compute pipeline");
+            library.store(&format!("unique-{n:04}"), &pso).expect("store distinct pipeline");
+            drop_desc(desc);
+            programs.push(dxil);
+        }
+        let build_time = build_at.elapsed();
+        let bytes = library.serialize().expect("serialize distinct pipelines");
+        let open_at = Instant::now();
+        let reopened = NativeLibrary::open(&pipelines.dev, bytes.clone()).expect("reopen distinct pipelines");
+        let open_time = open_at.elapsed();
+        let load_at = Instant::now();
+        for (n, dxil) in programs.iter().enumerate() {
+            let desc = compute_desc(dxil, &root);
+            reopened.load_compute(&format!("unique-{n:04}"), &desc).expect("load distinct pipeline");
+            drop_desc(desc);
+        }
+        let load_time = load_at.elapsed();
+        println!(
+            "pipeline library: unique={COUNT} serialized_bytes={} cold_ms={} open_us={} load_all_us={}",
+            bytes.len(), build_time.as_millis(), open_time.as_micros(), load_time.as_micros()
+        );
+    }
+
+    #[test]
     fn truncated_pipeline_library_is_rejected() {
         let Some((pipelines, dxil, root)) = fixture() else { return };
         let desc = compute_desc(&dxil, &root);

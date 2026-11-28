@@ -1976,8 +1976,8 @@ fn loose_inputs(dir: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
 }
 
 pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> Result<(), String> {
-    let corpus = pso_corpus::discover(root)?;
-    if let Some(corpus) = &corpus {
+    let summary = pso_corpus::summary(root)?;
+    if let Some(corpus) = &summary {
         if warm_library::reuse(corpus, &progress.adapter) {
             let (graphics, compute) = corpus.counts();
             let total = graphics.checked_add(compute).ok_or("Pipeline corpus count overflow")?;
@@ -1987,6 +1987,7 @@ pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> R
             return Ok(());
         }
     }
+    let corpus = pso_corpus::discover(root)?;
     prepare_title_inputs(root, progress, corpus.as_ref())?;
     if let Some(corpus) = corpus {
         corpus.prepare(progress)?;

@@ -238,6 +238,7 @@ mod tests {
         assert!(dir.join(RECEIPT).is_file() && dir.join(COMPUTE).is_file());
         assert!(!dir.join("compute.plib.pending").exists());
         assert!(take_ready().unwrap().compute.is_some());
+        std::fs::remove_file(dir.join("compute/0000000000000001.dxbc")).unwrap();
         std::fs::write(root.join("shaders.rpf"), b"invalid pack that the fast path must not read").unwrap();
         let progress = super::super::LaunchPreparation { adapter: "auto".into(), ..Default::default() };
         super::super::prepare_for_launch(&root, &progress).unwrap();
@@ -254,7 +255,7 @@ mod tests {
         assert!(!reuse(&corpus, "auto"));
         std::fs::write(&final_path, valid).unwrap();
         std::fs::write(dir.join("identity"), "02".repeat(32)).unwrap();
-        let changed = super::super::pso_corpus::discover(&root).unwrap().unwrap();
+        let changed = super::super::pso_corpus::summary(&root).unwrap().unwrap();
         assert!(!reuse(&changed, "auto"));
         drop(ManuallyDrop::into_inner(desc.pRootSignature));
     }
