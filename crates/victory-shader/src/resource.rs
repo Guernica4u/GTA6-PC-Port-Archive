@@ -1712,6 +1712,35 @@ impl<'a> Tracer<'a> {
             })
         };
         match (a, b) {
+            (Term::Value(va), Term::Value(vb))
+                if let (Some((pb_a, pi_a)), Some((pb_b, pi_b))) =
+                    (self.phis[va.0 as usize], self.phis[vb.0 as usize])
+                    && pb_a == pb_b =>
+            {
+                let block = &self.p.blocks[pb_a];
+                if block
+                    .preds
+                    .iter()
+                    .any(|&pred| self.rpo[pred] >= self.rpo[pb_a])
+                {
+                    return false;
+                }
+                let args_a = &block.phis[pi_a].args;
+                let args_b = &block.phis[pi_b].args;
+                block.preds.iter().zip(args_a.iter().zip(args_b)).all(
+                    |(&pred, (&arg_a, &arg_b))| {
+                        let mut edge = known.clone();
+                        Self::assume_edge(lanes, pred, pb_a, &mut edge);
+                        !self.consistent(&edge)
+                            || self.same_under(
+                                Term::Value(arg_a),
+                                Term::Value(arg_b),
+                                &edge,
+                                depth + 1,
+                            )
+                    },
+                )
+            }
             (Term::Value(va), _) if self.phis[va.0 as usize].is_some() => check_phi(va, b),
             (_, Term::Value(vb)) if self.phis[vb.0 as usize].is_some() => check_phi(vb, a),
             _ => false,
