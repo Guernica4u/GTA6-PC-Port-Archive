@@ -277,10 +277,15 @@ def _server_render_device(pid):
 @contextmanager
 def _xwayland(xwayland, display, auth, geometry, timeout, options=()):
     """Yield (DISPLAY, pid) of a started rootful Xwayland, or None; stop it when the block exits."""
+    # A driver cache path exported for the guest is not the server's. NVIDIA's
+    # driver in Xwayland would share it without the launcher's cleanup opt-out,
+    # and once the folder passes the default cap it deletes every file there
+    # that no running process holds: the guest's pipelines, at each launch.
+    env = {key: value for key, value in os.environ.items() if key != "__GL_SHADER_DISK_CACHE_PATH"}
     read, write = os.pipe()
     try:
         server = subprocess.Popen([xwayland, f":{display}", "-displayfd", str(write), "-geometry", geometry,
-                                   "-noreset", "-auth", str(auth), *options], pass_fds=(write,),
+                                   "-noreset", "-auth", str(auth), *options], pass_fds=(write,), env=env,
                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
         os.close(read)
