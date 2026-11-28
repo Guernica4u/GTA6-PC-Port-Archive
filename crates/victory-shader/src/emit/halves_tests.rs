@@ -175,7 +175,7 @@ fn refusal(words: &[u32], threads: u32, lds_bytes: u32) -> String {
 /// The hand-encoded words are the instructions their comments name.
 #[test]
 fn the_test_programs_are_what_their_comments_say() {
-    let programs: [(Vec<u32>, &[&str]); 37] = [
+    let programs: [(Vec<u32>, &[&str]); 38] = [
         (
             sum16(),
             &[
@@ -307,13 +307,14 @@ fn the_test_programs_are_what_their_comments_say() {
             ],
         ),
         (
-            mask_kept_by_a_shift(true),
+            mask_kept_by_a_shift(true, true),
             &[
                 "v_xor_b32 v3, 5, v0",
                 "s_cmp_eq_u32 s5, 0",
                 "s_cbranch_scc0",
                 "v_cmp_gt_u32 vcc, v3, v4",
                 "v_mov_b32 v4, vcc_hi",
+                "s_dcache_wb",
                 "v_add_nc_u32 v4, v2, v2 row_shr:15",
             ],
         ),
@@ -542,6 +543,18 @@ fn the_test_programs_are_what_their_comments_say() {
                 "v_readfirstlane_b32 s12, v2",
                 "v_mov_b32 v3, s12",
                 "buffer_store_dword v1, v16, s[40:43], 0 offen offset:4",
+            ],
+        ),
+        (
+            first_lane_beside_full_lds(),
+            &[
+                "v_and_b32 v1, 63, v0",
+                "ds_write_b32 v4, v5",
+                "s_barrier",
+                "v_cmp_lt_u32 vcc, 35, v1",
+                "v_readfirstlane_b32 s14, v0",
+                "ds_read_b32 v7, v4",
+                "buffer_store_dword v7, v16, s[40:43], 0 offen offset:4",
             ],
         ),
         (
@@ -1726,8 +1739,10 @@ fn collectives_cross_the_halves_on_every_gpu() {
 /// A mask's high dword read as data under a branch on a scalar compare,
 /// then kept by a DPP shift after the join in the lanes without a source
 /// lane (0-14 of each row). With `ends`, the branch ends the program where
-/// a second scalar compare holds (it never does).
-fn mask_kept_by_a_shift(ends: bool) -> Vec<u32> {
+/// a second scalar compare holds (it never does); with `effect`, the branch
+/// writes back the scalar cache (`s_dcache_wb`), an effect beyond its values
+/// that keeps its region from running wave-wide.
+fn mask_kept_by_a_shift(ends: bool, effect: bool) -> Vec<u32> {
     let mut w = PROLOGUE.to_vec();
     w.extend([
         0x3420_0085, // v_lshlrev_b32 v16, 5, v0
@@ -1742,6 +1757,9 @@ fn mask_kept_by_a_shift(ends: bool) -> Vec<u32> {
         0x7D88_0903,        // v_cmp_gt_u32 vcc, v3, v4
         vop1(4, 0x01, 107), // v_mov_b32 v4, vcc_hi
     ];
+    if effect {
+        body.extend([0xF484_0000, 0xFA00_0000]); // s_dcache_wb
+    }
     if ends {
         body.extend([
             0xBF06_8105, // s_cmp_eq_u32 s5, 1
@@ -1762,21 +1780,26 @@ fn mask_kept_by_a_shift(ends: bool) -> Vec<u32> {
 
 /// In halves a write under a lane guard (here DPP's lanes without a source)
 /// is refused when what the other lanes keep was refused: there, a mask
-/// read in a branch on a scalar compare, in a group of two console waves
-/// (run wave-wide, the branch able to end the program), where the halves
-/// would trade through group-shared memory the program's 32 KiB of LDS
-/// leaves no room for. Kept as zero it would store 0 where the console
-/// stores the mask. With room, the halves trade.
+/// read in a branch on a scalar compare, in a group of two console waves,
+/// where the halves cannot meet (the branch's scalar cache write-back keeps
+/// its region from running wave-wide). Kept as zero it would store 0 where
+/// the console stores the mask. Where its region runs wave-wide, the halves
+/// trade, also where the program's LDS takes the host's whole 32 KiB (the
+/// slots borrowed from it).
 #[test]
 fn a_kept_refused_value_refuses_the_write_in_halves() {
-    let why = refusal(&mask_kept_by_a_shift(true), 128, 32768);
+    let why = refusal(&mask_kept_by_a_shift(true, true), 128, 0);
     assert!(
-        why.contains("past the host's 32 KiB of group-shared memory"),
+        why.contains("written where not every thread of the group meets"),
         "{why}"
+    );
+    assert_eq!(
+        refusal(&mask_kept_by_a_shift(true, false), 128, 32768),
+        "translated"
     );
     for ends in [true, false] {
         for threads in [64, 128] {
-            let words = mask_kept_by_a_shift(ends);
+            let words = mask_kept_by_a_shift(ends, false);
             assert_eq!(
                 refusal(&words, threads, 0),
                 "translated",
@@ -3011,6 +3034,66 @@ fn scalars_a_loop_leaves_are_the_console_waves_in_every_lane_in_halves_on_every_
             let found = differences_in_halves(&lane_read_loop(joined), threads, 2, &want);
             failed.extend(found.into_iter().map(|d| format!("joined {joined}: {d}")));
         }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// Every thread writes its thread id plus 1000 at its own LDS dword, then
+/// the thread id of the first lane in EXEC among console lanes from 36
+/// (the console lane as data, the thread id's low six bits: nothing else
+/// reads other lanes) is read (`v6`), and each thread reads its LDS dword
+/// back (`v7`). Run with LDS of the host's whole 32 KiB, which leaves the
+/// trade no room beside it.
+fn first_lane_beside_full_lds() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085,                // v_lshlrev_b32 v16, 5, v0
+        vop2(1, 0x1B, 128 + 63, 0), // v_and_b32 v1, 63, v0
+        vop2(4, 0x1A, 128 + 2, 0),  // v_lshlrev_b32 v4, 2, v0
+        vop2(5, 0x25, 255, 0),
+        1000, // v_add_nc_u32 v5, 1000, v0
+        0xD834_0000,
+        0x0000_0504, // ds_write_b32 v4, v5
+        S_WAITCNT_LGKM,
+        0xBF8A_0000,         // s_barrier
+        0x7D82_02A3,         // v_cmp_lt_u32 vcc, 35, v1
+        0xBE94_246A,         // s_and_saveexec_b64 s[20:21], vcc
+        vop1(14, 0x02, 256), // v_readfirstlane_b32 s14, v0
+        0xBEFE_0414,         // s_mov_b64 exec, s[20:21]
+        vop1(6, 0x01, 14),   // v_mov_b32 v6, s14
+        0xD8D8_0000,
+        0x0700_0004, // ds_read_b32 v7, v4
+        S_WAITCNT_LGKM,
+    ]);
+    w.extend(store(6, 0));
+    w.extend(store(7, 4));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// [`first_lane_beside_full_lds`] on every hardware adapter in halves, in
+/// groups of 48, 64 and 128 (the last in halves for its first-lane read
+/// alone; the console's own form reads lane 0 under a narrowed EXEC on
+/// `main`, which #2830 fixes): the halves trade
+/// through slots borrowed from the program's LDS, which then holds the
+/// program's values again. Before, such a program was refused in halves,
+/// or, reading first lanes alone, kept each host wave's own first lane
+/// (carlosmegino's synthetic case).
+#[test]
+fn a_trade_beside_a_full_lds_borrows_its_slots_and_gives_them_back_on_every_gpu() {
+    let mut failed = Vec::new();
+    for threads in [48, 64, 128] {
+        let want: Vec<u32> = (0..threads)
+            .flat_map(|l| [(l & !63) + 36, l + 1000])
+            .collect();
+        failed.extend(compared(
+            &first_lane_beside_full_lds(),
+            threads,
+            32768,
+            2,
+            &want,
+            false,
+        ));
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }

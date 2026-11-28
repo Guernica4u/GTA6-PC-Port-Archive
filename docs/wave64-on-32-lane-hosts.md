@@ -54,7 +54,7 @@ group does (`lower::wide`), so the halves meet there.
 | `v_readlane_b32` of a value the same in every lane of the console wave, written where every lane runs | that value | the lane's own | 1 |
 | `v_readlane_b32`, any other | every lane gets lane L's value | the half holding lane L gives it (`Lower::across`) | 2, 3 |
 | `v_readfirstlane_b32` of a value the same in every lane of the console wave (`halves::lane_uniform`), or a waterfall loop's descriptor read | that value | exact | 1 |
-| `v_readfirstlane_b32`, any other | the first lane in EXEC of 64 | each half's first lane in EXEC and whether it has one, traded: the low half's if any (`Lower::first_lane`); a program with no other cross-lane read runs in halves for it (`halves::first_across`) | 2, 3 |
+| `v_readfirstlane_b32`, any other | the first lane in EXEC of 64 | each half's first lane in EXEC and whether it has one, traded: the low half's if any (`Lower::first_lane`); a program with no other cross-lane read runs in halves for it (`halves::first_across`), and where it cannot run there, keeps `main`'s form (each host wave's first lane: exact for the compiler's scalarization loops and for values it keeps the same in every lane) | 2, 3 |
 | A lane mask read as data (`s_bcnt1_i32_b64`, `s_ff1_i32_b64`, 64-bit compares, masks stored) | 64 bits | each half's ballot is one dword of it, traded (`Lower::mask_halves`) | 2, 3 |
 | Whole-wave sections (reductions, prefix sums) | over 64 lanes | each half's part, traded and combined, low half first (`Lower::reduce_halves`) | 2, 3 |
 | A value a whole-wave section leaves whose lanes hold different things (each half's sum in some, the wave's in others), read after it | each lane's own | where every thread meets, in a group of whole console waves, the section runs step by step, its lane reads across the halves traded (`halves::Literal`); main keeps such a value as zero in lanes a later masked write leaves, and refuses it in halves elsewhere | 2 |
@@ -102,7 +102,13 @@ from different places (#2214's review: undefined in D3D12).
 
 Each half writes two dwords per exchange, beside the program's own LDS:
 D3D12 gives a group 32 KiB of group-shared memory, the console up to 64 KiB
-of LDS, so the slots must fit (else the program is refused).
+of LDS. Where the program's LDS leaves the slots no room, they are its
+first dwords, borrowed (`Lower::take_slots`): a barrier (every thread's
+earlier accesses done), each thread saves one of them (its flat id's,
+modulo their count, so that every one is saved and threads that share one
+save the same value), a barrier, the exchange, and each thread stores back
+what it saved, then a barrier. Three barriers more, paid only by such
+programs.
 
 ## Level 3: regions only some lanes run
 
@@ -222,9 +228,10 @@ that 735 compute programs share):
 | regions a whole-group branch goes around or into | 2,721 |
 | sections step by step in blocks run wave-wide | 2,723 |
 | descriptors chosen where the whole group goes into a region | 2,725 |
+| trades through slots borrowed from a full LDS | 2,727 |
 
-Still refused in halves: 1 mask in a region of neither shape; 2 programs whose LDS leaves no room for the
-trades' 16 bytes per console wave; 6 tiled group shapes.
+Still refused in halves: 1 mask in a region of neither shape; 6 tiled
+group shapes.
 
 Before Levels 2 and 3, a local build that recorded every cross-half site
 (and went on past each refusal, so every block was seen) classified the
@@ -256,8 +263,9 @@ point every lane reaches):
 in halves and as one wave64 where the adapter runs 64-lane waves, against
 the console's results: lane reads, first lanes, masks and sums at meeting
 points, in one-half regions and wave-wide, LDS of one-wave groups
-(including a race that only barriers prevent), group shapes, and the
-group-shared slots' cost in barriers; loops each lane leaves in its own
+(including a race that only barriers prevent), group shapes, the
+group-shared slots' cost in barriers, and a trade beside LDS of the host's
+whole 32 KiB, through slots borrowed from it and given back; loops each lane leaves in its own
 round (the halves going round different numbers of times) with first
 lanes, masks and LDS inside, and a first lane read after such a loop;
 regions a whole-group branch goes around or into (also with a descriptor

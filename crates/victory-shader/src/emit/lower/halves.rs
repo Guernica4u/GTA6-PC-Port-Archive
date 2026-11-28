@@ -326,10 +326,12 @@ impl Lower<'_> {
     /// overwriting them first. Per word, the low half's and the high half's;
     /// a half without threads (in a group that ends inside a console wave's
     /// low half) gives the identity. A barrier one half skips hangs the GPU
-    /// (D3D12 leaves it undefined; NVIDIA waits for every thread).
+    /// (D3D12 leaves it undefined; NVIDIA waits for every thread). Slots
+    /// borrowed from the program's LDS are saved before and given back after
+    /// ([`Lower::take_slots`]).
     fn trade(&mut self, at: usize, words: &[(V, u32)]) -> Result<Vec<(V, V)>, Why> {
         debug_assert!(words.len() <= WORDS as usize);
-        let slots = self.slots()?;
+        let (slots, saved) = self.take_slots(at)?;
         let f = self.relabelled_flat();
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
         let (k5, k6, kw, k2w) = (k(self, 5), k(self, 6), k(self, WORDS), k(self, 2 * WORDS));
@@ -369,6 +371,7 @@ impl Lower<'_> {
             traded.push((lo, hi));
         }
         self.group_barrier(at);
+        self.give_back(at, slots, saved);
         Ok(traded)
     }
 
@@ -666,7 +669,7 @@ impl Lower<'_> {
             let both = self.s.m.bin(at, Bin::Or, low, high);
             return Ok(self.s.m.cmp(at, pred::NE, both, zero));
         }
-        let slots = self.slots()?;
+        let (slots, saved) = self.take_slots(at)?;
         let f = self.relabelled_flat();
         let (k5, kw) = (self.s.m.i32(5), self.s.m.i32(WORDS));
         let own = self.s.m.bin(at, Bin::LShr, f, k5);
@@ -682,6 +685,7 @@ impl Lower<'_> {
             any = self.s.m.bin(at, Bin::Or, any, w);
         }
         self.group_barrier(at);
+        self.give_back(at, slots, saved);
         Ok(self.s.m.cmp(at, pred::NE, any, zero))
     }
 
@@ -695,22 +699,71 @@ impl Lower<'_> {
     }
 
     /// The trade's group-shared slots, made once: [`WORDS`] dwords per half
-    /// of each console wave of the group, beside the program's own LDS and
-    /// within the host's 32 KiB.
-    fn slots(&mut self) -> Result<V, Why> {
+    /// of each console wave of the group ([`Lower::slot_dwords`]), beside
+    /// the program's own LDS and within the host's 32 KiB; where the
+    /// program's LDS leaves no room, its first dwords, borrowed (`true`).
+    fn slots(&mut self) -> Result<(V, bool), Why> {
         if let Some(g) = self.exchange.slots {
             return Ok(g);
         }
-        let group = self.s.threads.map_or(64, |t| t.iter().product::<u32>());
-        let dwords = 2 * WORDS * group.div_ceil(64);
-        if self.s.lds_dwords + dwords > 8192 {
+        let dwords = self.slot_dwords();
+        let g = if self.s.lds_dwords + dwords <= 8192 {
+            (self.s.shared("halves", dwords), false)
+        } else if dwords <= self.s.lds_dwords {
+            (self.s.lds(), true)
+        } else {
             return Err(
                 "a trade between 32-lane halves past the host's 32 KiB of group-shared memory",
             );
-        }
-        let g = self.s.shared("halves", dwords);
+        };
         self.exchange.slots = Some(g);
         Ok(g)
+    }
+
+    /// How many dwords the trade's slots take: [`WORDS`] per half of each
+    /// console wave of the group.
+    fn slot_dwords(&self) -> u32 {
+        let group = self.s.threads.map_or(64, |t| t.iter().product::<u32>());
+        2 * WORDS * group.div_ceil(64)
+    }
+
+    /// The trade's slots ([`Lower::slots`]), in DXIL block `at`, and where
+    /// they are borrowed from the program's LDS, what the thread saved of
+    /// it first: a group barrier (every thread's earlier accesses to them
+    /// done), each thread loads one slot ([`Lower::saved_slot`]), and a
+    /// second barrier before any is written.
+    fn take_slots(&mut self, at: usize) -> Result<(V, Option<V>), Why> {
+        let (slots, borrowed) = self.slots()?;
+        if !borrowed {
+            return Ok((slots, None));
+        }
+        self.group_barrier(at);
+        let p = self.saved_slot(at, slots);
+        let saved = self.s.m.load(at, p);
+        self.group_barrier(at);
+        Ok((slots, Some(saved)))
+    }
+
+    /// The slot a thread saves and gives back where the slots are
+    /// borrowed: its flat id's, modulo their count, so that every slot is
+    /// saved, and the threads that share one save and give back the same
+    /// value.
+    fn saved_slot(&mut self, at: usize, slots: V) -> V {
+        let f = self.relabelled_flat();
+        let n = self.s.m.i32(self.slot_dwords());
+        let index = self.s.m.bin(at, Bin::URem, f, n);
+        self.s.m.element(at, slots, index)
+    }
+
+    /// After a trade through slots borrowed from the program's LDS
+    /// ([`Lower::take_slots`]): each thread stores back the slot it saved,
+    /// and a group barrier before the program's next access.
+    fn give_back(&mut self, at: usize, slots: V, saved: Option<V>) {
+        if let Some(saved) = saved {
+            let p = self.saved_slot(at, slots);
+            self.s.m.store(at, p, saved);
+            self.group_barrier(at);
+        }
     }
 }
 
@@ -780,8 +833,9 @@ pub(super) struct Exchange {
     /// Per IR block: every thread of the group gets there together, the
     /// same number of times ([`meeting`]).
     meet: Vec<bool>,
-    /// [`Lower::slots`], once made.
-    slots: Option<V>,
+    /// [`Lower::slots`], once made, and whether they are borrowed from the
+    /// program's LDS.
+    slots: Option<(V, bool)>,
     /// A group of one console wave with LDS: where it needs barriers.
     lds: Option<Lds>,
     /// Why the program cannot run in halves ([`lds_fences`]).
