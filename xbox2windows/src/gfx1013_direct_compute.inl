@@ -35,6 +35,8 @@ struct DirectCompute {
     std::map<std::pair<unsigned,unsigned>,string> descriptor_strides;
     unsigned label_number = 0;
     bool pixel_stage = false;
+    bool complete_compute_quads = false;
+    bool compute_derivatives = false;
     // Straight-line graphics stages keep exact SSA definitions; a missing
     // entry value is resolved through the container's stage signature.
     std::function<string(unsigned)> graphics_input;
@@ -201,6 +203,7 @@ struct DirectCompute {
     }
     void initialize(unsigned user, unsigned flags, unsigned x, unsigned y, unsigned z) {
         unsigned threads = x * y * z;
+        complete_compute_quads = threads % 4 == 0;
         lane = ir.invoke("i32", "waveGetLaneIndex", 111, {}, "nounwind readnone");
         lane_bit = ir.binary("shl", "1", lane);
         write(126, ballot("true"));
@@ -538,6 +541,23 @@ struct DirectCompute {
             const unsigned limit = smem_sgpr_limit(!graphics_input && !wave64);
             const auto &low = s.at(i.src[0]);
             const bool root = low.type == Symbol::Type::root_address;
+            if (low.type == Symbol::Type::heap_offset) {
+                // A resource-heap address formed by s_add_u32 (heap_offset_add): the same slot read as the SGPR-offset
+                // load below, with the byte offset in the low word.
+                if (!heap_offset_address(s, i.src[0]))
+                    refuse(i.pc, "heap descriptor address high word is not the carry of its offset add");
+                if (i.op != 2)
+                    refuse(i.pc, "heap descriptor address must load one descriptor with s_load_dwordx4");
+                refuse_heap_contract(i.pc);
+                if (so != 125)
+                    refuse(i.pc, "heap descriptor address with a second offset register");
+                if (i.b & 0xfffff)
+                    refuse(i.pc, "heap descriptor load with an immediate offset addresses another slot than the captured selection");
+                auto index = ir.binary("lshr", read(i.src[0]), "5");
+                for (unsigned j = 0; j < 4; ++j)
+                    write(i.dst + j, index);
+                return;
+            }
             if (!root && low.type == Symbol::Type::table && low.value == compute_resource_heap) {
                 // Reads from the whole descriptor heap: only the indexed descriptor load of a captured raw buffer slot.
                 if (i.op >= 8)
@@ -828,8 +848,11 @@ struct DirectCompute {
         const bool compare_gather = i.op == 79;
         const bool compare = i.op == 40 || i.op == 47 || compare_gather;
         const bool implicit = i.op == 32 || i.op == 40 || bias || query || i.op == 64;
-        if (implicit && !pixel_stage)
-            refuse(i.pc, "implicit derivatives require a pixel stage");
+        if (implicit && !pixel_stage) {
+            if (!complete_compute_quads)
+                refuse(i.pc, "implicit derivatives require a pixel stage");
+            compute_derivatives = true;
+        }
         const bool gather = i.op == 64 || i.op == 71 || compare_gather;
         const bool gather_lod = i.op == 68;
         const bool sample = (!gather && implicit) || (compare && !gather) || gradient || i.op == 39 || i.op == 36,
@@ -840,14 +863,19 @@ struct DirectCompute {
         constexpr unsigned dx_kind[]{1, 2, 4, 5, 6, 7, 3, 8};
         constexpr unsigned coord_count[]{1, 2, 3, 3, 2, 3, 2, 3};
         const unsigned coords = coord_count[dim];
-        if ((i.op != 0 && i.op != 1 && !store && !sample && !gather && !gather_lod && !dimensions) || !mask || (i.a & 0x3e0c0u) ||
+        const bool exact_store = store && !half && !graphics_input && (dim == 1 || dim == 2 || dim == 5) &&
+                                 (mask == 1 || mask == 3 || mask == 7);
+        // Read-only image ops ignore GLC (bit 13, 0x2000) and DLC (bit 7, 0x0080) cache hints;
+        // LWE (0x20000), TFE (0x10000), R128 (0x8000), reserved bits (0x4040), and store GLC/DLC stay refused.
+        if ((i.op != 0 && i.op != 1 && !store && !sample && !gather && !gather_lod && !dimensions) || !mask ||
+            (i.a & (store ? 0x3e0c0u : 0x3c040u)) ||
             (i.b & 0x3c000000u) || (gather && ((mask & (mask - 1)) || (dim != 1 && dim != 3 && dim != 5))) ||
             (query && ((dim != 1 && dim != 3) || (mask & ~3u))) ||
             (compare && (mask != 1 || (dim != 1 && dim != 3 && dim != 5) || (i.a & 0x1000u))) ||
             (compare_gather && dim == 3) ||
             ((sample || gather) && (i.a & 0x1000u) && gradient) ||
             (dimensions && (dim == 4 || dim >= 6 || (i.b & 0x40000000u))) ||
-            (store && !half && mask != 15) || (half && mask != 1 && mask != 3 && mask != 15) ||
+            (store && !half && mask != 15 && !exact_store) || (half && mask != 1 && mask != 3 && mask != 15) ||
             s.at(base).type != Symbol::Type::descriptor)
             refuse(i.pc, "direct image opcode or descriptor modifiers");
         if (gather_lod && (dim != 1 || (mask & (mask - 1)) || (i.a & 0x1006u) || (i.b & 0xc0000000u) || i.dst > 252))
@@ -856,10 +884,13 @@ struct DirectCompute {
             (dim >= 6 && (sample || gather || store || lod)))
             refuse(i.pc, "unsupported cube or multisample operation");
         const bool d16_sample = !store && (i.b >> 31);
-        const unsigned channels = half && mask == 1 ? 1 : half && mask == 3 ? 2 : 4;
+        const unsigned channels = (half || exact_store) && mask == 1 ? 1 :
+                                  (half || exact_store) && mask == 3 ? 2 : exact_store ? 3 : 4;
         const bool cube_sample = dim == 3 && (sample || gather);
         const auto kind = half    ? (channels == 1 ? ComputeViewKind::half_scalar_uav :
                                      channels == 2 ? ComputeViewKind::half2_texture_uav : ComputeViewKind::half4_texture_uav)
+                          : exact_store ? (channels == 1 ? ComputeViewKind::float_texture_uav :
+                                           channels == 2 ? ComputeViewKind::float2_texture_uav : ComputeViewKind::float3_texture_uav)
                           : store ? ComputeViewKind::texture_uav
                           : cube_sample ? (compare ? ComputeViewKind::cube_comparison_srv : ComputeViewKind::cube_sample_srv)
                           : d16_sample ? ComputeViewKind::d16_sample_srv
@@ -2287,6 +2318,14 @@ struct DirectCompute {
     }
     void arithmetic(const Inst &i, const State &state, const string *permuted = nullptr, bool compute = false) {
         auto n = i.name;
+        if (compute) {
+            if (const auto offset = heap_offset_add(i, state)) {
+                // The heap base is slot 0 of ResourceDescriptorHeap: the low word keeps the byte offset, the carry is 0.
+                write(i.dst, operand32(i, i.src[*offset]));
+                write(128, "0");
+                return;
+            }
+        }
         if (compute && (n == "v_dot4_i32_i8" || n == "v_dot4_u32_u8")) {
             // Integer dot products use both packed words as-is. Require the
             // canonical VOP3P OP_SEL/OP_SEL_HI and zero NEG_LO/NEG_HI.
@@ -2854,7 +2893,7 @@ struct DirectCompute {
             return;
         }
         if (compute && n == "s_bfm_b64") {
-            if ((i.dst & 1) || i.dst > 104)
+            if ((i.dst & 1) || (i.dst > 104 && i.dst != 126))
                 refuse(i.pc, "invalid s_bfm_b64 destination");
             if ((i.src[0] > 105 && !constant32(i, i.src[0])) ||
                 (i.src[1] > 105 && !constant32(i, i.src[1])))
@@ -3019,7 +3058,7 @@ struct DirectCompute {
             if (i.dst > 105)
                 refuse(i.pc, "invalid " + string(n) + " destination");
             const unsigned s0 = i.src[0];
-            const bool s0_pair = s0 <= 104 && !(s0 & 1);
+            const bool s0_pair = (s0 <= 104 && !(s0 & 1)) || s0 == 126;
             const bool s0_int = s0 >= 128 && s0 <= 208;
             if (!(s0_pair || s0_int || s0 == 255))
                 refuse(i.pc, "invalid " + string(n) + " source");
@@ -3878,7 +3917,13 @@ struct DirectCompute {
         const unsigned rank_words = x * y * z > 64 ? x * y * z : 0;
         if ((uses_lds ? lds_words : 0) + rank_words + (uses_exchange ? exchange_words : 0) > 8192)
             refuse(entry, "combined shared storage exceeds 32 KiB");
-        r.dxil_ir = ir.finish_compute(x, y, z);
+        // SM 6.6 forms consecutive linear quads for 1D groups. In 2D it forms
+        // spatial 2x2 quads, which can cross the guest's consecutive lane quads.
+        // initialize() still reconstructs guest IDs using the original dimensions.
+        // The wave64 split occurs at lane 32, a quad boundary.
+        if (compute_derivatives)
+            ir.validator_minor = 8;
+        r.dxil_ir = compute_derivatives ? ir.finish_compute(x * y * z, 1, 1) : ir.finish_compute(x, y, z);
         return std::move(r);
     }
 };

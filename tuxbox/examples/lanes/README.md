@@ -48,6 +48,7 @@ The game also imports Windows core API sets for services such as files, timing a
 | `indirect-dispatch` | `ExecuteIndirect` on its Series X\|S slot matches a direct dispatch |
 | `gpu-indirect-dispatch` | A compute shader writes indirect dispatch arguments for 0, 1 and 2 groups. Check all 24 output words, including untouched guards. |
 | `gpu-indirect-order` | A compute shader rewrites dispatch arguments, and a command count, 48 times in one list, with no CPU wait before each `ExecuteIndirect` that reads them. Six cases: a transition to the indirect argument state, a transition to a combined read state, or only a UAV barrier between the write and the read, each with and without a count buffer. Every round must read the values just written. |
+| `mesh-signature` | A mesh dispatch signature is made when the device reports mesh shaders, and refused with `E_NOTIMPL` when it doesn't |
 | `dispatch-wait` | Copies a producer's word after a label wait, first at list start and then immediately after a course dispatch. Reports whether compute finished before producer submission and the word read by the CPU. |
 | `texture-readback` | `CopyMemoryToMemoryX` reads a guest texture into title memory |
 | `texture-publication` | The GPU writes a tiled guest texture several times while a compute queue waits for the last write's label. Title memory then holds each texel in its console position. The padding between texels, a page the title closed and write-watched memory past the texture are untouched. |
@@ -66,6 +67,7 @@ The game also imports Windows core API sets for services such as files, timing a
 | `raster-samplers` | A console pixel program's literal linear sampler, under a root whose static sampler at that register is point-filtered ([raster tables](#raster-tables)) |
 | `lane-spill-interp` | A console pixel program whose f16 interpolator's attribute selector matches the number of its lane-spill register ([raster tables](#raster-tables)) |
 | `raster-heap-stride` | A console vertex program reading its positions by index from a structured buffer in the resource heap ([raster tables](#raster-tables)); not part of `all` |
+| `large-dispatch` | A console compute program that stores its group ID, dispatched with 70,000 groups across and then 70,000 down ([large dispatches](#large-dispatches)); not part of `all` |
 | `compute-root` | Two root-less console compute programs under a root with three descriptor tables that the provider cannot reflect ([compute roots](#compute-roots)) |
 | `compute-root-srv` | A console compute program under three tables and a root SRV stores through a table slot that the title's root declares an SRV ([compute roots](#a-compute-root-with-a-root-srv-after-its-tables)) |
 | `mesh-samplers` | The same literal sampler in a mesh pipeline, whose mesh root the provider builds ([raster tables](#raster-tables)); not part of `all` |
@@ -164,6 +166,18 @@ python tuxbox.py verify --only lanes-compute-root --output build/lanes-compute-r
 
 It runs on the Proton backend and removes only these programs' cache entries from the prefix.
 
+## Large dispatches
+
+A console dispatch can have more groups in a dimension than the 65,535 a desktop `Dispatch` allows. The provider records it as several dispatches of at most 65,535 groups in each dimension that is over, and divides no other. Before each one it sets the console group ID that dispatch starts at in three root constants (`b0, space32766`) appended to the pipeline's root. The program is translated again against that root, and the translation adds the constants to every group ID it reads, so each group runs with its console ID. Group counts a program reads come from the title's own constants, which keep the console values. The variant is made at the first such dispatch. A pipeline that cannot take the group base, such as an inline ray-query program, a program the provider runs untranslated or a stream-created pipeline, still fails the list, with the reason in the log. `ExecuteIndirect` arguments over the limit are written by the GPU and are not split, and neither is `DispatchMesh`.
+
+The `large-dispatch` scenario runs a hand-written console program (`shader_fixture.py`; not taken from any game) that stores its group ID and a marker at record x + 2y of a raw UAV. It dispatches 70,000 x 1 x 1 groups, then 2 x 70,000 x 1, and checks every word of all 140,000 records, including those the first dispatch leaves unwritten. Without the split the list fails to close. `verify` runs it with the host worker and fails unless the provider made the variant, split the dispatch in two and substituted no stand-in.
+
+```sh
+python tuxbox.py verify --only lanes-large-dispatch --output build/lanes-large-dispatch.json
+```
+
+It runs on the Proton backend and removes only this program's cache entries from the prefix.
+
 ## Deterministic replay
 
 ```sh
@@ -206,6 +220,26 @@ Stand-ins are disabled.
 
 ```sh
 python tuxbox.py verify --only lanes-compute-root-srv --output build/lanes-compute-root-srv.json
+```
+
+### A root-less compute program through the heap stride table
+
+`compute-heap-stride` runs a root-less console compute program (`shader_fixture.py`;
+not taken from any game) under a version 1.1 root with no parameters and a paged
+resource heap (resident limit 64). Each of its 64 threads takes the thread number,
+reads the first dword of the 32-byte record it names in a structured buffer in
+the heap (slot 100) and stores the word back into the same index's record of a
+second structured buffer (slot 110). The load is an IDXEN raw access whose record
+stride the console stores in the descriptor's word 1, which the program carries no
+way to carry: the provider has to retry the translation against a root with its
+stride table appended and bind that table for the dispatch. Every record must
+then start with its expected marker and keep its decoy; a refused pipeline, a
+skipped dispatch or another stride leaves the record at its decoy. Stand-ins are
+disabled. `verify` requires the paged stride table bind and a translation made
+against the pipeline's root.
+
+```sh
+python tuxbox.py verify --only lanes-compute-heap-stride --output build/lanes-compute-heap-stride.json
 ```
 
 The `lanes-bindless-compute` verification suite runs three native console programs under direct-indexed roots, each with a roomy and a constrained paged resource heap (resident limit 64 in the constrained run). `bindless-compute` stores through the heap UAV at logical slot 80. `bindless-sampler` samples the heap texture at slot 90 with a linear sampler built from literal words, which the root does not declare, and stores the value through the UAV at slot 85. `bindless-table-compute` is `bindless-compute` under a direct-indexed root that also has a bound table of four UAVs, which the program does not read. `bindless-heap-read` runs the first program beside a guest texture whose UAV sits at slot 100, holds the dispatch on a label while the title rewrites the texture's memory, and fails if the provider then writes the texture back. `bindless-texture-store` stores one word to one texel of that texture and checks the GPU image and the title's memory. Each run requires a translation made against the pipeline's root, the paged map bind and disabled stand-ins.
