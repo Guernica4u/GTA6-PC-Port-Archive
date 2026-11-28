@@ -81,17 +81,36 @@ pub(super) fn geometry(
             D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES => {
                 // SAFETY: the descriptor's discriminant selects Triangles.
                 let triangles = unsafe { &mut geometry.Anonymous.Triangles };
+                // Indices in a format the host cannot read are decoded first:
+                // the vertex range is then sized by the largest of them.
+                let decoded = triangles.IndexFormat.0 as u32 == super::meshlet_indices::FORMAT;
+                if decoded {
+                    let indices = super::meshlet_indices::at(triangles.IndexBuffer, triangles.IndexCount)
+                        .ok_or(E_NOTIMPL)?;
+                    let bytes: Vec<u8> = indices.iter().flat_map(|index| index.to_le_bytes()).collect();
+                    // SAFETY: `owner` is the list's controlling guest device.
+                    let buffer = unsafe { crate::device::blas::geometry_upload(owner, &bytes) }?;
+                    retain(state, &[&buffer])?;
+                    triangles.IndexBuffer = unsafe { buffer.GetGPUVirtualAddress() };
+                    triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
+                    triangles.VertexCount = indices.iter().max().map_or(0, |last| last + 1);
+                }
                 let vertices = &mut triangles.VertexBuffer;
                 let bytes = span(triangles.VertexCount.into(), vertices.StrideInBytes, vertex_bytes(triangles.VertexFormat))
                     .ok_or(E_INVALIDARG)?;
                 vertices.StartAddress = native(state, owner, vertices.StartAddress, bytes, D3D12_RESOURCE_FLAG_NONE)?;
                 let index_bytes = match triangles.IndexFormat {
+                    DXGI_FORMAT_UNKNOWN => 0,
                     DXGI_FORMAT_R16_UINT => 2,
                     DXGI_FORMAT_R32_UINT => 4,
-                    _ => 0,
+                    // Sized as nothing, the title's address would reach the
+                    // host build as an index buffer.
+                    _ => return Err(E_NOTIMPL.into()),
                 };
-                let bytes = u64::from(triangles.IndexCount) * index_bytes;
-                triangles.IndexBuffer = native(state, owner, triangles.IndexBuffer, bytes, D3D12_RESOURCE_FLAG_NONE)?;
+                if !decoded {
+                    let bytes = u64::from(triangles.IndexCount) * index_bytes;
+                    triangles.IndexBuffer = native(state, owner, triangles.IndexBuffer, bytes, D3D12_RESOURCE_FLAG_NONE)?;
+                }
                 triangles.Transform3x4 = native(state, owner, triangles.Transform3x4, 48, D3D12_RESOURCE_FLAG_NONE)?;
             }
             D3D12_RAYTRACING_GEOMETRY_TYPE_PROCEDURAL_PRIMITIVE_AABBS => {

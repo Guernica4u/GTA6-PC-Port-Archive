@@ -215,6 +215,21 @@ pub(crate) unsafe fn instance_buffer(owner: &IUnknown, bytes: u64) -> Result<ID3
     rebuild::upload_buffer(&unsafe { guest(owner) }.native, bytes)
 }
 
+/// An upload buffer holding `data`: geometry the CPU decoded from a format
+/// the host cannot build from.
+///
+/// # Safety
+/// The owner must identify the controlling guest device.
+pub(crate) unsafe fn geometry_upload(owner: &IUnknown, data: &[u8]) -> Result<ID3D12Resource> {
+    let buffer = rebuild::upload_buffer(&unsafe { guest(owner) }.native, data.len() as u64)?;
+    let mut mapped = core::ptr::null_mut();
+    unsafe { buffer.Map(0, Some(&D3D12_RANGE::default()), Some(&mut mapped))? };
+    // SAFETY: the mapping spans at least `data.len()` bytes.
+    unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), mapped.cast::<u8>(), data.len()) };
+    unsafe { buffer.Unmap(0, None) };
+    Ok(buffer)
+}
+
 /// Empty TLASes still need a valid root SRV; no ray can index an instance.
 /// Committed upload memory starts zeroed and is read-only to every list.
 ///
