@@ -103,7 +103,7 @@ fn a_group_of_32_threads_runs_as_the_lower_half_of_a_console_wave() {
         assert!(hlsl.contains("[WaveSize(32)]\n[numthreads(32, 1, 1)]"), "{hlsl}");
         // The upper lanes start outside EXEC and are read as lanes of their own.
         assert!(hlsl.contains("exec_lo = 0xffffffffu, exec_hi = 0u,"), "{hlsl}");
-        assert!(hlsl.contains("WaveReadLaneAt(v2__1, tb_leader - 32u)"), "{hlsl}");
+        assert!(hlsl.contains("WaveReadLaneAt(v2__[1], tb_leader - 32u)"), "{hlsl}");
     }
     // Other incomplete waves have no host wave that holds exactly their lanes.
     for threads in [16, 48, 96] {
