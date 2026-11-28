@@ -37,7 +37,7 @@ NVIDIA_CACHE_BYTES = 4 << 30
 # A launch starts a new cache file once the current one holds this much, which
 # leaves one launch 3 GiB before the file's 32-bit index is full.
 NVIDIA_CACHE_ROTATE_BYTES = 1 << 30
-NVIDIA_CACHE_FILE = re.compile(r"tuxbox([0-9]+)0")
+NVIDIA_CACHE_FILE = re.compile(r"tuxbox([0-9]+)[0-9]")
 
 
 def requires_offline(executable):
@@ -348,12 +348,17 @@ def rotate_nvidia_shader_cache(env, cache):
                 sizes[blob.stem] = max(size, sizes.get(blob.stem, 0))
     except OSError:
         return None
-    # The driver appends a 0 to the name it is given.
-    numbers = [int(match[1]) for match in map(NVIDIA_CACHE_FILE.fullmatch, sizes) if match]
-    number = max(numbers, default=1)
-    if sizes.get(f"tuxbox{number}0", 0) >= NVIDIA_CACHE_ROTATE_BYTES:
+    # The driver appends one digit to the name it is given, and can keep
+    # several such files: a ProjectScarlett launch filled the one ending in 2.
+    largest = {}
+    for name, size in sizes.items():
+        if match := NVIDIA_CACHE_FILE.fullmatch(name):
+            largest[int(match[1])] = max(size, largest.get(int(match[1]), 0))
+    number = max(largest, default=1)
+    if largest.get(number, 0) >= NVIDIA_CACHE_ROTATE_BYTES:
         number += 1
-    older = sorted(name for name in sizes if name != f"tuxbox{number}0")
+    older = sorted(name for name in sizes
+                   if not ((match := NVIDIA_CACHE_FILE.fullmatch(name)) and int(match[1]) == number))
     env["__GL_SHADER_DISK_CACHE_APP_NAME"] = f"tuxbox{number}"
     if older:
         env["__GL_SHADER_DISK_CACHE_READ_ONLY_APP_NAME"] = ";".join(older)
@@ -370,6 +375,23 @@ def keep_nvidia_shader_cache(env):
     if env.get("__GL_SHADER_DISK_CACHE_PATH") and env.get("__GL_SHADER_DISK_CACHE") != "0":
         env.setdefault("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP", "1")
         env.setdefault("__GL_SHADER_DISK_CACHE_SIZE", str(NVIDIA_CACHE_BYTES))
+
+
+# glibc gives each busy thread its own arena, up to 8 per CPU, and a title
+# compiling pipelines on dozens of threads leaves free memory spread across all
+# of them. A ProjectScarlett launch with the defaults held 22.75 GiB in 371
+# arena heaps by 200 s; one with these reached its loading screen.
+GLIBC_MALLOC_LIMITS = {
+    "MALLOC_ARENA_MAX": "8",
+    "MALLOC_MMAP_THRESHOLD_": str(1 << 20),
+    "MALLOC_TRIM_THRESHOLD_": str(8 << 20),
+}
+
+
+def limit_malloc_growth(env):
+    """Bound what the C library keeps beyond what the title and driver use."""
+    for name, value in GLIBC_MALLOC_LIMITS.items():
+        env.setdefault(name, value)
 
 
 def configure_nvidia_shader_cache(env, report=None):
@@ -565,6 +587,7 @@ class Host:
                     log.status(f"The package is not mapped to G: because {drive} is not a drive link")
         try:
             if self.backend in ("proton", "wine"):
+                limit_malloc_growth(env)
                 configure_nvidia_shader_cache(env, log.status)
                 merge_pipeline_cache(env, executable, log.status)
             if "-nullrhi" not in (arg.lower() for arg in arguments):
