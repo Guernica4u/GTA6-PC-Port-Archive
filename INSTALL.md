@@ -128,3 +128,29 @@ cargo xtask policy
 - `docs/asset-policy.md` — what may and may not be in this repository
 - `playability-resume.md` — what is still needed to make the game playable
 - Issue tracker: https://github.com/ors33/victory-fork/issues
+## Original installation (upstream VIctory / VIctory-NVIDIA)
+
+This fork builds on VIctory (Marvisak) and, since 2026-11-26, on
+VIctory-NVIDIA (trustno1-coder). The original upstream installation is:
+
+1. Obtain your own dump of the title's Xbox Series build v1.0.2.1
+   (the folder with `game_scarlett_master.exe`).
+2. Install Rust (rustup) and the Visual Studio Build Tools with
+   "Desktop development with C++".
+3. In PowerShell:
+   ```powershell
+   git clone https://github.com/trustno1-coder/VIctory-NVIDIA
+   cd VIctory-NVIDIA
+   copy victory.example.toml victory.toml   # then set game_dir to your dump's folder
+   .\Get-NVIDIA-DLSS.cmd                  # once: NVIDIA's DLSS/FG files, ~70 MB
+   scripts\play-nvidia.ps1 -Exe 'D:\Games\MyDump\game_scarlett_master.exe'
+   ```
+4. The first start builds the layer (a few minutes).
+5. Requirements: Windows 10/11 (x64), AVX2 CPU, 32 GB RAM+, SSD,
+   NVIDIA GeForce RTX card, recent driver.
+6. In-game: F1 settings menu, F3 stats panel. Full screen via
+   `.\scripts\fullscreen.ps1`.
+
+Upstream repository: https://github.com/trustno1-coder/VIctory-NVIDIA
+Original VIctory: https://github.com/Marvisak/VIctory
+This fork: https://github.com/ors33/victory-fork
