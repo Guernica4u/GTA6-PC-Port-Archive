@@ -623,13 +623,15 @@ fn wide(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain([0]).collect()
 }
 
-/// The adapter a device made with no adapter named is on (the first), its
-/// name and LUID.
+/// The adapter the host device goes on ([`crate::host::fast_adapter`], else
+/// the first), its name and LUID.
 fn default_adapter() -> Option<(String, windows::Win32::Foundation::LUID)> {
     // SAFETY: plain DXGI queries.
     unsafe {
-        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
-        let adapter = factory.EnumAdapters1(0).ok()?;
+        let adapter = match crate::host::fast_adapter_quiet() {
+            Some(a) => a,
+            None => CreateDXGIFactory1::<IDXGIFactory1>().ok()?.EnumAdapters1(0).ok()?,
+        };
         let desc = adapter.GetDesc1().ok()?;
         let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
         Some((String::from_utf16_lossy(&desc.Description[..len]), desc.AdapterLuid))

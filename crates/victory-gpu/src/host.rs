@@ -910,6 +910,9 @@ fn create() -> windows::core::Result<Host> {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
+        } else if let Some(adapter) = fast_adapter() {
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            crate::tdr::log();
         } else {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             // Whether a GPU hang ends the run or freezes the PC (#1054).
@@ -1016,6 +1019,43 @@ impl Host {
 
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
+/// The host device's adapter: the one DXGI ranks first for performance, not
+/// adapter 0. Adapter 0 is the one driving the main display, so on a PC with
+/// an integrated GPU (a Ryzen's Radeon, Intel graphics) it can be that one: the
+/// monitor asleep, or plugged into the motherboard, and the run went to the
+/// integrated GPU at a frame a second with DLSS refused. Software adapters are
+/// never taken here. `VICTORY_GPU_PREFERENCE=0`: adapter 0, as before.
+fn fast_adapter() -> Option<IDXGIAdapter1> {
+    let adapter = fast_adapter_quiet()?;
+    // SAFETY: a plain adapter query.
+    if let Ok(desc) = unsafe { adapter.GetDesc1() } {
+        let name = String::from_utf16_lossy(&desc.Description);
+        tracing::info!(adapter = name.trim_end_matches(char::from(0)), "host device on the high-performance adapter");
+    }
+    Some(adapter)
+}
+
+/// [`fast_adapter`] without the log line (Streamline asks it too, to load
+/// DLSS for the same adapter).
+pub(crate) fn fast_adapter_quiet() -> Option<IDXGIAdapter1> {
+    if std::env::var("VICTORY_GPU_PREFERENCE").as_deref() == Ok("0") {
+        return None;
+    }
+    // SAFETY: plain DXGI adapter queries.
+    unsafe {
+        let factory: windows::Win32::Graphics::Dxgi::IDXGIFactory6 =
+            CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let adapter: IDXGIAdapter1 = factory
+            .EnumAdapterByGpuPreference(0, windows::Win32::Graphics::Dxgi::DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
+            .ok()?;
+        let desc = adapter.GetDesc1().ok()?;
+        if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+            return None;
+        }
+        Some(adapter)
+    }
+}
+
 pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
     // SAFETY: plain DXGI adapter queries.
     unsafe {
