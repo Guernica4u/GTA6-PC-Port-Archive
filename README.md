@@ -33,7 +33,7 @@ TuxBox is early. No retail game is playable yet.
 
 Games are tested on an NVIDIA GeForce RTX 4070 Ti SUPER; the built-in checks have also passed on other NVIDIA and AMD cards. You supply your own games and system files. [Progress](docs/PROGRESS.md) · [Test results](docs/RESULTS.md)
 
-[![Compatibility and shader progress for Frosty and Project Scarlett](docs/progress.svg)](docs/progress.svg)
+[![Library and RDNA 2 instruction coverage](docs/progress.svg)](docs/progress.svg)
 
 <p align="center">
   <img src="evidence/matrix-awakens/city-free-roam.jpg" alt="The Matrix Awakens city free-roam running through TuxBox" width="72%">

@@ -58,8 +58,9 @@ Single stages: `survey --xshader BUILD --output FILE`, `compare BEFORE AFTER`, a
 | --- | --- |
 | What the translator does with an instruction | `TUXBOX_BLESS_INSTRUCTIONS=1 cargo test --manifest-path tools/shader-compiler/Cargo.toml --target x86_64-unknown-linux-gnu instruction_inventory`, then `python tools/shader_harness.py inventory` |
 | A GPU check, or the recorded requests | `python tools/shader_harness.py run`, then `python tools/shader_harness.py inventory --from-run RUN-FOLDER` |
+| Anything the translator emits | `python tools/shader_harness.py inventory --compile`, which compiles each instruction's translation through DXC and DXV and saves which compile |
 
-The second saves the run's instruction names and counts under `evidence/shader-instructions/`. It needs `"title"` in the configuration, such as `"ProjectScarlett 1.0.2.1"`, and a passing run of a committed tree on every card you list. Commit the record, the evidence and the document together.
+The [progress map](progress.svg) counts an instruction as converted when its translation compiled or a GPU check ran it; regenerate it with `python tuxbox.py status --svg docs/progress.svg`. The second command saves the run's instruction names and counts under `evidence/shader-instructions/`. It needs `"title"` in the configuration, such as `"ProjectScarlett 1.0.2.1"`, and a passing run of a committed tree on every card you list. Commit the record, the evidence and the document together.
 
 The translator must refuse an instruction it can't translate. The inventory's test fails if any instruction makes it crash.
 
