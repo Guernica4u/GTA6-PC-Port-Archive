@@ -105,7 +105,7 @@ impl Memory for Span<'_> {
         };
         let at = (at / 4) as usize;
         match self.words.get(at..at + words.len()) {
-            Some(w) if address % 4 == 0 => {
+            Some(w) if address.is_multiple_of(4) => {
                 words.copy_from_slice(w);
                 true
             }
@@ -145,7 +145,7 @@ impl Pages {
 
 impl Memory for Pages {
     fn read(&self, address: u64, words: &mut [u32]) -> bool {
-        if address % 4 != 0 {
+        if !address.is_multiple_of(4) {
             return false;
         }
         for (n, w) in words.iter_mut().enumerate() {
@@ -297,7 +297,7 @@ impl Header {
         if turn != 0 {
             // Three quarter-turn-in-four-steps angles, about x, y and z;
             // the matrix is z * y * x and its inverse the transpose.
-            const COS: [f32; 5] = [1.0, 0.923_879_53, 0.707_106_78, 0.382_683_43, 0.0];
+            const COS: [f32; 5] = [1.0, 0.923_879_5, core::f32::consts::FRAC_1_SQRT_2, 0.382_683_43, 0.0];
             let (x, y, z) = ((turn & 3) as usize, (turn >> 2 & 3) as usize, (turn >> 4 & 3) as usize);
             let mx = [[1.0, 0.0, 0.0], [0.0, COS[x], COS[4 - x]], [0.0, -COS[4 - x], COS[x]]];
             let my = [[COS[y], 0.0, -COS[4 - y]], [0.0, 1.0, 0.0], [COS[4 - y], 0.0, COS[y]]];
