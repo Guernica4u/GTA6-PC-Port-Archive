@@ -247,10 +247,6 @@ def words_of(items_, llvm_mc, width):
 # A form names the translation: "32", "64" or "64-paired". Each fault is also
 # modelled, so the check fails when one disappears without this table changing.
 KNOWN = {
-    # In a wave32 program a VOP3 compare into s24 also writes s25 = 0. The
-    # translator takes the mask as one register only when some VOP3 compare
-    # writes an odd SGPR.
-    "s25": dict(forms=("32",), cause="a wave32 VOP3 compare into s24 zeroes s25"),
     # The skip behind `s_cbranch_execz` after a v_cmpx is decided per lane, so
     # a scalar written in the block reaches only the lanes left in EXEC. The
     # paired translation decides it for the whole wave.

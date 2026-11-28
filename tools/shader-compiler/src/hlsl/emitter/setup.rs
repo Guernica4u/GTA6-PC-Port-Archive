@@ -12,8 +12,9 @@ impl<'a> Emitter<'a> {
             || (i.enc == Enc::Sopk && matches!(i.op, 0x12 | 0x13 | 0x15) && i.raw[0] & 63 == 1));
         // A wave64 VALU mask occupies an even-aligned SGPR pair. An odd
         // VOP3 comparison destination proves one-word masks throughout the
-        // guest program, including comparisons that target even registers.
-        let wave32_compare_masks = insns.iter().any(|ins| {
+        // guest program, including comparisons that target even registers. So
+        // does a program that only ever handles its masks as 32 bits.
+        let wave32_compare_masks = operand_fields::one_word_masks(&insns) || insns.iter().any(|ins| {
             ins.enc == Enc::Vop3 && ins.mnemonic.starts_with("v_cmp_")
                 && matches!(ins.dst.as_slice(), [Opnd::Sgpr(n)] if n & 1 != 0)
         });
