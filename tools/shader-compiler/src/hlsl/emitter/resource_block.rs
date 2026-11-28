@@ -41,6 +41,8 @@ impl<'a> Emitter<'a> {
             // Dataflow key of a scalar location: SGPR number, or 1000+ for a lane-spill slot.
             let sg = |o: &Opnd| match o {
                 Opnd::Sgpr(n) => Some(*n as u16),
+                Opnd::VccLo => Some(106),
+                Opnd::VccHi => Some(107),
                 Opnd::Temp(n) if *n >= LANE_TEMP_BASE => Some(1000 + (*n - LANE_TEMP_BASE)),
                 _ => None,
             };
