@@ -22,6 +22,7 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
 pub(super) mod console;
+mod quads;
 
 type Why = &'static str;
 
@@ -302,6 +303,12 @@ struct Lower<'a> {
     console_flat: Option<V>,
     /// Group-shared slots the two halves exchange a dword through.
     xchg: Option<V>,
+    /// Compute code whose samples take an implicit level (derivatives
+    /// across quads of lanes) in a group of more than one row: the console's
+    /// thread-group size. The host group is one row of as many threads, so
+    /// its lanes run in the console's order (x, then y, then z), and the
+    /// thread ids are taken back from the flat id.
+    rows: Option<[u32; 3]>,
     /// Pixel: an ordered section (POPS), whose UAVs the host makes
     /// rasterizer-ordered views.
     pops: bool,
@@ -711,6 +718,7 @@ impl<'a> Lower<'a> {
         let mut split = false;
         let mut wants_console_flow = false;
         let mut no_console_flow = None;
+        let mut rows = None;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -871,6 +879,18 @@ impl<'a> Lower<'a> {
             } else if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
             }
+            // The console takes a sample's implicit level from quads of
+            // lanes, and its lanes hold threads in x-major order: in a group
+            // of more than one row, four threads of one row. Hosts place
+            // two-dimensional groups their own way (a run on an RX 6750 XT
+            // put 2x2 tiles of threads in a quad), so such a program runs
+            // as one row so each quad covers consecutive flat thread IDs.
+            if cs.threads[1] * cs.threads[2] > 1
+                && insts().any(|i| quads::implicit_level(i.name()))
+            {
+                rows = Some(cs.threads);
+                s.threads = Some([cs.threads.iter().product(), 1, 1]);
+            }
         }
         let mut no_barrier = HashSet::new();
         if let StageIo::Ms(ms) = &x.native.io {
@@ -965,6 +985,7 @@ impl<'a> Lower<'a> {
             no_console_flow,
             console_flat: None,
             xchg: None,
+            rows,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
                 if db_shader_control & 1 << 16 != 0),
             root_memory,
@@ -3361,9 +3382,14 @@ impl<'a> Lower<'a> {
     /// wave-aligned run of flat ids, as the console's waves do.)
     fn thread_id(&mut self, c: u8) -> Val {
         if !self.console_lanes {
+            if let Some(rows) = self.rows {
+                return self.row_thread_id(rows, c);
+            }
             return self.compute_id("threadIdInGroup.i32", 95, c);
         }
-        let [x, y, _] = self.s.threads.expect("compute");
+        // The hardware wave runs in the flattened host group. Convert its
+        // logical flat ID back to coordinates using the guest dimensions.
+        let [x, y, _] = self.rows.or(self.s.threads).expect("compute");
         let e = self.s.entry;
         let f = self.console_flat();
         let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
@@ -9171,7 +9197,7 @@ impl<'a> Lower<'a> {
         let (op, sample) = match name {
             "image_sample" | "image_sample_o" => (60, true),
             "image_sample_lz" | "image_sample_l" => (62, true),
-            "image_sample_b" => (61, true),
+            "image_sample_b" | "image_sample_b_o" => (61, true),
             "image_sample_c_lz" => (65, true),
             "image_sample_d" | "image_sample_d_cl" => (63, true),
             "image_get_lod" if self.s.pixel => (81, true),
@@ -9262,8 +9288,9 @@ impl<'a> Lower<'a> {
             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
             // signed (programmable offsets: gathers only).
             let offset_word = name.ends_with("_o");
-            let first =
-                usize::from(offset_word) + usize::from(name == "image_sample_b") + usize::from(cmp);
+            let first = usize::from(offset_word)
+                + usize::from(matches!(name, "image_sample_b" | "image_sample_b_o"))
+                + usize::from(cmp);
             // Coordinates the size divides (not the array slice); explicit
             // gradients (x then y) come before the coordinates.
             let spatial = coords - usize::from(kind == 6 || kind == 7);
@@ -9344,34 +9371,64 @@ impl<'a> Lower<'a> {
             }
             let mut args = vec![h, sh];
             args.extend(&cs);
+            // In compute shaders an implicit level of detail comes from
+            // the lanes' quads, as the hardware takes it: DXIL derivatives
+            // there need conditions the validator does not grant these
+            // programs, so the gradients are read from the quad and the
+            // sample takes them explicitly.
+            // A sample's texel offset word: DXIL takes immediate offsets in
+            // -8..=7; the console's are 6-bit and may be computed.
+            if offset_word && matches!(op, 60 | 61) {
+                let w = addr_val(self, 0)?;
+                self.sample_offsets(w, &mut os[..offsets])?;
+            }
+            let quad_grads = matches!(op, 60 | 61)
+                && self.s.threads.is_some()
+                && self.s.mesh.is_none()
+                && kind != 5;
+            // Quads are four lanes of a row: the tail of a group that is not
+            // whole quads has lanes to read that are not threads. Lanes of a
+            // quad that diverge before the sample give undefined derivatives,
+            // as on the hardware.
+            if quad_grads
+                && self
+                    .s
+                    .threads
+                    .is_some_and(|t| t.iter().product::<u32>() % 4 != 0)
+            {
+                return Err("an implicit-level sample in a group of partial quads");
+            }
             match op {
-                60 => {
-                    if offset_word {
-                        // DXIL takes immediate offsets in -8..=7; the
-                        // console's are 6-bit and may be computed.
-                        let w = addr_val(self, 0)?;
-                        let w = self
-                            .s
-                            .m
-                            .int_value(w)
-                            .ok_or("a sample offset that is not constant")?
-                            as u32;
-                        for (k, o) in os.iter_mut().enumerate().take(offsets) {
-                            let x = (w >> (8 * k) & 0x3F) as i32;
-                            let x = if x >= 32 { x - 64 } else { x };
-                            if !(-8..=7).contains(&x) {
-                                return Err("a sample offset past -8..7");
-                            }
-                            *o = self.s.m.i32(x as u32);
-                        }
+                60 | 61 if quad_grads => {
+                    // A bias scales the footprint by 2^bias; it follows the
+                    // offset word.
+                    let mut scale = None;
+                    if op == 61 {
+                        let bias = addr_val(self, usize::from(offset_word))?;
+                        let bias = to_float(self, bias);
+                        scale = Some(self.unary(21, bias));
                     }
+                    let g = self.quad_gradients(&cs[..spatial], scale);
+                    args.extend(&os);
+                    args.extend(g);
+                    args.push(fu);
+                    self.s.op(
+                        c,
+                        "sampleGrad.f32",
+                        Attr::ReadOnly,
+                        self.s.t.res_ret,
+                        63,
+                        &args,
+                    )
+                }
+                60 => {
                     args.extend(&os);
                     args.push(fu);
                     self.s
                         .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
                 }
                 61 => {
-                    let bias = addr_val(self, 0)?;
+                    let bias = addr_val(self, usize::from(offset_word))?;
                     let bias = to_float(self, bias);
                     args.extend(&os);
                     args.extend([bias, fu]);
