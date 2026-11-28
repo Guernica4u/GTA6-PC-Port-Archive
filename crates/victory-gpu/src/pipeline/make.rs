@@ -19,9 +19,10 @@
 //! is lost.
 //!
 //! `VICTORY_PSO_WORKERS` (`1..=64`) overrides the number of background compile
-//! workers, and `VICTORY_PSO_PRIORITY` (`below` or `normal`) overrides their
-//! thread priority. Both are read once when the workers start; the defaults
-//! (half the logical processors clamped to 2..=8, and `below`) are unchanged.
+//! workers, and `VICTORY_PSO_PRIORITY` (`below` or `normal`, case-insensitive)
+//! overrides their thread priority. Both are read once when the workers start;
+//! invalid values are warned about and fall back to the defaults (half the
+//! logical processors clamped to 2..=8, and `below`).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -276,7 +277,10 @@ fn worker_count(raw: Option<&str>, logical: usize) -> usize {
         None => default(logical),
         Some(raw) => match raw.trim().parse::<usize>() {
             Ok(n) if (1..=64).contains(&n) => n,
-            _ => default(logical),
+            _ => {
+                tracing::warn!(value = raw, "invalid VICTORY_PSO_WORKERS; using default");
+                default(logical)
+            }
         },
     }
 }
@@ -284,8 +288,13 @@ fn worker_count(raw: Option<&str>, logical: usize) -> usize {
 /// Worker priority from `VICTORY_PSO_PRIORITY`, defaulting to below normal.
 fn worker_priority(raw: Option<&str>) -> WorkerPriority {
     match raw.map(str::trim) {
-        Some("normal") => WorkerPriority::Normal,
-        _ => WorkerPriority::Below,
+        Some(value) if value.eq_ignore_ascii_case("normal") => WorkerPriority::Normal,
+        Some(value) if value.eq_ignore_ascii_case("below") => WorkerPriority::Below,
+        Some(value) => {
+            tracing::warn!(value, "invalid VICTORY_PSO_PRIORITY; using below");
+            WorkerPriority::Below
+        }
+        None => WorkerPriority::Below,
     }
 }
 
@@ -297,8 +306,8 @@ static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 2]>, Condvar) =
 /// Hands `p` to the workers (half the logical processors, 2 to 8, unless
 /// overridden), started on first use.
 fn queue(p: Arc<Pending>, now: bool) {
-    static WORKERS: OnceLock<usize> = OnceLock::new();
-    let workers = *WORKERS.get_or_init(|| {
+    static WORKERS: OnceLock<(usize, WorkerPriority)> = OnceLock::new();
+    let workers = WORKERS.get_or_init(|| {
         let logical = std::thread::available_parallelism().map_or(2, |n| n.get());
         let n = worker_count(
             std::env::var("VICTORY_PSO_WORKERS").ok().as_deref(),
@@ -306,18 +315,20 @@ fn queue(p: Arc<Pending>, now: bool) {
         );
         let priority = worker_priority(std::env::var("VICTORY_PSO_PRIORITY").ok().as_deref());
         tracing::info!(workers = n, ?priority, "host pipeline workers");
-        (0..n)
+        let started = (0..n)
             .filter(|i| {
                 let spawned = std::thread::Builder::new()
                     .name(format!("victory-pipelines-{i}"))
-                    .spawn(work);
+                    .spawn(move || work(priority));
                 if let Err(e) = &spawned {
                     tracing::warn!(error = %e, "no pipeline worker");
                 }
                 spawned.is_ok()
             })
-            .count()
-    });
+            .count();
+        (started, priority)
+    })
+    .0;
     if workers == 0 {
         // No worker: made here instead.
         if !p.taken.swap(true, Ordering::Relaxed) {
@@ -333,13 +344,13 @@ fn queue(p: Arc<Pending>, now: bool) {
 
 /// A worker: makes queued pipelines, those draws wait for first, and saves
 /// the cache when idle (first uses of pipelines made before).
-fn work() {
-    // Below the title's own threads by default, unless a run asks for normal
-    // priority to shorten warm-up compile hitches.
+fn work(priority: WorkerPriority) {
+    // Below the title's own threads by default, unless a run asked for normal
+    // priority to shorten warm-up compile hitches. The switch is read once by
+    // `queue` and carried into every worker.
     // SAFETY: a plain call on our own thread.
     unsafe {
         use windows::Win32::System::Threading::*;
-        let priority = worker_priority(std::env::var("VICTORY_PSO_PRIORITY").ok().as_deref());
         let priority = match priority {
             WorkerPriority::Below => THREAD_PRIORITY_BELOW_NORMAL,
             WorkerPriority::Normal => THREAD_PRIORITY_NORMAL,
@@ -500,5 +511,6 @@ mod tests {
         assert_eq!(worker_priority(Some("abc")), WorkerPriority::Below);
         assert_eq!(worker_priority(Some(" BELOW ")), WorkerPriority::Below);
         assert_eq!(worker_priority(Some(" normal ")), WorkerPriority::Normal);
+        assert_eq!(worker_priority(Some(" NORMAL ")), WorkerPriority::Normal);
     }
 }
