@@ -788,6 +788,7 @@ mod tests {
         assert_eq!(p.mips[2].in_tail, 1);
         assert_eq!(p.mips[2].swizzle, p.mips[0].swizzle);
         assert_eq!(p.mips[2].swizzle, 10);
+        assert_eq!(p.mips[2].tail_position, 0x1_0000);
 
         type Tiling = extern "system" fn(
             This,
