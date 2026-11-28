@@ -680,6 +680,68 @@ pub(crate) mod tests {
         two.close();
     }
 
+    /// Two lists share one budget block, each with its own slot: one list
+    /// spending part of its budget and having a batch rejected leaves the
+    /// other's word as it was, and after its reset and next submission the
+    /// first starts again from a full budget (a zeroed word).
+    #[test]
+    fn a_lists_spent_budget_does_not_touch_its_neighbour_and_resets_in_full() {
+        let Some(host) = host() else { return };
+        let (a, b) = (host.new_list().unwrap(), host.new_list().unwrap());
+        assert!(a.budget().is_some() && b.budget().is_some());
+        // The word of a list: its slot's address, as the shader's clamp
+        // reads and writes it (the host writes it here in the shader's stead).
+        let word = |list: &HostList| {
+            let held = list.budget.lock().unwrap();
+            let held = held.as_ref().expect("the list holds a budget word");
+            (held.buffer.as_raw(), held.mapped, held.gpu)
+        };
+        let read = |at: usize| {
+            // SAFETY: a slot's word in a live, mapped budget block.
+            unsafe { (at as *const u32).read_volatile() }
+        };
+        let write = |at: usize, value: u32| {
+            // SAFETY: as above; no submission runs this slot meanwhile.
+            unsafe { (at as *mut u32).write_volatile(value) }
+        };
+        let ((block_a, at_a, gpu_a), (block_b, at_b, gpu_b)) = (word(&a), word(&b));
+        assert_eq!(block_a, block_b, "both lists take their slot of one block");
+        assert_ne!(at_a, at_b, "each list's slot is its own");
+        assert_eq!(at_a.abs_diff(at_b) % BUDGET_SLOT, 0, "slots are whole strides apart");
+        assert_eq!(at_a.abs_diff(at_b) as u64, gpu_a.abs_diff(gpu_b), "host and device addresses agree");
+        // B has spent some of its budget.
+        write(at_b, 0xb0b);
+        // A is submitted (its word starts at zero), spends part of its
+        // budget, then has a batch rejected (which takes all that is left).
+        write(at_a, 0xdead);
+        a.close();
+        host.execute(&[&a]);
+        assert_eq!(read(at_a), 0, "a list's word is zeroed at its submission");
+        assert_eq!(read(at_b), 0xb0b, "B's word is not A's to zero");
+        write(at_a, 0x1234);
+        assert_eq!(read(at_b), 0xb0b, "A spending part of its budget leaves B's");
+        write(at_a, u32::MAX);
+        assert_eq!(read(at_b), 0xb0b, "A's rejected batch leaves B's");
+        // A is reset: it gives its slot back, B keeps its own untouched.
+        a.reset();
+        assert!(a.budget.lock().unwrap().is_none(), "A's slot goes back");
+        assert_eq!(read(at_b), 0xb0b, "A's reset leaves B's word");
+        assert_eq!(word(&b).1, at_b, "B still holds the same slot");
+        // A's next use takes a slot again (not necessarily the same one:
+        // the pool is shared with tests running in parallel), stale from
+        // the spent budget, and its next submission zeroes it: a full budget.
+        assert!(a.budget().is_some());
+        let (_, again, _) = word(&a);
+        assert_ne!(again, at_b, "A does not take B's slot");
+        write(again, u32::MAX);
+        a.close();
+        host.execute(&[&a]);
+        assert_eq!(read(again), 0, "A starts again from its full budget");
+        assert_eq!(read(at_b), 0xb0b, "B is unaffected by A's whole cycle");
+        a.reset();
+        b.close();
+    }
+
     #[test]
     fn present_compositor_builds_both_pipeline_states() {
         let Some(host) = host() else {
