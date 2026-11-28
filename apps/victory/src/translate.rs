@@ -588,6 +588,9 @@ fn translate_container(
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
     let programs = match native_programs(dxil) {
+        Ok(p) if p.is_empty() && selected.is_some() => {
+            return t.fail("no native programs".into(), example);
+        }
         Ok(p) => p,
         Err(e) => return t.fail(e.to_string(), example),
     };

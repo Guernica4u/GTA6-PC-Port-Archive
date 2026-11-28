@@ -7,6 +7,10 @@ fn container(tag: u8) -> Vec<u8> {
     // refusal. Vary only the container digest, keeping the DXIL identical.
     let mut part = vec![0; 0x18];
     part.extend(b"XDAT");
+    dxil_container(tag, &part)
+}
+
+fn dxil_container(tag: u8, part: &[u8]) -> Vec<u8> {
     let mut bytes = b"DXBC".to_vec();
     bytes.extend([tag; 16]);
     for word in [1, 44 + part.len() as u32, 1, 36] {
@@ -106,6 +110,23 @@ fn padded_file_length_is_a_candidate_only_at_the_start_of_a_raw_file() {
         error.ends_with(&format!("0000000000000000, {:016x}", id(&padded))),
         "{error}"
     );
+}
+
+#[test]
+fn reports_selected_container_without_native_programs() {
+    let mut part = vec![0; 0x18];
+    part.extend(b"XDAT");
+    part.extend([0; 8]); // No XDAT entries.
+    let bytes = dxil_container(1, &part);
+    let hash = id(&bytes);
+    let requested = BTreeSet::from([hash]);
+    let t = scan(&bytes, &requested);
+    check_matches(&requested, &t.matched).unwrap();
+    assert_eq!(
+        t.lines,
+        [format!("archive@0x0 hash={hash:016x}  no native programs")]
+    );
+    assert!(scan(&bytes, &BTreeSet::new()).lines.is_empty());
 }
 
 #[test]
