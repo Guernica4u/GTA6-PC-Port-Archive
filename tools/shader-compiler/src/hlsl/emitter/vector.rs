@@ -568,7 +568,7 @@ impl<'a> Emitter<'a> {
             "v_rndne_f32" => Some(format!("round({})", fa()?)),
             "v_floor_f32" => Some(format!("floor({})", fa()?)),
             "v_exp_f32" => Some(format!("exp2({})", fa()?)),
-            "v_log_f32" => Some(format!("log2({})", fa()?)),
+            "v_log_f32" => Some(format!("tb_log2({})", fa()?)),
             "v_rcp_f32" | "v_rcp_iflag_f32" => Some(format!("1.0 / {}", fa()?)),
             "v_rsq_f32" => Some(format!("rsqrt({})", fa()?)),
             "v_sqrt_f32" => Some(format!("sqrt({})", fa()?)),

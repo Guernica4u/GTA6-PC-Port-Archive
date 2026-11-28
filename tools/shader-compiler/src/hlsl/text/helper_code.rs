@@ -28,6 +28,16 @@ float tb_cubetc(float x, float y, float z) { float ax = abs(x), ay = abs(y), az 
 float tb_cubeid(float x, float y, float z) { float ax = abs(x), ay = abs(y), az = abs(z); if (az >= ax && az >= ay) return z < 0.0 ? 5.0 : 4.0; if (ay >= ax) return y < 0.0 ? 3.0 : 2.0; return x < 0.0 ? 1.0 : 0.0; }
 float3 tb_cube_dir(float s, float t, float face) { float u = (s - 1.5) * 2.0, v = (t - 1.5) * 2.0; int f = (int)round(face); if (f == 0) return float3(1.0, -v, -u); if (f == 1) return float3(-1.0, -v, u); if (f == 2) return float3(u, 1.0, v); if (f == 3) return float3(u, -1.0, -v); if (f == 4) return float3(u, -v, 1.0); return float3(-u, -v, -1.0); }
 float tb_mull(float a, float b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }
+// A host's log2 can be exact only to an absolute error, which is far more than
+// one unit of a result close to zero. Close to 1 the logarithm comes from the
+// series of 2 atanh((x - 1) / (x + 1)), whose error is relative to the result.
+float tb_log2(float x) {
+    precise float d = x - 1.0;
+    precise float s = d / (2.0 + d);
+    precise float q = s * s;
+    precise float near = 2.885390081777927 * s * (1.0 + q * (0.3333333333 + q * (0.2 + q * (0.1428571429 + q * (0.1111111111 + q * 0.0909090909)))));
+    return (x > 0.75 && x < 1.5) ? near : log2(x);
+}
 uint tb_f16_cvt(float x, bool rtz) {
     uint u = asuint(x);
     uint s = (u >> 16) & 0x8000u;
