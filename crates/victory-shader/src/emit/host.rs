@@ -85,7 +85,33 @@ impl Host {
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             } else {
-                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                // The adapter DXGI ranks first for performance, as the game's
+                // host device (victory-gpu `fast_adapter`): adapter 0 drives
+                // the main display and can be a CPU's integrated GPU (with
+                // the monitor asleep, a Ryzen's Radeon took these pipelines
+                // and its compiler crashed on one of them).
+                // `VICTORY_GPU_PREFERENCE=0`: adapter 0, as before.
+                let fast = (std::env::var("VICTORY_GPU_PREFERENCE").as_deref() != Ok("0"))
+                    .then(|| {
+                        CreateDXGIFactory2::<windows::Win32::Graphics::Dxgi::IDXGIFactory6>(
+                            DXGI_CREATE_FACTORY_FLAGS(0),
+                        )
+                        .and_then(|f| {
+                            f.EnumAdapterByGpuPreference::<IDXGIAdapter1>(
+                                0,
+                                windows::Win32::Graphics::Dxgi::DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                            )
+                        })
+                        .ok()
+                    })
+                    .flatten()
+                    .filter(|a| a.GetDesc1().is_ok_and(|d| d.Flags & 2 == 0));
+                match &fast {
+                    Some(adapter) => {
+                        D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?
+                    }
+                    None => D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?,
+                }
                 // A machine without a graphics card gives the software
                 // adapter as its default device (a hosted test runner,
                 // whose first adapter is a display stub that cannot make a
