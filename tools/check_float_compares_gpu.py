@@ -319,7 +319,9 @@ def instrument(hlsl, width):
 
 def register(hlsl, name):
     """A register the program never touches is not declared."""
-    return name if re.search(rf"\b{name}\b", hlsl) else "0u"
+    # A two-lane register `v7__[0]` is the pair `v7__`, which the code indexes by lane.
+    base = name.split("[", 1)[0]
+    return name if re.search(rf"\b{base}\b", hlsl) else "0u"
 
 
 def instrument_paired(hlsl):
@@ -328,11 +330,12 @@ def instrument_paired(hlsl):
     if not start or "tb_pair" not in hlsl or "[WaveSize(32)]" not in hlsl:
         raise ValueError("fixture must take the paired translation")
     lanes = [f"(tb_first + tb_pair + {32 * half}u)" for half in (0, 1)]
-    load = "".join(f"    v0__{half} = output.Load(4u * {lanes[half]}); v1__{half} = output.Load(4u * (64u + {lanes[half]}));\n"
+    # The two-lane form holds each vector register as a pair indexed by the lane.
+    load = "".join(f"    v0__[{half}] = output.Load(4u * {lanes[half]}); v1__[{half}] = output.Load(4u * (64u + {lanes[half]}));\n"
                    for half in (0, 1))
     load += f"    uint2 tb_entry = output.Load2({4 * EXEC_WORD}u); exec_lo = tb_entry.x; exec_hi = tb_entry.y;\n"
     stores = "".join(f"    output.Store(4u * ({64 * (FIRST_SLOT + n - 10)}u + {lanes[half]}), "
-                     f"{register(hlsl, f'v{n}__{half}')});\n" for n in OUTPUTS[64] for half in (0, 1))
+                     f"{register(hlsl, f'v{n}__[{half}]')});\n" for n in OUTPUTS[64] for half in (0, 1))
     hlsl = hlsl[:start.end()] + load + hlsl[start.end():]
     end = hlsl.rstrip().rfind("}")
     return "RWByteAddressBuffer output : register(u0);\n" + hlsl[:end] + stores + "}\n"
