@@ -228,6 +228,27 @@ fn same_register_at_two_slots_fails_closed() {
 }
 
 #[test]
+fn a_vertex_root_recovers_the_slot_its_fssm_row_names() {
+    // The raster stages read their tables from s8, and the console encodes a
+    // vertex descriptor load with the register space in bits 8 and up, so the
+    // user-data location is 8 and the used-resource row is 0x804 (raw SRV).
+    let mut root = three_tables_srv_constants();
+    root.params[0].kind = RootParamKind::Table(vec![RootRange {
+        range_type: 0, num: 1, base_register: 0, space: 0, offset_in_table: 0,
+    }]);
+    let user = [[3, 16, 1, 28, 0x008]];
+    let used = [[0x300, 16, 28, 1, 0x804]];
+    let image = program(&user, &used);
+    let resources = [[4u32, 1, 28, 28]];
+    assert_eq!(uncovered_descriptor(&image, &resources, 1, 8, 64, &root), Some((0, 28, 1)));
+    let shader = raster_shader(1, &user, &used, &resources);
+    assert_eq!(missing_root_descriptors(&shader, &root, 1),
+               vec![Binding { table: 0, kind: 0, register: 28, space: 1, slot: 2 }]);
+    // The same bytes name nothing when they are read as a compute program.
+    assert!(missing_root_descriptors(&shader, &root, 5).is_empty());
+}
+
+#[test]
 fn third_compute_table_can_recover_corroborated_missing_descriptors() {
     // Third table is s6. The root has a raw SRV at slot zero but
     // leaves slot two uncovered. Metadata identifies the missing binding.
@@ -247,7 +268,7 @@ fn third_compute_table_can_recover_corroborated_missing_descriptors() {
         assert_eq!(uncovered_descriptor(&image, &resources, 5, 6, 64, &root),
                    Some((kind, 28, 1)), "class={class:#x} width={width}");
         let shader = raster_shader(5, &user, &used, &resources);
-        assert_eq!(missing_root_descriptors(&shader, &root),
+        assert_eq!(missing_root_descriptors(&shader, &root, 5),
                    vec![Binding { table: 2, kind, register: 28, space: 1, slot: 2 }]);
         let mut bad = root.clone();
         bad.params[2].kind = RootParamKind::Constants { register: 28, space: 1, num32: 1 };
