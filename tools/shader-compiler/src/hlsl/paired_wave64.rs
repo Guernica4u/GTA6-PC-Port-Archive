@@ -229,6 +229,10 @@ fn read_lane(em: &mut Emitter<'_>, destination: &Opnd, source: &Opnd, leader: &s
         Opnd::Vgpr(n) => format!("{to} = tb_leader < 32u ? WaveReadLaneAt(v{n}__0, tb_leader) : WaveReadLaneAt(v{n}__1, tb_leader - 32u);"),
         other => format!("{to} = {};", r(other)?),
     };
+    // A heap index read from a wave with no active lane becomes slot 0.
+    let value = if leader.is_empty() && em.heap_index_reads.contains(&em.cur_idx) {
+        format!("{value} if ((exec_lo | exec_hi) == 0u) {to} = 0u;")
+    } else { value };
     let first = if leader.is_empty() { first_lane(&value)[0].clone() } else { format!("uint tb_leader = {leader}; {value}") };
     em.line(&format!("{{ {first} }}"));
     Ok(())

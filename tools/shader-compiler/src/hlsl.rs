@@ -65,6 +65,9 @@ mod cpu_oracle;
 #[path = "tests/hlsl/heap_resinfo.rs"]
 mod heap_resinfo;
 #[cfg(test)]
+#[path = "tests/hlsl/descriptor_waterfall.rs"]
+mod descriptor_waterfall;
+#[cfg(test)]
 #[path = "tests/hlsl/compute_swizzle.rs"]
 mod compute_swizzle;
 #[cfg(test)]
@@ -131,6 +134,7 @@ mod screen_gather;
 mod reflection_far;
 mod sampler_heap;
 mod lane_reads;
+mod descriptor_broadcast;
 mod heap_offsets;
 mod heap_origins;
 mod operand_fields;
@@ -393,6 +397,14 @@ struct Emitter<'a> {
     /// Back-edge indices of loops whose single-wave group runs an exchange the
     /// same number of times: only these vote in the emitted while loop.
     accepted_swizzle_loops: BTreeSet<usize>,
+    /// `v_mov_b32 v, s` copies and the `v_readfirstlane_b32` reads proven to return
+    /// them (see `descriptor_broadcast`).
+    descriptor_copies: BTreeSet<usize>,
+    descriptor_reads: BTreeSet<usize>,
+    /// First-lane reads whose result indexes a descriptor heap. With no active lane
+    /// the console reads lane 0 and then touches nothing; here the result still
+    /// indexes the heap, so it must not be whatever lane 0 holds.
+    heap_index_reads: BTreeSet<usize>,
     /// Nesting stack of whether each open loop is an accepted swizzle loop.
     in_accepted_swizzle_loop_stack: Vec<bool>,
     fspx_wave: Option<u32>,

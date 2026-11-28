@@ -9,7 +9,7 @@ use super::Emitter;
 use crate::rdna2::disassemble;
 use crate::{ShaderExtract, Stage};
 
-fn fssm_rows(rows: &[[u32; 5]]) -> Vec<u8> {
+pub(super) fn fssm_rows(rows: &[[u32; 5]]) -> Vec<u8> {
     let mut program = vec![0; 0x100];
     program[..8].copy_from_slice(b"FSSM\x01\x01\0\0");
     let offset = (program.len() - 16) as u64;
@@ -21,7 +21,7 @@ fn fssm_rows(rows: &[[u32; 5]]) -> Vec<u8> {
     program
 }
 
-fn heap_extract(isa: &[u8]) -> ShaderExtract {
+pub(super) fn heap_extract(isa: &[u8]) -> ShaderExtract {
     ShaderExtract { flat_inputs: Vec::new(), flat_outputs: Vec::new(),
         stage: Stage::Compute,
         shader_model: (6, 6),
