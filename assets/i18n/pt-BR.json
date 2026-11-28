@@ -199,8 +199,11 @@
 
   "news.kicker": "O que está acontecendo",
   "news.title": "Notícias",
+  "news.archiveTitle": "GTA VI no PC: as notícias",
   "news.sub": "O que importa em torno do vazamento: remoções, vazamentos confirmados, notícias jurídicas e golpes. Resumos curtos com nossas próprias palavras, com links para as reportagens originais.",
   "news.all": "Todas as notícias",
+  "news.more": "Mais notícias",
+  "news.rss": "Feed RSS",
   "news.close": "Fechar artigo",
   "news.image": "Imagem:",
   "news.headlines": "Últimas manchetes",
@@ -262,6 +265,8 @@
   "footer.disclaimer": "Rastreador feito por fãs. Sem afiliação ou endosso da Rockstar Games, Take-Two ou Microsoft. Grand Theft Auto e as marcas relacionadas pertencem aos seus donos. Nenhum arquivo do jogo, chave ou executável é hospedado ou indicado aqui.",
   "footer.data": "Dados:",
   "footer.dataTail": ", atualizados a cada 3 horas pelo robô de busca.",
+  "footer.live": "O GTA VI já roda no PC? Ver o tracker ao vivo",
+  "footer.rss": "Feed RSS de notícias",
   "footer.scoutRun": "Última execução do robô de busca {ago}",
 
   "error.load": "Não foi possível carregar os dados do rastreador: {msg}",

@@ -44,8 +44,10 @@ const BRAND = `<svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
           <circle cx="16" cy="16" r="12" fill="none" stroke="url(#bm)" stroke-width="5" stroke-linecap="round" stroke-dasharray="52 76" transform="rotate(-90 16 16)"/>
         </svg>`;
 
-// Article pages live in news/, so every site link is relative to the parent folder.
-function shell({ title, description, canonical, ogType = 'website', image, imageIsSocial, head = '', main, track }) {
+// Article pages live in news/, so every site link is relative to the parent folder. The header and footer
+// mirror index.html so a reader who lands here from a search engine gets the same navigation; page.js
+// translates them, and the article itself, when the visitor's language has an overlay.
+function shell({ title, description, canonical, ogType = 'website', image, imageIsSocial, head = '', main, track, story = '' }) {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -73,17 +75,19 @@ function shell({ title, description, canonical, ogType = 'website', image, image
   <link rel="stylesheet" href="../assets/css/style.css">
   <script src="../assets/js/theme.js"></script>${head}
 </head>
-<body class="page-news">
+<body class="page-news"${story ? ` data-story="${esc(story)}"` : ''}>
   <header class="nav is-scrolled">
     <div class="wrap nav-inner">
-      <a class="brand" href="../" aria-label="PortWatch VI home">
+      <a class="brand" href="../" aria-label="PortWatch VI home" data-i18n-attr="aria-label:nav.home">
         ${BRAND}
         <span>PortWatch<b>VI</b></span>
       </a>
-      <nav class="nav-links" aria-label="Sections">
-        <a href="../#race">Race</a>
-        <a href="./" class="is-current">News</a>
-        <a href="../#method">Scoring</a>
+      <nav class="nav-links" aria-label="Sections" data-i18n-attr="aria-label:nav.sections">
+        <a href="../#race" data-i18n="nav.race">Race</a>
+        <a href="./" class="is-current" data-i18n="nav.news">News</a>
+        <a href="../#watchlist" data-i18n="nav.watchlist">Watchlist</a>
+        <a href="../#toolkit" data-i18n="nav.toolkit">Toolkit</a>
+        <a href="../#method" data-i18n="nav.scoring">Scoring</a>
       </nav>
     </div>
   </header>
@@ -96,14 +100,15 @@ ${main}
     <div class="wrap footer-inner">
       <div>
         <a class="brand brand-sm" href="../"><span>PortWatch<b>VI</b></span></a>
-        <p>Fan-made tracker. Not affiliated with or endorsed by Rockstar Games, Take-Two or Microsoft. Grand Theft Auto and related marks belong to their owners. No game files, keys or executables are hosted or linked here.</p>
+        <p data-i18n="footer.disclaimer">Fan-made tracker. Not affiliated with or endorsed by Rockstar Games, Take-Two or Microsoft. Grand Theft Auto and related marks belong to their owners. No game files, keys or executables are hosted or linked here.</p>
       </div>
       <div class="footer-meta">
-        <p><a href="../">Does GTA VI run on PC yet? See the live tracker.</a></p>
-        <p><a href="feed.xml">News RSS feed</a></p>
+        <p><a href="../" data-i18n="footer.live">Does GTA VI run on PC yet? See the live tracker.</a></p>
+        <p><a href="feed.xml" data-i18n="footer.rss">News RSS feed</a></p>
       </div>
     </div>
   </footer>
+  <script type="module" src="../assets/js/page.js"></script>
   <script type="module">
     import { trackView } from '../assets/js/backend.js';
     trackView(${JSON.stringify(track)});
@@ -116,11 +121,11 @@ ${main}
 // Cover art sits under the photo, so a photo that fails to load (hotlink blocked, gone) shows the cover instead.
 function media(n, cls = '') {
   const img = httpsOnly(n.image?.url);
-  return `<div class="story-media page-media ${cls}">${coverHtml(n.category)}${img ? `<img src="${esc(img)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()">` : ''}<span class="story-cat">${esc(n.category)}</span></div>`;
+  return `<div class="story-media page-media ${cls}">${coverHtml(n.category)}${img ? `<img src="${esc(img)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()">` : ''}<span class="story-cat" data-cat="${esc(n.category)}">${esc(n.category)}</span></div>`;
 }
 
 const card = (n, small) => `
-      <a class="story ${small ? 'is-small' : ''}" href="${esc(n.id)}.html">
+      <a class="story ${small ? 'is-small' : ''}" href="${esc(n.id)}.html" data-news-id="${esc(n.id)}">
         ${media(n)}
         <div class="story-body">
           ${whenTag(n)}
@@ -156,34 +161,35 @@ function articlePage(n, others) {
     isPartOf: { '@type': 'WebSite', name: SITE_NAME, url: SITE_URL },
   };
   const credit = n.image?.credit && img
-    ? `Image: ${httpsOnly(n.image.link) ? `<a href="${esc(httpsOnly(n.image.link))}" target="_blank" rel="noopener">${esc(n.image.credit)}</a>` : esc(n.image.credit)}. `
+    ? `<span data-i18n="news.image">Image:</span> ${httpsOnly(n.image.link) ? `<a href="${esc(httpsOnly(n.image.link))}" target="_blank" rel="noopener">${esc(n.image.credit)}</a>` : esc(n.image.credit)}. `
     : '';
+  const bylineKey = n.by === 'claude' ? 'news.byClaude' : n.by === 'report' ? 'news.byReport' : 'news.byPortWatch';
   const byline = n.by === 'claude' ? 'Written automatically by Claude from the linked sources.'
     : n.by === 'report' ? 'Reported by PortWatch; not yet confirmed by a public source.'
     : 'Written by PortWatch from the linked sources.';
   const more = others.slice(0, 6);
-  const main = `    <nav class="crumbs" aria-label="Breadcrumb"><a href="../">PortWatch VI</a><span aria-hidden="true">/</span><a href="./">News</a></nav>
+  const main = `    <nav class="crumbs" aria-label="Breadcrumb"><a href="../">PortWatch VI</a><span aria-hidden="true">/</span><a href="./" data-i18n="news.title">News</a></nav>
     <article class="reader reader-page">
       ${media(n)}
       <div class="reader-inner">
-        <p class="meta">${esc(n.category)} · ${whenTag(n)}</p>
+        <p class="meta"><span data-cat="${esc(n.category)}">${esc(n.category)}</span> · ${whenTag(n)}</p>
         <h1>${esc(n.title)}</h1>
         ${n.dek ? `<p class="dek">${esc(n.dek)}</p>` : ''}
         <div class="article">
           ${(n.body || []).map((p) => `<p>${esc(p)}</p>`).join('\n          ')}
         </div>
         <div class="sources">
-          <h2>Sources</h2>
+          <h2 data-i18n="news.sources">Sources</h2>
           <ul>${(n.sources || []).map(sourceItem).join('')}</ul>
-          <p class="fine">${credit}${byline}</p>
+          <p class="fine">${credit}<span data-i18n="${bylineKey}">${byline}</span></p>
         </div>
       </div>
     </article>
 ${more.length ? `    <section class="more-news" aria-labelledby="more-title">
-      <h2 class="mini-title" id="more-title">More news</h2>
+      <h2 class="mini-title" id="more-title" data-i18n="news.more">More news</h2>
       <div class="news-list">${more.map((o) => card(o, true)).join('')}
       </div>
-      <p><a class="more-link" href="./">All news</a> <a class="more-link" href="../">Live tracker</a></p>
+      <p><a class="more-link" href="./" data-i18n="news.all">All news</a> <a class="more-link" href="../" data-i18n="hero.live">Live tracker</a></p>
     </section>` : ''}`;
   return shell({
     title: `${n.title} · ${SITE_NAME}`,
@@ -199,6 +205,7 @@ ${more.length ? `    <section class="more-news" aria-labelledby="more-title">
   <script type="application/ld+json">${jsonLd(ld)}</script>`,
     main,
     track: `/news/${n.id}`,
+    story: n.id,
   });
 }
 
@@ -214,14 +221,14 @@ function archivePage(news) {
     isPartOf: { '@type': 'WebSite', name: SITE_NAME, url: SITE_URL },
     mainEntity: { '@type': 'ItemList', itemListElement: news.map((n, i) => ({ '@type': 'ListItem', position: i + 1, url: articleUrl(n) })) },
   };
-  const main = `    <nav class="crumbs" aria-label="Breadcrumb"><a href="../">PortWatch VI</a><span aria-hidden="true">/</span><span>News</span></nav>
+  const main = `    <nav class="crumbs" aria-label="Breadcrumb"><a href="../">PortWatch VI</a><span aria-hidden="true">/</span><span data-i18n="news.title">News</span></nav>
     <div class="section-head">
       <div>
-        <p class="kicker">What's happening</p>
-        <h1 class="page-title">GTA VI on PC: the news</h1>
-        <p class="sub">The moves that matter around the leak: takedowns, confirmed leaks, legal news and scams. Short summaries in our own words, with links to the original reporting.</p>
+        <p class="kicker" data-i18n="news.kicker">What's happening</p>
+        <h1 class="page-title" data-i18n="news.archiveTitle">GTA VI on PC: the news</h1>
+        <p class="sub" data-i18n="news.sub">The moves that matter around the leak: takedowns, confirmed leaks, legal news and scams. Short summaries in our own words, with links to the original reporting.</p>
       </div>
-      <a class="more-link" href="feed.xml">RSS feed</a>
+      <a class="more-link" href="feed.xml" data-i18n="news.rss">RSS feed</a>
     </div>
     <div class="archive">${news.map((n) => card(n, false)).join('') || '\n      <p class="empty">No stories yet.</p>'}
     </div>`;

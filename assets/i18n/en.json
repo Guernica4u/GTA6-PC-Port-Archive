@@ -145,8 +145,11 @@
 
   "news.kicker": "What's happening",
   "news.title": "News",
+  "news.archiveTitle": "GTA VI on PC: the news",
   "news.sub": "The moves that matter around the leak: takedowns, confirmed leaks, legal news and scams. Short summaries in our own words, with links to the original reporting.",
   "news.all": "All news",
+  "news.more": "More news",
+  "news.rss": "RSS feed",
   "news.close": "Close article",
   "news.image": "Image:",
   "news.headlines": "Latest headlines",
@@ -210,6 +213,8 @@
   "footer.disclaimer": "Fan-made tracker. Not affiliated with or endorsed by Rockstar Games, Take-Two or Microsoft. Grand Theft Auto and related marks belong to their owners. No game files, keys or executables are hosted or linked here.",
   "footer.data": "Data:",
   "footer.dataTail": ", refreshed every 3 hours by the scout.",
+  "footer.live": "Does GTA VI run on PC yet? See the live tracker.",
+  "footer.rss": "News RSS feed",
   "footer.scoutRun": "Last scout run {ago}",
 
   "error.load": "Couldn't load tracker data: {msg}",

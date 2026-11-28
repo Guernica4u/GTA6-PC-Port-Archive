@@ -199,8 +199,11 @@
 
   "news.kicker": "Qué está pasando",
   "news.title": "Noticias",
+  "news.archiveTitle": "GTA VI en PC: las noticias",
   "news.sub": "Lo que importa en torno a la filtración: retiradas, filtraciones confirmadas, noticias legales y estafas. Resúmenes breves con nuestras propias palabras y enlaces a la información original.",
   "news.all": "Todas las noticias",
+  "news.more": "Más noticias",
+  "news.rss": "Canal RSS",
   "news.close": "Cerrar artículo",
   "news.image": "Imagen:",
   "news.headlines": "Últimos titulares",
@@ -262,6 +265,8 @@
   "footer.disclaimer": "Tracker hecho por fans. Sin afiliación ni respaldo de Rockstar Games, Take-Two o Microsoft. Grand Theft Auto y las marcas relacionadas pertenecen a sus dueños. Aquí no se alojan ni se enlazan archivos del juego, claves ni ejecutables.",
   "footer.data": "Datos:",
   "footer.dataTail": ", actualizados cada 3 horas por el rastreador.",
+  "footer.live": "¿GTA VI ya funciona en PC? Ver el tracker en vivo",
+  "footer.rss": "Canal RSS de noticias",
   "footer.scoutRun": "Última ejecución del rastreador {ago}",
 
   "error.load": "No se pudieron cargar los datos del tracker: {msg}",
