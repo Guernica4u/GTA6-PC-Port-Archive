@@ -20,6 +20,7 @@ from time import monotonic
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from project_tuxbox.inspect import digest  # noqa: E402
 from project_tuxbox.jobs import check_jobs  # noqa: E402
 # The launcher builds its Vulkan layer on first use; one case at a time.
 LAYER_BUILD = Lock()
@@ -45,17 +46,13 @@ CASES = {
     "buffer-unmap-released": ("d3d12-buffer-import", ("--unmap-released",), "d3d12-buffer-unmap", ("mode=released", "later-submits=ok")),
     "null-usage": ("d3d12-null-usage", (), "d3d12-null-usage", ("words=64/64", "recorded=64", "valid=2")),
     "null-disabled": ("d3d12-null-usage", ("--reject",), "d3d12-null-disabled", ("rejected=1", "valid=1")),
+    "address-uav": ("d3d12-address-uav", (), "d3d12-address-uav", ("words=10/10", "start=432", "stride=20")),
 }
 DEFAULT = tuple(name for name in CASES if name not in ("root-cbv-window", "root-cbv-offsets", "alias-deferred", "copy-resource", "indirect-scarlett", "mesh", "buffer-import", "buffer-import-reject", "buffer-layout", "buffer-remap", "buffer-unmap-alive", "buffer-unmap-released"))
 # These run with the constant-buffer settings `tuxbox.py run` gives a game. The
 # other cases keep vkd3d-proton's defaults.
 LAUNCHER_CBV = ("root-cbv-offsets",)
 DIGEST = hashlib.sha256(bytes.fromhex("78563412efcdab90")).hexdigest()
-
-
-def sha(path):
-    with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
 def imports(records):
@@ -212,7 +209,7 @@ def main(argv=None):
         artifacts["xmem.dll"]=a.xmem
     if any(not p.is_file() for p in (*artifacts.values(),wine)):
         ap.error("missing build, Proton or compiler artifact")
-    fingerprints={k:sha(p) for k,p in artifacts.items()}
+    fingerprints={k:digest(p) for k,p in artifacts.items()}
     a.work.mkdir(parents=True)
     def run_case(case):
         start=monotonic()
@@ -222,7 +219,7 @@ def main(argv=None):
             for k,source in artifacts.items():
                 if k.endswith(".dll") or k==name+".exe":
                     shutil.copyfile(source,trial/k)
-                    if sha(trial/k)!=fingerprints[k]:
+                    if digest(trial/k)!=fingerprints[k]:
                         raise ValueError("artifact changed during staging")
             copy_prefix(a.prefix, trial/"prefix")
             for k in ("tmp","runtime","cache"):
@@ -276,7 +273,7 @@ def main(argv=None):
         for row,failure in pool.map(run_case,selected):
             rows.append(row)
             print(row["case"],"PASS" if row["passed"] else "FAIL",*([failure] if failure else []),flush=True)
-    unchanged=fingerprints=={k:sha(p) for k,p in artifacts.items()}
+    unchanged=fingerprints=={k:digest(p) for k,p in artifacts.items()}
     report=dict(schema=1,scope="Synthetic D3D12 provider controls; not retail execution",
                 adapter=a.adapter.lower(),proton=(a.proton/"version").read_text().strip(),
                 artifacts_sha256=fingerprints,unchanged=unchanged,cases=rows,

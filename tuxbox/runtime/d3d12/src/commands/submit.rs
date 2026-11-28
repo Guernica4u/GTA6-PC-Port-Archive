@@ -33,11 +33,23 @@ pub(super) fn reject(queue: &Queue, error: HRESULT) {
         Ordering::AcqRel,
         Ordering::Acquire,
     );
-    unsafe {
-        OutputDebugStringA(s!(
-            "Project TuxBox: direct queue rejected a guest command-list batch\n"
-        ))
+    let text = rejection_text(queue.state.kind, error);
+    unsafe { OutputDebugStringA(windows::core::PCSTR(text.as_ptr())) };
+}
+
+/// The report of a rejected batch, NUL-terminated. The queue keeps the error,
+/// so every later batch submitted to it is dropped as well.
+fn rejection_text(kind: D3D12_COMMAND_LIST_TYPE, error: HRESULT) -> String {
+    let queue = match kind {
+        D3D12_COMMAND_LIST_TYPE_DIRECT => "direct",
+        D3D12_COMMAND_LIST_TYPE_COMPUTE => "compute",
+        D3D12_COMMAND_LIST_TYPE_COPY => "copy",
+        _ => "other",
     };
+    format!(
+        "Project TuxBox: {queue} queue rejected a guest command-list batch ({:#010x}); its later batches are dropped\n\0",
+        error.0 as u32
+    )
 }
 
 pub(super) unsafe extern "system" fn execute_frame(
@@ -172,7 +184,6 @@ pub(super) unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut
                 .then(|| placement::held::Waits::new(splits.len().into()));
             let waits = holds.clone();
             unsafe {
-                placement::gather_reads(parent(&queue.parent), &read_views.borrow(), &mut textures);
                 placement::submit(
                     parent(&queue.parent),
                     &queue.native,
@@ -180,6 +191,7 @@ pub(super) unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut
                     &mut textures,
                     &mut writes,
                     &shader_views,
+                    &read_views.borrow(),
                     holds,
                     || {
                         let pending_waits = memory_wait::PendingWaits::new(waits, splits.len());
@@ -340,3 +352,7 @@ pub(super) unsafe extern "system" fn signal_x(
     }
     unsafe { queue_fence::<false>(queue, fence, value) }
 }
+
+#[cfg(test)]
+#[path = "../tests/commands/submit.rs"]
+mod tests;
