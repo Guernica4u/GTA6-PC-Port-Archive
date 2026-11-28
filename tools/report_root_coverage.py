@@ -221,7 +221,10 @@ def attribute(failures, capture, xshader, work):
         declared = declarations(hlsl)
         for signature in signatures:
             try:
-                _, flags, params = parse_root(signature.read_bytes())
+                data = signature.read_bytes()
+                # The provider writes the whole serialized container; older
+                # captures may hold the bare RTS0 payload.
+                _, flags, params = parse_root(rts0_payload(data) or data)
             except (ValueError, struct.error) as error:
                 reasons[f"unreadable signature: {error}"] += 1
                 continue
