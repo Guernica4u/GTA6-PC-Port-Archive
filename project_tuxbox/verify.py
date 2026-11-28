@@ -204,8 +204,16 @@ def cpu_model():
     return platform.processor() or platform.machine()
 
 
-def guid_receipt(imports):
-    symbols = next((module["symbols"] for module in imports if module["module"].lower() == "d3d12_xs.dll"), ())
+def guid_receipt(imports, provider):
+    """The receipt line for the identifiers the guest imports from `provider`, by name or by ordinal."""
+    symbols = {symbol for module in imports if module["module"].lower() == provider.name.lower()
+               for symbol in module["symbols"]}
+    ordinals = {symbol for symbol in symbols if symbol.startswith("#") and symbol[1:].isdigit()}
+    if ordinals:  # MSVC's link.exe imports exported data by ordinal
+        slots, _ = export_table(provider)
+        symbols -= ordinals
+        for symbol in ordinals:
+            symbols.update(slots.get(int(symbol[1:]), ()))
     count = sum(name.startswith(("IID_", "WKPDID_")) for name in symbols)
     return f"d3d12-guids PASS identifiers={count} bytes={16 * count}"
 
@@ -921,7 +929,7 @@ def verify(host, output, adapter, selected=None, samples=1):
                              "D3D12CreateRootSignatureDeserializer", "D3D12CreateVersionedRootSignatureDeserializer")})
         if "d3d12-guids" in selected:
             check("d3d12-guids", "d3d12-smoke/d3d12-guids.exe", ["--report"],
-                  guid_receipt,
+                  lambda modules: guid_receipt(modules, BUILD / "d3d12-smoke/d3d12_xs.dll"),
                   providers={"d3d12-smoke/d3d12_xs.dll": ("IID_ID3D12Device",)})
         if "xg-provider" in selected:
             check("xg-dcc", "xg-provider/xg-dcc.exe", ["--report"],
