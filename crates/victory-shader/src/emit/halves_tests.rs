@@ -175,7 +175,7 @@ fn refusal(words: &[u32], threads: u32, lds_bytes: u32) -> String {
 /// The hand-encoded words are the instructions their comments name.
 #[test]
 fn the_test_programs_are_what_their_comments_say() {
-    let programs: [(Vec<u32>, &[&str]); 36] = [
+    let programs: [(Vec<u32>, &[&str]); 37] = [
         (
             sum16(),
             &[
@@ -542,6 +542,17 @@ fn the_test_programs_are_what_their_comments_say() {
                 "v_readfirstlane_b32 s12, v2",
                 "v_mov_b32 v3, s12",
                 "buffer_store_dword v1, v16, s[40:43], 0 offen offset:4",
+            ],
+        ),
+        (
+            descriptor_into(true),
+            &[
+                "s_load_dwordx4 s[44:47], s[4:5], 0x000040",
+                "s_cmp_eq_u32 s5, 0",
+                "s_cbranch_scc1",
+                "s_bcnt1_i32_b64 s12, vcc",
+                "v_readfirstlane_b32 s13, v1",
+                "buffer_store_dword v3, v16, s[44:47], 0 offen offset:4",
             ],
         ),
         (
@@ -2392,10 +2403,60 @@ fn whole_group_into(skip: bool) -> Vec<u32> {
     w
 }
 
+/// [`whole_group_into`] with its stores' descriptor (`s[44:47]`, the same
+/// UAV) chosen by control flow: loaded before the branch the whole group
+/// takes into the region, and again inside the region before the block that
+/// branch goes to, where the two meet (the shape of the title's clustered
+/// lights).
+fn descriptor_into(skip: bool) -> Vec<u32> {
+    // s_load_dwordx4 s[44:47], s[4:5], 0x40
+    const LOAD: [u32; 3] = [0xF408_0B02, 0xFA00_0040, S_WAITCNT_LGKM];
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0xD766_0001,
+        0x0002_02C1, // v_mbcnt_hi_u32_b32 v1, -1, v1
+        vop1(2, 0x01, 255),
+        0xDEAD, // v_mov_b32 v2, 0xdead
+    ]);
+    let mut read = vec![
+        vop1(13, 0x02, 256 + 1), // v_readfirstlane_b32 s13, v1
+        vop1(3, 0x01, 13),       // v_mov_b32 v3, s13
+    ];
+    for (vdata, offset) in [(2, 0), (3, 4)] {
+        // buffer_store_dword v<vdata>, v16, s[44:47], 0 offen offset:<offset>
+        read.extend([0xE070_1000 | offset, 0x800B_0010 | vdata << 8]);
+    }
+    let mut count = vec![
+        0x7C00_0000 | 0xC4 << 17 | 1 << 9 | 168, // v_cmp_gt_u32 vcc, 40, v1
+        sop1(12, 0x10, 106),                     // s_bcnt1_i32_b64 s12, vcc
+        vop1(2, 0x01, 12),                       // v_mov_b32 v2, s12
+    ];
+    count.extend(LOAD);
+    let leave = [
+        0x7C00_0000 | 0xC4 << 17 | 1 << 9 | 138, // v_cmp_gt_u32 vcc, 10, v1
+        0x8AFE_6A7E,                             // s_andn2_b64 exec, exec, vcc
+        0xBF88_0000 | (count.len() + read.len()) as u32, // s_cbranch_execz to the end
+    ];
+    w.extend(LOAD);
+    w.extend([
+        0xBF06_8005 | u32::from(!skip) << 8, // s_cmp_eq_u32 s5, 0 (1 without `skip`)
+        0xBF85_0000 | (leave.len() + count.len()) as u32, // s_cbranch_scc1 to the read
+    ]);
+    w.extend(leave);
+    w.extend(count);
+    w.extend(read);
+    w.push(S_ENDPGM);
+    w
+}
+
 /// Regions run wave-wide that the whole group may also go around, to their
 /// join ([`whole_group_around`]), or into, at a block past their head
-/// ([`whole_group_into`]), on a branch it takes together, translate in
-/// halves in groups of one and of several console waves, to valid DXIL.
+/// ([`whole_group_into`], also with a descriptor chosen there,
+/// [`descriptor_into`]), on a branch it takes together, translate in halves
+/// in groups of one and of several console waves, to valid DXIL.
 #[test]
 fn regions_the_whole_group_goes_around_or_into_translate_in_halves() {
     let mut validator =
@@ -2405,6 +2466,7 @@ fn regions_the_whole_group_goes_around_or_into_translate_in_halves() {
             for (name, words) in [
                 ("around", whole_group_around(skip)),
                 ("into", whole_group_into(skip)),
+                ("descriptor", descriptor_into(skip)),
             ] {
                 let l = lowered(&native(&words, true, threads, 0), true)
                     .unwrap_or_else(|e| panic!("{name} {threads} {skip}: {e}"));
@@ -2417,9 +2479,10 @@ fn regions_the_whole_group_goes_around_or_into_translate_in_halves() {
     }
 }
 
-/// [`whole_group_around`] and [`whole_group_into`] on every hardware
-/// adapter, in halves and as one wave64 where the adapter runs those, in
-/// groups of 48, 64 and 128, with the whole group going its own way or not.
+/// [`whole_group_around`], [`whole_group_into`] and [`descriptor_into`] on
+/// every hardware adapter, in halves and as one wave64 where the adapter
+/// runs those, in groups of 48, 64 and 128, with the whole group going its
+/// own way or not.
 #[test]
 fn regions_the_whole_group_goes_around_or_into_match_the_console_on_every_gpu() {
     let mut failed = Vec::new();
@@ -2451,6 +2514,7 @@ fn regions_the_whole_group_goes_around_or_into_match_the_console_on_every_gpu() 
                 })
                 .collect();
             failed.extend(differences(&whole_group_into(skip), threads, 2, &into));
+            failed.extend(differences(&descriptor_into(skip), threads, 2, &into));
         }
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));

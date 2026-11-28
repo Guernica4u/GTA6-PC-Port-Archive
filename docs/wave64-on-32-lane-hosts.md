@@ -132,9 +132,11 @@ regions. Two cases are lowered, tried in this order after Level 2:
   region to its join, or into it past its head: going around, no lane is
   in the region; going in, the group runs it from its first block, with
   every lane in the block it went to and none in those before, and what
-  only one way in defines is zero along the others (a region with a
-  descriptor chosen by control flow is not entered that way). Every thread runs
-  every block of it in order, each
+  only one way in defines is zero along the others; a descriptor chosen by
+  control flow there is the console wave's scalar, folded as below (not
+  one chosen per lane or between two immediate samplers, nor at a loop's
+  header: a region with one of those is not entered that way). Every
+  thread runs every block of it in order, each
   block after those its forward edges come from and a loop's blocks
   together, and each block acts only in its own lanes, those along its
   edges in. Each vector instruction's guard takes in the block's lanes (a
@@ -219,10 +221,9 @@ that 735 compute programs share):
 | sections step by step, lane permutes per instruction | 2,704 |
 | regions a whole-group branch goes around or into | 2,721 |
 | sections step by step in blocks run wave-wide | 2,723 |
+| descriptors chosen where the whole group goes into a region | 2,725 |
 
-Still refused in halves: 2 first lanes in a region entered by a
-whole-group branch that holds a descriptor chosen by control flow, 1 mask
-in a region of neither shape; 2 programs whose LDS leaves no room for the
+Still refused in halves: 1 mask in a region of neither shape; 2 programs whose LDS leaves no room for the
 trades' 16 bytes per console wave; 6 tiled group shapes.
 
 Before Levels 2 and 3, a local build that recorded every cross-half site
@@ -259,7 +260,8 @@ points, in one-half regions and wave-wide, LDS of one-wave groups
 group-shared slots' cost in barriers; loops each lane leaves in its own
 round (the halves going round different numbers of times) with first
 lanes, masks and LDS inside, and a first lane read after such a loop;
-regions a whole-group branch goes around or into, a section run step by
+regions a whole-group branch goes around or into (also with a descriptor
+chosen where it goes in), a section run step by
 step whose uneven lanes are kept (also in a block run wave-wide), a 16-bit
 sum, and the lane permutes; and the scalars branches and loops leave: a
 first-lane read in a branch of each of Lyrnc's masks (lanes of one half,

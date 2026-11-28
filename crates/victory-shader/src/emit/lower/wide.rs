@@ -266,7 +266,7 @@ fn regions(x: &Parts) -> Vec<Region> {
     // meets there, and no lane branch leaves them (in a group of several
     // console waves every branch is one: each wave may take its own way).
     let together = |q: usize| meet[q] && !branches.iter().any(|(h, _)| *h == q);
-    let joins = descriptor_joins(x);
+    let (folded, unfolded) = descriptor_joins(x);
     let region = |members: &[usize]| -> Option<Region> {
         let mut blocks = vec![false; n];
         for &b in members {
@@ -305,11 +305,23 @@ fn regions(x: &Parts) -> Vec<Region> {
         if ends == join.is_some() {
             return None;
         }
-        // shortcut: a descriptor chosen by control flow in a region entered
-        // other than from its head is made from each way in's own block
-        // (`Lower::uniform_heap_index`), which does not lead to the region's
-        // blocks there; such a region is not run wave-wide.
-        if !entries.is_empty() && members.iter().any(|b| joins.contains(b)) {
+        // A descriptor chosen by control flow in a region entered other than
+        // from its head is folded there as the console wave's scalar
+        // (`Lower::wide_heap_index`). shortcut: one chosen per lane or
+        // between two immediate samplers, or at a loop's header, is made
+        // from each way in's own block, which does not lead to the region's
+        // blocks there: such a region is not run wave-wide.
+        let header = |b: usize| {
+            p.blocks[b]
+                .preds
+                .iter()
+                .any(|&q| blocks[q] && rpo[q] >= rpo[b])
+        };
+        if !entries.is_empty()
+            && members
+                .iter()
+                .any(|&b| unfolded.contains(&b) || folded.contains(&b) && header(b))
+        {
             return None;
         }
         // After the first block it is entered from (an edge in past the head
@@ -712,28 +724,36 @@ impl Wide {
     }
 }
 
-/// The blocks where a descriptor of the program is chosen by control flow
-/// ([`Source::Phi`], [`Source::LanePhi`]).
-fn descriptor_joins(x: &Parts) -> HashSet<usize> {
-    fn walk(s: &Source, out: &mut HashSet<usize>) {
+/// The blocks where a descriptor is chosen by control flow: those a region
+/// run wave-wide folds ([`Lower::wide_heap_index`]), and the others (per
+/// lane, or between two immediate samplers).
+fn descriptor_joins(x: &Parts) -> (HashSet<usize>, HashSet<usize>) {
+    type Out = (HashSet<usize>, HashSet<usize>);
+    fn walk(s: &Source, sampler: bool, out: &mut Out) {
         match s {
+            // Between two immediate samplers ([`Lower::handle`]).
+            Source::Phi { block, args }
+                if sampler && matches!(args[..], [Source::Constant(_), Source::Constant(_)]) =>
+            {
+                out.1.insert(*block);
+            }
             Source::Phi { block, args } => {
-                out.insert(*block);
-                args.iter().for_each(|a| walk(a, out));
+                out.0.insert(*block);
+                args.iter().for_each(|a| walk(a, sampler, out));
             }
             Source::LanePhi { block, args } => {
-                out.insert(*block);
-                args.iter().flatten().for_each(|a| walk(a, out));
+                out.1.insert(*block);
+                args.iter().flatten().for_each(|a| walk(a, sampler, out));
             }
             Source::Select { args, .. } | Source::Lanes { args, .. } => {
-                args.iter().for_each(|a| walk(a, out));
+                args.iter().for_each(|a| walk(a, sampler, out));
             }
             _ => {}
         }
     }
-    let mut out = HashSet::new();
+    let mut out = Out::default();
     for d in &x.res.descriptors {
-        walk(&d.source, &mut out);
+        walk(&d.source, d.role == Role::Sampler, &mut out);
     }
     out
 }
@@ -1374,15 +1394,10 @@ impl Lower<'_> {
             self.s.m.set_phi(v, incoming);
             return Ok(());
         };
-        let around = |q: usize| {
-            !self.wide.inside[q]
-                && !self.wide.next.contains_key(&q)
-                && !self.wide.entry_into.contains_key(&(q, b))
-        };
         let (around, edges): (Vec<_>, Vec<_>) = incoming
             .into_iter()
             .zip(from)
-            .partition(|&(_, &q)| around(q));
+            .partition(|&(_, &q)| self.wide_around(q, b));
         let swaps = self
             .wide
             .entered_by
@@ -1411,6 +1426,63 @@ impl Lower<'_> {
         }
         self.s.m.set_phi(v, incoming);
         Ok(())
+    }
+
+    /// Whether IR edge `(q, b)` goes around a region run wave-wide to its
+    /// join `b` (the whole group took it): it keeps its own DXIL
+    /// predecessor ([`Lower::wide_phi`]).
+    fn wide_around(&self, q: usize, b: usize) -> bool {
+        !self.wide.inside[q]
+            && !self.wide.next.contains_key(&q)
+            && !self.wide.entry_into.contains_key(&(q, b))
+    }
+
+    /// The heap index of a descriptor chosen by control flow at IR block
+    /// `b` (`args` along its edges), where `b` is in a region run wave-wide
+    /// or joins one; `None` elsewhere. On the console the descriptor is
+    /// scalar data the wave holds, so the index is folded as a scalar
+    /// ([`Lower::wide_fold`]). Each way's index is made in the DXIL block
+    /// `b` is entered from, which every way reaches (a way in past the
+    /// region's head is no DXIL predecessor of `b`, and what only it
+    /// defines is swapped there, [`Lower::wide_entries`]); an edge around
+    /// the region makes its own in its own block. Not at a loop's header,
+    /// whose rounds are not lowered yet.
+    pub(super) fn wide_heap_index(
+        &mut self,
+        b: usize,
+        args: &[Source],
+        sampler: bool,
+    ) -> Option<Result<V, Why>> {
+        let &at = self.wide.from.get(&b)?;
+        if self.wide.loops.contains_key(&b) {
+            return Some(Err(
+                "a descriptor chosen by control flow at the header of a loop run wave-wide",
+            ));
+        }
+        let mut made = || {
+            let join = self.block[b].ok_or("a descriptor chosen by control flow")?;
+            let preds = self.x.p.blocks[b].preds.clone();
+            let (mut incoming, mut from) = (Vec::new(), Vec::new());
+            for (&q, arg) in preds.iter().zip(args) {
+                let Some(tail) = self.tail[q] else { continue };
+                let qb = self.edges.get(&(q, b)).copied().unwrap_or(tail);
+                let index = if self.never_taken(q, b) {
+                    self.s.m.i32(0)
+                } else {
+                    let there = if self.wide_around(q, b) { qb } else { at };
+                    let here = std::mem::replace(&mut self.cur, there);
+                    let index = self.uniform_heap_index(arg, sampler);
+                    self.cur = here;
+                    index?
+                };
+                incoming.push((index, qb));
+                from.push(q);
+            }
+            let phi = self.s.m.phi(join, self.s.t.i32);
+            self.wide_phi(phi, b, incoming, &from, true)?;
+            Ok(phi)
+        };
+        Some(made())
     }
 
     /// The value along `edges` into `b` in DXIL block `at`: a scalar's as

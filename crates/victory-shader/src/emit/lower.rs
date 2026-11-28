@@ -5771,6 +5771,9 @@ impl<'a> Lower<'a> {
         match src {
             Source::Loaded { load, first } => self.heap_index(*load, *first, sampler),
             Source::Phi { block, args } => {
+                if let Some(index) = self.wide_heap_index(*block, args, sampler) {
+                    return index;
+                }
                 let mut incoming = Vec::new();
                 for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
                     if self.block[q].is_none() {
