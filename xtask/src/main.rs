@@ -79,7 +79,15 @@ fn run_qa(root: &Path, fix: bool) -> Result<()> {
 
     println!("==> Step 3/3: Running workspace lints (clippy)...");
     let clippy_status = Command::new("cargo")
-        .args(["clippy", "--workspace", "--all-targets"])
+        .args([
+            "clippy",
+            "--workspace",
+            "--all-targets",
+            "--locked",
+            "--",
+            "-D",
+            "warnings",
+        ])
         .current_dir(root)
         .status()
         .context("running cargo clippy")?;
@@ -107,9 +115,6 @@ fn changed_rust_files(root: &Path) -> Vec<String> {
                 if !files.contains(&line.to_string()) && root.join(line).is_file() {
                     files.push(line.to_string());
                 }
-            }
-            if !files.is_empty() {
-                break;
             }
         }
     }
