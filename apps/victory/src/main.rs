@@ -154,7 +154,8 @@ fn main() -> Result<()> {
     if matches!(
         &cli.command,
         Command::Translate {
-            pipelines: true, ..
+            pipelines: true,
+            ..
         } | Command::Run { execute: true, .. }
     ) {
         sdkpath::check()?;
