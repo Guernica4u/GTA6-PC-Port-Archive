@@ -398,3 +398,13 @@ fn a_guarded_reduction_behind_interleaved_loops_branches_with_the_wave() {
     assert!(hlsl.contains("(vcc_lo & 1u) == 0u"), "{hlsl}");
     assert!(hlsl.contains("!WaveActiveAnyTrue((exec_lo & 1u) != 0u)"), "{hlsl}");
 }
+
+#[test]
+fn a_prefix_sum_over_the_wave_keeps_its_lanes_together() {
+    let prefix = || insn(crate::hlsl::wave_alloc::PREFIX, Enc::Sop1, 0, vec![Opnd::Vgpr(2)], vec![Opnd::Vgpr(1)]);
+    assert_eq!(prove(&program(vec![compare(), jump(7, 1), prefix()]), 64).unwrap(), Proof::default());
+    // It is written under EXEC, which a number in EXEC cannot say.
+    let mut number = scalar("s_mov_b32", 0, vec![Opnd::Literal(0xffff)]);
+    number.dst = vec![Opnd::ExecLo];
+    assert_eq!(prove(&program(vec![number, prefix()]), 64), None);
+}
