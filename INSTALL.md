@@ -1,107 +1,82 @@
-# Installation Guide — VIctory Fork (ors33/victory-fork)
+# Installation — VIctory Fork (ors33/victory-fork)
 
-This file sits at the repository root so it is easy to find. It explains how to
-build and run the layer from source. The layer contains **no game files**; you
-must supply your own legally obtained dump of the title's Xbox Series build
-v1.0.2.1 (the folder containing `game_scarlett_master.exe`).
+Source-only. No game files are included; supply your own dump of the title's
+Xbox Series build v1.0.2.1 (folder with `game_scarlett_master.exe`).
 
-This guide is for **our fork**: https://github.com/ors33/victory-fork
-(issue tracker: https://github.com/ors33/victory-fork/issues).
+## Prerequisites
 
-## 1. Prerequisites
+- Windows 10/11 x64, AVX2 CPU, 32 GB RAM+, SSD
+- NVIDIA GeForce RTX, recent driver, HAGS on
+- Rust 1.98.1 (rustup) + Visual Studio Build Tools "Desktop development with C++"
 
-- Windows 10 or 11 (x64)
-- CPU with AVX2 (AMD Zen 2+ or Intel Haswell+)
-- 32 GB RAM or more (64 GB comfortable), SSD
-- NVIDIA GeForce RTX card with a recent driver (RTX 40+ for frame generation)
-- Hardware-accelerated GPU scheduling (HAGS) enabled
-- Rust (toolchain pinned in `rust-toolchain.toml`: 1.98.1)
-- Visual Studio Build Tools with "Desktop development with C++"
-
-## 2. Get the source
+## Get source
 
 ```powershell
 git clone https://github.com/ors33/victory-fork
 cd victory-fork
 ```
 
-## 3. Configure
+## Configure
 
 ```powershell
 copy victory.example.toml victory.toml
 ```
 
-Edit `victory.toml` and set `game_dir` to the folder of your dump (outside this
-repository). Optionally set `cache_dir` (defaults to `%LOCALAPPDATA%\victory\cache`).
+Set `game_dir` in `victory.toml` to your dump folder (outside the repo).
 
-## 4. Fetch NVIDIA's DLSS / Frame Generation files (optional, ~70 MB)
+## DLSS files (optional, ~70 MB)
 
 ```powershell
 .\Get-NVIDIA-DLSS.cmd
 ```
 
-These are NVIDIA's own files, fetched from NVIDIA's GitHub. Without them the game
-still runs with its own upscaling and no frame generation. You can also run
-`victory get-dlss` later.
+Or later: `victory get-dlss`. Without them, runs with own upscaling, no frame gen.
 
-## 5. Build
+## Build
 
 ```powershell
 cargo build --release -p victory
 ```
 
-The first build takes a few minutes. For the diagnostics build (captures,
-timelines, recording time in the F3 panel):
+Diagnostics build:
 
 ```powershell
 cargo build --profile diag -p victory --features diagnostics
 ```
 
-## 6. Install git hooks (recommended for contributors)
+## Git hooks (contributors)
 
 ```powershell
 cargo xtask install-hooks
 ```
 
-This enables the asset-policy check on every commit.
+## Run
 
-## 7. Run
-
-Put `victory.exe` beside `game_scarlett_master.exe` in your dump folder, then:
+Place `victory.exe` beside `game_scarlett_master.exe` in your dump folder:
 
 ```powershell
 victory play
 ```
 
-Or name the executable explicitly:
+Or:
 
 ```powershell
 victory play 'D:\Games\MyDump\game_scarlett_master.exe'
 ```
 
-First start builds the layer (a few minutes). Useful options:
+Options: `-SeriesS`, `-FrameGen`/`-FrameGenX 4`, `-Dlss off|dlaa|balanced|performance`,
+`-Fps 60`, `-Res 1080to1440|4k`, `-Build diag`.
 
-| Option | Effect |
-|--------|--------|
-| `-SeriesS` | Series S profile (1280x720 inside, faster, softer) |
-| `-FrameGen`, `-FrameGenX 4` | Frame generation on from start (2 to 6 frames shown per rendered) |
-| `-Dlss off` / `dlaa` / `balanced` / `performance` | DLSS mode |
-| `-Fps 60` | Frame rate cap (30 is the title's own) |
-| `-Res 1080to1440` / `4k` | Scene at 1080p upscaled / stock 4K output |
-| `-Build diag` | Diagnostics build |
+F1 menu saves override options via `victory-settings.txt`; delete it to reset.
 
-What the F1 menu saves (`victory-settings.txt`) overrides these at every start;
-delete that file to go back to defaults.
+## In game
 
-## 8. In the game
+- F1: settings menu. F3: stats panel.
+- Full screen: run `.\scripts\fullscreen.ps1` after starting.
 
-- **F1** — settings menu (arrow keys pick/change, Enter applies)
-- **F3** — stats panel (frame rate, draws, GPU and memory numbers)
-- Full screen: start the game, then run `.\scripts\fullscreen.ps1` in another window
+Logs: `%LOCALAPPDATA%\victory\logs`. Saves: `%LOCALAPPDATA%\victory\data`.
 
-Logs go to `%LOCALAPPDATA%\victory\logs`, saves to `%LOCALAPPDATA%\victory\data`.
-
-## 9. Verify (contributors)
+## Verify (contributors)
 
 ```powershell
 cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -112,45 +87,32 @@ cargo xtask policy
 
 ## Troubleshooting
 
-- First run of every new build stutters while the driver compiles pipelines;
-  run `.\scripts\warm_shaders.bat` (or `victory warm`) once, then restart.
-- "SAVE AND RESTART NOW" can leave the old process behind without a window;
-  it goes when the PC restarts.
-- Frame generation needs room in the card's memory; the launcher holds back a
-  fifth of the budget when frame generation is ready or on.
-- Linux/Proton: use `launch_linux_proton.sh` to stop the bundled
-  `D3D12Core.dll` from replacing vkd3d-proton.
+- First build stutters while pipelines compile; run `.\scripts\warm_shaders.bat` once.
+- "SAVE AND RESTART NOW" may leave old process; restarts clear it.
+- Frame gen needs VRAM; launcher holds back 1/5 of budget.
+- Linux/Proton: use `launch_linux_proton.sh`.
 
-## See also
+## References
 
-- `README.md` — full project overview and status
-- `docs/architecture.md` — the layer's parts
-- `docs/asset-policy.md` — what may and may not be in this repository
-- `playability-resume.md` — what is still needed to make the game playable
-- Issue tracker: https://github.com/ors33/victory-fork/issues
-## Original installation (upstream VIctory / VIctory-NVIDIA)
+- README.md, docs/architecture.md, docs/asset-policy.md, playability-resume.md
+- Issues: https://github.com/ors33/victory-fork/issues
 
-This fork builds on VIctory (Marvisak) and, since 2026-11-26, on
-VIctory-NVIDIA (trustno1-coder). The original upstream installation is:
+## Original upstream install (VIctory / VIctory-NVIDIA)
 
-1. Obtain your own dump of the title's Xbox Series build v1.0.2.1
-   (the folder with `game_scarlett_master.exe`).
-2. Install Rust (rustup) and the Visual Studio Build Tools with
-   "Desktop development with C++".
-3. In PowerShell:
+1. Get your own dump of the title (Xbox Series v1.0.2.1).
+2. Install Rust + Visual Studio Build Tools "Desktop development with C++".
+3. PowerShell:
    ```powershell
    git clone https://github.com/trustno1-coder/VIctory-NVIDIA
    cd VIctory-NVIDIA
-   copy victory.example.toml victory.toml   # then set game_dir to your dump's folder
-   .\Get-NVIDIA-DLSS.cmd                  # once: NVIDIA's DLSS/FG files, ~70 MB
+   copy victory.example.toml victory.toml
+   .\Get-NVIDIA-DLSS.cmd
    scripts\play-nvidia.ps1 -Exe 'D:\Games\MyDump\game_scarlett_master.exe'
    ```
-4. The first start builds the layer (a few minutes).
-5. Requirements: Windows 10/11 (x64), AVX2 CPU, 32 GB RAM+, SSD,
-   NVIDIA GeForce RTX card, recent driver.
-6. In-game: F1 settings menu, F3 stats panel. Full screen via
-   `.\scripts\fullscreen.ps1`.
+4. First start builds the layer.
+5. Requirements: Windows 10/11, AVX2, 32 GB RAM+, SSD, NVIDIA RTX.
+6. In game: F1 settings, F3 stats, `.\scripts\fullscreen.ps1`.
 
-Upstream repository: https://github.com/trustno1-coder/VIctory-NVIDIA
-Original VIctory: https://github.com/Marvisak/VIctory
+Upstream: https://github.com/trustno1-coder/VIctory-NVIDIA
+Original: https://github.com/Marvisak/VIctory
 This fork: https://github.com/ors33/victory-fork
