@@ -114,3 +114,30 @@ fn a_group_of_32_threads_runs_as_the_lower_half_of_a_console_wave() {
     let whole = translate_paired_wave64(&program(64, words)).unwrap().hlsl;
     assert!(whole.contains("[numthreads(32, 1, 1)]") && whole.contains("exec_hi = 0xffffffffu,"), "{whole}");
 }
+
+/// `v_permlanex16_b32 v4, v3, -1, -1` with rows 1 and 3 active, as a prefix sum
+/// over a wave hands each row's total to the next:
+/// s_or_saveexec_b64 s[10:11], -1; s_mov_b32 exec_lo, 0xffff0000; s_mov_b32 exec_hi, 0xffff0000;
+/// the permute; s_mov_b64 exec, s[10:11].
+fn row_permute(op_sel: u32) -> ShaderExtract {
+    program(64, &[0xbe8a25c1, 0xbefe03ff, 0xffff0000, 0xbeff03ff, 0xffff0000, 0xd7780004 | op_sel << 11, 0x03058303,
+        0xbefe040a, 0xbf810000])
+}
+
+#[test]
+fn a_row_permute_treats_an_inactive_source_as_its_modifiers_say() {
+    let hlsl = |op_sel| translate_paired_wave64(&row_permute(op_sel)).map(|t| t.hlsl);
+    // Neither modifier: the destination keeps its value.
+    assert!(hlsl(0).unwrap().contains(" && (((tb_from0 < 32u ? exec_lo : exec_hi) >> (tb_from0 & 31u)) & 1u) != 0u) v4__[0] = tbp_0;"));
+    // Fetch inactive, with and without the bit the console compiler also sets.
+    for op_sel in [1, 9] {
+        let hlsl = hlsl(op_sel).unwrap();
+        assert!(hlsl.contains("if (((exec_lo >> tb_pair) & 1u) != 0u) v4__[0] = tbp_0;"), "{hlsl}");
+        assert!(hlsl.contains("if (((exec_hi >> tb_pair) & 1u) != 0u) v4__[1] = tbp_1;"), "{hlsl}");
+    }
+    // Bound control: an inactive source supplies zero.
+    assert!(hlsl(2).unwrap().contains(" != 0u ? tbp_1 : 0u;"));
+    // Fetch inactive wins over bound control.
+    assert!(hlsl(3).unwrap().contains("if (((exec_lo >> tb_pair) & 1u) != 0u) v4__[0] = tbp_0;"));
+    assert_eq!(hlsl(4).unwrap_err(), "paired wave64: permlane modifiers [v_permlanex16_b32 @ 0x14]");
+}
