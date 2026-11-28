@@ -494,6 +494,12 @@ impl<'a> Emitter<'a> {
     pub(in crate::hlsl) fn emit_sopc(&mut self, ins: &Insn) -> Result<(), String> {
         let m = ins.mnemonic.as_str();
         let s = &ins.src;
+        // A 64-bit compare also reads the upper register of each pair.
+        if m.ends_with("_u64") {
+            for operand in s.iter().take(2) {
+                self.touch(&hi(operand));
+            }
+        }
         let c = match m {
             "s_bitcmp0_b32" => format!("((({} >> ({} & 31u)) & 1u) == 0u)", r(&s[0])?, r(&s[1])?),
             "s_bitcmp1_b32" => format!("((({} >> ({} & 31u)) & 1u) != 0u)", r(&s[0])?, r(&s[1])?),
