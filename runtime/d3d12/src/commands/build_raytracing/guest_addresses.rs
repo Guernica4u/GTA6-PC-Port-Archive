@@ -85,6 +85,8 @@ pub(super) fn geometry(
                 // the vertex range is then sized by the largest of them.
                 let decoded = triangles.IndexFormat.0 as u32 == super::meshlet_indices::FORMAT;
                 if decoded {
+                    // Only a stream in title memory can be read on the CPU at its address.
+                    imported(state, owner, triangles.IndexBuffer, 12, D3D12_RESOURCE_FLAG_NONE)?.ok_or(E_NOTIMPL)?;
                     let indices = super::meshlet_indices::at(triangles.IndexBuffer, triangles.IndexCount)
                         .ok_or(E_NOTIMPL)?;
                     let bytes: Vec<u8> = indices.iter().flat_map(|index| index.to_le_bytes()).collect();
