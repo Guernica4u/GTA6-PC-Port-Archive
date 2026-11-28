@@ -51,6 +51,7 @@ The launcher sets these for a Proton or Wine launch. A value you set yourself is
 | `TUXBOX_TRACE_PIPELINE_REQUESTS` | `0` | With diagnostic logging enabled, also log start and completion of short slot-62 compute pipeline attempts, including the selected shader cache request key and byte size |
 | `TUXBOX_PIPELINE_DEADLINE` | `20` | Seconds before a large compile gets an empty stand-in; `0` waits |
 | `TUXBOX_NULL_PIPELINES` | on | `0` fails unsupported pipelines instead of giving empty stand-ins |
+| `TUXBOX_RASTER_APPEND` | off | `1` appends the descriptor slots a raster root leaves out, so dxil-spirv can remap them. Experimental: it assumes the guest heap holds a descriptor at every appended slot, and a slot the title never wrote makes the GPU fault |
 | `TUXBOX_PROGRESS_OVERLAY` | `auto` | `always` or `0` for the progress panel |
 | `TUXBOX_PROGRESS_OVERLAY_POS` | `tr` | `tl`, `tr`, `bl` or `br` |
 | `TUXBOX_CHECK_DISPLAY` | private | The window checks sample a private Xwayland on Wayland desktops; `desktop` uses the current display. The splash check is skipped, and reported as skipped, for a GPU that presents to the private server through software |

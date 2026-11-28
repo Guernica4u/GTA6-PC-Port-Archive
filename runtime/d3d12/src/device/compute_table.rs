@@ -357,9 +357,10 @@ fn reflected_root(
         // leaves out in the FSSM rows. Append them the way a compute root's are
         // appended: every existing range keeps its table offset, so a stage
         // translated against the guest root keeps its registers.
-        (Program::Raster { vertex, pixel }, _) => {
+        (Program::Raster { vertex, pixel }, _) if append_raster_slots() => {
             return append_missing_raster_ranges(device, original, vertex, pixel, &signature, node, strides);
         }
+        _ => return Ok(TableLayout::Unsupported),
     };
     let Some(bindings) = bindings else {
         if let Program::Compute(shader) = program {
@@ -625,6 +626,18 @@ fn append_corroborated_ranges(
     append_ranges_and_map(device, original, &extra, signature, node, append_map, append_strides)
 }
 
+/// `TUXBOX_RASTER_APPEND=1`: append the descriptor slots a raster root leaves out.
+/// Off by default, because a slot is only usable when the guest heap really holds
+/// a descriptor there and this path cannot check that yet: given a slot the title
+/// never wrote, the translated program reads empty descriptor memory and the GPU
+/// faults on it.
+fn append_raster_slots() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("TUXBOX_RASTER_APPEND").is_ok_and(|value| value.trim() == "1")
+    });
+    *ENABLED
+}
+
 /// Append the FSSM slots a raster root leaves out, for both stages.
 ///
 /// The arms above only rebuild a root with one leading table plus trailing root
@@ -661,6 +674,27 @@ fn append_missing_raster_ranges(
     extra.dedup_by_key(|binding| (binding.table, binding.slot));
     if extra.is_empty() {
         return Ok(TableLayout::Unsupported);
+    }
+    // The appended slots are only usable if the guest heap really holds a
+    // descriptor there. Say which slots a pipeline was given, so a run's log can
+    // be matched against a pipeline that faults.
+    if crate::diagnostics::logging() {
+        let stages = [("VS", vertex), ("PS", pixel)].map(|(name, code)| {
+            let digest = super::shader_cache::source_digest(code).unwrap_or_default();
+            format!("{name}={}", &digest[..12.min(digest.len())])
+        });
+        let slots: Vec<_> = extra
+            .iter()
+            .take(8)
+            .map(|b| format!("t{}s{}k{}r{}p{}", b.table, b.slot, b.kind, b.register, b.space))
+            .collect();
+        crate::diagnostics::log(&format!(
+            "appended {} descriptor slot(s) for {} {}: {}",
+            extra.len(),
+            stages[0],
+            stages[1],
+            slots.join(" ")
+        ));
     }
     append_ranges_and_map(device, original, &extra, signature, node, false, strides)
 }
