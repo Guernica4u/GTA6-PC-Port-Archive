@@ -103,11 +103,15 @@ pub(super) fn geometry(
                 if triangles.VertexFormat == DXGI_FORMAT_R32G32_FLOAT && triangles.VertexCount != 0 {
                     // The console builder reads this format as packed records
                     // with a header before them; both must be title memory.
+                    // The title's stride carries high bits the builder ignores.
+                    let stride = super::packed_positions::stride(vertices.StrideInBytes);
+                    let bytes = span(triangles.VertexCount.into(), stride, vertex_bytes(triangles.VertexFormat))
+                        .ok_or(E_INVALIDARG)?;
                     let header = vertices.StartAddress.checked_sub(super::packed_positions::HEADER).ok_or(E_NOTIMPL)?;
                     let whole = bytes.checked_add(super::packed_positions::HEADER).ok_or(E_INVALIDARG)?;
                     imported(state, owner, header, whole, D3D12_RESOURCE_FLAG_NONE)?.ok_or(E_NOTIMPL)?;
                     let positions =
-                        super::packed_positions::at(vertices.StartAddress, triangles.VertexCount, vertices.StrideInBytes)
+                        super::packed_positions::at(vertices.StartAddress, triangles.VertexCount, stride)
                             .ok_or(E_NOTIMPL)?;
                     let bytes: Vec<u8> = positions.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
                     // SAFETY: `owner` is the list's controlling guest device.

@@ -14,6 +14,9 @@
 //! them: 0 gives (c, b, a), 1 gives (b, c, a), anything else (a, b, c). The
 //! build's own transform still applies afterwards.
 //!
+//! The builder reads the vertex stride through a 14-bit field: titles pass
+//! strides such as 0x8008 for 8-byte records, so only the low 14 bits count.
+//!
 //! A host build would read the records as two floats per vertex, so they are
 //! decoded on the CPU into R32G32B32_FLOAT positions.
 use windows::Win32::System::{Diagnostics::Debug::ReadProcessMemory, Threading::GetCurrentProcess};
@@ -37,7 +40,14 @@ fn read(address: u64, bytes: usize) -> Option<Vec<u8>> {
     (copied == bytes).then_some(out)
 }
 
-/// The positions of `count` records `stride` bytes apart at `address`.
+/// The stride the console builder uses for a title's `StrideInBytes`: the
+/// low 14 bits.
+pub(super) fn stride(title: u64) -> u64 {
+    title & 0x3fff
+}
+
+/// The positions of `count` records at `address`, `stride` (already
+/// masked, see `stride`) bytes apart.
 pub(super) fn at(address: u64, count: u32, stride: u64) -> Option<Vec<[f32; 3]>> {
     let header = read(address.checked_sub(HEADER)?, HEADER as usize)?;
     let stride = usize::try_from(stride).ok()?;

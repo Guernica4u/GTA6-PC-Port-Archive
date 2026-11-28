@@ -42,3 +42,17 @@ fn unusable_headers_and_short_ranges_are_refused() {
     assert_eq!(decode(&header([0.0; 3], 2, [1.0; 3]), &records, 2, 8), None);
     assert_eq!(decode(&header([0.0; 3], 2, [1.0; 3]), &records, 1, 4), None);
 }
+
+#[test]
+fn the_builder_reads_only_the_low_14_bits_of_the_stride() {
+    // ProjectScarlett passes 0x8008 for its 8-byte records.
+    assert_eq!(stride(0x8008), 8);
+    assert_eq!(stride(8), 8);
+    assert_eq!(stride(16), 16);
+    assert_eq!(stride(0x3fff), 0x3fff);
+    let records = [record(1, 0, 0), record(2, 0, 0)].concat();
+    assert_eq!(
+        decode(&header([0.0; 3], 2, [1.0; 3]), &records, 2, stride(0x8008) as usize),
+        Some(vec![[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]])
+    );
+}
