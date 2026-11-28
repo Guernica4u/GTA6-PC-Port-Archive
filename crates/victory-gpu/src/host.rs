@@ -355,8 +355,8 @@ fn log_gpu_times(frames: f64) {
     // it faster. Report its measured total and count even when it does.
     if !traced_shaders().is_empty() {
         for (key, (ms, n)) in &by {
-            if is_traced(key) {
-                tracing::info!(command = %key, commands = *n, total_ms = *ms, "traced GPU timing");
+            if !key.starts_with("DROPPED ") && is_traced(key) {
+                tracing::info!(command = %key, commands = *n, total_ms = *ms, frames, "traced GPU timing");
             }
         }
     }
