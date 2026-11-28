@@ -551,8 +551,9 @@ def separate(a, b, c, legacy=False):
 TRIG_ERROR = 2.0 ** -20
 # The manual gives these 1 ULP on the console, and both hosts measured stay within it.
 APPROXIMATE = 1
-# NVIDIA's log2 was 11 ULP out for inputs just below 1, and its exp2 2 ULP; RADV's were within 1.
-LOGARITHM = 16
+# The translator's own logarithm near 1 and the hosts' elsewhere were within 2 ULP on
+# both cards measured. NVIDIA's exp2 was 2 ULP out on one input; RADV's was within 1.
+LOGARITHM = 4
 EXPONENTIAL = 4
 ADDEND = 0x40490fdb
 
@@ -1160,6 +1161,9 @@ def main():
                         values = [to_bits(rng.uniform(-1, 1) * 2.0 ** rng.randint(-30, 30)) for _ in range(3)]
                         if rng.random() < 0.2:
                             values[1] = values[0]
+                        # Close to 1, where a logarithm's result is small and its error shows.
+                        if rng.random() < 0.25:
+                            values[0] = to_bits(1.0 + rng.uniform(-1, 1) * 2.0 ** rng.randint(-20, -1))
                     else:
                         values = [rng.getrandbits(32) for _ in range(3)]
                         if rng.random() < 0.1:
@@ -1177,7 +1181,7 @@ def main():
                                           a.prefix, a.provider, a.compiler_dir)
         if status or fields.get("adapter") != a.adapter:
             raise RuntimeError(f"guest failed: {status} {fields}")
-        wrong, worst, alternatives = {}, {}, set()
+        wrong, worst, worst_input, alternatives = {}, {}, {}, set()
         for label, chunk in chunks.items():
             observed = struct.unpack("<384I", (trial / (label + ".bin")).read_bytes())
             wanted = expected[label]
@@ -1186,8 +1190,9 @@ def main():
                 owners = [name for name in chunk for _ in range(count(name))]
                 name = owners[column - 3] if 0 <= lane < GROUPS and 3 <= column < 3 + len(owners) else "guard"
                 apart = distance(got_word, want_word)
-                if apart is not None:
-                    worst[name] = max(worst.get(name, 0), apart)
+                if apart is not None and apart > worst.get(name, -1):
+                    worst[name] = apart
+                    worst_input[name] = f"{wanted[96 + STRIDE * lane]:#010x}"
                 if isinstance(want_word, Float) and got_word != want_word.bits and got_word in want_word.also:
                     alternatives.add(name)
                 if matches(got_word, want_word):
@@ -1198,7 +1203,7 @@ def main():
                                                                    for n in ("emitter", "dxc", "provider")},
                "checked": sorted({name.split("@")[0] for name in supported}), "forms": len(supported), "refused": refused, "wrong": wrong, "inputs": a.rounds * GROUPS,
                # The largest error seen from each approximate instruction, in units in the last place.
-               "worst_ulps": dict(sorted(worst.items())),
+               "worst_ulps": dict(sorted(worst.items())), "worst_ulps_input": dict(sorted(worst_input.items())),
                # Instructions that gave a documented alternative to the console's result.
                "alternatives": sorted(alternatives)}
     a.output.write_text(json.dumps(receipt, indent=2) + "\n")

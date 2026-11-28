@@ -326,7 +326,9 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
                 if (half_alu && ((i.dst_select != 4 && i.dst_select != 5) ||
                                  (i.dst_unused != 0 && i.dst_unused != 2)))
                     refuse(pc, "unsupported SDWA destination modifier");
-                if (i.dst_select == 7 || i.dst_unused == 3 || ((i.clamp || i.scale) && !floats.count(name) && !conversion) ||
+                const bool clamp_only = !graphics && name == "v_cvt_f32_f16";
+                if (i.dst_select == 7 || i.dst_unused == 3 ||
+                    ((i.scale || (i.clamp && !clamp_only)) && !floats.count(name) && !conversion) ||
                     (sources == 1 && (ext & 0xbf000000u)))
                     refuse(pc, "unsupported SDWA destination modifier");
             }
@@ -1691,7 +1693,11 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
         initial[next] = {Symbol::Type::table, compute_resource_heap};
         initial[next + 1] = {Symbol::Type::table, compute_sampler_heap};
     }
-    const bool wave64 = stage && !stage->wave32;
+    // The legacy HLSL profile models wave32. Direct DXIL supports both guest wave sizes. A wave64 request whose
+    // group has at most 32 threads stays on the wave32 model, as before the wave size was read: its one guest wave
+    // has lanes 0..31 only, so EXEC's high word is zero and v_mbcnt_hi adds nothing for its lanes. The model
+    // does not write the zero high word that a wave64 compare or carry-out stores in an SGPR pair destination.
+    const bool wave64 = stage ? !stage->wave32 : direct_dxil && !request.wave32 && threads > 32;
     // The byte-address rewrite of a GPU-selected heap descriptor is read only under the raw_buffer contract.
     const bool heap_window = direct_dxil && heap_view == HeapViewContract::raw_buffer;
     auto program = parse(request.code, entry, initial, direct_dxil, false, wave64, false, heap_window);

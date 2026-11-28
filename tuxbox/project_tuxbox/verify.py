@@ -204,8 +204,16 @@ def cpu_model():
     return platform.processor() or platform.machine()
 
 
-def guid_receipt(imports):
-    symbols = next((module["symbols"] for module in imports if module["module"].lower() == "d3d12_xs.dll"), ())
+def guid_receipt(imports, provider):
+    """The receipt line for the identifiers the guest imports from `provider`, by name or by ordinal."""
+    symbols = {symbol for module in imports if module["module"].lower() == provider.name.lower()
+               for symbol in module["symbols"]}
+    ordinals = {symbol for symbol in symbols if symbol.startswith("#") and symbol[1:].isdigit()}
+    if ordinals:  # MSVC's link.exe imports exported data by ordinal
+        slots, _ = export_table(provider)
+        symbols -= ordinals
+        for symbol in ordinals:
+            symbols.update(slots.get(int(symbol[1:]), ()))
     count = sum(name.startswith(("IID_", "WKPDID_")) for name in symbols)
     return f"d3d12-guids PASS identifiers={count} bytes={16 * count}"
 
@@ -277,10 +285,15 @@ def _server_render_device(pid):
 @contextmanager
 def _xwayland(xwayland, display, auth, geometry, timeout, options=()):
     """Yield (DISPLAY, pid) of a started rootful Xwayland, or None; stop it when the block exits."""
+    # A driver cache path exported for the guest is not the server's. NVIDIA's
+    # driver in Xwayland would share it without the launcher's cleanup opt-out,
+    # and once the folder passes the default cap it deletes every file there
+    # that no running process holds: the guest's pipelines, at each launch.
+    env = {key: value for key, value in os.environ.items() if key != "__GL_SHADER_DISK_CACHE_PATH"}
     read, write = os.pipe()
     try:
         server = subprocess.Popen([xwayland, f":{display}", "-displayfd", str(write), "-geometry", geometry,
-                                   "-noreset", "-auth", str(auth), *options], pass_fds=(write,),
+                                   "-noreset", "-auth", str(auth), *options], pass_fds=(write,), env=env,
                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
         os.close(read)
@@ -916,7 +929,7 @@ def verify(host, output, adapter, selected=None, samples=1):
                              "D3D12CreateRootSignatureDeserializer", "D3D12CreateVersionedRootSignatureDeserializer")})
         if "d3d12-guids" in selected:
             check("d3d12-guids", "d3d12-smoke/d3d12-guids.exe", ["--report"],
-                  guid_receipt,
+                  lambda modules: guid_receipt(modules, BUILD / "d3d12-smoke/d3d12_xs.dll"),
                   providers={"d3d12-smoke/d3d12_xs.dll": ("IID_ID3D12Device",)})
         if "xg-provider" in selected:
             check("xg-dcc", "xg-provider/xg-dcc.exe", ["--report"],
@@ -955,7 +968,7 @@ def verify(host, output, adapter, selected=None, samples=1):
                   providers={"xapu/xapu.dll": ("XApuConnect", "XApuEnqueueCommand", "XApuDequeueResult")})
         if "xcrdapi" in selected:
             check("xcrdapi", "xcrdapi/xcrdapi-read.exe", [],
-                  r"raw=16 zlib=16 guards=2 errors=2 cancellation=1 autosubmit=64 PASS",
+                  r"raw=16 zlib=16 guards=2 errors=2 cancellation=1 bc1=4 bc7=2 autosubmit=64 PASS",
                   providers={"xcrdapi/xcrdapi.dll": ("DStorageGetFactory",)})
         if "xmem" in selected:
             check("xmem-heaps", "xmem-smoke/xmem-smoke.exe", ["--heaps", "--report"],

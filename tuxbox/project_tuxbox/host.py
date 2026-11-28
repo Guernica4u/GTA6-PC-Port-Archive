@@ -322,6 +322,18 @@ def report_unindexed_nvidia_cache(cache, report):
                "while no game is running to let the driver start a new cache.")
 
 
+def keep_nvidia_shader_cache(env):
+    """Stop NVIDIA's driver deleting an exported cache folder.
+
+    Without SKIP_CLEANUP, any process given the path checks the whole folder
+    against the default cap at startup. Past it, the driver deletes every file
+    that no running process holds, including the title's pipelines.
+    """
+    if env.get("__GL_SHADER_DISK_CACHE_PATH") and env.get("__GL_SHADER_DISK_CACHE") != "0":
+        env.setdefault("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP", "1")
+        env.setdefault("__GL_SHADER_DISK_CACHE_SIZE", str(NVIDIA_CACHE_BYTES))
+
+
 def configure_nvidia_shader_cache(env, report=None):
     """Keep this prefix's compiled GPU pipelines for the next launch.
 
@@ -338,8 +350,7 @@ def configure_nvidia_shader_cache(env, report=None):
         return
     explicit = env.get("__GL_SHADER_DISK_CACHE_PATH")
     if explicit:
-        env.setdefault("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP", "1")
-        env.setdefault("__GL_SHADER_DISK_CACHE_SIZE", str(NVIDIA_CACHE_BYTES))
+        keep_nvidia_shader_cache(env)
         if report:
             report(f"NVIDIA shader cache: {explicit} (path set by the environment)")
             report_unindexed_nvidia_cache(explicit, report)

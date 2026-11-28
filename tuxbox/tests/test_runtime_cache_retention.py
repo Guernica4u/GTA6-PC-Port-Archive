@@ -20,6 +20,7 @@ from project_tuxbox.runtime_shaders import (
 import tools.rank_pipeline_failures as ranking
 
 
+@unittest.skipUnless(sys.platform == "linux", "Runtime shader caches are claimed with flock, on Proton on Linux")
 class RuntimeCacheRetention(unittest.TestCase):
     def setUp(self):
         temp = TemporaryDirectory()

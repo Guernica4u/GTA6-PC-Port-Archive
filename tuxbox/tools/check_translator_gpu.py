@@ -71,6 +71,7 @@ CHECKS = {
     "image-cmpswap": Check("check_image_cmpswap_gpu", emitter="image_cmpswap", llvm=True, dxc=True),
     "paired-wave64": Check("check_paired_wave64", emitter="paired_wave64", llvm=True, dxc=True),
     "mask-ballots": Check("check_mask_ballots_gpu", emitter="mask_ballots", llvm=True, dxc=True),
+    "float-compares": Check("check_float_compares_gpu", emitter="mask_ballots", llvm=True, dxc=True),
     "key-counts": Check("check_key_counts_gpu", emitter="key_counts", dxc=True),
     "dpp8-exchange": Check("check_dpp8_exchange", emitter="lone_lane_probe", dxc=True),
     **{f"dpp8-exchange-{layout}": Check("check_dpp8_exchange", emitter="lone_lane_probe", dxc=True,

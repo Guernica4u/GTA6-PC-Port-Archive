@@ -33,7 +33,7 @@ TuxBox is early. No retail game is playable yet.
 
 Games are tested on an NVIDIA GeForce RTX 4070 Ti SUPER; the built-in checks have also passed on other NVIDIA and AMD cards. You supply your own games and system files. [Progress](docs/PROGRESS.md) · [Test results](docs/RESULTS.md)
 
-[![Compatibility and shader progress for Frosty and Project Scarlett](docs/progress.svg)](docs/progress.svg)
+[![Library and RDNA 2 instruction coverage](docs/progress.svg)](docs/progress.svg)
 
 <p align="center">
   <img src="evidence/matrix-awakens/city-free-roam.jpg" alt="The Matrix Awakens city free-roam running through TuxBox" width="72%">
@@ -70,4 +70,4 @@ Every change must pass the checks relevant to it, on a real GPU where it affects
 
 ## `06 / license`
 
-Copyright © 2026 TuxBox contributors. TuxBox is licensed under the [Apache License 2.0](LICENSE). Third-party materials retain their own terms. [Third-party notices](docs/REFERENCES.md#shader-compiler-attribution)
+Copyright © 2026 TuxBox contributors. TuxBox is licensed under the [Apache License 2.0](LICENSE). Third-party materials retain their own terms. [Third-party notices](docs/REFERENCES.md#shader-compiler-attribution) · BCPack decoding is based on [bcpack-rs](https://github.com/Ahmet-Dedeler/bcpack-rs) by Ahmet Dedeler and Microsoft's [silicon-rans](https://github.com/microsoft/silicon-rans). [Storage codec notices](docs/REFERENCES.md#storage-codec-attribution)

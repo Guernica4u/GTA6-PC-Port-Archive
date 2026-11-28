@@ -307,6 +307,10 @@ fn step(op: &Insn, state: &mut State, width: u16, ballot: &mut bool) -> Option<O
                 state.set(destination?, 1, Class::Uniform);
                 return Some(None);
             }
+            // A prefix sum over the wave, which is together here, written under EXEC.
+            if name == super::wave_alloc::PREFIX {
+                return state.get(EXEC).is_mask().then_some(None);
+            }
             if name.starts_with("tb_") {
                 return None;
             }
