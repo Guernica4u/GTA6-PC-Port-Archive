@@ -4,7 +4,7 @@
 // buffers (`srv <i> buf table <param> <byte>` and `srv <i> buf root <param>` inputs, `uav <i> table <param> <byte>`
 // outputs, or `uav <i> bufhalf table <param> <byte> bytes <stride>` for typed half stores)
 // named by hardware buffer descriptors or 64-bit root SRV addresses, and textures
-// (`srv <i> tex2d table <param> <byte>` inputs, `uav <i> tex1d/tex2d/tex2da/tex3d float table <param> <byte> channels <n>` outputs) named
+// (`srv <i> tex1d|tex2d|tex2da|tex3d table <param> <byte>` inputs, `uav <i> tex1d/tex2d/tex2da/tex3d float table <param> <byte> channels <n>` outputs) named
 // by the token of a view the title created (device slots 18 and 19). `smp`, `smpl` and `smpc` lines become static samplers. Entry
 // values come from the compute root constants of slots 37 and 39, or from the descriptor a buffer input or output is
 // bound from: its stride and word 3 (`stride`, `descword3`), and word 3, the upper half of word 1 and the record
@@ -38,6 +38,7 @@ struct ComputeTranslation {
         bool root = false;
         bool atomic_uint_texture = false;
         unsigned channels = 4;
+        D3D12_SRV_DIMENSION srv_dimension = D3D12_SRV_DIMENSION_UNKNOWN;
         unsigned half_buffer_bytes = 0;
     };
     u64 key = 0;
@@ -176,6 +177,13 @@ const char* load_compute_translation(ComputeTranslation& tr)
             if (!std::strcmp(name, "tex3d")) return D3D12_UAV_DIMENSION_TEXTURE3D;
             return D3D12_UAV_DIMENSION_UNKNOWN;
         };
+        const auto srv_dimension = [&] {
+            if (!std::strcmp(name, "tex1d")) return D3D12_SRV_DIMENSION_TEXTURE1D;
+            if (!std::strcmp(name, "tex2d")) return D3D12_SRV_DIMENSION_TEXTURE2D;
+            if (!std::strcmp(name, "tex2da")) return D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+            if (!std::strcmp(name, "tex3d")) return D3D12_SRV_DIMENSION_TEXTURE3D;
+            return D3D12_SRV_DIMENSION_UNKNOWN;
+        };
         if (line.empty() || (std::sscanf(line.c_str(), "group %u %u %u%n", &x, &y, &z, &used) == 3 && whole())) continue;
         if (std::sscanf(line.c_str(), "ud %u%n", &declared_uds, &used) == 1 && whole()) continue;
         if (std::sscanf(line.c_str(), "udsrc %u rootconst %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.uds.size())
@@ -219,8 +227,11 @@ const char* load_compute_translation(ComputeTranslation& tr)
             tr.uavs.back().uav_dimension = uav_dimension();
             tr.uavs.back().channels = x;
         }
-        else if (std::sscanf(line.c_str(), "srv %u tex2d table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size())
+        else if (std::sscanf(line.c_str(), "srv %u %15s table %d %d%n", &i, name, &a, &b, &used) == 4 && whole() &&
+                 i == tr.srvs.size() && srv_dimension() != D3D12_SRV_DIMENSION_UNKNOWN) {
             tr.srvs.push_back({a, b, true});
+            tr.srvs.back().srv_dimension = srv_dimension();
+        }
         else if (std::sscanf(line.c_str(), "resheap %u %u%n", &x, &y, &used) == 2 && whole()) {
             if (tr.heap_srvs || !x || x > x2w_startup::max_translated_resheap || y != x2w_startup::translated_resheap_space)
                 return "a resource heap range outside the supported layout";
@@ -234,7 +245,7 @@ const char* load_compute_translation(ComputeTranslation& tr)
                   std::sscanf(line.c_str(), "smpc %u %x %x %x %x%n", &i, &x, &y, &z, &w, &used) == 5) && whole() &&
                  i == tr.samplers.statics.size())
             tr.samplers.read_manifest_line(line.c_str());
-        else return line.rfind("srv", 0) == 0 ? "a resource that is not a raw table buffer or a 2D texture"
+        else return line.rfind("srv", 0) == 0 ? "a resource that is not a raw table buffer or a 1D/2D/2D-array/3D texture"
                   : line.rfind("uav", 0) == 0 ? "an unsupported compute output view"
                   : line.rfind("udsrc", 0) == 0 ? "an entry value that is not a root constant or a buffer descriptor word"
                   : line.rfind("smp", 0) == 0 ? "a sampler that is not a plain static one" : "an unknown manifest line";
@@ -542,6 +553,21 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 if (!known || record.slot != 18) reason = "an input texture entry is not the token of a shader resource view";
                 else if (!texture || (resource.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))
                     reason = "an input texture has no desktop texture to sample";
+                else if (slot.srv_dimension != D3D12_SRV_DIMENSION_TEXTURE2D) {
+                    // 1D, 2D array and 3D: only the title's own described view of that dimension, inside its texture.
+                    const bool one = slot.srv_dimension == D3D12_SRV_DIMENSION_TEXTURE1D;
+                    const bool array = slot.srv_dimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+                    if (!described)
+                        reason = one ? "an input 1D texture has no recorded view description"
+                            : array ? "an input 2D array texture has no recorded view description"
+                            : "an input 3D texture has no recorded view description";
+                    else if (desc.ViewDimension != slot.srv_dimension)
+                        reason = one ? "an input texture view is not 1D" : array ? "an input texture view is not 2D array"
+                            : "an input texture view is not 3D";
+                    else if (!x2w_startup::address_view_fits(resource, desc))
+                        reason = "an input texture view does not fit its texture";
+                    else if (x2w_startup::packed_target_format(desc.Format)) reason = "an input texture view has a packed format";
+                }
                 else if (described ? desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D
                                    : resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.DepthOrArraySize != 1)
                     reason = "an input texture view is not 2D";

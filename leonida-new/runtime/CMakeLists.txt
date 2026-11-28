@@ -785,6 +785,13 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     target_compile_options(gameinput_no_sdl_test PRIVATE /W4 /permissive- /utf-8)
     target_link_options(gameinput_no_sdl_test PRIVATE /OPT:NOREF)
   endif()
+  # When the keyboard pad clips the cursor (shims/gameinput_clip.h): not while the window is dragged. No SDL, no window.
+  add_executable(gameinput_clip_test test/gameinput_clip_test.cpp)
+  target_include_directories(gameinput_clip_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  if(MSVC)
+    target_compile_options(gameinput_clip_test PRIVATE /W4 /permissive- /utf-8)
+  endif()
+  add_test(NAME gameinput_clip COMMAND gameinput_clip_test)
   if(LEONIDA_SDL3 AND TARGET SDL3::SDL3-static)
     target_sources(gta6rt PRIVATE shims/gameinput.cpp)
     target_link_libraries(gta6rt PRIVATE SDL3::SDL3-static)
@@ -3353,6 +3360,12 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_resource_desc_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_resource_desc COMMAND d3d12_resource_desc_test)
 
+    # Mapped session staging file, compile activity and cache cleanup (shims/d3d12_pipeline_checkpoint.h).
+    add_executable(d3d12_pipeline_checkpoint_test test/d3d12_pipeline_checkpoint_test.cpp)
+    target_compile_definitions(d3d12_pipeline_checkpoint_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_pipeline_checkpoint_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_pipeline_checkpoint COMMAND d3d12_pipeline_checkpoint_test)
+
     # Multi-viewport & multi-scissor rendering (RSSetViewports / RSSetScissorRects 1..16) against host D3D12.
     add_executable(d3d12_multi_viewport_test test/d3d12_multi_viewport_test.cpp)
     target_link_libraries(d3d12_multi_viewport_test PRIVATE gta6rt_d3d12_com d3d12 dxgi dxguid)
@@ -4481,6 +4494,11 @@ if(TARGET Vulkan::Headers)
     target_link_libraries(d3d12_set_descriptor_heaps_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
     target_compile_definitions(d3d12_set_descriptor_heaps_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_set_descriptor_heaps_test PRIVATE /W4 /permissive- /utf-8)
+    if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+      target_sources(d3d12_set_descriptor_heaps_test PRIVATE ${LEONIDA_TEST_CS})
+      target_compile_definitions(d3d12_set_descriptor_heaps_test PRIVATE
+                                 LEONIDA_TEST_CS_SPV="${LEONIDA_TEST_CS}")
+    endif()
     add_test(NAME d3d12_set_descriptor_heaps COMMAND d3d12_set_descriptor_heaps_test)
     set_tests_properties(d3d12_set_descriptor_heaps PROPERTIES SKIP_RETURN_CODE 77
                          FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
@@ -4874,6 +4892,7 @@ if(TARGET Vulkan::Headers)
       endif()
     endif()
     add_test(NAME vk_xdxr_postbuild_readback COMMAND vk_xdxr_postbuild_readback_test)
+    set_tests_properties(vk_xdxr_postbuild_readback PROPERTIES SKIP_RETURN_CODE 77)
 
     # Title-placed buffer VAs (device slot 133) and the console VA shaders reach them by (src/title_va_alias.h).
     add_executable(title_va_alias_test test/title_va_alias_test.cpp)
