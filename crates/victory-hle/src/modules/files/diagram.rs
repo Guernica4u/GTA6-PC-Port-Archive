@@ -46,7 +46,8 @@ impl Diagram {
         }
         Ok(Self {
             package_path: Path::new(r"G:\").join(file),
-            profiles,
+            // The guest can change the process's current directory after startup.
+            profiles: std::path::absolute(profiles)?,
         })
     }
 
@@ -91,6 +92,15 @@ impl Diagram {
 mod tests {
     use super::*;
     use std::io::Read;
+
+    #[test]
+    fn relative_profiles_are_resolved_at_configuration() {
+        let diagram = Diagram::new(Path::new("ui/controls.bin"), "packs".into()).unwrap();
+        assert_eq!(
+            diagram.profiles,
+            std::env::current_dir().unwrap().join("packs")
+        );
+    }
 
     #[test]
     fn only_accepts_a_file_relative_to_the_package() {
