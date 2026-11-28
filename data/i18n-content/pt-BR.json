@@ -1,0 +1,974 @@
+{
+  "lang": "pt-BR",
+  "values": {
+    "approach": {
+      "Compatibility layer": "Camada de compatibilidade",
+      "Compatibility runtime": "Runtime de compatibilidade",
+      "HLE emulator": "Emulador HLE",
+      "Relinker + shader recompiler": "Relinker + recompilador de shaders",
+      "Static recompilation": "Recompilação estática",
+      "Relinker (PS5 route)": "Relinker (rota PS5)",
+      "API bridge": "Ponte de API",
+      "Relinker": "Relinker",
+      "Research probes": "Sondas de pesquisa",
+      "Static recompilation (DX12)": "Recompilação estática (DX12)",
+      "Emulator": "Emulador"
+    },
+    "target": {
+      "GTA VI only": "Só GTA VI",
+      "Any Xbox Series game": "Qualquer jogo de Xbox Series",
+      "GTA VI first": "GTA VI primeiro",
+      "Any Xbox One or Series game": "Qualquer jogo de Xbox One ou Series",
+      "PS5 build": "Versão de PS5",
+      "GTA VI": "GTA VI",
+      "GTA VI (Xbox Series)": "GTA VI (Xbox Series)"
+    },
+    "kind": {
+      "Archive toolkit": "Kit de arquivos",
+      "Coordination hub": "Centro de coordenação",
+      "Asset extractor": "Extrator de recursos",
+      "Archive explorer": "Explorador de arquivos",
+      "Texture codec": "Codec de texturas",
+      "RE toolkit": "Kit de engenharia reversa",
+      "Texture tool": "Ferramenta de texturas",
+      "Format notes": "Notas de formato",
+      "Curated list": "Lista curada",
+      "Asset explorer": "Explorador de recursos",
+      "World viewer": "Visualizador do mundo",
+      "Data decoder": "Decodificador de dados",
+      "Audio extractor": "Extrator de áudio",
+      "Format research": "Pesquisa de formatos",
+      "Front end": "Interface",
+      "Test tools": "Ferramentas de teste",
+      "Build inspector": "Inspetor de builds"
+    },
+    "byline": {
+      "Removed by GitHub · was public, based on VIctory": "Removido pelo GitHub · era público, baseado no VIctory",
+      "Streamed on Rumble · code not public": "Transmitido no Rumble · código não público",
+      "Working in private · built on JoshuuDev's victory-amd": "Trabalho privado · baseado no victory-amd do JoshuuDev",
+      "Streamed on Rumble · built on a VIctory fork (which one isn't known)": "Transmitido no Rumble · baseado em um fork do VIctory (não se sabe qual)",
+      "Working in private · built on hyphennn's victory-fork": "Trabalho privado · baseado no victory-fork do hyphennn",
+      "Streamed on Rumble by Swaggely · built on hyphennn's victory-fork (formerly victory-gta6)": "Transmitido no Rumble por Swaggely · baseado no victory-fork do hyphennn (antes victory-gta6)",
+      "Private code · based on VIctory and XCL": "Código privado · baseado no VIctory e no XCL"
+    },
+    "evidence": {
+      "Verified by PortWatch": "Verificado pelo PortWatch",
+      "Rumble stream": "Transmissão no Rumble",
+      "Confirmed by PortWatch": "Confirmado pelo PortWatch",
+      "Live streams on Rumble": "Transmissões ao vivo no Rumble",
+      "Checked by PortWatch with the group": "Checado pelo PortWatch com o grupo"
+    },
+    "proof": {
+      "36-minute external playtest": "Teste externo de 36 minutos",
+      "Watch the first kill": "Ver a primeira morte",
+      "Video on Reddit": "Vídeo no Reddit",
+      "Watch on Rumble": "Assistir no Rumble",
+      "Doomsday on X": "Doomsday no X",
+      "Watch video": "Assistir vídeo"
+    }
+  },
+  "changes": {
+    "effort": "O robô de busca encontrou {repo} (possível projeto, substância {n}).",
+    "tool": "O robô de busca encontrou {repo} (ferramenta, substância {n}).",
+    "repo": "O robô de busca encontrou {repo} (substância {n})."
+  },
+  "pinned": {
+    "text": "**Por que a melhor nota está travada em 91,3 %: agora o que pesa é a renderização, não os FPS.**\n\nOs FPS são a parte fácil. Desligue o ray tracing, renderize em baixa resolução e faça upscale, e você chega a 60. Na nossa escala, passar de 30 fps não soma, e uma imagem borrada em baixa resolução custa pontos de renderização.\n\nO que falta é uma imagem como a do console: iluminação completa, ray tracing e texturas nítidas. Como o DexNom disse, o caminho é consertar a renderização."
+  },
+  "efforts": {
+    "kelvaroq": {
+      "summary": "Kelvaroq é um runtime Rust público construído sobre o VIctory e o victory-fork. Adiciona patches de renderização e melhorias medidas no envio de trabalho, e leva o GTA VI pelo prólogo e pela primeira missão.",
+      "highlights": [
+        "Código público sob GPL-3.0, com revisões upstream fixadas e uma série de patches documentada",
+        "O prólogo é jogável a cerca de 10 fps, com 7-8 fps nas cenas mais pesadas",
+        "Um teste externo de 36 minutos numa RTX 4090 chegou à primeira missão sem travar"
+      ],
+      "blockers": [
+        "O envio e a sincronização de CPU continuam sendo o principal gargalo",
+        "Faltam pipelines de shader, 7% dos draws são descartados e a pressão de VRAM continua",
+        "A evidência de estabilidade é de uma única sessão e as medições em duas plataformas são limitadas"
+      ]
+    },
+    "victory-nvidia": {
+      "summary": "Um fork do VIctory para NVIDIA sobre o foxhound do readmet3xt-lab, com DLSS, geração de quadros e menu de ajustes dentro do jogo. O PortWatch verificou: é quase tão jogável quanto os líderes, a 20 fps sem geração de quadros e sem travar.",
+      "highlights": [
+        "Plataforma no README: GeForce RTX 5070 12 GB, Ryzen 7 9800X3D, 64 GB de RAM, Windows 11",
+        "20 fps sem geração de quadros, sem travar, verificado pelo PortWatch. README: 26-30 fps na abertura",
+        "DLSS e geração de quadros, de 2 a 6 vezes nas placas RTX 50, com menu F1 dentro do jogo"
+      ],
+      "blockers": [
+        "Sem ray tracing por padrão; ligar dá cerca de 3 fps e uma imagem quebrada",
+        "Há engasgos, piores na primeira execução enquanto os shaders compilam; a geração de quadros exige uma RTX 40 ou superior",
+        "Quase tudo é código do foxhound; o exe publicado não é assinado e não pode ser conferido com o código, então compile você mesmo"
+      ]
+    },
+    "belobug": {
+      "summary": "O fork do VIctory do Belobug para AMD Radeon é muito jogável: cerca de 22 fps de média sem travar e progresso de história avaliado em 80%. O GitHub removeu o código e a conta em 27 de novembro por violação dos termos de serviço, o que o PortWatch confirmou.",
+      "highlights": [
+        "Plataforma: AMD Radeon RX 9070 XT 16 GB, Ryzen 7 9800X3D, 64 GB de RAM, Windows 11",
+        "Muito jogável: cerca de 22 fps de média e sem travar, usando uns 30 GB de RAM e 12 GB de VRAM",
+        "Mundo aberto iluminado com texturas, pessoas, veículos, vegetação, água e céu; a imagem fica logo abaixo da do DexNom",
+        "O autor informa que a iluminação com ray tracing já funciona na AMD",
+        "Dá para jogar as missões; progresso de história em 80%, empatado com o CGBJ",
+        "Construído sobre a branch principal do VIctory e seus pull requests upstream"
+      ],
+      "blockers": [
+        "O GitHub removeu o código e a conta em 27 de novembro por violação dos termos de serviço; ninguém de fora pode testar",
+        "O último README público informava 5-7 fps e dizia que a versão «ainda não é jogável»",
+        "Testado em apenas um PC AMD; nada ainda em NVIDIA ou Intel"
+      ],
+      "nukedNote": "O GitHub removeu o repositório e a conta em 27 de novembro por violação dos termos de serviço, confirmado pelo PortWatch. O progresso dele ainda conta no nosso número geral."
+    },
+    "dexnom": {
+      "summary": "O DexNom Runtime é um fork do VIctory para AMD Radeon, testado numa Radeon RX 7900 XTX. Ele se apoia no victory-world-runtime do ZSlayerHQ com correções próprias de shaders, streaming de texturas e memória de GPU. O PortWatch viu funcionando com iluminação por ray tracing, a primeira versão AMD da nossa tabela a conseguir isso. A imagem é a melhor avaliada da tabela, embora iluminação e materiais ainda deem problema, e dá para jogar as missões a cerca de 3-4 fps (cerca de 1 fps com ray tracing), quase sem travar.",
+      "highlights": [
+        "Plataforma: AMD Radeon RX 7900 XTX, Windows x64",
+        "Iluminação com ray tracing funcionando, visto pelo PortWatch: a primeira versão AMD da tabela a conseguir",
+        "A imagem melhor avaliada da tabela; dá para jogar as missões",
+        "Traduz 25.742 dos 25.758 shaders do arquivo de testes; os 2.191 shaders de vértice passam no validador DXIL da Microsoft (segundo o relatório dele)",
+        "Compila do código com o próprio Setup.cmd; sem downloads pré-compilados; GPL-3.0"
+      ],
+      "blockers": [
+        "Cerca de 1 fps com ray tracing; 3,5-4 fps em interiores da cidade do capítulo 1 sem ele (relatório de testes dele)",
+        "O README ainda chama o ray tracing de experimental e o relatório aponta iluminação interna errada (portas superexpostas, objetos escuros)",
+        "Testado em apenas uma placa AMD; ainda não foi reproduzido por outros"
+      ]
+    },
+    "zettrox": {
+      "summary": "A versão do ZETTROX, baseada no VIctory e no victory-fork do hyphennn, para placas NVIDIA. Joga do prólogo da Lucia até a primeira missão do Jason, «Gone Fishing», onde o PortWatch verificou a primeira morte com arma no GTA VI para PC. A renderização continua ruim e roda a cerca de 2 fps, mas é jogável e quase nunca trava.",
+      "highlights": [
+        "Joga do prólogo da Lucia até a primeira missão do Jason, «Gone Fishing»",
+        "A primeira morte com arma no GTA VI para PC, verificada pelo PortWatch",
+        "Quase nunca trava: o README informa mais de 1 h 30 min sem travar",
+        "Prólogo concluído: a primeira versão da tabela a chegar nesse ponto da história"
+      ],
+      "blockers": [
+        "A renderização continua ruim: tudo que está na sombra sai preto e cenas claras estouram",
+        "Roda a cerca de 2 fps (1-3 no README)",
+        "Código publicado em 25 de novembro; ainda não foi reproduzido por outros"
+      ],
+      "nukedNote": "O repositório no GitHub e a conta do Zettrox sumiram em 25 de novembro (HTTP 404 desde 17:26 UTC). Ainda não há aviso DMCA publicado."
+    },
+    "vitoriabr": {
+      "summary": "O VItoriaBr do Uilian, sobre o victory-fork do hyphennn com o trabalho próprio dele para NVIDIA, transmitido ao vivo no YouTube. Na live chega à primeira missão do Jason, «Gone Fishing», com renderização ruim, até 4 fps e poucos travamentos.",
+      "highlights": [
+        "Chega à primeira missão do Jason, «Gone Fishing», nas lives",
+        "Poucos travamentos na live",
+        "Menus, introdução e saves a 30 fps numa NVIDIA RTX 5060 Ti (README)"
+      ],
+      "blockers": [
+        "A renderização é ruim; áreas na sombra ficam escuras",
+        "Até 4 fps",
+        "O código agora só difere do victory-fork em duas mudanças pequenas"
+      ]
+    },
+    "avatarmanz": {
+      "summary": "O fork do VIctory do AvatarManz para a AMD Radeon RX 7900 XTX, verificado pelo PortWatch a cerca de 16 fps de média e com som. O GitHub removeu o código e a conta em 27 de novembro por violação dos termos de serviço, como no caso do Belobug, o que o PortWatch confirmou.",
+      "highlights": [
+        "Plataforma: AMD Radeon RX 7900 XTX, Intel Core i9-12900K, 64 GB de RAM, Windows 11",
+        "Cerca de 16 fps de média no jogo, verificado pelo PortWatch. README: 13-20 fps em interiores do prólogo, 19-22 na primeira missão de barco, 30 nos menus",
+        "41 minutos numa sessão sem travar (README); o som funciona",
+        "Juntou victory-fork, DexNom e Belobug sobre o VIctory, mantendo histórico e créditos; GPL-3.0-or-later"
+      ],
+      "blockers": [
+        "O GitHub removeu o código e a conta em 27 de novembro por violação dos termos de serviço; ninguém de fora pode testar",
+        "Perseguições em ruas movimentadas caem para 6-10 fps, com quadros isolados bem mais longos; a pé em áreas externas roda a cerca de 11-17 fps (README)",
+        "Chegou a usar 40-46 GB de memória (recomendam-se 64 GB); testado em um PC só, sem reprodução por outros"
+      ],
+      "nukedNote": "O GitHub removeu o repositório e a conta em 27 de novembro por violação dos termos de serviço, como no caso do Belobug, confirmado pelo PortWatch. O progresso dele ainda conta no nosso número geral."
+    },
+    "notnozy": {
+      "summary": "Uma versão privada mostrada na «GTA6 Modding Stream» do NotNozy no Rumble. Parece mais ou menos a versão do AvatarManz; o autor avalia o progresso de história em 80%. Roda numa placa AMD. Código não público, e não se sabe sobre o que é construída.",
+      "highlights": [
+        "Parece mais ou menos a versão do AvatarManz, o líder da tabela",
+        "O autor avalia o progresso de história em 80%",
+        "Roda numa placa AMD"
+      ],
+      "blockers": [
+        "Sem taxa de fps medida, registro de travamentos ou PC de testes: os valores seguem a versão do AvatarManz, à qual se parece",
+        "O código é privado, então ninguém de fora pode testar ou reproduzir"
+      ]
+    },
+    "doomsday": {
+      "summary": "A versão de um grupo privado sobre o victory-amd do JoshuuDev (um fork do VIctory), verificada pelo PortWatch. Roda o GTA VI com iluminação por ray tracing a cerca de 3-5 fps, quase nunca trava e o autor avalia o progresso de história em 80%. O celular do jogo renderiza muito bem e o menu do mapa roda a mais fps. Feita principalmente para AMD e também funciona em NVIDIA, a menos fps. Código não público.",
+      "highlights": [
+        "Iluminação por ray tracing a cerca de 3-5 fps, verificada pelo PortWatch",
+        "Quase nunca trava; o autor avalia o progresso de história em 80%",
+        "O celular do jogo renderiza muito bem; o menu do mapa roda a mais fps",
+        "Roda principalmente em AMD; também funciona em NVIDIA a menos fps"
+      ],
+      "blockers": [
+        "O ray tracing funciona, mas as texturas ficam piores que as do DexNom",
+        "Cerca de 3-5 fps",
+        "O código é privado, então ninguém de fora pode testar ou reproduzir"
+      ]
+    },
+    "darkworldhm": {
+      "summary": "Uma versão mostrada na live do darkworldhm no Rumble em 25 de novembro, com o modo livre do GTA VI a cerca de 12-15 fps, oscilando entre 5 e 24: a maior taxa da nossa tabela. O autor avalia o progresso de história em 80% e até agora não travou. A imagem parece aceitável, com alguns glitches de textura ou de ray tracing. Ao que parece numa placa NVIDIA RTX da série 50. É baseada no VIctory, mas não se sabe qual fork. Código não público.",
+      "highlights": [
+        "Cerca de 12-15 fps no modo livre, chegando a 24: a maior taxa da nossa tabela",
+        "O autor avalia o progresso de história em 80%",
+        "Nenhum travamento visto até agora"
+      ],
+      "blockers": [
+        "A taxa oscila entre cerca de 5 e 24 fps",
+        "Alguns glitches de textura ou de ray tracing",
+        "O código é privado, então ninguém de fora pode testar ou reproduzir"
+      ]
+    },
+    "suri": {
+      "summary": "Uma versão privada sobre o victory-fork do hyphennn (um fork do VIctory). O PortWatch confirmou um jogador andando pelo prólogo da Lucia a cerca de 3 fps; o autor agora avalia o progresso de história em 80%. O código não é público.",
+      "highlights": [
+        "O PortWatch confirmou um jogador andando, a cerca de 3 fps",
+        "O autor avalia o progresso de história em 80%"
+      ],
+      "blockers": [
+        "Roda a cerca de 3 fps",
+        "O PortWatch só confirmou o prólogo; os 80% de história são a avaliação do autor",
+        "O código é privado, então ninguém de fora pode testar ou reproduzir"
+      ]
+    },
+    "omonkey": {
+      "summary": "Um desenvolvedor que transmite todo o trabalho ao vivo no Rumble, pelo canal do Swaggely. Os shaders do GTA VI começaram a carregar direito e um jogador anda devagar pela cena inicial da prisão a cerca de 5 fps. Sem código público.",
+      "highlights": [
+        "Os shaders do GTA VI começaram a carregar direito",
+        "Um jogador anda devagar pela cena inicial, a prisão da Lucia",
+        "Todo o desenvolvimento é transmitido ao vivo no Rumble"
+      ],
+      "blockers": [
+        "Preso na cena inicial da prisão",
+        "Roda a cerca de 5 fps",
+        "Sem código ou versão públicos, ninguém pode testar fora das lives"
+      ],
+      "nukedNote": "Retirado em 25 de novembro (segundo o autor). O código nunca foi público; o canal do Swaggely no Rumble, onde era transmitido, ainda carregava às 18:18 UTC."
+    },
+    "cgbj": {
+      "summary": "Versão privada do VIctory/XCL, verificada pelo PortWatch. O autor avalia o progresso de história em 80%, a renderização em 0,7 e a estabilidade em 0,85. Faz 25 fps de média com 8 GB de RAM e 16 GB de VRAM. O código foi público por pouco tempo e agora está fora do ar.",
+      "highlights": [
+        "Avaliações do autor: 80% de história, 0,7 de renderização, 0,85 de estabilidade",
+        "25 fps de média no jogo"
+      ],
+      "blockers": [
+        "Ainda há glitches visuais menores",
+        "No jogo não sustenta 30 fps; a média informada é 25 fps",
+        "O código é privado, então ninguém fora do grupo pode testar ou reproduzir"
+      ]
+    },
+    "victory-gta6": {
+      "summary": "O fork do VIctory do hyphennn (antes victory-gta6), com correções próprias de renderização e velocidade. Nas lives dele no Rumble o prólogo roda com iluminação por ray tracing, texturas detalhadas e cabelo a cerca de 3 fps; o README ainda diz que as sombras são pretas. Dados do próprio autor.",
+      "highlights": [
+        "As lives mostram o prólogo com ray tracing, texturas detalhadas e cabelo",
+        "README: a primeira cena jogável renderiza, com HUD, menu de pausa e controle funcionando",
+        "Correções próprias de culling de meshlets, tabelas de descritores e shaders não traduzidos, sobre o VIctory"
+      ],
+      "blockers": [
+        "Cerca de 3 fps nas lives; o README agora mede 8-10 fps nas primeiras salas, com opções",
+        "O README não acompanhou as lives: diz que as sombras são pretas e que o ray tracing ainda não ilumina nada",
+        "Testado em um PC (RTX 4070); ainda não foi reproduzido por outros"
+      ]
+    },
+    "marvis": {
+      "summary": "A camada Rust do Marvis executa o GTA VI de forma nativa. O autor informa que já dá para jogar controlando o personagem, embora a versão continue instável; o README ainda diz que não é jogável e informa cerca de 1 fps no mundo.",
+      "highlights": [
+        "README: telas de boot, vídeo de introdução, tela inicial e saves a 30 fps",
+        "A cena de introdução é desenhada com texturas e iluminação, com cabelo, céu e profundidade de campo",
+        "O autor informa que já dá para jogar controlando o personagem, mas continua instável"
+      ],
+      "blockers": [
+        "Cerca de 1 fps; faltam sombras por ray tracing e luz indireta",
+        "Testado em uma máquina (AMD RX 6700 XT); ainda não foi reproduzido por outros",
+        "O README ainda diz que não é jogável; o novo relato de gameplay não foi reproduzido"
+      ]
+    },
+    "xcl": {
+      "summary": "Camada estilo Wine que executa o código do jogo de forma nativa. Na branch principal, vários testadores fazem o GTA VI passar dos menus e entrar no mundo, mas a tela fica num indicador de carregamento e um watchdog de GPU encerra a execução. Não verificado.",
+      "highlights": [
+        "As execuções de vários testadores chegam ao mundo do GTA VI: o estado do jogo diz «Game Running», com pedestres e veículos gerados",
+        "Menus a 30 fps; depois deles o vídeo de introdução roda e o mundo carrega por streaming",
+        "Todos os 26.698 programas RDNA2 do pacote de shaders do GTA VI viram HLSL; as amostras compilam para DXIL"
+      ],
+      "blockers": [
+        "README: uma branch para NVIDIA não mesclada chega ao mundo a cerca de 5 fps, com partes da imagem faltando",
+        "O watchdog de GPU do jogo encerra cada execução entre 3 e 14 minutos, em AMD e NVIDIA",
+        "Os pipelines ficam para trás ao carregar o mundo e as texturas comprimidas em BCPack ainda não são decodificadas"
+      ]
+    },
+    "americas-recomp": {
+      "summary": "Fork do AnyPS5 que testou se o recompilador de shaders RDNA2 da ferramenta de port de PS5 dá conta do jogo de Xbox. Retirado em 23 de novembro: o repositório dá 404, a conta do autor continua ativa e não há aviso DMCA publicado.",
+      "highlights": [
+        "SPIR-V válido para 100% dos shaders de vértice, 99,97% dos de pixel, 99,99% dos mesh e 99,6% dos de computação",
+        "Os shaders recompilados foram conferidos bit a bit com um interpretador de CPU independente numa GPU",
+        "O substituto do xgameruntime implementa 388 de 398 métodos; as 611 importações de DLL resolvem"
+      ],
+      "blockers": [
+        "O repositório sumiu do GitHub em 23 de novembro (HTTP 404); a conta do autor continua ativa",
+        "Nenhum quadro foi renderizado ainda",
+        "O layout de vértices, a mistura e o estado de descritores vêm do executável"
+      ],
+      "nukedNote": "O repositório no GitHub sumiu em 23 de novembro por volta de 22:00 UTC (HTTP 404). A conta do autor continua ativa e não há aviso DMCA publicado, então provavelmente foi apagado ou virou privado."
+    },
+    "leonida": {
+      "summary": "Feito só para o GTA VI, pelo autor do Hookshot. Retirado em 23 de novembro: o Discord sumiu, o repositório no GitHub foi apagado e o criador disse que desistiu. Último resultado: o exe rodou, os quadros continuaram pretos.",
+      "highlights": [
+        "O exe de varejo rodou até 10 minutos sem travar no Windows e no Wine, AMD e NVIDIA",
+        "O jogo emitiu chamadas de desenho (408.781 numa execução) e apresentou quadros na própria janela",
+        "Todos os 26.503 shaders do GTA VI foram traduzidos para SPIR-V e passaram na validação"
+      ],
+      "blockers": [
+        "Retirado: repositório no GitHub apagado, Discord sumido, o criador saiu",
+        "O DMCA da Take-Two (24 de novembro) desativou os 3.007 forks no GitHub; restam cópias e um espelho congelado",
+        "Último estado: todo quadro apresentado era preto"
+      ],
+      "nukedNote": "Discord sumido, repositório no GitHub apagado e criador que desistiu em 23 de novembro. Em 24 de novembro um aviso DMCA da Take-Two desativou a rede de 3.007 forks no GitHub; restam cópias enviadas à parte e um espelho congelado."
+    },
+    "xbox-emulator": {
+      "summary": "Runtime Rust que executa builds de Xbox Series extraídas como processos normais do Windows, continuando o projeto TomBox. Informa corridas de Trackmania a cerca de 60 fps e o Terraria chegando ao seu mundo, além do lobby do Fortnite. Dados do próprio autor.",
+      "highlights": [
+        "Informa corridas de Trackmania a ~60 fps com teclado e controle",
+        "Informa o Terraria chegando ao seu mundo a 60 fps; o Fortnite vai até o lobby do Battle Royale",
+        "Já examinou os 26.503 shaders do GTA VI: uma amostra de 4.000 desmonta limpa"
+      ],
+      "blockers": [
+        "Um terço dos shaders de vértice do GTA VI é traduzido; os shaders mesh precisam dos dados de binding do executável",
+        "As cenas 3D ainda saem erradas: vídeo e texturas em streaming pretos, passes de iluminação escuros",
+        "GTA VI não rodou: falta o executável"
+      ]
+    },
+    "scarlettx": {
+      "summary": "Emulador de alto nível em sala limpa do SO Scarlett e do runtime GDK. Informa dois jogos de varejo de Xbox Series, Concept Destruction e Unicorn Overlord, jogáveis no Windows.",
+      "highlights": [
+        "Concept Destruction e Unicorn Overlord jogáveis segundo o autor, numa GPU real",
+        "281 de 422 funções acompanhadas concluídas; 42 dos 46 marcos de inicialização do Concept Destruction",
+        "Controle, saída de áudio e saves funcionam no Concept Destruction"
+      ],
+      "blockers": [
+        "Ainda sem lifting de shaders RDNA2 (0%). O GTA VI traz shaders de console pré-compilados",
+        "Memória unificada do Xbox e o kernelx completo não começaram",
+        "Os resultados de jogo são do próprio autor e ainda não foram reproduzidos"
+      ]
+    },
+    "tuxbox": {
+      "summary": "Camada que prioriza o nativo para jogos de Xbox Series desempacotados, testada principalmente no Linux via Proton. O GTA VI informou o próprio estado como «Game Running» na intro da história antes de travar após uns dez minutos, mas nenhuma imagem aparece depois da seleção de personagem. Dados do próprio autor.",
+      "highlights": [
+        "Uma execução gravada do GTA VI chegou ao script da intro («Game Running», quadro 10.146) antes de travar",
+        "The Matrix Awakens chegou à perseguição na rodovia e à cidade aberta em testes no Linux com ajustes reduzidos",
+        "Traz um joguinho de teste (Lanes) que usa as bibliotecas de gráficos, memória e entrada do Xbox"
+      ],
+      "blockers": [
+        "Imagens, entrada e tempos de quadro dessa execução não foram verificados; a causa do travamento é desconhecida",
+        "12.087 das 16.868 requisições de shader capturadas do GTA VI compilam; shaders de computação grandes levam minutos",
+        "O suporte a Windows ainda está em desenvolvimento; resultados não reproduzidos"
+      ]
+    },
+    "openscarlett": {
+      "summary": "Camada de tradução C++20 com licença MIT para D3D12 e Vulkan. Agora afirma ter superado 17 paradas de boot num jogo de varejo que não nomeia, sem registro de execução nem imagem, então ainda não há marco de GTA VI.",
+      "highlights": [
+        "Seis amostras da Microsoft Scarlett sem modificação rodam ao vivo em 4K",
+        "Informa 775 de 779 opcodes RDNA2 verificados numa GPU real",
+        "Roda um port caseiro de Freedoom a 60 FPS; 79 testes automatizados passam"
+      ],
+      "blockers": [
+        "Nenhum jogo de varejo rodado do início ao fim; a inicialização de Minecraft e Matrix Awakens continua em branches",
+        "O corpus de shaders é próprio, não o do GTA VI",
+        "As porcentagens de status medem a própria lista, não o GTA VI"
+      ]
+    },
+    "scarlett-layer": {
+      "summary": "Carregador mais uma DLL hook injetada que redireciona chamadas exclusivas do console para camadas do Windows, com wrapper d3d12_xs e lifter de shaders próprios. Informa a build GDK do Terraria desenhando seus menus com áudio; ainda sem gameplay.",
+      "highlights": [
+        "Informa o Terraria (build GDK desempacotada) bootando em menus limpos com áudio",
+        "O loader.exe inicia o título suspenso, reescreve as importações e injeta uma DLL hook",
+        "A amostra SimpleTriangle do GDK de desktop da Microsoft boota, renderiza e sai por ele"
+      ],
+      "blockers": [
+        "Nenhum título jogado ainda: entrada e gameplay do Terraria são o próximo passo",
+        "O lifter de shaders foi testado na própria varredura de 255 programas, não nos shaders do GTA VI"
+      ]
+    },
+    "xbox2windows": {
+      "summary": "Pesquisa de recompilação estática que converte código e shaders de Xbox Series em C++ para Windows e DXIL, com mais de 50 colaboradores. O material compartilhado pelo projeto mostra os menus do GTA VI, instáveis. O README agora informa um exe de diagnóstico modificado que reproduz a intro e o texto de configuração; o exe original e os menus continuam sem verificação.",
+      "highlights": [
+        "O material compartilhado mostra os menus do GTA VI no PC, embora as execuções sejam instáveis",
+        "O exe principal chega à criação de pipelines D3D12 nas execuções de diagnóstico do mantenedor",
+        "851 de 12.101 shaders de pixel do GTA VI (7%) batem com a saída de testes controlados em RTX e WARP"
+      ],
+      "blockers": [
+        "A intro e o texto de configuração vêm de um exe de diagnóstico modificado; o exe original não está verificado",
+        "Só 865 de 26.503 shaders têm saída verificada pelos próprios testes",
+        "Os testes cobrem cerca de um quarto das formas de instrução de shader"
+      ]
+    },
+    "anyxboxx": {
+      "summary": "Protótipo em francês: emulação do runtime GDK sobre Unicorn, mais um modo nativo estilo Wine que roda jogos de teste GDK pequenos. Os resultados com o GTA VI (mundo a cerca de 5 fps, cinemáticas, o relato de um colaborador sobre as duas primeiras missões) vêm do código do victory-fork, já copiado para o repositório, então não valem marco nenhum.",
+      "highlights": [
+        "As 16 DLLs do pacote Scarlett inicializam sem chamadas não emuladas",
+        "Roda nativamente os jogos gratuitos de teste SimpleTriangle e SDL3 testgdk",
+        "Com o tradutor do Leonida, 51 dos 52 shaders de construção de ray tracing do pacote são traduzidos"
+      ],
+      "blockers": [
+        "Ainda falta quase toda a tradução de shaders de GPU",
+        "Nenhum jogo de varejo rodou"
+      ]
+    },
+    "keylime": {
+      "summary": "Runtime C++20 escrito do zero, com gráficos Vulkan e tradutor próprio de RDNA2 para SPIR-V. Informa a intro e o menu principal do GTA VI a 30 fps e o mundo carregando na cinemática inicial, que ainda não é desenhada. Dados do próprio autor.",
+      "highlights": [
+        "README: o GTA VI boota nativamente, com intro e menu principal a 30 fps travados",
+        "O mundo carrega depois do menu para a cinemática inicial, com áudio",
+        "Código próprio do começo ao fim, não é fork do VIctory nem do XCL"
+      ],
+      "blockers": [
+        "A imagem da cinemática inicial ainda não é desenhada; sem gameplay",
+        "O tradutor transforma instruções que não conhece em no-ops, então as contagens de shader não valem",
+        "Alguns shaders de computação gravam dados errados; o watchdog de GPU do jogo está desligado para mantê-lo rodando"
+      ]
+    },
+    "xvalkyrie": {
+      "summary": "Camada C++ estilo Wine para títulos de Xbox One e Series, com código nativo e shaders RDNA2 para HLSL. Agora chama o Minecraft Preview e o Unicorn Overlord de jogáveis, embora a nota sobre Minecraft descreva só o menu principal. Não verificado.",
+      "highlights": [
+        "Todas as 40 amostras públicas do GDK que compilam para Series desenham sua imagem",
+        "O tradutor de shaders para em instruções que não conhece em vez de falsificá-las",
+        "Títulos de Xbox One chegam aos menus e cenas com controle"
+      ],
+      "blockers": [
+        "Ainda sem execução do GTA VI relatada, e o pacote de shaders dele não foi testado",
+        "Ainda sem shaders mesh ou de geometria; os que ele não traduz não desenham nada",
+        "Outros títulos de varejo de Series param cedo ou perdem o dispositivo D3D12; resultados não reproduzidos"
+      ]
+    },
+    "gtavi-recomp": {
+      "summary": "Mira a versão de PS5 pelo AnyPS5 e não funciona com arquivos vazados, então a pesquisa do jogo está travada. O trabalho continua no próprio AnyPS5.",
+      "highlights": [
+        "75 de 138 tarefas do roteiro concluídas, quase todas herdadas do AnyPS5"
+      ],
+      "blockers": [
+        "15 tarefas travadas até ser possível pesquisar os arquivos do GTA VI legalmente"
+      ]
+    },
+    "anyxboxseries": {
+      "summary": "Camada de tradução só para o GTA VI, com mapeador PE emprestado do Xbox2Windows, um lifter de shaders escalar inicial e um jogo de amostra que testa apresentação e entrada.",
+      "highlights": [
+        "O jogo de amostra apresenta quadros numa RTX 5070 Ti Laptop e no WARP",
+        "O mapeador PE roda um executável de teste sintético",
+        "Eleva algumas instruções escalares RDNA2 para HLSL"
+      ],
+      "blockers": [
+        "GTA VI travado antes de começar: sem executável e com APIs faltando"
+      ]
+    },
+    "scarab": {
+      "summary": "Descobriu que o d3d12_xs do console usa os mesmos 28 IDs de interface do D3D12 de PC, então as chamadas padrão podem ser encaminhadas e só as extensões de console precisam ser construídas.",
+      "highlights": [
+        "Os 28 IDs de interface D3D12 compartilhados são idênticos byte a byte"
+      ],
+      "blockers": [
+        "Nada executa um título ainda; os adaptadores de memória e apresentação são só interfaces",
+        "A recompilação de shaders continua em andamento após a extração"
+      ]
+    },
+    "anybox": {
+      "summary": "Revincula executáveis GDK contra bibliotecas de sistema reimplementadas, ao estilo do AnyPS5. O pipeline funciona de ponta a ponta num título de teste.",
+      "highlights": [
+        "Relinker, build das bibliotecas e relatórios de execução funcionam num título de teste"
+      ],
+      "blockers": [
+        "Quase todas as funções de sistema são stubs; o d3d12_x implementa 4 das 7 exportações conhecidas",
+        "O caminho gráfico Vulkan e o armazenamento de shaders ainda não renderizam título nenhum"
+      ]
+    },
+    "percyscarlett": {
+      "summary": "Camada Rust com DLLs de sistema substitutas e um recompilador de shaders inicial. O GTA VI agora chega a um loop de quadros pretos e então a GPU trava. O caminho de shaders ainda usa substitutos e as contagens de estágio não batem com as de outros projetos.",
+      "highlights": [
+        "O código do próprio GTA VI chega a um loop de quadros e às primeiras apresentações (quadros pretos)",
+        "O README informa a build Scarlett do Minecraft chegando ao jogo"
+      ],
+      "blockers": [
+        "GTA VI trava a GPU (887a0006) em poucos segundos; nada visível ainda",
+        "As contagens de estágio de shader não batem com a divisão conhecida do GTA VI",
+        "A contagem rígida é baseada no decodificador, então ainda não mostra que os shaders funcionam"
+      ]
+    },
+    "grandtheftxbox": {
+      "summary": "Camada estilo Wine planejada para títulos de Series e One. Fica entre os marcos 0 e 1, sem atividade desde 20 de novembro.",
+      "highlights": [
+        "A xgameruntime.dll substituta roda um programa de amostra do GDK"
+      ],
+      "blockers": [
+        "Nenhum jogo de console roda ainda; sem atividade desde 20 de novembro"
+      ]
+    },
+    "scarlett-windows-compat": {
+      "summary": "Programas de teste em sala limpa sobre como o software Game Core encontra o Windows: carregamento, memória, apresentação e entrada, mais um radar que observa outros projetos.",
+      "highlights": [
+        "Testes de inspeção de executável, memória, D3D12 e entrada passam no CI",
+        "Compilou o carregador de outro projeto a partir do código e rodou os próprios programas de teste com ele"
+      ],
+      "blockers": [
+        "Só pesquisa; nenhum título de Xbox ou shader de console rodou"
+      ]
+    },
+    "dedsec": {
+      "summary": "Port do GTA VI em português mirando DirectX 12, com tradutor de RDNA2 para HLSL. A maioria dos arquivos fica nos mesmos caminhos dos do Leonida, 86 deles idênticos, e o README não credita o Leonida. Não boota.",
+      "highlights": [
+        "Extrai e desmonta todos os 26.503 shaders do GTA VI",
+        "O tradutor RDNA2 para HLSL diz cobrir as 1.630 formas de instrução"
+      ],
+      "blockers": [
+        "A cobertura é contada em formas de instrução, não em shaders do jogo traduzidos",
+        "O README diz que o FSR3 está «ativo e testado» embora nada rode ainda",
+        "Compartilha boa parte do layout de arquivos do Leonida; a contribuição própria não é clara"
+      ]
+    },
+    "xbgtasix": {
+      "summary": "Camada em chinês que coloca DLLs substitutas de xgameruntime, xmem e d3d12_xs ao lado do executável, mais notas de pesquisa com fontes sobre os formatos de arquivo, shaders e texturas.",
+      "highlights": [
+        "Escada de testes de 15 passos, do binding de importações ao ray tracing DXR e à renderização de um recurso real",
+        "17 notas de pesquisa sobre arquivos RPF9, o corpus de shaders e os pools de textura",
+        "Informa que as 16 DLLs auxiliares do GTA VI carregam sobre os substitutos (não checado aqui)"
+      ],
+      "blockers": [
+        "Os testes usam programas próprios; nenhum título de Xbox rodou",
+        "Ainda sem tradução de shaders RDNA2"
+      ]
+    },
+    "seriesx-emulator": {
+      "summary": "Emulador C++ que interpreta código x86-64 em vez de executá-lo nativamente, com launcher e sete funções do XGameRuntime. Só rodam os programas que ele mesmo compila; ele diz que nenhum jogo comercial funciona.",
+      "highlights": [
+        "Decodifica 627 das 1.153 instruções RDNA2 e executa 43 num interpretador de teste",
+        "A página de status classifica cada API e instrução como stub, parcial ou validada"
+      ],
+      "blockers": [
+        "Nenhum título de Xbox rodou; ainda sem GPU, kernel ou tradução de shaders",
+        "Um interpretador provavelmente é lento demais para um jogo de console moderno"
+      ]
+    },
+    "gta6-compat-layer": {
+      "summary": "Camada C++ com carregador PE e registro de funções do Xbox próprios. O README agora informa que o exe do GTA VI carrega com as 587 importações e roda a inicialização até a criação de pipelines em 113 boots; ainda sem imagem. Dados do próprio autor.",
+      "highlights": [
+        "Informa o exe do GTA VI carregando com as 587 importações resolvidas e o init funcionando",
+        "Rotula cada função do Xbox que cobre como implementada, stub ou ausente"
+      ],
+      "blockers": [
+        "Ainda sem imagem ou menu; as execuções param onde faltam funções de lista de comandos D3D12",
+        "O tradutor de shaders é novo e ainda não faz parte da execução",
+        "A base não foi rechecada contra o código desde a execução do GTA VI"
+      ]
+    },
+    "xlaunchvi": {
+      "summary": "Camada C++ com vários colaboradores, carregador PE, backend D3D12 e tradutor de shaders RDNA2 que bate bit a bit com shaders de teste compilados pela AMD. Quase todo o código está em pull requests abertos, e nenhum título de Xbox rodou.",
+      "highlights": [
+        "Informa 12 de 12 shaders de computação compilados pela AMD batendo bit a bit com resultados de CPU",
+        "O tradutor recusa instruções que não suporta em vez de falsificá-las",
+        "Tabelas de decodificação conferidas com a especificação oficial de instruções RDNA2 da AMD"
+      ],
+      "blockers": [
+        "Nenhum título de Xbox rodou; a inicialização do Matrix Awakens continua em diagnóstico",
+        "Quase tudo está em pull requests abertos; a branch principal só tem documentação",
+        "Testado com shaders próprios, não os do GTA VI; ainda sem tiling de texturas de console"
+      ]
+    },
+    "openscarlett-ce": {
+      "summary": "Camada C++ AGPL, separada do outro OpenScarlett, que troca as DLLs do console pelas do Direct3D 12 do PC e traduz o código de GPU do console. Informa Minecraft Preview jogável a cerca de 60 fps e um jogo de varejo mais novo sem nome chegando à tela inicial. Dados do próprio autor; sem crédito para o GTA VI até nomear os arquivos do jogo.",
+      "highlights": [
+        "Informa Minecraft Preview jogável a ~60 fps no Windows e no Linux, com vídeo",
+        "Informa The Matrix Awakens com menus e a perseguição inicial a ~20 fps",
+        "O tradutor de shaders para em instruções que não conhece em vez de falsificá-las"
+      ],
+      "blockers": [
+        "Os shaders do GTA VI não foram testados; ainda sem áudio",
+        "Passes de ray tracing não verificados: algumas cenas de Matrix Awakens saem pretas",
+        "A execução do jogo novo não nomeia os arquivos do GTA VI, então não conta"
+      ]
+    },
+    "port-of-the-americas": {
+      "summary": "Camada Linux que roda o exe do próprio GTA VI sob Proton com DLLs de console substitutas num vkd3d-proton remendado. O repositório mostra a seleção de personagem e as telas de carregamento; o mundo é desenhado preto. A tradução de shaders se apoia na do Leonida. Dados do próprio autor.",
+      "highlights": [
+        "Capturas no repositório mostram a seleção de personagem e as telas de carregamento do GTA VI no Linux",
+        "DLLs substitutas próprias para memória, runtime, DirectStorage, entrada e áudio",
+        "Registro detalhado de cada teste, com commit e ajustes"
+      ],
+      "blockers": [
+        "A carga do mundo funciona mas desenha preto",
+        "Precisa das traduções de shader do Leonida, que não estão no repositório",
+        "Testado em apenas uma máquina AMD"
+      ]
+    },
+    "five-star-recomp": {
+      "summary": "Camada e kit em C# para o GTA VI. Informa que o jogo carrega o modo história e reproduz os letreiros, o diálogo e o som da cinemática inicial a 30 fps, mas o mundo 3D da cinemática ainda não é desenhado. Dados do próprio autor; sem captura.",
+      "highlights": [
+        "Informa o modo história carregando e os letreiros, o diálogo e o som da cinemática inicial a 30 fps",
+        "As telas do primeiro boot são respondidas com entrada de controle programada; boots seguintes as pulam com os ajustes salvos",
+        "O tradutor marca instruções não suportadas como falha em vez de falsificá-las"
+      ],
+      "blockers": [
+        "O mundo 3D da cinemática inicial ainda não é desenhado: nem mundo nem jogador",
+        "O travamento de GPU após carregar a história é limitado, não consertado",
+        "Sem captura ou gravação no repositório"
+      ]
+    },
+    "g6recomp": {
+      "summary": "Carregador C++ e reescrita do runtime de console para o GTA VI, testados com cuidado e com código próprio do começo ao fim. As DLLs auxiliares do jogo inicializam sob ele; os shaders só são decodificados e ainda não há camada gráfica.",
+      "highlights": [
+        "Informa as DLLs auxiliares do GTA VI inicializando sob o carregador",
+        "Cada mudança no carregador é testada em DLLs fixture originais, medindo o comportamento do Windows",
+        "Chamadas não implementadas falham com erros documentados em vez de fingir sucesso"
+      ],
+      "blockers": [
+        "Ainda sem tradução de shaders: a ferramenta só decodifica código RDNA2",
+        "Ainda sem camada gráfica; o primeiro quadro é um marco posterior",
+        "GTA VI não rodou: falta o executável"
+      ]
+    },
+    "gta6-boottest": {
+      "summary": "DLLs substitutas em C e um arnês de depuração que levam o exe do GTA VI no Windows até o loop de quadros. Diz que a primeira tela de interface já é desenhada numa GPU de PC, mas ainda não mostra captura. Dados do próprio autor.",
+      "highlights": [
+        "O exe do GTA VI carrega os arquivos por streaming e roda o loop de quadros com DLLs substitutas",
+        "Relatório público detalhado das DLLs de console e das chamadas de que o exe precisa"
+      ],
+      "blockers": [
+        "A afirmação da primeira tela não tem captura nem registro ainda",
+        "O tradutor de shaders cobre só os shaders que uma execução registrou; saída não verificada",
+        "Muito novo, um desenvolvedor só; testado num PC AMD"
+      ]
+    },
+    "palmetto": {
+      "summary": "Continuação aberta do Leonida depois que o repositório virou privado. Informa que o exe do GTA VI roda mais de 300 s, executa seus desenhos e apresenta na própria janela, mas todo quadro é lido preto. Dados do próprio autor, uma RTX 4090.",
+      "highlights": [
+        "Leva o código do Leonida adiante, mantendo histórico e créditos",
+        "Cada parada de boot do exe do GTA VI é documentada com o que a resolveu"
+      ],
+      "blockers": [
+        "Ainda sem imagem: os quadros apresentados são pretos; a geometria do jogo não gera fragmentos",
+        "A contagem de shaders se apoia no spirv-val, que não mostra que eles funcionam",
+        "Testado só numa RTX 4090"
+      ]
+    }
+  },
+  "tools": {
+    "lynxnathan/rage-tools-vi": {
+      "desc": "Kit RPF9 em Python: reconstrói entradas de arquivo a partir de cargas verificadas, decodifica áudio e o esquema de scripts."
+    },
+    "fishingpvalues/gta6-pc-port-hub": {
+      "desc": "Notas compartilhadas para projetos de port: inventário de pacotes, formato do censo de shaders e bloqueios comuns."
+    },
+    "holdmysocks/SixNG": {
+      "desc": "CLI e app de desktop: modelos para glTF, texturas e dados de mapa a partir da sua própria instalação."
+    },
+    "rpatty-dev/PercyStar": {
+      "desc": "Explorador RPF9 rápido em Rust, com player Bink2 e decodificador de áudio ADAT Opus."
+    },
+    "breadbbbb/rpf9-explorer": {
+      "desc": "Explorador RPF para Windows com prévias de modelos, texturas, áudio e vídeo. O Leonida usa seus decodificadores."
+    },
+    "Ahmet-Dedeler/bcpack-rs": {
+      "desc": "Decodificador limpo de texturas BCPack do Xbox. BC1 funciona; BC7 em andamento."
+    },
+    "nullbrik/RageForge": {
+      "desc": "Explore e analise arquivos RPF9 / TTPF."
+    },
+    "woreksami/ttpf-studio": {
+      "desc": "Ver, exportar e substituir texturas .ttpf; reprodução de vídeo Bink."
+    },
+    "walkthestars/GTA6-Asset-Info": {
+      "desc": "Notas de formato para RPF9, texturas, BCPack, modelos e dados de mapa."
+    },
+    "Ahmet-Dedeler/awesome-gta6-reverse-engineering": {
+      "desc": "Lista viva de ferramentas e camadas de engenharia reversa de GTA VI de código aberto."
+    },
+    "HolyRoses/gta6-explorer": {
+      "desc": "Kit em Python só de leitura: navegue pelos seus pacotes e extraia texturas, áudio, vídeo e shaders."
+    },
+    "meetox80/6stars": {
+      "desc": "Engine para macOS escrita do zero (Swift, Metal) que renderiza o mapa, a vegetação e o clima a partir dos seus próprios arquivos."
+    },
+    "Ahmet-Dedeler/rage9-re": {
+      "desc": "Decodifica os arquivos de script e animação (dados PSO, animações) com exportação para glTF."
+    },
+    "Albotterin/AWC_from_RPF9_Extractor": {
+      "desc": "Extrai os streams de música (AWC) dos arquivos RPF9."
+    },
+    "SentinelInteractive/0x52504639": {
+      "desc": "Notas, catálogos e ferramentas do formato RPF9."
+    },
+    "JoshRob297/rpf9-research": {
+      "desc": "Engenharia reversa em espanhol do cabeçalho, da tabela de conteúdo e da tabela de nomes do RPF9."
+    },
+    "Librett0/vice-lens": {
+      "desc": "Explorador de desktop para o mapa, modelos, animações, vídeos e som da sua própria cópia."
+    },
+    "batatinhafcbatatinha-pixel/xseriesrecomp": {
+      "desc": "Um launcher sobre cópias empacotadas de quatro projetos monitorados; sem teste com nenhum jogo."
+    },
+    "sub-north/xbox-hle-lab": {
+      "desc": "Sondas de GPU, scripts de máquina virtual e patches para o XCL, para testar em uma VM isolada."
+    },
+    "kry-vex-gta/XBOX-Inspector": {
+      "desc": "Ferramenta Rust de desktop que inventaria em modo somente leitura uma build de Xbox Series desempacotada e confere cabeçalhos RPF9 e faixas de dados. Documentação em russo."
+    },
+    "nineforge0/forge9": {
+      "desc": "Kit RPF9 em Rust: inspecione, extraia e rempacote arquivos usando chaves da sua própria cópia."
+    },
+    "TheoBIET/OpenVI": {
+      "desc": "Explorador de desktop estilo OpenIV para os arquivos RPF9 da sua própria instalação; veja modelos e dados de catálogo."
+    }
+  },
+  "news": {
+    "2026-11-27-belobug-dmca": {
+      "title": "Exclusivo: GitHub remove a versão do GTA VI do Belobug por violar os termos de serviço",
+      "dek": "O repositório e a conta no GitHub por trás da versão mais bem avaliada da nossa tabela sumiram. O PortWatch confirmou que o GitHub os removeu por violação dos termos de serviço.",
+      "body": [
+        "A versão do GTA VI do Belobug foi retirada do GitHub. O repositório Belobug/VIctory-Belobug-AMD e a conta Belobug por trás dele pararam de carregar na sexta-feira, e o PortWatch confirmou que o GitHub os removeu por violação dos termos de serviço.",
+        "Era a versão a ser batida: um fork do VIctory do Marvis para placas AMD Radeon, muito jogável a cerca de 22 fps de média sem travar e entre as mais avançadas na história da nossa tabela. Tinha mais de 4.000 estrelas e 1.200 forks, e com 91,3% era a mais bem avaliada entre as que acompanhamos.",
+        "O GitHub não disse publicamente qual regra foi violada. Diferente dos avisos DMCA, que publica num log público, as remoções por termos de serviço não são divulgadas. Vamos atualizar este artigo se soubermos mais.",
+        "O card do Belobug na nossa tabela agora está marcado como derrubado e não é mais ranqueado, então o VIctory-NVIDIA, com 90%, lidera a corrida. O progresso alcançado continua valendo: nosso número geral segue em 91,3%. Não saia procurando cópias do código do Belobug: forks de um repositório removido também podem cair, e downloads não oficiais costumam trazer malware."
+      ]
+    },
+    "2026-11-26-multiplayer-running": {
+      "title": "Exclusivo: o multiplayer do GTA VI está rodando no PC",
+      "dek": "O grupo do TeK tem jogadores, carros e chat de voz por proximidade a 25-30 fps estáveis, num fork privado da versão do CGBJ. O PortWatch verificou que o vídeo é real.",
+      "body": [
+        "O multiplayer do GTA VI está rodando no PC. Na quinta à noite, TeK (@TeKGameR950) publicou no X um vídeo do que o grupo chama de multiplayer funcional: personagens e veículos juntos no mundo, com chat de voz por proximidade, então você ouve os jogadores perto de você. O PortWatch verificou que o vídeo é real.",
+        "Roda a 25-30 quadros por segundo estáveis. A versão é um fork privado da do CGBJ, a de VIctory e XCL que faz 25 fps de média no single-player, e o grupo só agora começou o multiplayer.",
+        "Até aqui, todas as versões que acompanhamos eram single-player: fazer a história do GTA VI rodar no PC já consumiu o esforço de todo mundo. Multiplayer significa cópias separadas do jogo concordando sobre onde está cada jogador e cada carro, e nenhuma versão da nossa tabela tinha mostrado isso antes.",
+        "O código é privado, então ninguém fora do grupo pode testar por enquanto. Também não está na nossa tabela: avaliamos cada versão separadamente, e esta ainda não tem avaliações próprias."
+      ]
+    },
+    "2026-11-25-belobug-way-ahead": {
+      "title": "Vimos a versão AMD do Belobug e ela está muito à frente",
+      "dek": "O mundo aberto do GTA VI parece próximo do jogo de varejo num PC todo AMD, e dá para jogar as missões. Roda a cerca de 3 fps, mas nada mais na nossa tabela se parece com isso.",
+      "body": [
+        "Vimos a versão do GTA VI do Belobug rodando, e a equipe do PortWatch acha que ela está muito à frente de todas as que acompanhamos. O mundo aberto renderiza iluminado, com texturas, pessoas, veículos, vegetação, água e céu, e parece próximo do jogo de varejo, só que muito devagar. Dá para jogar as missões e raramente trava.",
+        "Foi direto para o nº 1 da nossa tabela com 77,4%, mais de 13 pontos à frente dos 64,2% do ZETTROX, que liderava até esta manhã. A renderização é avaliada em 0,85 na nossa escala, a mais alta que já demos, e o progresso de história em 0,5 («Primeiro ato»). A segunda melhor imagem, a versão privada do suri, está em 0,8; a do ZETTROX, que desenha preto tudo que está na sombra, em 0,3.",
+        "É feita para AMD Radeon, enquanto a do ZETTROX, a líder anterior, é afinada para NVIDIA. O Belobug roda numa Radeon RX 9070 XT 16 GB com Ryzen 7 9800X3D, 64 GB de RAM e Windows 11. É um fork do VIctory do Marvis, seguindo a branch principal mais pull requests upstream, e o README diz que não há código do victory-fork do hyphennn ali. As correções próprias incluem um substituto para a luz indireta por ray tracing do jogo, que deixava as folhas magenta e os interiores em blocos coloridos, uma correção das linhas que apareciam em cada triângulo na pintura dos carros, no vidro e na pele, e uma mudança que baixou o tempo de GPU de uma cena pesada de 225 para cerca de 80 milissegundos por quadro.",
+        "Não é rápido. O README aponta 3-5 fps, cerca de 3 ao dirigir, e por isso ainda chama a versão de «ainda não jogável». Partes dos veículos em movimento ficam para trás ou esticam, árvores distantes não são desenhadas, a sombra é chapada, e precisa de uns 22 GB de RAM e mais VRAM do que uma placa de 16 GB tem. Até agora rodou num PC só; ninguém testou em NVIDIA ou Intel.",
+        "O código é público, como Belobug/VIctory-Belobug-AMD, sob a licença GPL-3.0 do VIctory, então outras pessoas com placas AMD podem testar. Não contém arquivos do jogo: você precisa da sua própria cópia.",
+        "Atualização, 27/11/2026: o GitHub removeu o repositório e a conta do Belobug por violação dos termos de serviço, o que o PortWatch confirmou. O card dele na nossa tabela agora está marcado como derrubado."
+      ]
+    },
+    "2026-11-25-zettrox-no-crashes": {
+      "title": "A versão do GTA VI do ZETTROX parece não travar nunca",
+      "dek": "Não travou nenhuma vez do prólogo da Lucia até a primeira missão do Jason, e avança devagar rumo ao modo livre. Algo ali é diferente.",
+      "body": [
+        "A versão do GTA VI do ZETTROX ainda não travou. Jogou do prólogo da Lucia até a primeira missão do Jason, «Gone Fishing», onde mostrou a primeira morte com arma no GTA VI para PC, e não caiu nenhuma vez no caminho. O README informa mais de uma hora e meia numa sessão sem travar.",
+        "É raro tão cedo. Rodar um jogo feito para outro hardware costuma significar travamentos, e com frequência. A do ZETTROX é a única versão da nossa tabela avaliada acima de «Trava às vezes»: na quarta-feira a estabilidade subiu de 0,5 para 0,8 («Raramente trava»), o que a coloca em primeiro com 64,2%.",
+        "Ela também avança devagar rumo ao modo livre, o ponto em que a história solta e o mundo aberto é seu. Isso exige paciência: a versão roda a 1-3 fps e a imagem continua ruim, com tudo que está na sombra desenhado preto e cenas claras estouradas.",
+        "Ainda não está claro o que a mantém rodando. Como o VItoriaBr do Uilian, ela se baseia no VIctory e no victory-fork do hyphennn, com o trabalho próprio do ZETTROX para placas NVIDIA, testado numa RTX 3050. Diferente de quase todas as versões tão avançadas, o código é público, como Zettrox/ztrx, então qualquer um pode comparar com o victory-fork e ver o que muda."
+      ]
+    },
+    "2026-11-25-prologue-gone-fishing": {
+      "title": "Várias versões do GTA VI passam do prólogo da Lucia e chegam à primeira missão do Jason",
+      "dek": "As versões privadas já jogam a abertura e entram em «Gone Fishing», embora quase todas renderizem mal e os veículos raramente funcionem.",
+      "body": [
+        "Várias versões privadas do GTA VI para PC já conseguem jogar o prólogo da Lucia e seguir para a primeira missão do Jason, «Gone Fishing». Até agora, as mais avançadas que acompanhamos só chegavam ao prólogo, então este é o ponto mais profundo na história que alguém relatou.",
+        "É cru. Quase todas ainda renderizam mal o mundo, e os veículos não funcionam na maior parte do tempo: em Gone Fishing o barco muitas vezes não pode ser conduzido. Em algumas versões o mapa do menu de pausa abre.",
+        "Ainda não dá para dizer de quem são essas versões. Quem chega tão longe trabalha em privado, e quase todos parecem se apoiar no victory-fork do hyphennn, o fork público do VIctory por trás da liderança da nossa tabela. As mudanças deles não são públicas, então ninguém mais pode testar.",
+        "«Prólogo concluído» é o primeiro passo da nossa trilha de história, mas nenhuma nota muda até sabermos quais versões conseguiram. Se a sua é uma delas, abra uma issue no nosso GitHub com um link para uma gravação ou uma live."
+      ]
+    },
+    "2026-11-24-take-two-dmca-leonida-forks": {
+      "title": "Primeira remoção da Take-Two contra um port de GTA VI desativa o Leonida e 3.007 forks",
+      "dek": "Um aviso DMCA publicado pelo GitHub na terça mira o repositório do Leonida, e o GitHub aplicou a toda a rede de forks do projeto.",
+      "body": [
+        "A Take-Two protocolou seu primeiro aviso DMCA contra um port de GTA VI. O aviso, publicado no log público de DMCA do GitHub na terça, nomeia o repositório Leonida, de ItsNotRexed. Como a rede de forks passava de 100 repositórios e a Take-Two alegou que os forks infringem tanto quanto o original, o GitHub processou contra a rede inteira: 3.007 repositórios. Os forks de colaboradores que sobreviveram ao fim do Leonida na segunda agora mostram a página de «indisponível» do GitHub.",
+        "A publicadora chama o Leonida de obra derivada do GTA VI e diz que ele viola a proibição de engenharia reversa nos termos da Rockstar. Também argumenta que a frase «traga seus próprios arquivos» do projeto é enganosa: pelo timing, diz, os arquivos que o usuário deve fornecer só podem ser a build vazada do Xbox.",
+        "O aviso nomeia só o Leonida. Projetos que não são forks dele no GitHub, como VIctory e XCL, e cópias do Leonida enviadas como repositórios novos, continuam no ar por enquanto. Mas o mesmo argumento pode valer para qualquer um deles.",
+        "O Leonida fica na nossa tabela como derrubado, para registro."
+      ]
+    },
+    "2026-11-24-new-progress-scale": {
+      "title": "A nova escala do PortWatch: jogável é metade, terminar o jogo é 100%",
+      "dek": "Entrar no GTA VI agora é metade da régua. A outra metade é quanto você joga, o quão certo ele parece, quão rápido roda e por quanto tempo aguenta.",
+      "body": [
+        "Mudamos como o PortWatch pontua os projetos. A régua antiga subia da preparação até «No jogo», depois para 30 FPS e «Estável». Muitos apontaram que isso misturava duas coisas diferentes: fazer o jogo rodar, e fazer ele rodar bem. Andar num mundo escuro a 5 quadros por segundo não é estar a três quartos do caminho de jogar GTA VI no PC.",
+        "Entrar agora é uma escada até 50%. A preparação ocupa os primeiros 10%. Depois vêm Exe rodando (10%), Primeiro frame (20%), Menu principal (30%), No mundo (40%), quando o modo história carrega o mundo e o desenha, por mais quebrado que esteja, e Jogável (50%), quando você controla um personagem.",
+        "Depois de Jogável, quatro trilhas preenchem a outra metade em paralelo: progresso da história (35 pontos), de preso na abertura a 100% de conclusão; renderização (25), de preto ou quebrado a igual ao console; desempenho (20), a taxa média dividida por 30; e estabilidade (20). 100% agora significa que o jogo inteiro pode ser terminado, parecendo o console, a 30 fps ou mais e sem travar.",
+        "Todos os projetos foram repontuados, e os números são menores. As versões mais avançadas agora acabaram de passar da metade: a privada do hyphennn em 59,4%, a do omonkey em 57,9%, victory-gta6 em 57,3% e a do CGBJ em 54,5%. O VIctory está em 40%, no mundo mas ainda não jogável, e o XCL em 35%. Ninguém andou para trás: os mesmos resultados agora valem menos do jogo completo.",
+        "O gráfico de histórico também foi convertido para a nova escala. As regras completas, com os passos escritos de história e renderização, estão na seção de pontuação no fim da página."
+      ]
+    },
+    "2026-11-24-omonkey-shaders-prison": {
+      "title": "Os shaders do GTA VI começam a carregar na versão do omonkey, transmitida ao vivo no Rumble",
+      "dek": "Um jogador consegue andar devagar pela cena inicial da prisão, a cerca de 5 quadros por segundo. Todo o trabalho sai ao vivo, num canal do Rumble de outra pessoa.",
+      "body": [
+        "Um desenvolvedor chamado omonkey tem o GTA VI rodando no PC com os shaders começando a carregar direito. Roda a cerca de 5 quadros por segundo e está preso na cena inicial, a prisão da Lucia, mas um jogador consegue se mover por ela, devagar.",
+        "Isso o coloca à frente de todos os projetos que acompanhamos. O CGBJ, que adicionamos antes na terça, também tem um jogador se movendo, mas numa tela preta, e o vídeo dele mostra a abertura em cores chapadas e sem iluminação.",
+        "omonkey transmite todo o trabalho de desenvolvimento no Rumble, mas não num canal próprio. As lives saem no Swaggely, um canal com cerca de 1.800 seguidores que pertence a outra pessoa. Não está claro por que os dois trabalham assim.",
+        "Adicionamos o omonkey à tabela com 76%, no nosso estágio No jogo, o que o coloca em primeiro. Como o trabalho foi transmitido ao vivo o tempo todo, temos certeza de que é real. Mas não encontramos código público dele, então ninguém pode testar fora das lives.",
+        "Atualização, 20:10 UTC: a versão do omonkey é baseada no victory-gta6, o fork público do VIctory do fxceless, que agora adicionamos à corrida com 74%. Nossa corrida agora ranqueia só projetos com código público, então a versão privada do omonkey aparece abaixo, sem classificação. Com 76% ela ainda lidera nosso número geral, e aparece no card do victory-gta6 como uma versão sobre aquele código."
+      ]
+    },
+    "2026-11-24-cgbj-in-game": {
+      "title": "Exclusivo: CGBJ coloca o GTA VI dentro do jogo, andando e conversando num mundo sem luz",
+      "dek": "A versão do CGBJ, baseada em VIctory e XCL, deixa um jogador andar e conversar com NPCs. O código foi público por pouco tempo e voltou a ser privado.",
+      "body": [
+        "Um grupo chamado CGBJ colocou o GTA VI dentro do mundo do jogo no PC, e um jogador consegue se mover nele. Com controle ele anda, conversa com NPCs e abre o menu do jogo. O PortWatch verificou que ele entra no jogo. Nenhum projeto público tinha mostrado um jogador se movendo ainda.",
+        "Está longe de jogável e roda muito devagar. Na execução em que um jogador andava, a tela estava preta. Um vídeo de 77 segundos publicado no X na terça mostra mais: as cenas iniciais do GTA VI em cores chapadas e sem iluminação, do interior de um carro a uma rua com NPCs acenando, um guarda e um pátio de prisão.",
+        "A versão do CGBJ é baseada no VIctory e também pega parte do trabalho do XCL. O código é privado; foi público por pouco tempo como codec-d/cool_fox em 26/11/2026.",
+        "Adicionamos o CGBJ à tabela com 72%, no nosso estágio No jogo, o que o coloca em primeiro. Isso se apoia na nossa própria checagem: o vídeo não nomeia o projeto.",
+        "Atualização, 26/11/2026: o repositório do CGBJ é público e a entrada agora participa da corrida pública como codec-d/cool_fox.",
+        "Atualização, mais tarde em 26/11/2026: o repositório codec-d/cool_fox está fora do ar, então o CGBJ volta a aparecer como versão privada."
+      ]
+    },
+    "2026-11-24-xcl-30fps-in-game": {
+      "title": "Exclusivo: XCL relata 30 fps no GTA VI, mas não diz se passou dos menus",
+      "dek": "A equipe se recusou a falar mais por medo de ser derrubada, mas insinuou a um dos nossos membros que está funcionando muito bem. Atualização: relatos de testadores mostram que ele carrega o mundo.",
+      "body": [
+        "O XCL diz que o GTA VI agora roda a 30 quadros por segundo no jogo, mas não diz onde. Perguntado se isso significa os menus que já alcançava ou gameplay de verdade, a equipe se recusou a responder, dizendo temer ser derrubada. Em privado, insinuou a um membro da nossa comunidade que as coisas estão funcionando muito bem.",
+        "As notas públicas não acompanharam. O README do XCL ainda chama o jogo de «um jogo de varejo mais recente» que chega aos menus a 30 fps estáveis, sem alcançar o gameplay. Na terça de manhã o projeto mesclou uma mudança que mostra a taxa de quadros ao vivo no título da janela.",
+        "A cautela atravessa a cena. O servidor de Discord do XCL é bem fechado, com os chats bloqueados, e os membros temem ser derrubados depois que o Leonida perdeu servidor, repositório e criador em uma hora na segunda à noite. O servidor de Discord do GTA 6 Modding também caiu.",
+        "Atualização, 01:50 UTC: testadores no GitHub do XCL agora relatam que o GTA VI passa dos menus e entra no mundo com o código público. O estado do próprio jogo diz «Game Running», mas a tela fica num indicador de carregamento e um watchdog de GPU encerra cada execução em minutos. Um relato afirma gameplay a 28-30 fps, sem captura. O XCL sobe para 62,5%, na metade do caminho de No jogo."
+      ]
+    },
+    "2026-11-24-tuxbox-first-frame-victory-world": {
+      "title": "TuxBox desenha a primeira tela do GTA VI e o VIctory encosta no mundo",
+      "dek": "Numa noite, uma camada para Linux mostrou a seleção de personagem do GTA VI, o VIctory relatou um letreiro dentro do mundo e dois projetos menores fizeram o código do GTA VI rodar.",
+      "body": [
+        "A saída do Leonida não desacelerou os outros ports de GTA VI. O TuxBox, uma camada de compatibilidade testada principalmente no Linux via Proton, publicou um registro de execução mostrando a seleção de personagem do jogo em 4K numa RTX 4070 Ti SUPER. Ele ainda não enviou nenhuma entrada ao jogo, então contamos como primeiro frame, não como menu. Isso leva o TuxBox de 25% para 40%.",
+        "O VIctory, empatado com o XCL no menu principal, agora diz que suas execuções chegam ao mundo. O letreiro da primeira missão renderiza, mas a cena atrás continua escura a cerca de um quadro a cada um ou dois segundos, e o projeto avisa que GPUs reais podem travar. Isso não é jogável, então o VIctory fica em 55%.",
+        "O PercyScarlett relata o GTA VI chegando a um loop de quadros pretos antes de a GPU travar, e um projeto novo, GTA6-BootTest, leva o exe dele pela mesma etapa com DLLs substitutas. Os dois agora estão em «Exe rodando». Como sempre, são relatos dos próprios projetos; nenhum foi reproduzido de forma independente."
+      ]
+    },
+    "2026-11-23-leonida-nuked": {
+      "title": "Leonida é derrubado: repositório no GitHub apagado, Discord sumido, criador desiste",
+      "dek": "Em menos de uma hora na segunda à noite, o maior port de GTA VI perdeu o servidor de Discord e o repositório no GitHub, e o criador disse que ia sair.",
+      "body": [
+        "O Leonida, o port de GTA VI com mais estrelas, mais de 33.000 no GitHub, saiu do ar em menos de uma hora na segunda à noite. O servidor de Discord parou de resolver por volta de 23:07 UTC. Às 23:47 o repositório no GitHub já não existia. Quase ao mesmo tempo, o criador, NotRexed, escreveu «desisti, pessoal» no X, dizendo que esbarrava sempre em problemas que não conseguia controlar e que ia se afastar, e agradeceu a comunidade do Discord.",
+        "O repositório agora responde «não encontrado», não a página de «indisponível» que o GitHub mostra após uma remoção DMCA, e o log público de DMCA do GitHub não tem aviso contra ele. Isso aponta para os donos tendo retirado, e não a Take-Two, embora só eles possam dizer. Mais cedo naquela noite, o repositório tinha migrado para uma organização nova, ProjectLeonida, cujos mantenedores fecharam milhares de pull requests e issues abertos.",
+        "O código não se perdeu. Os forks dos colaboradores continuam no GitHub, entre eles o que carrega as correções de boot combinadas, e um espelho no próprio servidor Git do NotRexed guarda o código de 23:30 UTC, embora não possa mais sincronizar.",
+        "Marcamos o Leonida como derrubado na tabela. Ele fica na página para registro, mas não conta mais no ranking.",
+        "Atualização, 24 de novembro: a Take-Two depois protocolou um aviso DMCA contra o Leonida, publicado no log do GitHub em 24 de novembro, e o GitHub desativou toda a rede de 3.007 forks do repositório, incluindo o fork de colaboradores linkado abaixo. Cópias enviadas como repositórios separados não fazem parte dessa rede."
+      ]
+    },
+    "2026-11-23-leonida-discord-down": {
+      "title": "O Discord do Leonida some enquanto o projeto migra para uma conta nova no GitHub",
+      "dek": "O servidor de 179.000 membros parou de resolver na segunda à noite. Membros dizem que o Discord baniu; ninguém disse por quê. Atualização: o repositório no GitHub também foi apagado.",
+      "body": [
+        "O servidor de Discord do Leonida caiu na segunda à noite. Às 23:06 UTC o convite ainda levava a um servidor de cerca de 179.000 membros, 74.000 deles online. Em um minuto, o Discord respondeu que tanto o convite quanto o servidor eram desconhecidos. Membros dizem que o Discord baniu. Nem o Discord nem a equipe do Leonida disseram por quê, e de fora não dá para distinguir banimento de exclusão.",
+        "No começo o código estava intacto. Uma hora antes, o repositório tinha migrado da conta pessoal do criador para uma organização nova, ProjectLeonida, criada às 22:08 UTC. Links antigos redirecionavam e as issues continuavam sendo atualizadas depois que o servidor apagou. Quase ao mesmo tempo, os mantenedores fecharam milhares de pull requests e issues abertos, cortando a lista de quase 4.900 para cerca de 200.",
+        "O log público de DMCA do GitHub não mostra aviso contra o projeto. O sumiço vem depois de outras pressões sobre as comunidades de GTA VI: no começo do mês o Discord do GTA 6 Mapping Project sumiu sem explicação, e em agosto a Take-Two pediu intimações ao Discord para identificar o vazador, que o Discord disse não ter recebido.",
+        "Atualização, 23:47 UTC: o repositório no GitHub foi apagado depois, e o criador diz que desistiu. Veja nossa continuação."
+      ]
+    },
+    "2026-11-23-marvis-menus-stream": {
+      "title": "Exclusivo: Marvis transmite ao vivo o GTA VI chegando aos menus a cerca de 15 fps",
+      "dek": "Depois ele publicou o código como VIctory, mas ninguém reproduziu a execução ainda. Espectadores que estudaram a live acham que é muito provavelmente real.",
+      "body": [
+        "Um desenvolvedor conhecido como Marvis transmitiu ao vivo na segunda o GTA VI rodando num PC, chegando até os menus do jogo a cerca de 15 quadros por segundo. Nenhum projeto público tinha mostrado tanto: Leonida, XCL e TuxBox executam o código do próprio jogo, mas suas telas continuam pretas ou em branco.",
+        "Na segunda à noite ele publicou o código no GitHub como VIctory, uma camada Rust que executa o código do próprio jogo nativamente no Windows. O README vai além da live: telas de boot, vídeo de introdução, tela inicial e saves a 30 fps, e o carregamento chega ao mundo aberto, onde a imagem continua preta e a placa de vídeo falha em segundos.",
+        "Espectadores que reviram a live com atenção concluíram em sua maioria que é genuíno. Uma farsa encenada exigiria uma produção muito elaborada, e poucos acham que foi o caso. O timing também bate: no mesmo dia, uma mudança não mesclada de um colaborador externo no XCL relata chegar aos primeiros menus.",
+        "O VIctory está no nosso estágio Menu principal, 55%. Os resultados ainda são dele, de um PC com AMD RX 6700 XT; vamos atualizar a entrada quando outros testarem o código, e retirá-la se a execução se revelar encenada."
+      ]
+    },
+    "2026-11-23-leonida-exe-runs": {
+      "title": "Leonida coloca o executável do GTA VI rodando, mas ainda não há nada na tela",
+      "dek": "As versões dos colaboradores executam o código do próprio jogo por minutos atrás de uma janela em branco; posts no Discord dizem que hoje não será jogável, mas talvez amanhã.",
+      "body": [
+        "Horas depois de o executável do Cyberleek aparecer na segunda, os colaboradores do Leonida começaram a executá-lo pelo runtime do projeto e a registrar cada tentativa numa issue compartilhada. Em versões que empilham uns 25 pull requests não mesclados, o executável de varejo agora roda o próprio código por até três minutos no Windows, Wine e Proton. Ele configura o dispositivo gráfico, passa pela configuração de áudio, constrói dezenas de milhares de pipelines gráficos e abre uma janela.",
+        "Essa janela fica em branco. O muro atual é uma chamada exclusiva de console nos alocadores de comando do jogo que a camada de PC não responde, então os quadros nunca terminam. Nenhuma das correções de boot está na branch principal do Leonida ainda, e os colaboradores chamam a mesclagem delas de gargalo.",
+        "Posts no Discord do Leonida contavam a mesma história. Logo após o lançamento, um dizia que o jogo não será jogável hoje, «mas talvez amanhã». Depois, outro disse que ele «quase boota», com tela preta e áudio que corta. Não podemos verificar essa linha do tempo, e o repositório ainda lista entrada, saves e streaming como não iniciados.",
+        "O Leonida não está sozinho. O XCL roda um jogo de varejo que suas notas identificam pelo executável do GTA VI a 30 fps numa tela preta, e o TuxBox mostra a mesma janela preta no Proton. Os três agora estão no nosso estágio Exe rodando, 25%. Nenhum desenhou uma imagem."
+      ]
+    },
+    "2026-11-23-exe-readme": {
+      "title": "O README do Cyberleek apresenta o vazamento como protesto e pede criptomoedas",
+      "dek": "Uma nota que supostamente acompanha o executável diz que doações financiam um projeto secreto e conta cada negociação do token como voto. Nada disso pode ser verificado.",
+      "body": [
+        "Um arquivo de texto que se diz ser o README do pacote do Cyberleek foi compartilhado no Reddit em 23 de novembro, pouco depois do lançamento do executável. Não vimos o pacote nós mesmos, então não podemos confirmar que a nota seja autêntica. Aqui está tudo o que ela diz, com nossas palavras.",
+        "Ela apresenta os vazamentos como uma luta contra o que chama de hábitos anticonsumidor nos jogos: assinaturas adicionadas a títulos single-player, edições especiais caras que só desbloqueiam conteúdo que já está nos arquivos, e licenças vendidas como se fossem compras. O resumo dela: «O inimigo é a tática, não o jogo». Diz que os jogadores nunca foram o alvo, por isso o final e a história ficaram fora dos vazamentos, e que cada entrega desde o primeiro clipe em agosto de 2026 não custou nada.",
+        "Depois o tom vira desafio. Ela afirma que meses de remoções, intimações e rastreamento de carteiras não pararam os uploads, e argumenta que dinheiro não torna nenhuma proteção inquebrável e que os tribunais não conseguem recolher o que já se espalhou online.",
+        "Aí vem o dinheiro. A nota diz que doações financiam um projeto que não será descrito até haver algo para mostrar, e que algum dinheiro já chegou e pagou os primeiros passos. Diz que as habilidades por trás da versão renderiam mais em outros trabalhos mais discretos, insistindo que isso não é ameaça. Apoiadores, diz, só podem mudar a rapidez com que esse projeto vira a ocupação principal, não para onde ele vai. Promete que as entregas futuras serão gratuitas haja ou não pagamento, mas conta cada doação e cada negociação do token como voto.",
+        "Admite que o lado cripto atrai raiva e o defende como a única forma de mover dinheiro sem nomes. Termina chamando a versão e o executável de presente de Natal antecipado para os jogadores, um mês antes das festas.",
+        "Entregas anteriores estavam ligadas ao mesmo token, num esquema que a Decrypt descreveu como pump de cripto. Nada na nota pode ser verificado, e comprar o token não compra nada checável. Para a corrida, nada muda: nenhum projeto bootou o GTA VI."
+      ]
+    },
+    "2026-11-23-exe-released": {
+      "title": "Cyberleek diz que o executável que faltava do GTA VI saiu, horas antes do próprio prazo",
+      "dek": "O vazador publicou o aviso às 15:36 CET. Ninguém confirmou que o arquivo é genuíno ainda, e nenhum projeto bootou o jogo.",
+      "body": [
+        "O Cyberleek publicou na segunda, 23 de novembro, às 15:36 CET (14:36 UTC) que o executável que faltava no vazamento da build de Xbox Series do GTA VI já saiu. Isso é cerca de duas horas e meia antes do prazo das 18:00 CET que o vazador tinha se dado. O post diz que a entrega é gratuita e que passa o trabalho para os projetos de recompilação e emulação de código aberto.",
+        "Não baixamos nem checamos o arquivo, e não vamos linkar. Na publicação, nenhum veículo tinha confirmado que é genuíno. O post também pede doações em cripto, e o Cyberleek já ligou entregas anteriores a um token, então trate com cuidado as afirmações em volta.",
+        "Espere falsificações. Arquivos vazados são um jeito fácil de espalhar malware, e downloads falsos de GTA VI circulavam antes desta entrega. Não execute arquivos que chegaram de desconhecidos, e use só os repositórios originais linkados na corrida da nossa página inicial.",
+        "Para a corrida, é o tiro de largada: até agora nenhum projeto podia sequer tentar bootar o GTA VI. Nada muda na tabela até um deles mostrar rodando, e a contagem regressiva da nossa página inicial agora conta para cima desde o lançamento."
+      ]
+    },
+    "2026-11-22-anyps5-developer-x-suspended": {
+      "title": "Desenvolvedor do AnyPS5 é suspenso no X, sem evidência de que Sony ou Rockstar estivessem por trás",
+      "dek": "A suspensão é real, mas a causa não é pública, e uma conta que culpa as duas empresas também promove um token.",
+      "body": [
+        "A conta no X de boykopovar, desenvolvedor da ferramenta PS5 para PC AnyPS5, está suspensa. Vimos o aviso no perfil em 22 de novembro. Ele aponta para as regras do X em geral e não diz qual foi violada nem se alguém reclamou.",
+        "Uma conta que se descreve como a conta da comunidade do AnyPS5 chamou de suspensão repetida e sugeriu que Sony e Rockstar temem o projeto. Não mostrou evidência de que qualquer uma das empresas tenha participado, e não encontramos reportagem ou declaração dizendo isso. Também não conseguimos confirmar uma suspensão anterior.",
+        "O AnyPS5 em si continua no ar: código novo chegou ao repositório no GitHub mais tarde naquele dia. Um dos projetos que acompanhamos, americas-recomp, é um fork dele. A suspensão não muda nota nenhuma nem mostra avanço em rodar o GTA VI.",
+        "Cuidado com o que viaja junto desta história. A conta que faz a acusação promove um token com o nome do projeto e diz que o desenvolvedor apoia. Não verificamos isso, e não vimos menção a token no README do projeto nem no canal público de Telegram do desenvolvedor. Não trate a suspensão como motivo para comprar um."
+      ]
+    },
+    "2026-11-22-xcl-takes-lead": {
+      "title": "XCL assume a liderança depois de rodar seus primeiros jogos de varejo do Xbox no PC",
+      "dek": "A camada estilo Wine diz que Minecraft Preview é totalmente jogável no Windows. O GTA VI ainda não arranca, porque falta o executável.",
+      "body": [
+        "O XCL executa código de Xbox Series nativamente e troca as bibliotecas do sistema do console por versões próprias. Em 22 de novembro o README começou a informar que Minecraft Preview é totalmente jogável num PC, com mundos, som e controle. Fortnite e XDefiant chegam às telas de título e menus, até onde conseguem sem seus serviços online.",
+        "O histórico de commits do dia bate com esse relato: a tela de abertura do Fortnite pela manhã, o menu principal do Minecraft no começo da tarde e uma versão jogável à noite. Os resultados são do próprio projeto e ninguém mais os reproduziu ainda.",
+        "Para o GTA VI, o XCL diz que todos os 26.698 programas de GPU do pacote de shaders do jogo são traduzidos para HLSL e que as amostras compilam para PC. Rodar outro jogo de varejo do início ao fim é o sinal mais forte até agora de que uma camada assim pode levar o GTA VI. A nota do XCL sobe para cerca de 22%, à frente do xbox-emulator.",
+        "Em outras frentes, o americas-recomp já traduz quase todos os shaders do jogo, e o carregador do Leonida roda um programa substituto de ponta a ponta. Todos os projetos continuam esperando o mesmo arquivo."
+      ]
+    },
+    "2026-11-22-exe-deadline-time": {
+      "title": "O executável que falta do GTA VI vence na segunda às 18:00 CET, e os votos custam dinheiro",
+      "dek": "A contagem do Cyberleek termina em 23 de novembro às 17:00 UTC enquanto o site cobra por votos na enquete; a meta do token para lançamento antecipado teria caído para 6 milhões de dólares.",
+      "body": [
+        "A contagem que o Cyberleek criou para o executável retido termina na segunda, 23 de novembro, às 18:00 CET (17:00 UTC), e a RockstarINTEL informa o mesmo prazo. É mais preciso que a «segunda-feira» anunciada no começo, e é a hora que a contagem desta página usa agora.",
+        "O site do vazador combina o timer com uma enquete sobre o que acontece depois, e os votos são dados pagando em criptomoeda. A RockstarINTEL também informa que a meta do token para um lançamento antecipado caiu para 6 milhões de dólares, depois de 30 milhões em outubro e 15 no começo da semana. Relatos colocam o token em cerca de 1,4 milhão.",
+        "Nada disso está verificado. Nenhum veículo confirmou que o grupo tenha um executável funcional, e a Decrypt e outros descrevem a contagem como forma de inflar o token. O grupo encerrou uma campanha parecida em outubro quando a meta não foi atingida.",
+        "Se um arquivo aparecer, espere falsificações primeiro. Pesquisadores de segurança já encontraram falsos «instaladores de GTA VI» com o infostealer Vidar e centenas de domínios empurrando launchers falsos. Esta tabela só vai noticiar um lançamento quando veículos confirmarem, e nunca vai linkar."
+      ]
+    },
+    "2026-11-22-copies": {
+      "title": "Reuploads dos principais projetos de GTA VI já circulam",
+      "dek": "Na primeira execução, nosso robô de busca encontrou três cópias do Leonida em outras contas. Uma tinha sido renomeada e ganhado uma descrição vaga.",
+      "body": [
+        "Nosso robô de busca rodou pela primeira vez no sábado à noite. Entre uma dúzia de repositórios novos, encontrou três que não eram projetos novos: eram reuploads do Leonida, o port de GTA VI com mais estrelas, publicados em contas sem relação.",
+        "Dois mantinham o nome original. O terceiro tinha sido renomeado para algo que soa como GTA, trazia uma descrição de uma linha e tinha um README 97% idêntico ao do Leonida.",
+        "Um reupload não é necessariamente malicioso. Muita gente espelha código de que gosta. Mas um repositório copiado é o lugar mais fácil para enfiar um script de build modificado ou um executável falso em algo que parece confiável, e o Leonida é compilado dando dois cliques num arquivo em lotes.",
+        "A partir de hoje, o robô compara o README de cada repositório novo com os projetos que acompanhamos e marca cópias próximas em vez de listá-las. Repositórios não revisados não são mais linkados neste site. Se você acompanha um projeto, use só o repositório original linkado na corrida."
+      ]
+    },
+    "2026-11-21-exe-deadline": {
+      "title": "A build de Xbox do Cyberleek saiu, menos o arquivo que a executa",
+      "dek": "O vazador diz que o executável que falta será liberado na segunda, 23 de novembro, ou antes se a memecoin dele atingir 15 milhões de dólares de valor de mercado.",
+      "body": [
+        "O Cyberleek, o grupo por trás dos vazamentos de imagens do GTA VI deste ano, diz ter liberado por torrent uma build de Xbox Series de cerca de 209 GB, rotulada como versão 1.0.2.1. O executável principal do jogo não está incluído.",
+        "Segundo o comunicado do grupo, o executável será liberado na segunda, 23 de novembro, sem condições. Diz que o arquivo sai na hora se o token CYBERLEEK chegar antes a 15 milhões de dólares de valor de mercado.",
+        "Nenhum veículo ou pesquisador de segurança verificou de forma independente que os arquivos são uma build genuína do GTA VI, e Rockstar e Take-Two não comentaram. Os projetos desta tabela dizem trabalhar com um pacote cujo conteúdo bate com o que esperam, incluindo 26.503 shaders, mas nenhum consegue bootar sem o executável.",
+        "O Cyberleek também previu que os jogadores de PC estariam emulando a build em uma semana. Como a Gamereactor aponta, ainda não existe emulador funcional de Xbox Series X|S. Essa lacuna é exatamente o que os projetos desta página tentam fechar."
+      ]
+    },
+    "2026-11-19-fake-downloads": {
+      "title": "Todo download de «GTA VI para PC» é falso, e alguns esvaziam suas contas",
+      "dek": "Empresas de segurança rastrearam dezenas de milhares de detecções de malware do GTA VI, e um kit de golpe pronto está à venda na dark web.",
+      "body": [
+        "Não existe versão de GTA VI para PC. A Rockstar não anunciou nenhuma, e nenhum port da comunidade roda o jogo ainda. Isso não impediu uma onda de instaladores falsos.",
+        "A Kaspersky registrou mais de 27.000 detecções de malware e software indesejado com tema de GTA VI desde junho. A ESET encontrou um arquivo chamado gta6_installer.exe carregando o infostealer Vidar. A Cynet analisou um download falso que instala um stealer que leva senhas salvas, cookies do navegador, logins de Steam e Roblox e dados de carteiras cripto.",
+        "Pesquisadores da NordVPN também encontraram um pacote na dark web vendido por cerca de 200 dólares em cripto. Ele permite que golpistas sem muita técnica rodem suas próprias campanhas de downloads falsos de GTA VI.",
+        "Os sinais de alerta são sempre os mesmos: instruções para rodar o arquivo como administrador, clicar por cima de avisos de segurança ou adicionar uma exclusão no antivírus, e ofertas que pedem pagamento em cripto ou cartão-presente. Com o executável que falta do Cyberleek previsto para segunda, espere uma enxurrada de arquivos dizendo ser ele. Se você já rodou um, trate o PC como comprometido e troque suas senhas de outro dispositivo."
+      ]
+    },
+    "2026-11-18-take-two-dmca": {
+      "title": "Take-Two ataca ports de GTA V no GitHub e diz que «traga seus arquivos» não é defesa",
+      "dek": "Quatro avisos DMCA, protocolados no dia anterior ao lançamento do GTA VI, derrubaram ports não oficiais de GTA V junto com centenas de forks.",
+      "body": [
+        "Em 18 de novembro, o dia anterior ao lançamento do GTA VI, a Take-Two enviou ao GitHub quatro avisos de remoção DMCA voltados a ports não oficiais de GTA V. Os alvos incluíam um port para iOS e macOS, um runtime multiplataforma, um port para Android e repositórios ligados a uma versão de navegador.",
+        "Os relatos divergem na escala. Um contou 349 forks desativados de um único port, enquanto outra manchete colocava o total acima de 600 projetos. O GitHub não publicou contagem final.",
+        "O argumento importa mais que os números. Três dos quatro projetos não traziam arquivos do jogo e diziam aos usuários que fornecessem a própria cópia. Os avisos da Take-Two argumentam que esse arranjo não desculpa ajudar outros a reproduzir o jogo sem permissão.",
+        "Todos os projetos de GTA VI desta tabela usam o mesmo aviso de «use sua própria cópia». Desenvolvedores podem contestar uma remoção com uma contranotificação, que obriga o GitHub a restaurar o código a menos que a Take-Two processe, como fez com os projetos re3 e reVC em 2021."
+      ]
+    },
+    "2026-11-16-kurtaj-plea": {
+      "title": "O hacker do GTA VI de 2022 se declara culpado e será sentenciado na segunda",
+      "dek": "Arion Kurtaj admitiu ter hackeado a Rockstar e publicado cerca de 90 clipes de desenvolvimento. A sentença cai no mesmo dia do prazo do executável do Cyberleek.",
+      "body": [
+        "Arion Kurtaj, o hacker por trás do vazamento de setembro de 2022 de imagens iniciais do GTA VI, se declarou culpado no Woolwich Crown Court, em Londres, em 16 de novembro. Admitiu ter hackeado a Rockstar Games e colocado cerca de 90 clipes online.",
+        "As acusações também cobrem invasões a outras empresas. A sentença está prevista no mesmo tribunal na segunda, 23 de novembro, o mesmo dia em que o Cyberleek diz que vai liberar o executável que falta da build de Xbox.",
+        "Os dois vazamentos são separados. A invasão de 2022 expôs imagens inacabadas de dentro da Rockstar. A entrega do Cyberleek em 2026 diz ser uma build de console finalizada do jogo já lançado."
+      ]
+    }
+  }
+}
