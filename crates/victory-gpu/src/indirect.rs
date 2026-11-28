@@ -2701,8 +2701,10 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             }
             sig.unwrap()
         };
-        // Three records of 65,535 x 16 groups: about half the budget each.
-        let Some((big, big_ptr)) = host.shared_buffer(3 * u64::from(STRIDE)) else {
+        // Two records of 32,768 x 32 groups: half the budget each, exactly,
+        // so the two spend all of it whether or not a record that does not
+        // fit takes the rest (`rest`, off by default).
+        let Some((big, big_ptr)) = host.shared_buffer(2 * u64::from(STRIDE)) else {
             return;
         };
         let Some((small, small_ptr)) = host.shared_buffer(u64::from(STRIDE)) else {
@@ -2713,8 +2715,8 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         };
         // SAFETY: mapped buffers of these sizes; nothing runs yet.
         unsafe {
-            for i in 0..3 {
-                let words = [65535u32, 16, 1];
+            for i in 0..2 {
+                let words = [32768u32, 32, 1];
                 std::ptr::copy_nonoverlapping(
                     words.as_ptr().cast::<u8>(),
                     big_ptr.add(i * STRIDE as usize),
@@ -2726,10 +2728,9 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         }
         // SAFETY: a live buffer.
         let hits_gpu = unsafe { hits_buf.GetGPUVirtualAddress() };
-        let small_fits_after_rejected = u32::from(rest() == 0);
         for round in 0..2 {
             // Spends the budget (clamped, not executed), then one group.
-            bound(&list, (&big, 0), None, (KIND_DISPATCH, STRIDE, 3)).unwrap();
+            bound(&list, (&big, 0), None, (KIND_DISPATCH, STRIDE, 2)).unwrap();
             let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
             // SAFETY: an open list; the worker's root signature and
             // pipeline; buffers the test holds until the list has run.
@@ -2745,9 +2746,10 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             list.reset();
             // SAFETY: the list has run; a mapped buffer.
             let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
-            // With REST=0, the oversized third record leaves room for the
-            // small one; with REST=1 it consumes the remaining budget.
-            assert_eq!(hits, (round + 1) * small_fits_after_rejected, "round {round}: small record after rejected work");
+            // The two half-budget records spend all of it in either mode:
+            // the small record that follows runs only when the next
+            // submission starts empty, every round alike.
+            assert_eq!(hits, 0, "round {round}: the spent budget empties the record after it");
         }
         // A recording with only the small record: the budget is empty
         // again, so it runs.
@@ -2765,7 +2767,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         list.reset();
         // SAFETY: the list has run; a mapped buffer.
         let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
-        assert_eq!(hits, 2 * small_fits_after_rejected + 1, "the budget starts empty at the next submission");
+        assert_eq!(hits, 1, "the budget starts empty at the next submission");
     }
 
     /// Records the dispatch records `groups` (three words each, `step`
