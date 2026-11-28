@@ -28,11 +28,13 @@ The launcher sets these for a Proton or Wine launch. A value you set yourself is
 
 | Variable | Value | Purpose |
 | --- | --- | --- |
-| `VKD3D_SHADER_CACHE_PATH` | `<prefix>/shadercache` | vkd3d-proton's pipeline cache; `0` disables it |
+| `VKD3D_SHADER_CACHE_PATH` | `<prefix>/shadercache` | vkd3d-proton's pipeline cache; `0` disables it. The launcher merges the last launch's `.write` archive into it, which GE-Proton11-14 otherwise discards |
 | `__GL_SHADER_DISK_CACHE` | `1` | NVIDIA driver cache; `0` leaves it off |
 | `__GL_SHADER_DISK_CACHE_PATH` | `<prefix>/shadercache` | Gives each prefix its own NVIDIA cache |
 | `__GL_SHADER_DISK_CACHE_SKIP_CLEANUP` | `1` | Asks the NVIDIA driver not to trim the cache |
 | `__GL_SHADER_DISK_CACHE_SIZE` | 4 GiB | Size limit; larger cache files stopped being indexed |
+| `__GL_SHADER_DISK_CACHE_APP_NAME` | `tuxbox<n>` | Cache file this launch writes. A new number starts at 1 GiB, because the driver cannot index past 4 GiB |
+| `__GL_SHADER_DISK_CACHE_READ_ONLY_APP_NAME` | every other file | Cache files the driver also reads. Setting either name yourself leaves both alone |
 | `TUXBOX_LOG` | `1` (`stderr` on Windows) | Sends provider messages to the game log |
 | `WINEDEBUG`, `VKD3D_DEBUG`, `DXVK_LOG_LEVEL` | warnings and errors | Backend messages in the game log |
 | `UMU_RUNTIME_UPDATE` | `0` for offline launches (always set) | Stops umu-run from needing the network |
@@ -49,7 +51,7 @@ The launcher sets these for a Proton or Wine launch. A value you set yourself is
 | `TUXBOX_SCARLETT_SEED_PACK` | off | `1` prepares every shader in `shaders.rpf` |
 | `TUXBOX_LARGE_COMPILES` | `4` | Large compute pipelines compiling at once; `0` removes the limit |
 | `TUXBOX_TRACE_PIPELINE_REQUESTS` | `0` | With diagnostic logging enabled, also log start and completion of short slot-62 compute pipeline attempts, including the selected shader cache request key and byte size |
-| `TUXBOX_PIPELINE_DEADLINE` | `20` | Seconds before a large compile gets an empty stand-in; `0` waits |
+| `TUXBOX_PIPELINE_DEADLINE` | `20` | Seconds, whole or fractional, before a large compile gets an empty stand-in, which the finished compile later replaces; `0` waits |
 | `TUXBOX_NULL_PIPELINES` | on | `0` fails unsupported pipelines instead of giving empty stand-ins |
 | `TUXBOX_PROGRESS_OVERLAY` | `auto` | `always` or `0` for the progress panel |
 | `TUXBOX_PROGRESS_OVERLAY_POS` | `tr` | `tl`, `tr`, `bl` or `br` |
