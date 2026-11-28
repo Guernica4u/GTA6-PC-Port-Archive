@@ -1,9 +1,12 @@
-# Installation Guide — VIctory Fork
+# Installation Guide — VIctory Fork (ors33/victory-fork)
 
 This file sits at the repository root so it is easy to find. It explains how to
 build and run the layer from source. The layer contains **no game files**; you
 must supply your own legally obtained dump of the title's Xbox Series build
 v1.0.2.1 (the folder containing `game_scarlett_master.exe`).
+
+This guide is for **our fork**: https://github.com/ors33/victory-fork
+(issue tracker: https://github.com/ors33/victory-fork/issues).
 
 ## 1. Prerequisites
 
@@ -18,7 +21,7 @@ v1.0.2.1 (the folder containing `game_scarlett_master.exe`).
 ## 2. Get the source
 
 ```powershell
-git clone https://github.com/fxceless/victory-fork
+git clone https://github.com/ors33/victory-fork
 cd victory-fork
 ```
 
@@ -124,3 +127,4 @@ cargo xtask policy
 - `docs/architecture.md` — the layer's parts
 - `docs/asset-policy.md` — what may and may not be in this repository
 - `playability-resume.md` — what is still needed to make the game playable
+- Issue tracker: https://github.com/ors33/victory-fork/issues
