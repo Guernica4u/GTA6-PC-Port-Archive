@@ -1675,13 +1675,12 @@ fn the_pass_on_the_card_writes_the_hosts_instances() {
             };
             // (The host's own search: its nearest triangle of the built
             // bottom levels, and how many boxes it asks the program about.)
-            for mode in [0] {
+            let mode = 0;
                 let (a, b) = (ask(&from_pass, mode), ask(&from_cpu, mode));
                 let hits = a.chunks_exact(8).filter(|o| o[0] == 1).count();
                 let candidates: u64 = a.chunks_exact(8).map(|o| u64::from(o[7])).sum();
                 assert_eq!(a, b, "{target}, case {which}, mode {mode}: the two top levels answer differently");
                 assert!(hits > RAYS / 20 && candidates > 0, "{hits} hits, {candidates} candidates");
-            }
         }
     }
 }

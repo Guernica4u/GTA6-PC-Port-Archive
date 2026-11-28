@@ -855,6 +855,7 @@ impl Guide {
     /// Whether the first list has been recorded, and whether everything is
     /// made from now on ([`Guide::begin`]'s frames have passed and, where
     /// tokens are waited for, its list was submitted).
+    #[allow(dead_code)]
     pub fn state(&self, frame: u64) -> (bool, bool) {
         (self.born.is_some(), self.live(frame))
     }
@@ -911,6 +912,7 @@ impl Guide {
     }
 
     /// Memory let go and not yet free again: entries, and of them buffers.
+    #[allow(dead_code)]
     pub fn waiting_to_go(&self) -> (usize, usize) {
         (self.freed.len(), self.freed.iter().filter(|f| matches!(f.2, Freed::Buffer(_))).count())
     }
@@ -1536,6 +1538,7 @@ impl Guide {
 
     /// Bottom levels the title builds at run time: held now, their
     /// triangles, the pool's bytes they hold, and those waiting for a count.
+    #[allow(dead_code)]
     pub fn moving_standing(&self) -> (usize, u64, u64, usize) {
         (self.moved.len(), self.moved.values().map(|m| u64::from(m.triangles)).sum(), self.moving_held, self.census.len())
     }

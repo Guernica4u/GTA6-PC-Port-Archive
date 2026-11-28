@@ -1859,7 +1859,7 @@ pub(crate) mod tests {
                 b
             })
             .collect();
-        let narrow = |n: u32| n % 3 != 0;
+        let narrow = |n: u32| !n.is_multiple_of(3);
         let count = |first_leaf: u32| {
             let leaves: Vec<_> = bounds.iter().enumerate().map(|(n, b)| ((first_leaf + n as u32) << 3, *b)).collect();
             tree(&leaves, 1, &narrow)
@@ -1962,7 +1962,7 @@ pub(crate) mod tests {
                 std::array::from_fn(|k| world[k] + if k < 3 { -1.0 } else { 1.0 } * (1e-3 + 1e-4 * world[k].abs()))
             })
             .collect();
-        let narrow = |n: u32| n % 2 == 0;
+        let narrow = |n: u32| n.is_multiple_of(2);
         let count = |first_leaf: u32| {
             let leaves: Vec<_> =
                 bounds.iter().enumerate().map(|(n, b)| ((first_leaf + 2 * n as u32) << 3 | 6, *b)).collect();
@@ -2663,7 +2663,7 @@ pub(crate) mod tests {
         words[15] = 0x2000_0000;
         let h = header(&Span { base, words: &words }, base).unwrap();
         let v = h.to_object([1.0, 2.0, 3.0]);
-        assert!((v[0] + 0.707_106_8).abs() < 1e-6 && (v[1] - 2.121_320_3).abs() < 1e-6 && v[2] == 3.0, "{v:?}");
+        assert!((v[0] + core::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6 && (v[1] - 2.121_320_3).abs() < 1e-6 && v[2] == 3.0, "{v:?}");
     }
 
     /// The console's own instance flags do not reach the host's build.
