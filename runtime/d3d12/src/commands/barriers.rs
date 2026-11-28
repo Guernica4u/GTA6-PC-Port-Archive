@@ -301,7 +301,7 @@ pub(super) fn order_indirect_reads(state: &mut Recording) {
         });
         return;
     };
-    let barrier = indirect_order::BARRIER;
+    let barrier = indirect_order::barrier(state.list_type);
     let group = D3D12_BARRIER_GROUP {
         Type: D3D12_BARRIER_TYPE_GLOBAL,
         NumBarriers: 1,
