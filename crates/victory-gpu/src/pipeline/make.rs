@@ -179,6 +179,7 @@ fn amd_range() -> Option<(usize, usize)> {
         if module.is_null() {
             return None;
         }
+        // SAFETY: MODULEINFO is a plain C struct; zero-initialization is valid.
         let mut info: MODULEINFO = unsafe { std::mem::zeroed() };
         // SAFETY: live module handle in the current process.
         let ok = unsafe {
@@ -208,8 +209,8 @@ static NEXT_SLOT: AtomicUsize = AtomicUsize::new(0);
 /// The event the handler signals (a Win32 handle).
 static CRASH_EVENT: AtomicUsize = AtomicUsize::new(0);
 /// What each slot's worker is making and its thread id. Never locked by the handler.
-static ACTIVE_JOBS: Mutex<Vec<Option<(Arc<Pending>, std::thread::ThreadId)>>> =
-    Mutex::new(Vec::new());
+type ActiveJob = (Arc<Pending>, std::thread::ThreadId);
+static ACTIVE_JOBS: Mutex<Vec<Option<ActiveJob>>> = Mutex::new(Vec::new());
 
 thread_local! {
     /// This worker's slot (`usize::MAX`: none).
