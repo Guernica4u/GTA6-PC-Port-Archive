@@ -153,11 +153,47 @@ fn is_bad_key(key: &str) -> bool {
     bad_keys(|keys| keys.contains(key))
 }
 
-/// Whether the driver's compiler crashes are caught
-/// (`VICTORY_COMPILER_GUARD=0`: not).
+/// Whether the driver's compiler crashes are caught: on by default only when
+/// `amdxc64.dll` is loaded, or forced with `VICTORY_COMPILER_GUARD=1`
+/// (`VICTORY_COMPILER_GUARD=0`: off).
 fn guard_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_COMPILER_GUARD").is_none_or(|v| v != "0"))
+    *ON.get_or_init(
+        || match std::env::var("VICTORY_COMPILER_GUARD").ok().as_deref() {
+            Some("0") => false,
+            Some("1") => true,
+            _ => amd_range().is_some(),
+        },
+    )
+}
+
+/// `[start, end)` address range of `amdxc64.dll` if loaded in the process.
+fn amd_range() -> Option<(usize, usize)> {
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::System::ProcessStatus::{GetModuleInformation, MODULEINFO};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    static RANGE: OnceLock<Option<(usize, usize)>> = OnceLock::new();
+    *RANGE.get_or_init(|| {
+        // SAFETY: NUL-terminated static UTF-16 module name; read-only handle lookup.
+        let module = unsafe { GetModuleHandleW(windows::core::w!("amdxc64.dll").as_ptr()) };
+        if module.is_null() {
+            return None;
+        }
+        let mut info: MODULEINFO = unsafe { std::mem::zeroed() };
+        // SAFETY: live module handle in the current process.
+        let ok = unsafe {
+            GetModuleInformation(
+                GetCurrentProcess(),
+                module,
+                &mut info,
+                size_of::<MODULEINFO>() as u32,
+            )
+        };
+        (ok != 0 && info.SizeOfImage > 0).then(|| {
+            let start = info.lpBaseOfDll as usize;
+            (start, start.saturating_add(info.SizeOfImage as usize))
+        })
+    })
 }
 
 /// Worker threads that can be told apart by the guard, over the run.
@@ -166,11 +202,14 @@ const MAX_SLOTS: usize = 128;
 static CRASHED: [AtomicBool; MAX_SLOTS] = [const { AtomicBool::new(false) }; MAX_SLOTS];
 static FAULT_ADDR: [AtomicU64; MAX_SLOTS] = [const { AtomicU64::new(0) }; MAX_SLOTS];
 static FAULT_RIP: [AtomicU64; MAX_SLOTS] = [const { AtomicU64::new(0) }; MAX_SLOTS];
+static AMD_START: AtomicUsize = AtomicUsize::new(0);
+static AMD_END: AtomicUsize = AtomicUsize::new(0);
 static NEXT_SLOT: AtomicUsize = AtomicUsize::new(0);
 /// The event the handler signals (a Win32 handle).
 static CRASH_EVENT: AtomicUsize = AtomicUsize::new(0);
-/// What each slot's worker is making. Never locked by the handler.
-static ACTIVE_JOBS: Mutex<Vec<Option<Arc<Pending>>>> = Mutex::new(Vec::new());
+/// What each slot's worker is making and its thread id. Never locked by the handler.
+static ACTIVE_JOBS: Mutex<Vec<Option<(Arc<Pending>, std::thread::ThreadId)>>> =
+    Mutex::new(Vec::new());
 
 thread_local! {
     /// This worker's slot (`usize::MAX`: none).
@@ -191,7 +230,7 @@ impl Compile {
             if jobs.len() < MAX_SLOTS {
                 jobs.resize(MAX_SLOTS, None);
             }
-            jobs[slot] = Some(p.clone());
+            jobs[slot] = Some((p.clone(), std::thread::current().id()));
             COMPILING.set(true);
         }
         Compile { slot }
@@ -223,6 +262,10 @@ fn guard_start() {
         return;
     }
     ONCE.call_once(|| {
+        if let Some((start, end)) = amd_range() {
+            AMD_START.store(start, Ordering::Release);
+            AMD_END.store(end, Ordering::Release);
+        }
         // SAFETY: an unnamed auto-reset event, no security attributes.
         let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
         if event.is_null() {
@@ -266,6 +309,16 @@ unsafe extern "system" fn compiler_crashed(
     if !COMPILING.try_with(|c| c.get()).unwrap_or(false) {
         return CONTINUE_SEARCH;
     }
+    let (amd_start, amd_end) = (
+        AMD_START.load(Ordering::Acquire),
+        AMD_END.load(Ordering::Acquire),
+    );
+    if amd_end > amd_start {
+        let addr = record.ExceptionAddress as usize;
+        if addr < amd_start || addr >= amd_end {
+            return CONTINUE_SEARCH;
+        }
+    }
     let slot = WORKER_SLOT.try_with(|s| s.get()).unwrap_or(usize::MAX);
     if slot >= MAX_SLOTS {
         return CONTINUE_SEARCH;
@@ -304,13 +357,14 @@ fn watch() {
 
 /// The worker at `slot` is gone with the pipeline it was making.
 fn lost(slot: usize) {
-    let p = {
+    let entry = {
         let mut jobs = ACTIVE_JOBS.lock().unwrap_or_else(|e| e.into_inner());
         jobs.get_mut(slot).and_then(Option::take)
     };
-    let Some(p) = p else {
+    let Some((p, tid)) = entry else {
         return;
     };
+    super::library::release_held_by(tid);
     tracing::error!(
         key = p.key,
         shaders = ?p.shaders,
