@@ -7,7 +7,7 @@ import struct
 import tempfile
 
 from project_tuxbox.verify import (
-    lanes_imports, missing_provider_imports, private_x_server, screen_capture_problem, splash_skip_reason, xauthority_entry)
+    _xwayland, lanes_imports, missing_provider_imports, private_x_server, screen_capture_problem, splash_skip_reason, xauthority_entry)
 
 
 class SplashSkipTests(unittest.TestCase):
@@ -82,6 +82,19 @@ class PrivateXServerTests(unittest.TestCase):
                 self.assertEqual(server[2], {})
             probe.assert_not_called()
         self.assertEqual(started, [()])
+
+    def test_xwayland_keeps_out_of_the_guest_driver_cache(self):
+        # With the guest's cache path and the driver's default cleanup, the server's
+        # own driver deletes every unlocked file there once the folder passes its cap.
+        environment = {"WAYLAND_DISPLAY": "wayland-0", "__GL_SHADER_DISK_CACHE_PATH": "/caches/nv",
+                       "__GL_SHADER_DISK_CACHE_SIZE": "4294967296"}
+        with mock.patch.dict("project_tuxbox.verify.os.environ", environment, clear=True), \
+             mock.patch("project_tuxbox.verify.subprocess.Popen") as start:
+            with _xwayland("/usr/bin/Xwayland", 5, "/tmp/auth", "640x480", 0) as server:
+                self.assertIsNone(server)
+        passed = start.call_args.kwargs["env"]
+        self.assertNotIn("__GL_SHADER_DISK_CACHE_PATH", passed)
+        self.assertEqual(passed["WAYLAND_DISPLAY"], "wayland-0")
 
 class ScreenCaptureTests(unittest.TestCase):
     def test_only_an_x_display_on_linux_is_probed(self):
