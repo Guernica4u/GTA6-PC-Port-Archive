@@ -64,7 +64,7 @@ extern "system" fn text_entry_async(
     let max_length = max_length_for(scope, max_length);
     tracing::info!(title, description, max_length, "text entry");
     xasync::pending_with(block, (&raw const TEXT).cast(), move || {
-        match ask(&title, &description, &default, max_length) {
+        match ask(&title, &description, &default, max_length, scope == PASSWORD) {
             Some(typed) => {
                 tracing::info!(length = typed.chars().count(), "text entry: done");
                 let mut bytes = limit(&typed, max_length).into_bytes();
@@ -125,14 +125,14 @@ fn limit(typed: &str, max: u32) -> String {
 
 /// Asks the user in a modal host dialog; `None` if dismissed.
 #[cfg(not(test))]
-fn ask(title: &str, description: &str, default: &str, max: u32) -> Option<String> {
-    dialog::ask(title, description, default, max)
+fn ask(title: &str, description: &str, default: &str, max: u32, password: bool) -> Option<String> {
+    dialog::ask(title, description, default, max, password)
 }
 
 /// Tests answer for the user: "typed" for a title starting with "Type",
 /// cancelled otherwise.
 #[cfg(test)]
-fn ask(title: &str, _: &str, default: &str, _: u32) -> Option<String> {
+fn ask(title: &str, _: &str, default: &str, _: u32, _: bool) -> Option<String> {
     title.starts_with("Type").then(|| format!("{default}typed"))
 }
 
@@ -157,7 +157,7 @@ mod dialog {
     /// from an in-memory template (dialog units, the system font); Enter
     /// accepts, Esc cancels.
     #[allow(dead_code)] // unused in test builds
-    pub(super) fn ask(title: &str, description: &str, default: &str, max: u32) -> Option<String> {
+    pub(super) fn ask(title: &str, description: &str, default: &str, max: u32, password: bool) -> Option<String> {
         let mut t: Vec<u16> = Vec::new();
         fn dword(t: &mut Vec<u16>, v: u32) {
             t.extend([v as u16, (v >> 16) as u16]);
@@ -186,7 +186,10 @@ mod dialog {
         let (button, edit, label) = (0x80, 0x81, 0x82);
         let tab = wm::WS_TABSTOP;
         item(0, [7, 7, 226, 10], 0xffff, label, description);
-        let edit_style = wm::WS_BORDER | tab | wm::ES_AUTOHSCROLL as u32;
+        let mut edit_style = wm::WS_BORDER | tab | wm::ES_AUTOHSCROLL as u32;
+        if password {
+            edit_style |= wm::ES_PASSWORD as u32;
+        }
         item(edit_style, [7, 20, 226, 12], EDIT as u16, edit, default);
         let ok = wm::BS_DEFPUSHBUTTON as u32 | tab;
         item(ok, [129, 40, 50, 14], wm::IDOK as u16, button, "OK");
