@@ -76,28 +76,44 @@ fn emits(hlsl: &str) -> bool {
 
 /// `yes` when some stage translates the instruction alone, `nothing` when it
 /// translates to no statement, else why compute refuses it.
-fn outcome(words: &[u32]) -> String {
+/// The DXC target `xshader` writes for a translation, as `main.rs` chooses it.
+fn target(stage: Stage, done: &super::Translated) -> String {
+    let model = if done.required_wave_size.is_some() || done.typed_int64_atomics
+        || matches!(done.profile, "ps_6_6" | "cs_6_6" | "ms_6_6") { "6_6" }
+        else if stage == Stage::Mesh || done.profile == "cs_6_5" { "6_5" }
+        else if done.packed_dot_product { "6_4" }
+        else if done.needs_barycentrics { "6_1" }
+        else { "6_0" };
+    format!("{}_{model}", done.profile.split('_').next().unwrap_or("cs"))
+}
+
+fn outcome(words: &[u32]) -> (String, Option<(String, String)>) {
     let mut refusal = String::new();
     for stage in [Stage::Compute, Stage::Pixel, Stage::Vertex] {
         let shader = program(stage, &[words, &[END]].concat());
         match std::panic::catch_unwind(|| super::translate(&shader)) {
             Ok(Ok(done)) => {
                 let result = if emits(&done.hlsl) { "yes" } else { "nothing" };
-                return if stage == Stage::Compute { result.into() } else { format!("{result} ({stage:?} only)") };
+                let text = if stage == Stage::Compute { result.into() } else { format!("{result} ({stage:?} only)") };
+                let profile = target(stage, &done);
+                return (text, (result == "yes").then_some((done.hlsl, profile)));
             }
             Ok(Err(why)) if refusal.is_empty() => refusal = reason(&why),
             Ok(Err(_)) => {}
             // The translator must refuse, never crash.
-            Err(_) => return format!("CRASH in {stage:?}"),
+            Err(_) => return (format!("CRASH in {stage:?}"), None),
         }
     }
-    refusal
+    (refusal, None)
 }
 
 #[test]
 fn instruction_inventory_matches_the_record() {
     let mut now = String::new();
     let mut seen = BTreeMap::new();
+    // With this set, every translation that emits a statement is written to the
+    // folder it names, for `shader_harness.py inventory --compile` to compile.
+    let dump = std::env::var_os("TUXBOX_INSTRUCTION_HLSL").map(std::path::PathBuf::from);
     for (enc, limit) in FAMILIES {
         for op in 0..limit {
             let words = encode(enc, op);
@@ -106,7 +122,12 @@ fn instruction_inventory_matches_the_record() {
             if decoded.mnemonic.contains('<') { continue; }
             assert_eq!((decoded.enc, decoded.op, decoded.dwords), (enc, op, words.len()), "{}", decoded.mnemonic);
             *seen.entry(format!("{enc:?}")).or_insert(0) += 1;
-            let result = outcome(&words);
+            let (result, translated) = outcome(&words);
+            if let (Some(folder), Some((hlsl, profile))) = (&dump, translated) {
+                let stem = folder.join(format!("{enc:?}-{op:#x}-{}", decoded.mnemonic));
+                std::fs::write(stem.with_extension("hlsl"), hlsl).unwrap();
+                std::fs::write(stem.with_extension("profile"), profile).unwrap();
+            }
             assert!(!result.starts_with("CRASH"), "the translator crashed on {}: it must refuse", decoded.mnemonic);
             writeln!(now, "{enc:?} {op:#x} {} | {result}", decoded.mnemonic).unwrap();
         }
