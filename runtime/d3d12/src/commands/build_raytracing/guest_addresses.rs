@@ -100,7 +100,25 @@ pub(super) fn geometry(
                 let vertices = &mut triangles.VertexBuffer;
                 let bytes = span(triangles.VertexCount.into(), vertices.StrideInBytes, vertex_bytes(triangles.VertexFormat))
                     .ok_or(E_INVALIDARG)?;
-                vertices.StartAddress = native(state, owner, vertices.StartAddress, bytes, D3D12_RESOURCE_FLAG_NONE)?;
+                if triangles.VertexFormat == DXGI_FORMAT_R32G32_FLOAT && triangles.VertexCount != 0 {
+                    // The console builder reads this format as packed records
+                    // with a header before them; both must be title memory.
+                    let header = vertices.StartAddress.checked_sub(super::packed_positions::HEADER).ok_or(E_NOTIMPL)?;
+                    let whole = bytes.checked_add(super::packed_positions::HEADER).ok_or(E_INVALIDARG)?;
+                    imported(state, owner, header, whole, D3D12_RESOURCE_FLAG_NONE)?.ok_or(E_NOTIMPL)?;
+                    let positions =
+                        super::packed_positions::at(vertices.StartAddress, triangles.VertexCount, vertices.StrideInBytes)
+                            .ok_or(E_NOTIMPL)?;
+                    let bytes: Vec<u8> = positions.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
+                    // SAFETY: `owner` is the list's controlling guest device.
+                    let buffer = unsafe { crate::device::blas::geometry_upload(owner, &bytes) }?;
+                    retain(state, &[&buffer])?;
+                    vertices.StartAddress = unsafe { buffer.GetGPUVirtualAddress() };
+                    vertices.StrideInBytes = 12;
+                    triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+                } else {
+                    vertices.StartAddress = native(state, owner, vertices.StartAddress, bytes, D3D12_RESOURCE_FLAG_NONE)?;
+                }
                 let index_bytes = match triangles.IndexFormat {
                     DXGI_FORMAT_UNKNOWN => 0,
                     DXGI_FORMAT_R16_UINT => 2,

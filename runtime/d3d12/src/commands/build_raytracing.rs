@@ -12,6 +12,7 @@ use windows::core::{GUID, IUnknown, Result};
 
 pub(super) mod guest_addresses;
 mod meshlet_indices;
+mod packed_positions;
 
 pub(crate) const LIST6: GUID = GUID::from_u128(0xc3827890_4024_474c_98cf_645b51dc4874);
 
