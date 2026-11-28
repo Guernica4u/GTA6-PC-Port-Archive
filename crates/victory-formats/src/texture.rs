@@ -896,6 +896,10 @@ impl Texture {
 /// A texture view's first mip and mip count (`u32::MAX`: all the rest),
 /// moved so that it starts no finer than mip `first` of a texture of `mips`
 /// mips. Unchanged if it starts there or coarser already.
+///
+/// Edge case: a view whose own range ends before `first` overlaps no mip
+/// that is there. It then gets exactly one mip, `first`, which the title's
+/// descriptor excluded (a view cannot be empty).
 pub fn start_view_at(most_detailed: u32, count: u32, first: u32, mips: u32) -> (u32, u32) {
     if first <= most_detailed || first >= mips {
         return (most_detailed, count);
