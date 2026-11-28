@@ -238,6 +238,11 @@ unsafe extern "system" fn cpu_handle(this: &DescriptorHeap) -> usize {
 }
 
 unsafe extern "system" fn gpu_handle(this: &DescriptorHeap) -> u64 {
+    // The console returns a null handle for a heap shaders can't see. The
+    // desktop runtime returns an undefined, often nonzero, value there.
+    if !this.state.desc.Flags.contains(D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) {
+        return 0;
+    }
     this.state.arena.as_ref().map_or_else(|| unsafe { this.native.GetGPUDescriptorHandleForHeapStart().ptr }, |arena| arena.base() as u64)
 }
 
