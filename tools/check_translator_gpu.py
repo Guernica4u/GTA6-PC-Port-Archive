@@ -54,6 +54,7 @@ CHECKS = {
     "f64": assembled("check_f64_exact_gpu"),
     "swizzle": Check("check_compute_swizzle", emitter="compute_swizzle"),
     "swizzle-loop": Check("check_compute_swizzle_loop", emitter="compute_swizzle_loop"),
+    "derivative-lanes": Check("check_derivative_lanes_gpu", emitter="derivative_lanes", dxc=True),
     "readlane": Check("check_readlane_gpu", emitter="readlane_probe", dxc=True),
     **{f"wave-extrema-{width}": Check("check_wave_extrema", emitter="wave_extrema", dxc=True,
                                       extra=("--width", str(width)))
