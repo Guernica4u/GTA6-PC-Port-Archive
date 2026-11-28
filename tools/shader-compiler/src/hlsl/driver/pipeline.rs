@@ -108,14 +108,11 @@ pub fn translate_stencil_target(ex: &ShaderExtract, slot: u32) -> Result<Transla
 pub(in crate::hlsl) fn translate_outputs(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, output_order: &[String],
     stencil_target: Option<u32>) -> Result<Translated, String> {
     let translated = translate_outputs_per_lane(ex, feeds_ps, output_order, stencil_target);
-    // A group of 32 threads is the lower half of one 64-lane console wave. Where no
-    // one-lane-per-thread form runs the program, the two-lane form keeps the lanes
-    // that never start, which a reduction over the whole wave reads.
-    let half_wave = ex.stage == Stage::Compute && stencil_target.is_none()
-        && compute_group(ex).into_iter().try_fold(1u32, u32::checked_mul) == Some(paired_wave64::HALF_WAVE);
+    // Where no one-lane-per-thread form runs the program, the two-lane form may: it
+    // keeps both halves of a console wave and branches once for the whole wave.
     match translated {
-        Err(reason) if half_wave && reason == "wave operation requires complete 64-lane compute waves" => {
-            translate_paired_wave64(ex).map_err(|_| reason)
+        Err(reason) if stencil_target.is_none() && paired_wave64::takes_over(ex, &reason) => {
+            translate_paired_wave64(ex).ok().filter(|paired| paired.hlsl.len() <= MAX_HLSL_BYTES).ok_or(reason)
         }
         other => other,
     }

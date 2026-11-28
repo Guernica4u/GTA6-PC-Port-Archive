@@ -83,6 +83,12 @@ PROGRAMS = {
     'masks': ['v_cmp_lt_u32_e32 vcc, 0x3e8, v0', 's_not_b64 s[14:15], vcc', 's_and_b64 s[14:15], s[14:15], exec',
               's_bcnt1_i32_b64 s20, s[14:15]', 's_ff1_i32_b64 s21, s[14:15]', 's_or_saveexec_b64 s[10:11], -1',
               'v_cndmask_b32_e64 v10, 0, v1, s[14:15]', 's_mov_b64 exec, s[10:11]', 'v_add_nc_u32_e32 v11, 1, v1'],
+    # Lanes are served in groups that share a value, and each group exchanges within its quads.
+    'swizzle_loop': ['v_and_b32_e32 v4, 3, v0', 's_mov_b64 s[10:11], exec', ('label', 'again'),
+                     'v_readfirstlane_b32 s20, v4', 'v_cmp_eq_u32_e32 vcc, s20, v4', 's_and_saveexec_b64 s[12:13], vcc',
+                     'ds_swizzle_b32 v5, v0 offset:0x801b', 'v_add_nc_u32_e32 v10, v5, v10', 'v_mov_b32_e32 v11, v5',
+                     's_add_u32 s21, s21, 1', 's_andn2_b64 exec, s[12:13], exec', ('branch', 's_cbranch_execnz', 'again'),
+                     's_mov_b64 exec, s[10:11]'],
     # A sum over all 64 lanes, as a console compiler reduces a wave: lanes outside
     # EXEC add zero, groups of eight, rows, the two rows of a half, the two halves.
     'reduce': ['s_or_saveexec_b64 s[10:11], -1', 'v_cndmask_b32_e64 v10, 0, v0, s[10:11]',
