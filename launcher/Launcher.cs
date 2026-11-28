@@ -25,8 +25,8 @@ using System.Xml;
 [assembly: AssemblyTitle("GTA VI Launcher")]
 [assembly: AssemblyDescription("Runs your game dump through the PC port runtimes")]
 [assembly: AssemblyProduct("GTA VI Launcher")]
-[assembly: AssemblyVersion("1.10.1.0")]
-[assembly: AssemblyFileVersion("1.10.1.0")]
+[assembly: AssemblyVersion("1.11.0.0")]
+[assembly: AssemblyFileVersion("1.11.0.0")]
 
 // One runtime project, as the archive's site describes it.
 class Runtime
@@ -106,6 +106,9 @@ class Runtime
         }
     }
 
+    // Pulls the archive's newest copy of its branch into its folder and rebuilds it there.
+    public string Update { get { return "cd /d \"" + Dir + "\" && git fetch --depth 1 origin " + Branch + "/main && git reset -q --hard FETCH_HEAD && " + Build; } }
+
     public string Build
     {
         get
@@ -151,7 +154,7 @@ static class Launcher
     public static readonly string Settings = Path.Combine(Here, "launcher.txt");
     public const string Archive = "https://github.com/Guernica4u/GTA6-PC-Port-Archive.git";
     const string ArchiveSite = "https://raw.githubusercontent.com/Guernica4u/GTA6-PC-Port-Archive/main/docs/index.html";
-    static readonly string[] Wanted = { "ztrx", "hyphenn", "victory-fork", "victory", "xcl", "cool-fox", "kelvaroq", "victory-nvidia" }; // the user's picks: Zettrox, Hyphen (renamed), VIctory, xcl, cool_fox, Kelvaroq, VIctory-NVIDIA; kept even once gone or unpinned
+    static readonly string[] Wanted = { "ztrx", "hyphenn", "victory-fork", "victory", "xcl", "cool-fox", "kelvaroq", "victory-nvidia", "belobug", "victory-7900xtx" }; // the user's picks: Zettrox, Hyphen (renamed), VIctory, xcl, cool_fox, Kelvaroq, VIctory-NVIDIA, Belobug, 7900XTX; kept even once gone or unpinned
     public const string Repo = "https://github.com/Guernica4u/GTA6-PC-Port-Archive"; // the site's ${REPO}
     static readonly string[] Excluded = { "anyxboxx" }; // the user doesn't want it, even when it ranks
     static readonly Dictionary<string, string> Names = new Dictionary<string, string>
@@ -232,21 +235,22 @@ static class Launcher
         return pick;
     }
 
-    // Offline fallback: the archive on 27 Nov 2026: Belobug first, cool_fox :CGBJ (private, with two ready-made builds) second.
+    // Offline fallback: the archive on 28 Nov 2026: cool_fox :CGBJ (private, with two ready-made builds) first, VIctory-NVIDIA second,
+    // Kelvaroq third; Belobug and 7900XTX were taken off GitHub.
     const string Builtin =
-        "  \"cool-fox\": { repo: \"codec-d/cool_fox\", gone: \"26 Nov 2026\", private: true, name: \"cool_fox :CGBJ\", gpu: \"amd\", top: 2, branch: \"cool-fox\", reached: 5,\n" +
+        "  \"cool-fox\": { repo: \"codec-d/cool_fox\", gone: \"26 Nov 2026\", private: true, name: \"cool_fox :CGBJ\", gpu: \"amd\", top: 1, branch: \"cool-fox\", reached: 5,\n" +
         "    builds: [\n" +
         "      { label: \"willy build 30e54b4 (newest)\", url: `${REPO}/releases/download/cgbj-willy-30e54b4/victory-cool_fox-willy.zip` },\n" +
         "      { label: \"pareto-residency build (Defender flags it)\", url: `${REPO}/releases/download/cgbj-pareto-residency/cool_fox-pareto-residency-windows-x64.zip` },\n" +
         "    ],\n" +
         "    note: \"Newest build: about 30 fps median on an RTX 4090, 60 fps cap, keyboard and mouse, memory peak about 27 GB.\" },\n" +
-        "  \"victory-7900xtx\": { repo: \"avatarmanz/VIctory-7900XTX\", name: \"VIctory-7900XTX\", gpu: \"amd\", top: 3, branch: \"victory-7900xtx\", reached: 5, note: \"Prologue and first mission at 13-22 fps. Needs about 64 GB of RAM.\" },\n" +
+        "  \"victory-7900xtx\": { repo: \"avatarmanz/VIctory-7900XTX\", gone: \"27 Nov 2026\", name: \"VIctory-7900XTX\", gpu: \"amd\", branch: \"victory-7900xtx\", reached: 5, note: \"Prologue and first mission at 13-22 fps. Needs about 64 GB of RAM.\" },\n" +
         "  ztrx: { repo: \"Zettrox/ztrx\", gone: \"25 Nov 2026\", name: \"ztrx\", branch: \"ztrx\", reached: 5, note: \"The prologue is playable. NVIDIA only.\" },\n" +
-        "  hyphenn: { repo: \"fxceless/victory-fork\", name: \"hyphenn\", gpu: \"nvidia\", top: 6, branch: \"hyphenn\", reached: 4, note: \"First gameplay scene at 2-4 fps.\" },\n" +
-        "  dexnom: { repo: \"DexNom/VIctory\", name: \"DexNom Runtime\", gpu: \"amd\", top: 5, branch: \"dexnom\", reached: 4, note: \"VIctory fork tuned on Radeon, experimental ray tracing.\" },\n" +
-        "  belobug: { repo: \"Belobug/VIctory-Belobug-AMD\", name: \"VIctory-Belobug-AMD\", gpu: \"amd\", top: 1, branch: \"belobug\", reached: 4, note: \"The world renders lit at 5-7 fps on an RX 9070 XT.\" },\n" +
-        "  kelvaroq: { repo: \"stellarr-studio/kelvaroq\", name: \"Kelvaroq\", gpu: \"nvidia\", top: 4, branch: \"kelvaroq\", reached: 5, note: \"Plays the prologue at about 10 fps at 4K on an RTX 5080.\" },\n" +
-        "  \"victory-nvidia\": { repo: \"trustno1-coder/VIctory-NVIDIA\", name: \"VIctory-NVIDIA\", gpu: \"nvidia\", branch: \"victory-nvidia\", reached: 5, note: \"Opening rooms at 26-30 fps on an RTX 5070 with DLSS. Needs 32 GB of RAM.\" },\n" +
+        "  hyphenn: { repo: \"fxceless/victory-fork\", name: \"hyphenn\", gpu: \"nvidia\", top: 5, branch: \"hyphenn\", reached: 4, note: \"First gameplay scene at 2-4 fps.\" },\n" +
+        "  dexnom: { repo: \"DexNom/VIctory\", name: \"DexNom Runtime\", gpu: \"amd\", top: 4, branch: \"dexnom\", reached: 4, note: \"VIctory fork tuned on Radeon, experimental ray tracing.\" },\n" +
+        "  belobug: { repo: \"Belobug/VIctory-Belobug-AMD\", gone: \"27 Nov 2026\", name: \"VIctory-Belobug-AMD\", gpu: \"amd\", branch: \"belobug\", reached: 4, note: \"The world renders lit at 5-7 fps on an RX 9070 XT.\" },\n" +
+        "  kelvaroq: { repo: \"stellarr-studio/kelvaroq\", name: \"Kelvaroq\", gpu: \"nvidia\", top: 3, branch: \"kelvaroq\", reached: 5, note: \"Plays the prologue at about 10 fps at 4K on an RTX 5080.\" },\n" +
+        "  \"victory-nvidia\": { repo: \"trustno1-coder/VIctory-NVIDIA\", name: \"VIctory-NVIDIA\", gpu: \"nvidia\", top: 2, branch: \"victory-nvidia\", reached: 5, note: \"Opening rooms at 26-30 fps on an RTX 5070 with DLSS. Needs 32 GB of RAM.\" },\n" +
         "  victory: { repo: \"Marvisak/VIctory\", name: \"VIctory\", branch: \"victory\", reached: 3, note: \"Menus and the world intro.\" },\n" +
         "  xcl: { repo: \"ivall/xcl\", name: \"xcl\", branch: \"xcl\", reached: 2, note: \"Its own code, not VIctory. Menus at 30 fps; gameplay not reached yet.\" },\n";
 
@@ -260,7 +264,7 @@ static class Launcher
             try
             {
                 ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072; // TLS 1.2
-                using (var wc = new WebClient { Encoding = Encoding.UTF8 }) html = wc.DownloadString(ArchiveSite);
+                using (var wc = new WebClient { Encoding = Encoding.UTF8 }) html = wc.DownloadString(ArchiveSite + "?t=" + DateTime.UtcNow.Ticks); // past raw.githubusercontent's 5-minute cache
                 if (ParseArchive(html).Count == 0) html = null;
                 else { Directory.CreateDirectory(Data); File.WriteAllText(CachedArchive, html); }
             }
@@ -269,6 +273,55 @@ static class Launcher
         if (html == null && File.Exists(CachedArchive)) html = File.ReadAllText(CachedArchive);
         var all = html == null ? new List<Runtime>() : ParseArchive(html);
         return Choose(all.Count > 0 ? all : ParseArchive(Builtin));
+    }
+
+    public static readonly Version Version = new Version(Assembly.GetExecutingAssembly().GetName().Version.ToString(3));
+
+    // The newest launcher-vX tag in GitHub's releases list.
+    public static Version NewestLauncher(string json)
+    {
+        Version best = null;
+        foreach (Match m in Regex.Matches(json, "\"tag_name\": *\"launcher-v(\\d+\\.\\d+\\.\\d+)\""))
+        {
+            var v = new Version(m.Groups[1].Value);
+            if (best == null || v > best) best = v;
+        }
+        return best;
+    }
+
+    public static Version CheckLauncher()
+    {
+        ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072; // TLS 1.2
+        using (var wc = new WebClient { Encoding = Encoding.UTF8 })
+        {
+            wc.Headers["User-Agent"] = "GTA-VI-Launcher"; // GitHub's API refuses requests without one
+            return NewestLauncher(wc.DownloadString("https://api.github.com/repos/Guernica4u/GTA6-PC-Port-Archive/releases?per_page=100"));
+        }
+    }
+
+    // git with no window; its exit code and output.
+    static int Git(string args, string dir, out string output)
+    {
+        var psi = new ProcessStartInfo("git", args) { WorkingDirectory = dir, UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true };
+        using (var p = Process.Start(psi)) { output = p.StandardOutput.ReadToEnd(); p.WaitForExit(); return p.ExitCode; }
+    }
+
+    // Folders of installed source runtimes whose archive branch has new code since they were built.
+    // README, docs, images and GitHub workflow changes don't count: those come every few hours and need no rebuild.
+    public static List<string> Outdated(IEnumerable<Runtime> list)
+    {
+        var res = new List<string>();
+        string heads, o;
+        if (Git("ls-remote " + Archive + " \"refs/heads/*/main\"", Here, out heads) != 0) return res;
+        foreach (var rt in list.Where(r => r.Release == null && r.Installed && Directory.Exists(Path.Combine(r.Dir, ".git"))))
+        {
+            var m = Regex.Match(heads, "^([0-9a-f]{40})\\trefs/heads/" + Regex.Escape(rt.Branch) + "/main\\r?$", RegexOptions.Multiline);
+            if (!m.Success || Git("rev-parse HEAD", rt.Dir, out o) != 0 || o.Trim() == m.Groups[1].Value) continue;
+            if (Git("fetch -q --depth 1 origin " + rt.Branch + "/main", rt.Dir, out o) == 0 &&
+                Git("diff --quiet HEAD FETCH_HEAD -- . \":(exclude)*.md\" \":(exclude)docs\" \":(exclude).github\" \":(exclude)*.svg\" \":(exclude)*.png\" \":(exclude)*.jpg\" \":(exclude)*.gif\"", rt.Dir, out o) == 1)
+                res.Add(rt.Dir);
+        }
+        return res;
     }
 
     [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
@@ -320,7 +373,7 @@ static class Launcher
             "  tuxbox: { repo: \"brcly/TuxBox\", name: \"TuxBox\", branch: \"tuxbox\", reached: 2 },\n" +
             "  \"leonida-old\": { repo: \"x/L\", gone: \"23 Nov 2026\", name: \"Leonida\", reached: 9 },\n";
         var keys = string.Join(",", Choose(ParseArchive(site)).Select(r => r.Key + r.Rank).ToArray());
-        if (keys != "belobug1,cool-fox2,victory-7900xtx3,kelvaroq0,hyphenn0,victory-nvidia0,ztrx0,victory0,xcl0") return 5;
+        if (keys != "cool-fox1,victory-nvidia2,kelvaroq3,hyphenn0,victory-7900xtx0,ztrx0,belobug0,victory0,xcl0") return 5;
         // The download picker: ready-made builds install by download with their pinned checksum and start through their
         // own script; the last choice builds from source. A release-only entry is one build, no source.
         var all = ParseArchive(Builtin);
@@ -340,9 +393,13 @@ static class Launcher
         var kel = all.First(r => r.Key == "kelvaroq");
         if (!kel.Exe.EndsWith(@"runtimes\kelvaroq\target\release\kelvaroq.exe") || !kel.Run(@"C:\g\game.exe").EndsWith(@"kelvaroq.exe"" play ""C:\g\game.exe""") ||
             !kel.Build.Contains("build_native.py") || !all.First(r => r.Key == "victory-nvidia").Run(@"C:\g\game.exe").Contains(@"scripts\play-nvidia.ps1' -Exe 'C:\g\game.exe'")) return 15;
+        // Launcher updates: the newest launcher-vX tag, other releases ignored; runtime updates pull the branch and rebuild.
+        var nl = NewestLauncher("[{\"tag_name\": \"cgbj-willy-30e54b4\"}, {\"tag_name\":\"launcher-v1.9.0\"}, {\"tag_name\": \"launcher-v1.10.1\"}, {\"tag_name\": \"launcher\"}]");
+        if (nl == null || nl.ToString() != "1.10.1" || !(new Version("1.10.2") > Version || Version >= nl) ||
+            !all.First(r => r.Key == "kelvaroq").Update.EndsWith("git fetch --depth 1 origin kelvaroq/main && git reset -q --hard FETCH_HEAD && " + all.First(r => r.Key == "kelvaroq").Build)) return 16;
         // Every runtime says which cards it's made for: the site's gpu, else the launcher's own list.
         if (string.Join(",", Choose(ParseArchive(Builtin)).Select(r => r.Key + ":" + r.Gpu).ToArray()) !=
-            "belobug:amd,cool-fox:amd,victory-7900xtx:amd,kelvaroq:nvidia,hyphenn:nvidia,victory-nvidia:nvidia,ztrx:nvidia,victory:amd,xcl:amd") return 14;
+            "cool-fox:amd,victory-nvidia:nvidia,kelvaroq:nvidia,hyphenn:nvidia,victory-7900xtx:amd,ztrx:nvidia,belobug:amd,victory:amd,xcl:amd") return 14;
 
         // Opus packet lengths: 20 ms CELT, 2x10 ms SILK, 3x20 ms CELT (code 3, count in byte 2).
         if (OpusDecoder.Samples(new byte[] { 0xF8 }, 0, 1) != 960 || OpusDecoder.Samples(new byte[] { 0x01 }, 0, 1) != 960 ||
@@ -365,7 +422,9 @@ class LauncherForm : Form
     [DllImport("gdi32.dll")] static extern bool BitBlt(IntPtr dst, int x, int y, int w, int h, IntPtr src, int sx, int sy, int rop);
     [DllImport("msimg32.dll")] static extern bool AlphaBlend(IntPtr dst, int x, int y, int w, int h, IntPtr src, int sx, int sy, int sw, int sh, int blend);
 
-    string exe, title, hover, state = "", runtimeKey; // state: "", "installing", "running"
+    string exe, title, hover, state = "", runtimeKey; // state: "", "installing", "updating", "running"
+    HashSet<string> outdated = new HashSet<string>(); // runtime folders with new code in the archive
+    Version newer; // a newer launcher release, once GitHub says so
     bool muted, moving, musicBusy;
     int tab, song; // tab: 0 Launcher, 1 Conversion, 2 Settings; song: index into GameMusic.Songs
     static readonly string[] Tabs = { "Launcher", "Conversion", "Settings" };
@@ -443,6 +502,13 @@ class LauncherForm : Form
         {
             var live = Launcher.LoadRuntimes(true);
             OnUi(() => { runtimes = WithPicks(live); Invalidate(); });
+            try { var o = Launcher.Outdated(live); OnUi(() => { outdated = new HashSet<string>(o); Invalidate(); }); }
+            catch { } // no git or offline: no update notices this time
+        }) { IsBackground = true }.Start();
+        new Thread(() =>
+        {
+            try { var v = Launcher.CheckLauncher(); if (v != null && v > Launcher.Version) OnUi(() => { newer = v; Invalidate(); }); }
+            catch { } // offline or rate-limited
         }) { IsBackground = true }.Start();
 
         LayoutUi();
@@ -583,6 +649,7 @@ class LauncherForm : Form
             else if (h == "max") ToggleFullScreen();
             else if (h == "mute") { muted = !muted; Save(); PlayMusic(); Invalidate(); }
             else if (h == "change") Pick();
+            else if (h == "app-update") UpdateLauncher();
             else if (h == "play") { if (state == "" && (exe != null || Pick())) Play(); }
             else if (h == "song-" || h == "song+")
             {
@@ -637,6 +704,22 @@ class LauncherForm : Form
     void Play()
     {
         var rt = Current;
+        if (rt.Installed && outdated.Contains(rt.Dir))
+        {
+            var a = MessageBox.Show(this, rt.Name + " has new code in the archive.\n\nUpdate it now? The launcher downloads the new code and rebuilds it (a few minutes; a console window shows the progress).\n\nNo plays the version you have.",
+                "GTA VI Launcher", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+            if (a == DialogResult.No) { Start(rt); return; }
+            if (a != DialogResult.Yes) return;
+            var u = RunConsole(rt.Update, Launcher.Here);
+            SetState("updating");
+            u.Exited += (o, e) => OnUi(() =>
+            {
+                SetState("");
+                if (u.ExitCode == 0) { outdated.Remove(rt.Dir); Invalidate(); }
+                else Launcher.Error("Updating " + rt.Name + " failed. The console window showed why. The version you had is still there.");
+            });
+            return;
+        }
         if (rt.Installed) { Start(rt); return; }
 
         string install = rt.Install;
@@ -655,6 +738,17 @@ class LauncherForm : Form
             if (rt.Installed) Start(rt);
             else Launcher.Error("Installing " + rt.Name + " failed. The console window showed why" + (rt.Ready ? "." : " (is git and Rust installed?)."));
         });
+    }
+
+    // Opens the new release's page to download it. Not a self-replacing update: Windows Defender flagged an unsigned exe that
+    // downloads and swaps in its own exe (Behavior:Win32/DefenseEvasion.A!ml) and then blocked that launcher's exe for good.
+    void UpdateLauncher()
+    {
+        if (newer == null) return;
+        if (MessageBox.Show(this, "GTA VI Launcher " + newer.ToString(3) + " is out (you have " + Launcher.Version.ToString(3) + ").\n\n" +
+            "Open its download page? Unzip it over this folder; your settings, runtimes and pictures stay.",
+            "GTA VI Launcher", MessageBoxButtons.YesNo, MessageBoxIcon.Information) != DialogResult.Yes) return;
+        Process.Start(Launcher.Repo + "/releases/tag/launcher-v" + newer.ToString(3));
     }
 
     void Start(Runtime rt)
@@ -676,7 +770,7 @@ class LauncherForm : Form
     // A console window that stays open if the command fails, so its error can be read.
     static Process RunConsole(string command, string cwd, Action<ProcessStartInfo> env = null)
     {
-        var psi = new ProcessStartInfo("cmd.exe", "/c \"" + command + " || pause\"") { WorkingDirectory = cwd, UseShellExecute = false };
+        var psi = new ProcessStartInfo("cmd.exe", "/c \"" + command + " || (pause & exit /b 1)\"") { WorkingDirectory = cwd, UseShellExecute = false };
         // Own temp folder: this PC blocks some tools writing to %TEMP% (MSVC failed with D8050 building xcl).
         string tmp = Path.Combine(Launcher.Data, "tmp");
         Directory.CreateDirectory(tmp);
@@ -1001,6 +1095,16 @@ class LauncherForm : Form
 
             // Top bar: app name, music, minimize, full screen, close.
             TextRenderer.DrawText(g, "GTA VI LAUNCHER", smallF, new Point(Rail + S(14), S(9)), Color.FromArgb(220, 255, 255, 255));
+            if (newer != null)
+            {
+                string up = "Launcher " + newer.ToString(3) + " is out  ·  Update";
+                int ux = Rail + S(28) + TextRenderer.MeasureText("GTA VI LAUNCHER", smallF).Width;
+                var ur = hits["app-update"] = new Rectangle(ux, S(5), TextRenderer.MeasureText(up, smallF).Width + S(20), S(24));
+                using (var path = Rounded(ur, ur.Height / 2))
+                using (var b = new SolidBrush(hover == "app-update" ? Color.FromArgb(255, 120, 162) : Accent))
+                    g.FillPath(b, path);
+                TextRenderer.DrawText(g, up, smallF, ur, Color.White, center);
+            }
             using (var hot = new SolidBrush(Color.FromArgb(40, 255, 255, 255)))
             {
                 if (hover == "min") g.FillRectangle(hot, minR);
@@ -1107,8 +1211,9 @@ class LauncherForm : Form
                     g.FillPath(b, path);
                 TextRenderer.DrawText(g, rt.ChoiceLabel + "  ▾", smallF, ob, fg, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
             }
-            TextRenderer.DrawText(g, on ? "Selected" : rt.Installed ? "Installed" : "Not installed", smallF,
-                new Rectangle(r.Right - S(126), r.Y, S(110), r.Height), on ? Accent : sub, mid | TextFormatFlags.Right);
+            bool old = rt.Installed && outdated.Contains(rt.Dir);
+            TextRenderer.DrawText(g, old ? "Update available" : on ? "Selected" : rt.Installed ? "Installed" : "Not installed", smallF,
+                new Rectangle(r.Right - S(126), r.Y, S(110), r.Height), on || old ? Accent : sub, mid | TextFormatFlags.Right);
         }
     }
 
@@ -1170,7 +1275,8 @@ class LauncherForm : Form
     void DrawPlay(Graphics g, double t, Runtime cur)
     {
         bool ready = state == "";
-        string label2 = state == "installing" ? "INSTALLING..." : state == "running" ? "RUNNING" : exe == null ? "SELECT GAME" : cur.Installed ? "PLAY" : "INSTALL & PLAY";
+        string label2 = state == "installing" ? "INSTALLING..." : state == "updating" ? "UPDATING..." : state == "running" ? "RUNNING" :
+            exe == null ? "SELECT GAME" : !cur.Installed ? "INSTALL & PLAY" : outdated.Contains(cur.Dir) ? "UPDATE" : "PLAY";
         if (ready)
         {
             float pulse = 0.5f + 0.5f * (float)Math.Sin(t * 2 * Math.PI / 2.6);
