@@ -292,10 +292,11 @@ fn exchanges_inside_a_branch_one_half_skips() {
     });
 }
 
-/// Groups of several console waves need the halves to meet without a
-/// group barrier: not yet.
+/// Groups of whole console waves take the console flow with pair meetings
+/// (`lower::pairs`); a group that is not a whole number of console waves
+/// is still refused.
 #[test]
-fn console_flow_is_for_one_console_wave_per_group() {
+fn console_flow_is_for_groups_of_whole_console_waves() {
     let body = [
         0xD760_0009,
         0x0001_5100, // v_readlane_b32 s9, v0, 40
@@ -306,7 +307,8 @@ fn console_flow_is_for_one_console_wave_per_group() {
         lanes_max: 32,
     };
     assert!(emit_for(&program(&body, 64), nvidia).is_ok());
-    assert!(emit_for(&program(&body, 128), nvidia).is_err());
+    assert!(emit_for(&program(&body, 128), nvidia).is_ok());
+    assert!(emit_for(&program(&body, 96), nvidia).is_err());
 }
 
 /// A loop lane t runs t times, with a lane read of the other half in
