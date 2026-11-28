@@ -34,6 +34,20 @@ def pattern(index):
     return 0x41000000 + 0x101 * index
 
 
+class Near:
+    """A float that may be one unit in the last place from `bits`: a division by
+    a format's largest value need not round the same on every host."""
+
+    def __init__(self, bits):
+        self.bits = bits
+
+    def __eq__(self, got):
+        return abs(got - self.bits) <= 1
+
+    def __repr__(self):
+        return f"~{self.bits:#x}"
+
+
 parser = argparse.ArgumentParser(description=__doc__)
 for name in ("hlsl", "provider", "proton", "prefix", "compiler-dir", "work", "output"):
     parser.add_argument("--" + name, type=Path, required=True)
@@ -55,7 +69,8 @@ for section in args.hlsl.read_text().split("//// ")[1:]:
     left, right = header.split(" | ")
     name, kind, *registers = left.split()
     # `pN` is word N of the source buffer as it was; anything else is a literal.
-    wanted = [pattern(int(token[1:])) if token[0] == "p" else int(token, 16) for token in right.split()]
+    wanted = [pattern(int(token[1:])) if token[0] == "p" else Near(int(token[1:], 16)) if token[0] == "~"
+              else int(token, 16) for token in right.split()]
     assert len(wanted) == len(registers), name
     threads = "[numthreads(1, 1, 1)]" if kind.endswith("-write") else "[numthreads(32, 1, 1)]"
     source = replace(source, threads, "RWByteAddressBuffer output : register(u0);\n" + threads)
@@ -65,8 +80,6 @@ for section in args.hlsl.read_text().split("//// ")[1:]:
     programs[name] = (kind, wanted, body + stores + "}\n")
 assert programs, "no programs in the --hlsl file"
 
-RANGES = {"constant": "D3D12_DESCRIPTOR_RANGE_TYPE_CBV", "raw": "D3D12_DESCRIPTOR_RANGE_TYPE_SRV",
-          "typed": "D3D12_DESCRIPTOR_RANGE_TYPE_SRV"}
 guest = (p / "tools/reference/independent-shaders/compute.cpp").read_text()
 guest = replace(guest, "D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0};", """std::string source_kind;
     if (!(std::ifstream(name + ".kind") >> source_kind))
@@ -76,6 +89,14 @@ guest = replace(guest, "D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE
         {source_kind == "constant" ? D3D12_DESCRIPTOR_RANGE_TYPE_CBV
          : writable ? D3D12_DESCRIPTOR_RANGE_TYPE_UAV : D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1, 0, 1}};""")
 guest = replace(guest, "table.DescriptorTable = {1, &range};", "table.DescriptorTable = {2, range};")
+# Root parameter 1 is a raw SRV at t5, for the programs that read a root-level buffer.
+guest = replace(guest, "    D3D12_ROOT_SIGNATURE_DESC description{1, &table, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};",
+                """    D3D12_ROOT_PARAMETER parameters[2]{table, {}};
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    parameters[1].Descriptor = {5, 0};
+    D3D12_ROOT_SIGNATURE_DESC description{2, parameters, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};""")
+guest = replace(guest, "    list->Dispatch(groups, 1, 1);",
+                "    list->SetComputeRootShaderResourceView(1, source_seed->GetGPUVirtualAddress());\n    list->Dispatch(groups, 1, 1);")
 guest = replace(guest, "D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1,", "D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,")
 guest = replace(guest, "    D3D12_COMMAND_QUEUE_DESC qd{};", f"""    // The source buffer, with a different word at every position.
     const UINT source_words = {SOURCE_WORDS};
@@ -111,7 +132,7 @@ guest = replace(guest, "    D3D12_COMMAND_QUEUE_DESC qd{};", f"""    // The sour
         D3D12_SHADER_RESOURCE_VIEW_DESC srv{{}};
         srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        if (source_kind == "raw") {{
+        if (source_kind == "raw" || source_kind == "root-raw" || source_kind == "code") {{
             srv.Format = DXGI_FORMAT_R32_TYPELESS;
             srv.Buffer.NumElements = source_words;
             srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
@@ -162,7 +183,8 @@ with TemporaryDirectory(dir=w) as td:
     for name, want in expected.items():
         actual = (trial / f"{name}.bin").read_bytes()
         got = struct.unpack(f"<{WORDS}I", actual)
-        differ = [(i - FIRST_WORD, f"{a:#x}", f"{b:#x}") for i, (a, b) in enumerate(zip(got, want)) if a != b]
+        differ = [(i - FIRST_WORD, f"{a:#x}", repr(b) if isinstance(b, Near) else f"{b:#x}")
+                  for i, (a, b) in enumerate(zip(got, want)) if b != a]
         if differ:
             wrong.append((name, differ[:6]))
         rows.append({"case": name, "kind": programs[name][0], "words": len(programs[name][1]), "matched": not differ,

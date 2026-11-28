@@ -1,6 +1,6 @@
 # DexNom Runtime GitHub export
 
-Issues, pull requests and comments from `DexNom/VIctory`, exported from the GitHub REST API on 2026-11-27.
+Issues, pull requests and comments from `DexNom/VIctory`, exported from the GitHub REST API on 2026-11-28.
 
 Each file in `data/` is gzipped JSON Lines: one API object per line, unchanged.
 

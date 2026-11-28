@@ -41,6 +41,8 @@ impl<'a> Emitter<'a> {
             // Dataflow key of a scalar location: SGPR number, or 1000+ for a lane-spill slot.
             let sg = |o: &Opnd| match o {
                 Opnd::Sgpr(n) => Some(*n as u16),
+                Opnd::VccLo => Some(106),
+                Opnd::VccHi => Some(107),
                 Opnd::Temp(n) if *n >= LANE_TEMP_BASE => Some(1000 + (*n - LANE_TEMP_BASE)),
                 _ => None,
             };
@@ -231,6 +233,16 @@ impl<'a> Emitter<'a> {
                         sym.insert(2000 + *v as u16, heap_value.unwrap());
                     }
                 }
+                // A word of a heap descriptor copied to every active lane. The read that
+                // `descriptor_broadcast` proved returns this copy brings it back.
+                Enc::Vop1 if self.descriptor_copies.contains(&idx) => {
+                    if let (Some(Opnd::Vgpr(v)), Some(source)) = (ins.dst.first(), ins.src.first().and_then(sg)) {
+                        match sym.get(&source).copied().filter(|s| heap_origins::tracked(*s)) {
+                            Some(word) => sym.insert(2000 + *v as u16, word),
+                            None => sym.remove(&(2000 + *v as u16)),
+                        };
+                    }
+                }
                 Enc::Vop2 | Enc::Vop3
                     if matches!(ins.mnemonic.as_str(), "v_add_co_u32" | "v_add_nc_u32")
                         && ins.src.iter().any(|o| sg(o).map(|s| sym.get(&s) == Some(&Sym::Code)).unwrap_or(false)) =>
@@ -246,8 +258,19 @@ impl<'a> Emitter<'a> {
                             .filter(|s| matches!(s, Sym::HeapOffset | Sym::HeapSamplerOffset)),
                         _ => None,
                     };
+                    let word = match ins.src.first() {
+                        Some(Opnd::Vgpr(v)) if self.descriptor_reads.contains(&idx) => sym.get(&(2000 + *v as u16)).copied()
+                            .filter(|s| heap_origins::tracked(*s)),
+                        _ => None,
+                    };
+                    // Judged again on each visit: the last one sees the block's final state.
+                    if matches!(word, Some(Sym::HeapDescriptor(..) | Sym::HeapSamplerIndex(_))) {
+                        self.heap_index_reads.insert(idx);
+                    } else {
+                        self.heap_index_reads.remove(&idx);
+                    }
                     if let Some(d) = ins.dst.first().and_then(sg) {
-                        if let Some(heap) = heap {
+                        if let Some(heap) = heap.or(word) {
                             // readfirstlane copies one lane's byte offset into an SGPR.
                             // Later uses index ResourceDescriptorHeap[sN]: the SGPR is
                             // uniform until something writes it, which rebinds the handle.

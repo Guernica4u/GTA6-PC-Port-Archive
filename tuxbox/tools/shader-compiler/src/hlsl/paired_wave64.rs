@@ -82,6 +82,34 @@ fn paired_once(ex: &ShaderExtract) -> Result<Translated, String> {
 /// The group size that fills the lower half of one console wave and one host wave.
 pub(super) const HALF_WAVE: u32 = 32;
 
+/// Whether the program keeps EXEC in two words, as only a 64-lane console wave does.
+fn console_wave64(insns: &[Insn]) -> bool {
+    let exec = |i: &&Insn| i.mnemonic.starts_with("s_") && (i.mnemonic.contains("saveexec") || i.mnemonic.contains("wrexec")
+        || i.dst.iter().chain(&i.src).any(|o| matches!(o, Opnd::ExecLo | Opnd::ExecHi)));
+    let narrow_compare = |i: &Insn| i.enc == Enc::Vop3 && i.mnemonic.starts_with("v_cmp_")
+        && matches!(i.dst.as_slice(), [Opnd::Sgpr(n)] if n & 1 != 0);
+    insns.iter().filter(exec).any(|i| i.mnemonic.ends_with("_b64"))
+        && !insns.iter().filter(exec).any(|i| i.mnemonic.ends_with("_b32"))
+        && !insns.iter().any(narrow_compare)
+}
+
+/// Whether the two-lane form can stand in for a one-lane-per-thread translation
+/// refused for `reason`, on any host.
+///
+/// - A group of 32 threads is the lower half of one 64-lane console wave. A
+///   reduction over the whole wave reads the lanes that never start.
+/// - A lane exchange inside a loop needs every thread to take the loop in step.
+///   Here a 64-lane console wave already branches as one.
+pub(super) fn takes_over(ex: &ShaderExtract, reason: &str) -> bool {
+    if ex.stage != Stage::Compute { return false; }
+    let threads = compute_group(ex).into_iter().try_fold(1u32, u32::checked_mul).unwrap_or(0);
+    match reason {
+        "wave operation requires complete 64-lane compute waves" => threads == HALF_WAVE,
+        "compute swizzle inside a loop" => threads != 0 && threads % 64 == 0 && console_wave64(&disassemble(&ex.isa)),
+        _ => false,
+    }
+}
+
 /// A branch on a lane mask tests the whole console mask.
 pub(super) fn branch_condition(op: u32) -> Option<&'static str> {
     Some(match op {
@@ -201,6 +229,10 @@ fn read_lane(em: &mut Emitter<'_>, destination: &Opnd, source: &Opnd, leader: &s
         Opnd::Vgpr(n) => format!("{to} = tb_leader < 32u ? WaveReadLaneAt(v{n}__0, tb_leader) : WaveReadLaneAt(v{n}__1, tb_leader - 32u);"),
         other => format!("{to} = {};", r(other)?),
     };
+    // A heap index read from a wave with no active lane becomes slot 0.
+    let value = if leader.is_empty() && em.heap_index_reads.contains(&em.cur_idx) {
+        format!("{value} if ((exec_lo | exec_hi) == 0u) {to} = 0u;")
+    } else { value };
     let first = if leader.is_empty() { first_lane(&value)[0].clone() } else { format!("uint tb_leader = {leader}; {value}") };
     em.line(&format!("{{ {first} }}"));
     Ok(())

@@ -108,14 +108,11 @@ pub fn translate_stencil_target(ex: &ShaderExtract, slot: u32) -> Result<Transla
 pub(in crate::hlsl) fn translate_outputs(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, output_order: &[String],
     stencil_target: Option<u32>) -> Result<Translated, String> {
     let translated = translate_outputs_per_lane(ex, feeds_ps, output_order, stencil_target);
-    // A group of 32 threads is the lower half of one 64-lane console wave. Where no
-    // one-lane-per-thread form runs the program, the two-lane form keeps the lanes
-    // that never start, which a reduction over the whole wave reads.
-    let half_wave = ex.stage == Stage::Compute && stencil_target.is_none()
-        && compute_group(ex).into_iter().try_fold(1u32, u32::checked_mul) == Some(paired_wave64::HALF_WAVE);
+    // Where no one-lane-per-thread form runs the program, the two-lane form may: it
+    // keeps both halves of a console wave and branches once for the whole wave.
     match translated {
-        Err(reason) if half_wave && reason == "wave operation requires complete 64-lane compute waves" => {
-            translate_paired_wave64(ex).map_err(|_| reason)
+        Err(reason) if stencil_target.is_none() && paired_wave64::takes_over(ex, &reason) => {
+            translate_paired_wave64(ex).ok().filter(|paired| paired.hlsl.len() <= MAX_HLSL_BYTES).ok_or(reason)
         }
         other => other,
     }
@@ -763,6 +760,17 @@ fn translate_outputs_once_impl(ex: &ShaderExtract, feeds_ps: Option<&InputInterp
     if material_classify { hlsl.insert_str(0, ps09_classify::DECLARATIONS); }
     hlsl.insert_str(0, &format!("// entry-live registers (read before written): {}
 ", live_in.join(" ")));
+    // A host lays a derivative-taking group out two by two, so a wave of a group wider
+    // than 16 threads holds two runs of thread numbers and need not start on a wave
+    // boundary. No recorded program is one; refuse instead of trusting the wave to be
+    // the console's.
+    if ex.stage == Stage::Compute && em.compute_derivatives {
+        let [x, y, z] = compute_group(ex);
+        let threads = x.saturating_mul(y).saturating_mul(z);
+        if x > 16 && (y > 1 || z > 1) && em.required_wave_size.is_some_and(|width| threads > width) {
+            return Err("derivatives in a group wider than 16 threads that spans several waves".into());
+        }
+    }
     // ps_5_0 forces UAV slots to start after the render-target outputs (FXC X4509);
     // SM5.1 has no such rule, and D3D12 accepts SM5.1 bytecode.
     let profile = if em.compute_derivatives || em.resolve_wave32 {

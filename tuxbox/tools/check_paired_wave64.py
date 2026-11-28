@@ -83,6 +83,27 @@ PROGRAMS = {
     'masks': ['v_cmp_lt_u32_e32 vcc, 0x3e8, v0', 's_not_b64 s[14:15], vcc', 's_and_b64 s[14:15], s[14:15], exec',
               's_bcnt1_i32_b64 s20, s[14:15]', 's_ff1_i32_b64 s21, s[14:15]', 's_or_saveexec_b64 s[10:11], -1',
               'v_cndmask_b32_e64 v10, 0, v1, s[14:15]', 's_mov_b64 exec, s[10:11]', 'v_add_nc_u32_e32 v11, 1, v1'],
+    # Lanes are served in groups that share a value, and each group exchanges within its quads.
+    'swizzle_loop': ['v_and_b32_e32 v4, 3, v0', 's_mov_b64 s[10:11], exec', ('label', 'again'),
+                     'v_readfirstlane_b32 s20, v4', 'v_cmp_eq_u32_e32 vcc, s20, v4', 's_and_saveexec_b64 s[12:13], vcc',
+                     'ds_swizzle_b32 v5, v0 offset:0x801b', 'v_add_nc_u32_e32 v10, v5, v10', 'v_mov_b32_e32 v11, v5',
+                     's_add_u32 s21, s21, 1', 's_andn2_b64 exec, s[12:13], exec', ('branch', 's_cbranch_execnz', 'again'),
+                     's_mov_b64 exec, s[10:11]'],
+    # A texture taken at a run-time heap index: the descriptor is copied to vector
+    # registers and a waterfall reads it back to load from it. The check stands a
+    # function of the heap index and the coordinate in for the heap (see `instrument`).
+    'heap_waterfall': ['v_readfirstlane_b32 s24, v2', 's_and_b32 s24, s24, 255', 's_lshl_b32 s24, s24, 5',
+                       'v_and_b32_e32 v4, 63, v1', 'v_and_b32_e32 v5, 7, v0',
+                       's_load_dwordx8 s[12:19], s[10:11], s24',
+                       *(f'v_mov_b32_e32 v{50 + k}, s{12 + k}' for k in range(8)),
+                       's_mov_b64 s[2:3], exec', ('label', 'again'),
+                       *(f'v_readfirstlane_b32 s{32 + k}, v{50 + k}' for k in range(8)),
+                       'v_cmp_eq_u64_e32 vcc, s[32:33], v[50:51]', 'v_cmp_eq_u64_e64 s[0:1], s[34:35], v[52:53]',
+                       's_and_b64 s[0:1], vcc, s[0:1]', 's_and_saveexec_b64 s[0:1], s[0:1]',
+                       'image_load v10, v[4:5], s[32:39] dmask:0x1 dim:SQ_RSRC_IMG_2D',
+                       's_xor_b64 exec, exec, s[0:1]', ('branch', 's_cbranch_execnz', 'again'),
+                       's_mov_b64 exec, s[2:3]', 'v_mov_b32_e32 v11, v50', 's_mov_b32 s20, s32',
+                       's_bcnt1_i32_b64 s21, exec'],
     # A sum over all 64 lanes, as a console compiler reduces a wave: lanes outside
     # EXEC add zero, groups of eight, rows, the two rows of a half, the two halves.
     'reduce': ['s_or_saveexec_b64 s[10:11], -1', 'v_cndmask_b32_e64 v10, 0, v0, s[10:11]',
@@ -162,6 +183,7 @@ class Wave:
 
     def value(self, token, lane):
         if m := re.fullmatch(r'v(\d+)', token): return self.v[int(m[1])][lane]
+        if m := re.fullmatch(r'v\[(\d+):(\d+)\]', token): return self.v[int(m[1])][lane] | self.v[int(m[2])][lane] << 32
         return self.scalar(token)
 
     def active(self, lane): return (self.exec >> lane) & 1
@@ -192,9 +214,16 @@ def step(w, text):
             x = w.scalar(ops[1], True); w.store(ops[0], ((x & -x).bit_length() - 1) & M32)
         elif base == 's_not_b64':
             x = ~w.scalar(ops[1], True) & M64; w.store(ops[0], x); w.scc = int(x != 0)
-        elif base in ('s_and_b64', 's_or_b64', 's_andn2_b64'):
+        elif base in ('s_and_b32', 's_lshl_b32'):
+            a, b = w.scalar(ops[1]), w.scalar(ops[2])
+            x = a & b if base == 's_and_b32' else a << (b & 31)
+            w.store(ops[0], x); w.scc = int(x & M32 != 0)
+        elif base == 's_load_dwordx8':
+            # The translation keeps a heap descriptor as its index, in the first word.
+            w.store('s' + re.match(r's\[(\d+)', ops[0])[1], w.scalar(ops[2]) >> 5)
+        elif base in ('s_and_b64', 's_or_b64', 's_andn2_b64', 's_xor_b64'):
             a, b = w.scalar(ops[1], True), w.scalar(ops[2], True)
-            x = a & b if base == 's_and_b64' else a | b if base == 's_or_b64' else a & ~b & M64
+            x = a & b if base == 's_and_b64' else a | b if base == 's_or_b64' else a ^ b if base == 's_xor_b64' else a & ~b & M64
             w.store(ops[0], x); w.scc = int(x != 0)
         elif base in ('s_and_saveexec_b64', 's_or_saveexec_b64'):
             source, old = w.scalar(ops[1], True), w.exec
@@ -212,6 +241,12 @@ def step(w, text):
             else:
                 partner = (l & ~31) | (((l & (off & 31)) | ((off >> 5) & 31)) ^ ((off >> 10) & 31))
             w.v[int(ops[0][1:])][l] = old[partner]
+        return
+    if base == 'image_load':
+        slot = w.scalar('s' + re.match(r's\[(\d+)', ops[2])[1])
+        x, y = (int(n) for n in re.fullmatch(r'v\[(\d+):(\d+)\]', ops[1]).groups())
+        for l in range(64):
+            if w.active(l): w.v[int(ops[0][1:])][l] = heap_texel(slot, w.v[x][l], w.v[y][l])
         return
     if base.startswith('ds_'):
         # One wave per group: its lanes are all of the group.
@@ -287,6 +322,16 @@ def step(w, text):
     for l, result in results.items(): w.v[dst][l] = result
 
 
+def heap_texel(slot, x, y):
+    """The bits of the value the stand-in heap returns for a texel: exact in a float."""
+    return struct.unpack('<I', struct.pack('<f', float(slot * 4096 + x * 64 + y)))[0]
+
+
+HEAP = ('struct TBHeapTexture { uint slot; float4 Load(int3 at) '
+        '{ return float4(float(slot * 4096u + uint(at.x) * 64u + uint(at.y)), 0.0, 0.0, 0.0); } };\n'
+        'TBHeapTexture tb_heap_texture(uint slot) { TBHeapTexture texture; texture.slot = slot; return texture; }\n')
+
+
 def model(items, inputs, group, started=64):
     w = Wave(inputs, group, started)
     labels = {item[1]: at for at, item in enumerate(items) if not isinstance(item, str) and item[0] == 'label'}
@@ -317,6 +362,11 @@ def instrument(hlsl, threads):
             value = name if re.search(rf'\b{name} = ', hlsl) else '0u'
             stores += f'    tb_out.Store(({index[h]} * 4u + {column}u) * 4u, {value});\n'
     hlsl = hlsl[:start.end()] + load + hlsl[start.end():]
+    if 'ResourceDescriptorHeap' in hlsl:
+        # The guest binds no heap. Each slot is a texture whose texels name the slot and the coordinate.
+        hlsl = re.sub(r'Texture2D<float4> (tb_heap_\w+);', r'TBHeapTexture \1;', hlsl)
+        hlsl = HEAP + re.sub(r'ResourceDescriptorHeap\[([^\]]+)\]', r'tb_heap_texture(\1)', hlsl)
+        assert 'ResourceDescriptorHeap' not in hlsl and 'Texture2D' not in hlsl, 'unexpected heap access'
     end = hlsl.rstrip().rfind('}')
     return ('ByteAddressBuffer tb_in : register(t0);\nRWByteAddressBuffer tb_out : register(u0);\n'
             + hlsl[:end] + stores + '}\n')
@@ -359,7 +409,8 @@ def main(argv=None):
         for name, body, threads in selected():
             items = START + body
             emitted = subprocess.check_output(
-                [args.emitter.resolve(), str(threads), *(f"{w:08x}" for w in words_of(args.llvm_mc, items))],
+                [args.emitter.resolve(), *(["heap"] if name.startswith("heap_") else []), str(threads),
+                 *(f"{w:08x}" for w in words_of(args.llvm_mc, items))],
                 text=True, timeout=60)
             source, blob = trial / f"{name}.hlsl", trial / f"{name}.cso"
             source.write_text(instrument(emitted, threads))

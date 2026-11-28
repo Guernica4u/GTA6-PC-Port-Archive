@@ -54,6 +54,7 @@ CHECKS = {
     "f64": assembled("check_f64_exact_gpu"),
     "swizzle": Check("check_compute_swizzle", emitter="compute_swizzle"),
     "swizzle-loop": Check("check_compute_swizzle_loop", emitter="compute_swizzle_loop"),
+    "derivative-lanes": Check("check_derivative_lanes_gpu", emitter="derivative_lanes", dxc=True),
     "readlane": Check("check_readlane_gpu", emitter="readlane_probe", dxc=True),
     **{f"wave-extrema-{width}": Check("check_wave_extrema", emitter="wave_extrema", dxc=True,
                                       extra=("--width", str(width)))
@@ -80,6 +81,7 @@ CHECKS = {
        for layout in ("linear", "2d", "3d")},
     "pixel-heap-offsets": Check("check_pixel_heap_offsets", emitter="pixel_heap_offsets", dxc=True),
     "straight-pixel-quads": Check("check_straight_pixel_quads", emitter="straight_pixel_quads", dxc=True),
+    "pixel-interp": Check("check_pixel_interp", emitter="pixel_interp", dxc=True),
     "translated-mesh": Check("check_translated_mesh_gpu", emitter="xshader", llvm=True, dxc=True),
     "pixel-link": Check("check_portable_pixel_link", emitter="xshader", dxc=True),
     "pixel-link-slot86": Check("check_slot86_portable_link", emitter="xshader", dxc=True),
@@ -93,6 +95,7 @@ CHECKS = {
     "pixel-code-offset": Check("check_pixel_code_offset",
                                capture=("pixel_embedded_table_offset_is_bounded_and_aligned", "--hlsl"), dxc=True),
     "buffer-loads": Check("check_buffer_loads", capture=("buffer_loads_for_the_gpu_check", "--hlsl")),
+    "image-ops": Check("check_image_ops", capture=("image_ops_for_the_gpu_check", "--hlsl")),
     "buffer-count": Check("check_buffer_count",
                           capture=("buffer_record_counts_for_the_gpu_check", "--hlsl")),
     "descriptor-size": Check("check_descriptor_size",

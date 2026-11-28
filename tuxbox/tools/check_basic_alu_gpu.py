@@ -317,6 +317,15 @@ SEQUENCES = {
                                f"v_cmpx_{name}_u64_e32 v[5:6], v[21:22]", "v_mov_b32_e32 {0}, 1", "s_mov_b32 exec_lo, s26"],
                               lambda a, b, c, name=name: [int(RELATIONS[name](b | c << 32, a | c << 32))])
        for name in ("eq", "ne", "lt", "gt", "le", "ge")},
+    # A hint and a wait change nothing a program can read.
+    "s_inst_prefetch": (["s_inst_prefetch 0x3", "v_mov_b32_e32 {0}, v4"], lambda a, b, c: [a]),
+    "s_waitcnt_vscnt": (["s_waitcnt_vscnt null, 0x0", "v_mov_b32_e32 {0}, v5"], lambda a, b, c: [b]),
+    # EXEC becomes the source without the lanes EXEC held, and the destination gets
+    # a copy. From an empty EXEC that is the comparison's mask.
+    "s_andn2_wrexec_b64": (["v_mov_b32_e32 {0}, 0", "s_mov_b64 s[26:27], exec", "v_cmp_lt_u32_e32 vcc_lo, v4, v5",
+                            "s_mov_b64 exec, 0", "s_andn2_wrexec_b64 s[30:31], vcc", "v_mov_b32_e32 {0}, 1",
+                            "s_mov_b64 exec, s[26:27]", "s_and_b32 s30, s30, 1", "v_mov_b32_e32 {1}, s30"],
+                           lambda a, b, c: [int(a < b), int(a < b)]),
     # M0 is added to the register number: v4 + 1 is v5, and v7 + 1 the second result.
     "v_movrels_b32": (["s_mov_b32 m0, 1", "v_movrels_b32 {0}, v4"], lambda a, b, c: [b]),
     "v_movreld_b32": (["s_mov_b32 m0, 1", "v_mov_b32_e32 {0}, v6", "v_movreld_b32 {0}, v4"], lambda a, b, c: [c, a]),
@@ -842,7 +851,18 @@ MIX = {
     **{f"v_fma_mixlo_f16@{sel}": (3, mix_to_half(sel)) for sel in ("lll", "hhh", "fff", "lhf")},
     **{f"v_fma_mixhi_f16@{sel}": (3, mix_to_half(sel)) for sel in ("lll", "hhh", "fff")},
 }
+def byte_pack(a, b, c):
+    """`v_cvt_pk_u8_f32`: the float as a byte, in the byte of the third source the
+    second names. The manual doesn't give the conversion; this is the nearest
+    integer, ties to even, held to 0..255, with NaN as 0."""
+    value = to_float(a)
+    byte = 0 if math.isnan(value) else max(0, min(255, round(max(-1.0, min(256.0, value)))))
+    shift = 8 * (b & 3)
+    return (c & ~(0xff << shift) & M) | byte << shift
+
+
 CONVERSIONS = {
+    "v_cvt_pk_u8_f32": (3, byte_pack),
     "v_cvt_pkrtz_f16_f32": (2, lambda a, b, c: Halves(rounded_toward_zero(a), rounded_toward_zero(b))),
 }
 FLOATS.update(CONVERSIONS)
@@ -1085,6 +1105,7 @@ def main():
         ap.add_argument("--" + n, type=Path, required=True)
     ap.add_argument("--adapter", required=True)
     ap.add_argument("--rounds", type=int, default=8, help=f"dispatches per shader, {GROUPS} inputs each")
+    ap.add_argument("--only", action="append", help="check only this instruction (repeatable)")
     a = ap.parse_args()
     if a.output.exists():
         ap.error("choose a fresh receipt")
@@ -1093,6 +1114,11 @@ def main():
     every = [*OPERATIONS, *SCALAR, *GROUP_MEMORY, *SEQUENCES, *PAIRS, *IN_PLACE, *CONSTANT, *CONSTANT_COMPARES, *COMPARES, *SCALAR_COMPARES,
              *EXEC_COMPARES, *HALF, *PACKED, *HALF_COMPARES, *HALF_EXEC_COMPARES, *FLOATS, *FLOAT_COMPARES,
              *FLOAT_EXEC_COMPARES]
+    if a.only:
+        unknown = sorted(set(a.only) - set(every))
+        if unknown:
+            ap.error(f"not in this check: {', '.join(unknown)}")
+        every = [name for name in every if name in a.only]
     supported, refused = probe(every, a.emitter, a.llvm_mc)
     expected, chunks = {}, {}
     with TemporaryDirectory(dir=a.work) as td:
