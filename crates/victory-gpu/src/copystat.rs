@@ -105,14 +105,21 @@ pub(crate) enum C {
     /// waiting for the heaps' lock (held by heap syncs and other writers).
     MirrorWaitUs,
     /// Argument clamps (`crate::indirect`): passes of one execution;
-    /// windows opened (`VICTORY_CLAMP_WINDOW`), indirect draws they took;
-    /// indirect draws clamped alone because their shaders may store.
+    /// windows opened (`VICTORY_CLAMP_WINDOW`), indirect executions they
+    /// took; indirect dispatches, and indirect draws whose shaders may
+    /// store, clamped in a window; executions that opened a window of
+    /// their own because a barrier or pipeline sync came after one that
+    /// may store; indirect draws that may store that a window refused
+    /// (alignment, size, a full table or prelude of sources).
     ClampSingle,
     ClampWindows,
     ClampWindowDraws,
+    ClampWindowDispatches,
+    ClampWindowStores,
+    ClampStale,
     ClampStoring,
 }
-const COUNTERS: usize = 65;
+const COUNTERS: usize = 68;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -316,9 +323,12 @@ pub(crate) fn log(frames: f64) {
         let (single, windows, draws) =
             (c[C::ClampSingle as usize], c[C::ClampWindows as usize], c[C::ClampWindowDraws as usize]);
         tracing::info!(
-            "clamps per frame: {:.0} passes ({single:.0} single, {windows:.0} windows of {draws:.0} indirect draws, {:.1} a window), {:.0} indirect draws alone as they may store",
+            "clamps per frame: {:.0} passes ({single:.0} single, {windows:.0} windows of {draws:.0} indirect executions, {:.1} a window), {:.0} of them indirect dispatches and {:.0} draws that may store; {:.0} executions left a window for a barrier or pipeline sync after one that may store, {:.0} draws that may store a window refused",
             single + windows,
             if windows > 0.0 { draws / windows } else { 0.0 },
+            c[C::ClampWindowDispatches as usize],
+            c[C::ClampWindowStores as usize],
+            c[C::ClampStale as usize],
             c[C::ClampStoring as usize],
         );
     }

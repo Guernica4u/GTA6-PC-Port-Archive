@@ -220,7 +220,7 @@ fn compile(source: &str, name: windows::core::PCSTR) -> windows::core::Result<Cl
 // layer cannot see view accesses; GPU-based validation might); upgrade to
 // per-list tracked buffer states if a driver or that validation minds.
 pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u32, u32)) -> Option<ID3D12Resource> {
-    // An open window first: its draws come before this, in order.
+    // An open window first: its executions come before this, in order.
     end_window(list);
     let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
         return None;
@@ -269,7 +269,7 @@ pub(crate) fn done(list: &HostList, arguments: &ID3D12Resource) {
     };
 }
 
-/// Whether consecutive indirect draws are clamped a window at a time
+/// Whether consecutive indirect executions are clamped a window at a time
 /// (`VICTORY_CLAMP_WINDOW=1`; off by default).
 ///
 /// Without it, each indirect execution has its own clamp: a wait for all
@@ -277,30 +277,81 @@ pub(crate) fn done(list: &HostList, arguments: &ID3D12Resource) {
 /// card goes from drawing to compute and back for every record and no
 /// draw overlaps the next.
 ///
-/// With it, an indirect draw opens a window: one clamp pass is recorded
-/// where the single clamp would be, and the draws after it that may join
-/// add their records to the pass's table (upload memory the CPU fills
-/// while recording; the GPU reads it when the list runs). They read their
-/// clamped records from the window's part of the list's argument buffer,
-/// with no pass and no barrier of their own. The pass clamps every record
-/// of the window in the order the draws come, charging the list's budget
-/// in that order, exactly what the single clamps did one after another.
+/// With it, an indirect execution opens a window: one clamp pass is
+/// recorded where the single clamp would be, and the executions after it
+/// that may join add their records to the pass's table (upload memory the
+/// CPU fills while recording; the GPU reads it when the list runs). They
+/// read their clamped records from the window's part of the list's
+/// argument buffer, with no pass and no barrier of their own. The pass
+/// clamps every record of the window in the order the executions come,
+/// charging the list's budget in that order, exactly what the single
+/// clamps did one after another.
 ///
-/// Moving a record's clamp before the window's earlier draws changes
-/// nothing as long as none of them writes buffers. So a window ends (the
-/// next indirect draw opens a new one, after a wait for all before) at:
-/// any draw, dispatch or unordered-access clear other than a joining
-/// indirect draw ([`end_window`] in `crate::draw`), an indirect dispatch,
-/// an indirect draw whose shaders may store to memory (unordered views,
-/// heap views, title memory), work a host library records, the list's
-/// end; and a draw does not join when the table, the window's argument
-/// bytes or its records are full, or its arguments lie in a host copy the
-/// pass has no view of. Title copies between buffers run on the CPU at
-/// submission, before the list, and stream output is not translated: no
-/// other command of a list writes buffer copies.
+/// Moving a record's clamp before the window's earlier executions changes
+/// nothing as long as none of them writes the records of a later one. So a
+/// window ends (the next indirect execution opens a new one, after a wait
+/// for all before) at: any draw, dispatch or unordered-access clear other
+/// than a joining indirect execution ([`end_window`] in `crate::draw`),
+/// work a host library records, the list's end; and an execution does not
+/// join when the table, the window's argument bytes or its records are
+/// full, or its arguments lie in a host copy the pass has no view of.
+/// Title copies between buffers run on the CPU at submission, before the
+/// list, and stream output is not translated: no other command of a list
+/// writes buffer copies.
+///
+/// Indirect dispatches join too, and so do executions whose shaders may
+/// store to memory (unordered views, heap views, title memory), which
+/// would otherwise all be clamped on their own: [`Run`] ends what such a
+/// window takes at a barrier or pipeline sync after one that may store.
 pub(crate) fn windows_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::switch::on("VICTORY_CLAMP_WINDOW"))
+}
+
+/// What a window may take after the executions it took ([`windowed`]).
+///
+/// The window's pass clamps every record before the window's first
+/// execution runs. An execution that stores could write the records of the
+/// next one; on the console, the next one reads its records when the
+/// command processor reaches it, which may be while the one before still
+/// runs, unless the title put a barrier or a pipeline sync between them:
+/// records written by one execution and read by the next with neither
+/// between race on the console too, so the title does not do that. So
+/// after an execution that may store, the window takes the next one only
+/// if no barrier or pipeline sync came between ([`stale_window`],
+/// `crate::list`); any other draw, dispatch or clear ends the window
+/// anyway ([`end_window`]), as do host-library work and the list's end.
+/// Barriers between executions that do not store leave the window as it
+/// was: nothing in it wrote.
+///
+/// The executions then also run without our waits between them, as the
+/// title recorded them: in base each indirect dispatch was ordered against
+/// its neighbours only by our clamps' barriers, which the title never
+/// asked for (direct dispatches have none either).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Run {
+    /// An execution in the window may store.
+    stored: bool,
+    /// Nothing but executions of the window was recorded since its last.
+    fresh: bool,
+}
+
+impl Run {
+    /// Whether the window may take another execution (it fits otherwise).
+    fn takes(self) -> bool {
+        !self.stored || self.fresh
+    }
+
+    /// The window took an execution that may store (`stores`) or not.
+    fn took(&mut self, stores: bool) {
+        self.stored |= stores;
+        self.fresh = true;
+    }
+
+    /// A barrier or pipeline sync was recorded.
+    fn stale(&mut self) {
+        self.fresh = false;
+    }
 }
 
 /// Draws a window's table holds at most.
@@ -459,6 +510,7 @@ struct Open {
     draws: u32,
     records: u32,
     bytes: u64,
+    run: Run,
 }
 
 /// Ends `list`'s window, if one is open: its argument buffer back to
@@ -473,6 +525,17 @@ pub(crate) fn end_window(list: &HostList) {
     }
 }
 
+/// A barrier or pipeline sync in `list`: its open window takes no more
+/// executions if one it took may store ([`Run`]).
+pub(crate) fn stale_window(list: &HostList) {
+    if !OPENED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    if let Some(open) = list.clamp_window().open.as_mut() {
+        open.run.stale();
+    }
+}
+
 /// Forgets `list`'s windows (it was reset).
 pub(crate) fn forget_windows(list: &HostList) {
     if OPENED.load(std::sync::atomic::Ordering::Relaxed) {
@@ -480,18 +543,19 @@ pub(crate) fn forget_windows(list: &HostList) {
     }
 }
 
-/// The clamped records of an indirect draw of `records` records of `kind`
-/// `stride` bytes apart, `offset` bytes into the host copy at host GPU
-/// address `source`, in `list`'s open window, or in one opened for it: the
-/// argument buffer, the records' offset in it, and whether a window was
-/// opened (its pass replaced the list's compute root signature and
-/// pipeline). `None` if the draw cannot be clamped in a window; the caller
-/// clamps it on its own ([`bound`]).
+/// The clamped records of an indirect execution of `records` records of
+/// `kind` `stride` bytes apart, `offset` bytes into the host copy at host
+/// GPU address `source`, whose shaders may store (`stores`), in `list`'s
+/// open window, or in one opened for it: the argument buffer, the records'
+/// offset in it, and whether a window was opened (its pass replaced the
+/// list's compute root signature and pipeline). `None` if it cannot be
+/// clamped in a window; the caller clamps it on its own ([`bound`]).
 pub(crate) fn windowed(
     list: &HostList,
     source: u64,
     offset: u64,
     (kind, stride, records): (u32, u32, u32),
+    stores: bool,
 ) -> Option<(ID3D12Resource, u64, bool)> {
     let bytes = u64::from(stride) * u64::from(records.max(1));
     if !source.is_multiple_of(4)
@@ -505,7 +569,16 @@ pub(crate) fn windowed(
     }
     let mut window = list.clamp_window();
     let mut opened = false;
-    if !window.open.as_ref().is_some_and(|o| o.fits(source, bytes, records)) {
+    let fits = window
+        .open
+        .as_ref()
+        .is_some_and(|o| o.fits(source, bytes, records));
+    let takes = fits && window.open.as_ref().is_some_and(|o| o.run.takes());
+    #[cfg(feature = "diagnostics")]
+    if fits && !takes {
+        crate::copystat::add(crate::copystat::C::ClampStale, 1);
+    }
+    if !takes {
         if let Some(old) = window.open.take() {
             done(list, &old.out);
         }
@@ -517,6 +590,7 @@ pub(crate) fn windowed(
         opened = true;
     }
     let o = window.open.as_mut()?;
+    o.run.took(stores);
     let at = o.bytes;
     if records > 0 {
         let index = o.sources.iter().position(|&s| s == source)? as u32;
@@ -556,12 +630,15 @@ impl Open {
     }
 }
 
-/// Whether an indirect draw (as [`windowed`] takes it) joins `list`'s open
-/// window (tests: to read a window's records before the next one).
+/// Whether an indirect execution (as [`windowed`] takes it) joins `list`'s
+/// open window (tests: to read a window's records before the next one).
 #[cfg(test)]
 fn joins(list: &HostList, source: u64, (_, stride, records): (u32, u32, u32)) -> bool {
     let bytes = u64::from(stride) * u64::from(records.max(1));
-    list.clamp_window().open.as_ref().is_some_and(|o| o.fits(source, bytes, records))
+    list.clamp_window()
+        .open
+        .as_ref()
+        .is_some_and(|o| o.fits(source, bytes, records) && o.run.takes())
 }
 
 /// Records a window's pass in `list`, reading records from `sources`.
@@ -596,7 +673,15 @@ fn open(list: &HostList, sources: Vec<u64>) -> Option<Open> {
             transition(&out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
         ]);
     }
-    Some(Open { out, table: table as usize, sources, draws: 0, records: 0, bytes: 0 })
+    Some(Open {
+        out,
+        table: table as usize,
+        sources,
+        draws: 0,
+        records: 0,
+        bytes: 0,
+        run: Run::default(),
+    })
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
@@ -761,14 +846,21 @@ mod tests {
     /// What a test list records, in order.
     #[derive(Clone, Copy)]
     enum Step {
-        /// An indirect draw: title buffer, byte offset, kind, records.
+        /// An indirect execution: title buffer, byte offset, kind, records.
         Draw(usize, u64, u32, u32),
+        /// As `Draw`, an execution whose shaders may store (an indirect
+        /// dispatch, or a draw `crate::draw` finds may store): it joins
+        /// windows too, and only until a barrier after it (`super::Run`).
+        Stores(usize, u64, u32, u32),
         /// A shader of the title writes `value` at a byte offset of a title
         /// buffer (a draw or dispatch that may store: it ends the window).
         Write(usize, u64, u32),
         /// As `Write`, with the window left open: what a window that did not
         /// end there would clamp.
         WriteUnended(usize, u64, u32),
+        /// The title's barrier (or pipeline sync): every earlier shader
+        /// write first (`super::stale_window`).
+        Barrier,
     }
 
     fn stride(kind: u32) -> u32 {
@@ -788,13 +880,14 @@ RWByteAddressBuffer title : register(u0);
 void main() { title.Store(at, value); }
 "#;
 
-    /// The open window's draws (offset in its buffer, bytes, offset in the
-    /// results) and its buffer.
+    /// The open window's executions (offset in its buffer, bytes, offset in
+    /// the results) and its buffer.
     type Pending = (Vec<(u64, u64, u64)>, Option<super::ID3D12Resource>);
 
     /// Records `steps` into one list over title buffers holding `init`,
-    /// each draw clamped on its own or (`window`) in windows, and runs it:
-    /// the words of each draw's clamped records. `None` without a host GPU.
+    /// each execution clamped on its own or (`window`) in windows, and runs
+    /// it: the words of each execution's clamped records. `None` without a
+    /// host GPU.
     fn run(init: &[Vec<u32>], steps: &[Step], window: bool) -> Option<Vec<Vec<u32>>> {
         use super::{D3D12_RESOURCE_STATE_COMMON as COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE as COPY_SOURCE};
         use super::{D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT as ARGUMENTS, transition};
@@ -836,7 +929,7 @@ void main() { title.Store(at, value); }
         };
         for &step in steps {
             match step {
-                Step::Draw(buffer, offset, kind, records) => {
+                Step::Draw(buffer, offset, kind, records) | Step::Stores(buffer, offset, kind, records) => {
                     let spec = (kind, stride(kind), records);
                     let len = u64::from(stride(kind)) * u64::from(records.max(1));
                     let source = titles[buffer].1;
@@ -844,7 +937,8 @@ void main() { title.Store(at, value); }
                         if !super::joins(&list, source, spec) {
                             flush(&mut pending);
                         }
-                        let (out, at, _) = super::windowed(&list, source, offset, spec).expect("a window");
+                        let stores = matches!(step, Step::Stores(..));
+                        let (out, at, _) = super::windowed(&list, source, offset, spec, stores).expect("a window");
                         pending.0.push((at, len, at_results));
                         pending.1 = Some(out);
                     } else {
@@ -875,6 +969,13 @@ void main() { title.Store(at, value); }
                         list.list.SetComputeRootUnorderedAccessView(1, titles[buffer].1);
                         list.list.Dispatch(1, 1, 1);
                     }
+                }
+                Step::Barrier => {
+                    if window {
+                        super::stale_window(&list);
+                    }
+                    // SAFETY: an open list.
+                    unsafe { list.list.ResourceBarrier(&[super::uav_barrier()]) };
                 }
             }
         }
@@ -992,6 +1093,97 @@ void main() { title.Store(at, value); }
         assert_eq!(unended[2], [5, 1, 1], "a window over the store clamps the record from before it");
     }
 
+    /// Indirect dispatches in windows: their records clamped as the single
+    /// clamp does, word for word, groups past 65,535 in x, too many groups
+    /// in all, garbage, and a budget that runs out in the middle; draws
+    /// between them in the same windows.
+    #[test]
+    fn dispatch_windows_clamp_as_single_clamps_do() {
+        let mut a: Vec<u32> = Vec::new();
+        for i in 0..60u32 {
+            a.extend(match i % 6 {
+                0 => [70_000, 2, 1],
+                1 => [65_535, 65_535, 2],
+                2 => [3 + i, 4, 5],
+                3 => [u32::MAX; 3],
+                4 => [1024, 1024, 1],
+                _ => [0, 7, 7],
+            });
+        }
+        let dispatches = a.len() as u64 * 4;
+        a.extend([3, 2, 0, 0, 5, 1, 0, 0]);
+        let mut steps = Vec::new();
+        for i in 0..60u64 {
+            steps.push(Step::Stores(0, 12 * i, 2, 1));
+            if i % 20 == 9 {
+                steps.push(Step::Draw(0, dispatches + 16 * (i % 2), 0, 1));
+            }
+        }
+        steps.push(Step::Stores(0, 0, 2, 6));
+        let Some(out) = same(&[a], &steps) else {
+            return; // no host GPU here
+        };
+        assert_eq!(out[0], [65_535, 2, 1], "x past 65,535");
+        assert_eq!(out[1], [0, 0, 0], "too many groups");
+        assert_eq!(out[2], [5, 4, 5], "a record as it is");
+        let ran = out
+            .iter()
+            .filter(|r| r.first().is_some_and(|&w| w != 0))
+            .count();
+        assert!(
+            ran + 10 < out.len(),
+            "the budget ran out: {ran} of {} ran",
+            out.len()
+        );
+    }
+
+    /// After an execution that may store, a barrier ends what the window
+    /// takes: the execution after it reads the record as the one before
+    /// wrote it, as clamped on its own. With no barrier between (what the
+    /// title records only for executions that do not depend on each other)
+    /// the window takes it, clamped before the store.
+    #[test]
+    fn a_barrier_after_a_store_ends_what_the_window_takes() {
+        let a = [5, 1, 1].repeat(4);
+        let steps = |barrier: bool| {
+            let mut s = vec![Step::Stores(0, 0, 2, 1), Step::WriteUnended(0, 12, 9)];
+            s.extend(barrier.then_some(Step::Barrier));
+            s.extend([Step::Stores(0, 12, 2, 1), Step::Draw(0, 24, 10, 1)]);
+            s
+        };
+        let Some(out) = same(std::slice::from_ref(&a), &steps(true)) else {
+            return; // no host GPU here
+        };
+        assert_eq!(
+            out[1],
+            [9, 1, 1],
+            "the record as written before the barrier"
+        );
+        let joined = run(std::slice::from_ref(&a), &steps(false), true).unwrap();
+        assert_eq!(
+            joined[1],
+            [5, 1, 1],
+            "no barrier: one window, clamped before the store"
+        );
+    }
+
+    /// What a window may take after executions that may store (CPU only).
+    #[test]
+    fn a_window_takes_after_stores_only_until_a_barrier() {
+        let mut window = super::Run::default();
+        assert!(window.takes(), "an empty window");
+        window.took(false);
+        window.stale();
+        assert!(
+            window.takes(),
+            "a barrier after executions that do not store"
+        );
+        window.took(true);
+        assert!(window.takes(), "right after one that may store");
+        window.stale();
+        assert!(!window.takes(), "a barrier after one that may store");
+    }
+
     /// An execution of `max` records with a count buffer asking for more
     /// (the GPU runs min(count, max)): exactly `max` records are clamped,
     /// across two tiles, the garbage after them in the title's buffer is
@@ -1031,9 +1223,9 @@ void main() { title.Store(at, value); }
         let recorded: Vec<_> = lists
             .iter()
             .map(|l| {
-                let (out, _, opened) = super::windowed(l, gpu, 0, (10, 12, 1)).unwrap();
+                let (out, _, opened) = super::windowed(l, gpu, 0, (10, 12, 1), false).unwrap();
                 assert!(opened);
-                let (again, at, opened) = super::windowed(l, gpu, 12, (10, 12, 1)).unwrap();
+                let (again, at, opened) = super::windowed(l, gpu, 12, (10, 12, 1), false).unwrap();
                 assert!(!opened && at == 12 && again.as_raw() == out.as_raw(), "the second draw joins");
                 l.close();
                 (out, issued())

@@ -1770,26 +1770,42 @@ impl State {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
-        // Draws whose shaders store to no buffer may be clamped in a window
-        // with the indirect draws next to them (`crate::indirect`).
-        let joins = crate::indirect::windows_on()
-            && kind != DISPATCH
-            && match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if may_store(p) => {
-                    #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(crate::copystat::C::ClampStoring, 1);
-                    false
-                }
-                Some(_) => true,
-                None => false,
-            };
-        let window = joins
+        // An execution may be clamped in a window with the indirect
+        // executions next to it, an indirect dispatch or one whose shaders
+        // may store included: with the switch on and a host pipeline to run,
+        // nothing else decides (`crate::indirect`, `crate::indirect::Run`).
+        let host_pipeline = crate::pipeline::host_pipeline(self.pipeline as This);
+        let windows = crate::indirect::windows_on() && host_pipeline.is_some();
+        // The window's pass needs to know whether this execution may store
+        // (`crate::indirect::Run`); with the switch off nothing asks.
+        let stores = windows && host_pipeline.is_some_and(may_store);
+        let window = windows
             .then(|| {
                 let (start, _) = args.range();
-                crate::indirect::windowed(list, args.gpu(start), arguments - start, (kind, stride, max))
+                crate::indirect::windowed(
+                    list,
+                    args.gpu(start),
+                    arguments - start,
+                    (kind, stride, max),
+                    stores,
+                )
             })
             .flatten();
         let windowed = window.is_some();
+        #[cfg(feature = "diagnostics")]
+        match (windowed, stores) {
+            (true, true) => crate::copystat::add(
+                if kind == DISPATCH {
+                    crate::copystat::C::ClampWindowDispatches
+                } else {
+                    crate::copystat::C::ClampWindowStores
+                },
+                1,
+            ),
+            // Windows off, or this execution the window refused.
+            (false, true) => crate::copystat::add(crate::copystat::C::ClampStoring, 1),
+            _ => {}
+        }
         let (clamped, at) = match window {
             Some((out, at, opened)) => {
                 if opened {
@@ -1884,8 +1900,9 @@ impl State {
 
 /// Whether a pipeline's shaders may store to memory (buffers among it):
 /// unordered views, in tables, roots or the heap, marked view writes, or
-/// title memory through the page table. Such a draw ends a window of
-/// clamped indirect draws (`crate::indirect::windowed`).
+/// title memory through the page table. Such an execution joins a window
+/// of clamped indirect executions only if nothing comes between it and the
+/// next (`crate::indirect::Run`), and is clamped on its own otherwise.
 fn may_store(p: &crate::pipeline::host::HostPipeline) -> bool {
     p.marks.is_some()
         || p.stages.iter().any(|s| {
