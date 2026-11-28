@@ -36,3 +36,14 @@ fn a_constant_is_known_only_where_every_path_ran_its_move() {
     assert_eq!(constant_before(&skipped, 2, 5), None);
     assert_eq!(run_start(&skipped, 2), 2);
 }
+
+#[test]
+fn a_program_with_only_32_bit_masks_has_one_word_masks() {
+    // s_mov_b32 s26, exec_lo; v_cmp_lt_f32 s24, v0, v1
+    let narrow = decode(&[0xbe9a037e, 0xd4010018, 0x00020300, 0xbf810000]);
+    assert!(one_word_masks(&narrow));
+    // s_mov_b64 s[26:27], exec handles the mask as 64 bits.
+    assert!(!one_word_masks(&decode(&[0xbe9a047e, 0xd4010018, 0x00020300, 0xbf810000])));
+    // Nothing shows the width of a program that never touches a mask with a scalar instruction.
+    assert!(!one_word_masks(&decode(&[0xd4010018, 0x00020300, 0xbf810000])));
+}

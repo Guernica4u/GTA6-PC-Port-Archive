@@ -86,6 +86,9 @@ impl<'a> Emitter<'a> {
             self.emit_buffer_count(idx)?;
             return Ok(());
         }
+        if !(8..=12).contains(&ins.op) {
+            return Err("unsupported scalar memory instruction".into());
+        }
         let n = 1u32 << (ins.op - 8);
         let base = sreg_num(&d.ok_or("no dst")?).ok_or("bad dst")?;
         let soff = ins.raw.get(1).copied().unwrap_or(0) >> 25;

@@ -103,7 +103,7 @@ cargo test --locked --target x86_64-unknown-linux-gnu -p tuxbox-xg-layout
 cargo check --locked --target x86_64-pc-windows-msvc -p tuxbox-d3d12
 ```
 
-The D3D12 command typechecks the Windows provider. The Python tests check that `docs/progress.svg` and `docs/RESULTS.md` match the recorded evidence.
+The D3D12 command typechecks the Windows provider. The Python tests check that `docs/progress.svg` and `docs/RESULTS.md` match the recorded evidence, and that [`docs/INSTRUCTIONS.md`](docs/SHADER_HARNESS.md#the-instruction-inventory) matches the translator's record of each instruction.
 
 ## Evidence
 

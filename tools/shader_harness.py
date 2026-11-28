@@ -30,6 +30,7 @@ from time import monotonic, strftime
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from project_tuxbox import instruction_inventory as inventory  # noqa: E402
 from project_tuxbox import shader_survey as survey  # noqa: E402
 from tools.compare_scarlett_shaders import compile_one  # noqa: E402
 
@@ -251,6 +252,92 @@ def render(report):
     return "\n".join(lines)
 
 
+def record_inventory(run, config):
+    """Save what a finished run measured as evidence, and regenerate the inventory."""
+    report = json.loads((run / "report.json").read_text())
+    if report["problems"] or report["dirty"]:
+        raise SystemExit("evidence comes from a passing run of a committed tree")
+    # The evidence must describe the translator that is checked out now.
+    source = "tools/shader-compiler"
+    translator = git("rev-parse", f"HEAD:{source}")
+    if git("rev-parse", f"{report['head']}:{source}") != translator or git("status", "--porcelain", "--", source):
+        raise SystemExit("the translator has changed since that run; run the harness again")
+    adapters = {}
+    for card in report["gpu"]:
+        names = set((run / "gpu" / card["name"] / "coverage.txt").read_text().split())
+        vendor = VENDORS.get(card["id"].split(":")[0], card["name"])
+        adapters[f"{vendor} {card['id']}"] = {"checks": card["checks"], "instructions": sorted(names)}
+    if not adapters:
+        raise SystemExit("the run has no GPU stage")
+    need(config, "title")
+    counts = {}
+    rows = survey.load(run / "survey-after.jsonl")
+    for row in rows:
+        for name in row.get("mnemonics", ()):
+            # `tb_` names are the translator's own lowered operations.
+            if not name.startswith("tb_"):
+                counts[name] = counts.get(name, 0) + 1
+    scope = "Instruction names only; no shader bytes or translated text"
+    inventory.EVIDENCE.mkdir(parents=True, exist_ok=True)
+    (inventory.EVIDENCE / "gpu-checks.json").write_text(json.dumps(
+        {"scope": f"Instructions in the programs the translator GPU checks ran. {scope}",
+         "translator_tree": translator, "adapters": adapters}, indent=1) + "\n")
+    (inventory.EVIDENCE / "recorded-use.json").write_text(json.dumps(
+        {"scope": f"Translated shader requests that hold each instruction, 64-lane and 32-lane translations counted "
+                  f"separately. {scope}", "title": config["title"], "translator_tree": translator,
+         "translations": sum(row["status"] == "translated" for row in rows),
+         "instructions": dict(sorted(counts.items()))}, indent=1) + "\n")
+    write_inventory()
+
+
+def compile_inventory(config):
+    """Compile every instruction the translator emits alone through DXC and DXV, and save which do."""
+    need(config, "dxc")
+    source = "tools/shader-compiler"
+    translator = git("rev-parse", f"HEAD:{source}")
+    if git("status", "--porcelain", "--", source):
+        raise SystemExit("commit the translator first, so the evidence names the tree it describes")
+    dxc = Path(config["dxc"])
+    with TemporaryDirectory(prefix="tuxbox-instructions-") as tmp:
+        folder = Path(tmp)
+        say("translating every instruction alone")
+        subprocess.run(["cargo", "test", "--quiet", "--locked", "--target", TARGET, "--manifest-path",
+                        str(ROOT / source / "Cargo.toml"), "--target-dir", str(ROOT / "build/shader-harness/cargo"),
+                        "instruction_inventory"], check=True, capture_output=True,
+                       env={**os.environ, "TUXBOX_INSTRUCTION_HLSL": str(folder)})
+        programs = sorted(folder.glob("*.hlsl"))
+        say(f"compiling {len(programs)} translations through DXC and DXV")
+
+        def build(hlsl):
+            blob = hlsl.with_suffix(".cso")
+            for command in ([dxc, "-T", hlsl.with_suffix(".profile").read_text().strip(), "-E", "main", "-Fo", blob, hlsl],
+                            [dxc.with_name("dxv"), blob]):
+                run = subprocess.run(command, capture_output=True, text=True, errors="replace", timeout=120)
+                if run.returncode:
+                    lines = [line for line in (run.stderr or run.stdout).splitlines() if "error" in line]
+                    return hlsl.stem, (lines or ["failed"])[0].split("error: ", 1)[-1][:200]
+            return hlsl.stem, None
+
+        with ThreadPoolExecutor(max(1, (os.cpu_count() or 2) - 2)) as pool:
+            results = dict(pool.map(build, programs))
+    version = subprocess.run([dxc, "--version"], capture_output=True, text=True).stdout.strip().splitlines()[0]
+    key = lambda stem: " ".join(stem.split("-", 2))
+    inventory.EVIDENCE.mkdir(parents=True, exist_ok=True)
+    (inventory.EVIDENCE / "dxil.json").write_text(json.dumps(
+        {"scope": "Each instruction the translator emits a statement for, translated alone and compiled through "
+                  "DXC and DXV. Instruction names only; no shader bytes or translated text",
+         "translator_tree": translator, "dxc": version,
+         "compiled": sorted(key(stem) for stem, error in results.items() if error is None),
+         "failed": {key(stem): error for stem, error in sorted(results.items()) if error}}, indent=1) + "\n")
+    failed = sum(error is not None for error in results.values())
+    say(f"{len(results) - failed} of {len(results)} compiled to DXIL")
+
+
+def write_inventory():
+    inventory.DOCUMENT.write_text(inventory.current())
+    say(f"wrote {inventory.DOCUMENT.relative_to(ROOT)}")
+
+
 def git(*args):
     return subprocess.run(["git", "-C", str(ROOT), *args], capture_output=True, text=True, check=True).stdout.strip()
 
@@ -326,6 +413,9 @@ def main(argv=None):
     two.add_argument("after", type=Path)
     two.add_argument("--identical", action="store_true")
     two.add_argument("--json", type=Path, help="write the request names too")
+    listed = commands.add_parser("inventory", help="regenerate docs/INSTRUCTIONS.md")
+    listed.add_argument("--from-run", type=Path, help="first save a passing run's coverage and use as evidence")
+    listed.add_argument("--compile", action="store_true", help="first compile each instruction's translation to DXIL")
     show = commands.add_parser("explain", help="one request on both hosts: outcome and instructions")
     show.add_argument("--xshader", type=Path, required=True)
     show.add_argument("request", help="request file name, or the start of it")
@@ -333,6 +423,14 @@ def main(argv=None):
     config = load_config(args.config)
     if args.command == "run":
         return full_run(args, config)
+    if args.command == "inventory":
+        if args.compile:
+            compile_inventory(config)
+        if args.from_run:
+            record_inventory(args.from_run.resolve(), config)
+        else:
+            write_inventory()
+        return 0
     if args.command == "survey":
         need(config, "requests")
         run_survey(args.xshader, config, args.output, args.jobs)

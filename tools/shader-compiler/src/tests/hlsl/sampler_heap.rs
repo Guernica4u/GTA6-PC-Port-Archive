@@ -583,3 +583,24 @@ fn scalar_load_through_a_root_descriptor_address_is_refused() {
     ex.resources.clear();
     assert!(super::super::translate(&ex).is_ok());
 }
+
+#[test]
+fn heap_offset_computed_into_vcc_hi_is_recognized() {
+    // s_lshl_b32 [VccHi] <- [Sgpr(12), ConstInt(5)]: the HeapOffset marking names a
+    // register decoded as VccHi (SOFFSET 107), which is not an ordinary SGPR.
+    // The heap index scales by the same 32-byte descriptor stride as any other
+    // offset, and the load indexes it the same way.
+    let words = [
+        0x8f6b850c,            // s_lshl_b32 [VccHi] <- [Sgpr(12), ConstInt(5)]
+        0xf40c0507, 0xd6000000, // s_load_dwordx8 [Sgpr(20)] <- [Sgpr(14)] imm=0, soff=107
+        0xbf810000,            // s_endpgm
+    ];
+    let out = super::super::translate(&pixel(&words)).unwrap();
+    assert!(out.hlsl.contains("s20 = tb_heap_index(vcc_hi >> 5)"), "{}", out.hlsl);
+    // vcc_hi is declared by the function header alone: the emitter must not add it
+    // again to the register declarations (dxc rejects the duplicate).
+    let declarations = out.hlsl.lines()
+        .filter(|line| line.contains("uint") && line.contains("vcc_hi ="))
+        .count();
+    assert_eq!(declarations, 1, "{declarations} vcc_hi declaration lines: {out:?}", out = out.hlsl);
+}

@@ -1,7 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" role="img" font-family="'Terminess Nerd Font Mono', 'DejaVu Sans Mono', Consolas, monospace" aria-labelledby="map-title map-description" viewBox="0 0 1000 1259" width="1000" height="1259">
+<svg xmlns="http://www.w3.org/2000/svg" role="img" font-family="'Terminess Nerd Font Mono', 'DejaVu Sans Mono', Consolas, monospace" aria-labelledby="map-title map-description" viewBox="0 0 1000 1031" width="1000" height="1031">
   <title id="map-title">TuxBox runtime compatibility</title>
-  <desc id="map-description">Overall coverage gives equal weight to verified Frosty library behaviors and shader translation. Project Scarlett shader preparation is measured on captured requests. Gameplay results identify the graphics settings used.</desc>
-  <rect x="0" y="0" width="1000" height="1259" fill="#0b0b0f" />
+  <desc id="map-description">Overall coverage gives equal weight to verified Frosty library behaviors and RDNA 2 instructions converted to HLSL that compiles to DXIL. Gameplay results identify the graphics settings used.</desc>
+  <rect x="0" y="0" width="1000" height="1031" fill="#0b0b0f" />
   <rect x="0" y="0" width="1000" height="48" fill="#090910" />
   <rect x="0" y="47" width="1000" height="1" fill="#272733" />
   <rect x="14" y="10" width="210" height="27" fill="#e2bc8c" />
@@ -12,100 +12,48 @@
     <title>Overall TuxBox coverage</title>
     <rect x="0" y="0" width="972" height="112" fill="#14141d" stroke="#e2bc8c" />
     <text x="18" y="32" fill="#e2bc8c" font-size="25" text-anchor="start" font-weight="bold">Overall TuxBox coverage</text>
-    <text x="954" y="32" fill="#6fc7d4" font-size="23" text-anchor="end" font-weight="bold">94.2%</text>
+    <text x="954" y="32" fill="#6fc7d4" font-size="23" text-anchor="end" font-weight="bold">76.2%</text>
     <rect x="18" y="45" width="936" height="8" fill="#272733" />
-    <rect x="18" y="45" width="882.0808625336928" height="8" fill="#6fc7d4" />
+    <rect x="18" y="45" width="713.1907834101381" height="8" fill="#6fc7d4" />
     <text x="18" y="77" fill="#d7d7de" font-size="15" text-anchor="start" font-weight="normal">Library behaviors · 8/9 verified (88.9%)</text>
-    <text x="954" y="77" fill="#d7d7de" font-size="15" text-anchor="end" font-weight="normal">Shader translation · 43,229/43,407 entries (99.6%)</text>
-    <text x="18" y="99" fill="#a0a0b1" font-size="13" text-anchor="start" font-weight="normal">Frosty sample · 50% required library behaviors, 50% shader translation.</text>
+    <text x="954" y="77" fill="#d7d7de" font-size="15" text-anchor="end" font-weight="normal">RDNA 2 instructions · 689/1,085 (63.5%)</text>
+    <text x="18" y="99" fill="#a0a0b1" font-size="13" text-anchor="start" font-weight="normal">50% required Frosty library behaviors, 50% RDNA 2 instructions converted to DXIL.</text>
   </g>
   <g transform="translate(14 184)">
-    <title>RDNA 2 shader translation</title>
-    <rect x="0" y="0" width="972" height="342" fill="#14141d" stroke="#272733" stroke-width="1" />
+    <title>RDNA 2 instructions</title>
+    <rect x="0" y="0" width="972" height="236" fill="#14141d" stroke="#272733" stroke-width="1" />
     <rect x="1" y="1" width="970" height="32" fill="#0d0d15" />
     <rect x="1" y="33" width="970" height="1" fill="#272733" />
     <circle cx="16" cy="17" r="4.5" fill="#e74c3c" />
     <circle cx="32" cy="17" r="4.5" fill="#f1c40f" />
     <circle cx="48" cy="17" r="4.5" fill="#2ecc71" />
-    <text x="68" y="22" fill="#6fc7d4" font-size="14" text-anchor="start" font-weight="normal">~/docs/SHADERS.md</text>
-    <text x="18" y="70" fill="#e2bc8c" font-size="25" text-anchor="start" font-weight="bold">RDNA 2 shader translation</text>
-    <text x="18" y="96" fill="#d7d7de" font-size="15" text-anchor="start" font-weight="normal">Measured on Frosty’s shader archives</text>
-    <text x="301" y="121" fill="#a0a0b1" font-size="13" text-anchor="start" font-weight="normal">Compiler output</text>
-    <text x="870" y="121" fill="#a0a0b1" font-size="13" text-anchor="end" font-weight="normal">Archive entries</text>
-    <g>
-      <title>Global raster · compiler snapshot be66324a0de67077bdaf3b997e2b13e88f8669084444eefe370f4bc195ae2f6e</title>
-      <rect x="18" y="127" width="936" height="1" fill="#272733" />
-      <text x="18" y="145" fill="#d7d7de" font-size="15" text-anchor="start" font-weight="normal">Global raster</text>
-      <text x="301" y="145" fill="#d7d7de" font-size="14" text-anchor="start" font-weight="normal">HLSL emitted</text>
-      <rect x="510" y="135" width="125" height="6" fill="#272733" />
-      <rect x="510" y="135" width="124.60216422660726" height="6" fill="#6fc7d4" />
-      <text x="870" y="145" fill="#d7d7de" font-size="14" text-anchor="end" font-weight="normal">1,566/1,571</text>
-      <text x="954" y="145" fill="#d7d7de" font-size="14" text-anchor="end" font-weight="normal">99.7%</text>
-    </g>
-    <g>
-      <title>Material raster · compiler snapshot be66324a0de67077bdaf3b997e2b13e88f8669084444eefe370f4bc195ae2f6e</title>
-      <rect x="18" y="155" width="936" height="1" fill="#272733" />
-      <text x="18" y="173" fill="#d7d7de" font-size="15" text-anchor="start" font-weight="normal">Material raster</text>
-      <text x="301" y="173" fill="#d7d7de" font-size="14" text-anchor="start" font-weight="normal">HLSL emitted</text>
-      <rect x="510" y="163" width="125" height="6" fill="#272733" />
-      <rect x="510" y="163" width="125.0" height="6" fill="#6fc7d4" />
-      <text x="870" y="173" fill="#d7d7de" font-size="14" text-anchor="end" font-weight="normal">32,122/32,122</text>
-      <text x="954" y="173" fill="#d7d7de" font-size="14" text-anchor="end" font-weight="normal">100.0%</text>
-    </g>
-    <g>
-      <title>Global compute · compiler snapshot b576bc1b0a335e1217f46ead7e1c7e8f04f7487a3fbd7d89bc33e895ded96013</title>
-      <rect x="18" y="183" width="936" height="1" fill="#272733" />
-      <text x="18" y="201" fill="#d7d7de" font-size="15" text-anchor="start" font-weight="normal">Global compute</text>
-      <text x="301" y="201" fill="#d7d7de" font-size="14" text-anchor="start" font-weight="normal">HLSL emitted</text>
-      <rect x="510" y="191" width="125" height="6" fill="#272733" />
-      <rect x="510" y="191" width="120.6140350877193" height="6" fill="#6fc7d4" />
-      <text x="870" y="201" fill="#d7d7de" font-size="14" text-anchor="end" font-weight="normal">2,420/2,508</text>
-      <text x="954" y="201" fill="#d7d7de" font-size="14" text-anchor="end" font-weight="normal">96.5%</text>
-    </g>
-    <g>
-      <title>Material compute · compiler snapshot be66324a0de67077bdaf3b997e2b13e88f8669084444eefe370f4bc195ae2f6e</title>
-      <rect x="18" y="211" width="936" height="1" fill="#272733" />
-      <text x="18" y="229" fill="#d7d7de" font-size="15" text-anchor="start" font-weight="normal">Material compute</text>
-      <text x="301" y="229" fill="#d7d7de" font-size="14" text-anchor="start" font-weight="normal">HLSL emitted</text>
-      <rect x="510" y="219" width="125" height="6" fill="#272733" />
-      <rect x="510" y="219" width="125.0" height="6" fill="#6fc7d4" />
-      <text x="870" y="229" fill="#d7d7de" font-size="14" text-anchor="end" font-weight="normal">734/734</text>
-      <text x="954" y="229" fill="#d7d7de" font-size="14" text-anchor="end" font-weight="normal">100.0%</text>
-    </g>
-    <g>
-      <title>Global mesh · compiler snapshot f42f9d916e6fe267d4e723efd3938eab5d8db8da2dde799eef4fb3d560f8ff19</title>
-      <rect x="18" y="239" width="936" height="1" fill="#272733" />
-      <text x="18" y="257" fill="#d7d7de" font-size="15" text-anchor="start" font-weight="normal">Global mesh</text>
-      <text x="301" y="257" fill="#d7d7de" font-size="14" text-anchor="start" font-weight="normal">HLSL emitted</text>
-      <rect x="510" y="247" width="125" height="6" fill="#272733" />
-      <rect x="510" y="247" width="125.0" height="6" fill="#6fc7d4" />
-      <text x="870" y="257" fill="#d7d7de" font-size="14" text-anchor="end" font-weight="normal">192/192</text>
-      <text x="954" y="257" fill="#d7d7de" font-size="14" text-anchor="end" font-weight="normal">100.0%</text>
-    </g>
-    <g>
-      <title>Ray tracing · compiler snapshot 7f502654627fd947d9e678313dad92ad7c3a4c3fbdbd19641c2b943d300b0844</title>
-      <rect x="18" y="267" width="936" height="1" fill="#272733" />
-      <text x="18" y="285" fill="#d7d7de" font-size="15" text-anchor="start" font-weight="normal">Ray tracing</text>
-      <text x="301" y="285" fill="#d7d7de" font-size="14" text-anchor="start" font-weight="normal">DXIL compiled</text>
-      <rect x="510" y="275" width="125" height="6" fill="#272733" />
-      <rect x="510" y="275" width="123.30812101910828" height="6" fill="#6fc7d4" />
-      <text x="870" y="285" fill="#d7d7de" font-size="14" text-anchor="end" font-weight="normal">6,195/6,280</text>
-      <text x="954" y="285" fill="#d7d7de" font-size="14" text-anchor="end" font-weight="normal">98.6%</text>
-    </g>
-    <text x="18" y="325" fill="#a0a0b1" font-size="14" text-anchor="start" font-weight="normal">Material hit groups emitting HLSL · 2,551/2,551 opaque · 2,551/2,551 with any-hit</text>
+    <text x="68" y="22" fill="#6fc7d4" font-size="14" text-anchor="start" font-weight="normal">~/docs/INSTRUCTIONS.md</text>
+    <text x="18" y="70" fill="#e2bc8c" font-size="25" text-anchor="start" font-weight="bold">RDNA 2 instructions</text>
+    <text x="18" y="96" fill="#d7d7de" font-size="15" text-anchor="start" font-weight="normal">Converted to HLSL that compiles to DXIL</text>
+    <rect x="18" y="110" width="936" height="1" fill="#272733" />
+    <text x="18" y="128" fill="#d7d7de" font-size="15" text-anchor="start" font-weight="normal">All instructions</text>
+    <text x="400" y="128" fill="#d7d7de" font-size="14" text-anchor="start" font-weight="normal">converted to DXIL</text>
+    <rect x="610" y="118" width="125" height="6" fill="#272733" />
+    <rect x="610" y="118" width="79.3778801843318" height="6" fill="#6fc7d4" />
+    <text x="870" y="128" fill="#d7d7de" font-size="14" text-anchor="end" font-weight="normal">689/1,085</text>
+    <text x="954" y="128" fill="#d7d7de" font-size="14" text-anchor="end" font-weight="normal">63.5%</text>
+    <rect x="18" y="138" width="936" height="1" fill="#272733" />
+    <text x="18" y="156" fill="#d7d7de" font-size="15" text-anchor="start" font-weight="normal">Used by ProjectScarlett 1.0.2.1</text>
+    <text x="400" y="156" fill="#d7d7de" font-size="14" text-anchor="start" font-weight="normal">converted to DXIL</text>
+    <rect x="610" y="146" width="125" height="6" fill="#272733" />
+    <rect x="610" y="146" width="123.99193548387096" height="6" fill="#6fc7d4" />
+    <text x="870" y="156" fill="#d7d7de" font-size="14" text-anchor="end" font-weight="normal">369/372</text>
+    <text x="954" y="156" fill="#d7d7de" font-size="14" text-anchor="end" font-weight="normal">99.2%</text>
+    <rect x="18" y="166" width="936" height="1" fill="#272733" />
+    <text x="18" y="184" fill="#d7d7de" font-size="15" text-anchor="start" font-weight="normal">Used by ProjectScarlett 1.0.2.1</text>
+    <text x="400" y="184" fill="#d7d7de" font-size="14" text-anchor="start" font-weight="normal">run on AMD and NVIDIA</text>
+    <rect x="610" y="174" width="125" height="6" fill="#272733" />
+    <rect x="610" y="174" width="123.99193548387096" height="6" fill="#6fc7d4" />
+    <text x="870" y="184" fill="#d7d7de" font-size="14" text-anchor="end" font-weight="normal">369/372</text>
+    <text x="954" y="184" fill="#d7d7de" font-size="14" text-anchor="end" font-weight="normal">99.2%</text>
+    <text x="18" y="218" fill="#a0a0b1" font-size="13" text-anchor="start" font-weight="normal">Compiled alone through DXC and DXV, or run by a GPU check. Compiling doesn't prove a result matches the console.</text>
   </g>
-  <g transform="translate(14 538)">
-    <title>Project Scarlett shader preparation</title>
-    <rect x="0" y="0" width="972" height="110" fill="#14141d" stroke="#272733" />
-    <text x="18" y="30" fill="#e2bc8c" font-size="23" text-anchor="start" font-weight="bold">Project Scarlett shader preparation</text>
-    <text x="954" y="30" fill="#6fc7d4" font-size="23" text-anchor="end" font-weight="bold">89.3%</text>
-    <rect x="18" y="42" width="936" height="7" fill="#272733" />
-    <rect x="18" y="42" width="835.4570426651081" height="7" fill="#6fc7d4" />
-    <text x="18" y="73" fill="#d7d7de" font-size="15" text-anchor="start" font-weight="normal">36,653/41,064 captured requests compiled</text>
-    <text x="954" y="73" fill="#a0a0b1" font-size="14" text-anchor="end" font-weight="normal">4,411 unsupported · 0 failed</text>
-    <text x="18" y="96" fill="#a0a0b1" font-size="14" text-anchor="start" font-weight="normal">Furthest run reached gameplay at frame 32,534, then exited with code 3 · not yet playable</text>
-  </g>
-  <g transform="translate(14 660)">
+  <g transform="translate(14 432)">
     <title>Required library behaviors</title>
     <rect x="0" y="0" width="972" height="402" fill="#14141d" stroke="#272733" stroke-width="1" />
     <rect x="1" y="1" width="970" height="32" fill="#0d0d15" />
@@ -183,7 +131,7 @@
       <text x="954" y="381" fill="#e2bc8c" font-size="14" text-anchor="end" font-weight="bold">Partial</text>
     </g>
   </g>
-  <g transform="translate(14 1074)">
+  <g transform="translate(14 846)">
     <title>Frosty retail test</title>
     <rect x="0" y="0" width="972" height="139" fill="#14141d" stroke="#272733" />
     <text x="18" y="32" fill="#e2bc8c" font-size="23" text-anchor="start" font-weight="bold">Frosty retail test</text>
@@ -191,7 +139,7 @@
     <text x="18" y="83" fill="#d7d7de" font-size="15" text-anchor="start" font-weight="normal">Chase intro loaded</text>
     <text x="18" y="126" fill="#2ecc71" font-size="15" text-anchor="start" font-weight="normal">Reduced settings · Wake Up reached the bullet-time scene</text>
   </g>
-  <g transform="translate(14 1225)">
+  <g transform="translate(14 997)">
     <title>Guest regression checks</title>
     <text x="0" y="21" fill="#a0a0b1" font-size="15" text-anchor="start" font-weight="normal">Guest regression checks</text>
     <text x="972" y="21" fill="#a0a0b1" font-size="15" text-anchor="end" font-weight="normal">535 of 571 passed across 13 host configurations</text>

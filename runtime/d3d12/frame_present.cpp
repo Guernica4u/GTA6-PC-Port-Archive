@@ -22,6 +22,17 @@ constexpr std::array<POINT, 5> samples{{{5, 5}, {95, 5}, {5, 95}, {95, 95}, {50,
 constexpr COLORREF splash_image = RGB(0x30, 0xc0, 0x90);
 constexpr LONG splash_width = 64, splash_height = 36;
 
+// GetPixel on the screen reads physical pixels, but a guest that is not DPI aware,
+// like a title, places its windows in logical pixels. They differ once Windows
+// scales the display, so move each sample point to the pixel it covers.
+COLORREF screen_pixel(HDC screen, HWND window, POINT at) {
+    using Convert = BOOL(WINAPI*)(HWND, POINT*);
+    static const auto convert = reinterpret_cast<Convert>(
+        GetProcAddress(GetModuleHandleW(L"user32.dll"), "LogicalToPhysicalPointForPerMonitorDPI"));
+    if (convert) convert(window, &at);
+    return GetPixel(screen, at.x, at.y);
+}
+
 std::string describe(const std::array<COLORREF, samples.size()>& pixels) {
     char text[80];
     std::snprintf(text, sizeof(text), " screen=%#lx/%#lx/%#lx/%#lx/%#lx", pixels[0], pixels[1], pixels[2],
@@ -126,8 +137,8 @@ std::array<COLORREF, 5> DisplayCheck::sample() const {
     HDC screen = GetDC(nullptr);
     if (!screen) throw std::runtime_error("could not acquire screen DC");
     for (size_t i = 0; i < pixels.size(); ++i)
-        pixels[i] = GetPixel(screen, origin.x + client.right * samples[i].x / 100,
-                             origin.y + client.bottom * samples[i].y / 100);
+        pixels[i] = screen_pixel(screen, window_, {origin.x + client.right * samples[i].x / 100,
+                                                   origin.y + client.bottom * samples[i].y / 100});
     ReleaseDC(nullptr, screen);
     return pixels;
 }
@@ -165,7 +176,7 @@ bool DisplayCheck::splash_shows(ULONGLONG milliseconds) const {
             // The sample points, moved inside the splash's own rectangle.
             const LONG x = bounds.left + (bounds.right - bounds.left) * (at.x / 2 + 25) / 100;
             const LONG y = bounds.top + (bounds.bottom - bounds.top) * (at.y / 2 + 25) / 100;
-            matched &= GetPixel(screen, x, y) == splash_image;
+            matched &= screen_pixel(screen, splash_window_, {x, y}) == splash_image;
         }
         ReleaseDC(nullptr, screen);
         if (matched) return true;

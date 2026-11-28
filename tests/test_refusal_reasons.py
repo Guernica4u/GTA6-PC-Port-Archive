@@ -2,6 +2,7 @@ import hashlib
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -12,6 +13,7 @@ from project_tuxbox.shader_prep import ToolFailure
 REASON = "wave reduction at 0x35c may execute in divergent control flow"
 
 
+@unittest.skipUnless(sys.platform == "linux", "Runtime shader compilation locks its cache with flock, on Proton on Linux")
 class CachedRefusalReasons(unittest.TestCase):
     def setUp(self):
         temporary = TemporaryDirectory()
@@ -79,6 +81,7 @@ if __name__ == "__main__":
     unittest.main()
 
 
+@unittest.skipUnless(sys.platform == "linux", "Runtime shader compilation locks its cache with flock, on Proton on Linux")
 class StrideTableRetry(unittest.TestCase):
     """An IDXEN stride refusal is retried with the stride table appended."""
 

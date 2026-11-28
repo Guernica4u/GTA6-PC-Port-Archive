@@ -306,6 +306,7 @@ class SeedShaderCache(unittest.TestCase):
             seed.assert_called_once()
 
 
+@unittest.skipUnless(sys.platform == "linux", "Network namespaces require Linux")
 class OfflineLaunch(unittest.TestCase):
     def host(self, probe_code=0, stderr=""):
         tmp = tempfile.TemporaryDirectory()

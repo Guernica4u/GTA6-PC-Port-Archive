@@ -97,6 +97,18 @@ fn wide_masks(insns: &[Insn]) -> bool {
             .any(|operand| matches!(operand, Opnd::ExecLo | Opnd::ExecHi | Opnd::VccLo | Opnd::VccHi))))
 }
 
+/// Whether every lane mask of the program is one register: some 32-bit scalar
+/// instruction takes the execution or carry mask, and nothing handles a mask as
+/// 64 bits or names its upper half. A compare then writes one register, and the
+/// one after it is not part of its result.
+pub(super) fn one_word_masks(insns: &[Insn]) -> bool {
+    let mask = |operand: &Opnd| matches!(operand, Opnd::ExecLo | Opnd::VccLo);
+    let upper = |operand: &Opnd| matches!(operand, Opnd::ExecHi | Opnd::VccHi);
+    let narrow = insns.iter().any(|ins| ins.mnemonic.starts_with("s_") && ins.mnemonic.ends_with("_b32")
+        && (ins.mnemonic.contains("saveexec") || ins.mnemonic.contains("wrexec") || ins.src.iter().chain(&ins.dst).any(mask)));
+    narrow && !wide_masks(insns) && !insns.iter().any(|ins| ins.src.iter().chain(&ins.dst).any(upper))
+}
+
 /// Whether the program is compiled for 32 lanes: it saves and combines the
 /// execution mask as 32 bits, and never handles a mask as 64.
 fn narrow_masks(insns: &[Insn]) -> bool {
