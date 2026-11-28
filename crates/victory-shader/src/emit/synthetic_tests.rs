@@ -1196,12 +1196,23 @@ fn compute_samples_take_derivatives_from_lane_quads() {
                 continue;
             };
             let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            let mut roots = vec![(0, Root::Constants(ud))];
+            // Buffer views are read through the table of view strides.
+            if shader.root_srvs.contains(&super::VIEW_STRIDES) {
+                roots.push((
+                    1,
+                    Root::View {
+                        srv: true,
+                        data: super::host::view_strides(&views),
+                    },
+                ));
+            }
             let out = host
                 .dispatch(
                     &root,
                     &pso,
                     &Dispatch {
-                        roots: vec![(0, Root::Constants(ud))],
+                        roots,
                         views: &views,
                         samplers: &[],
                         groups: [1, 1, 1],
@@ -1305,23 +1316,35 @@ fn multirow_samples_and_console_wave_reads_keep_each_guest_thread() {
                 continue;
             }
             let (root, pso) = host.compute_pipeline(&shader).unwrap();
+            let views = [
+                View::Mipped(64, 64, 7, &texels),
+                View::Buffer {
+                    data: &input,
+                    stride: Stride::Raw,
+                },
+                View::RawUav(2 * n),
+            ];
+            let mut roots = vec![(
+                0,
+                Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]),
+            )];
+            // Buffer views are read through the table of view strides.
+            if shader.root_srvs.contains(&super::VIEW_STRIDES) {
+                roots.push((
+                    1,
+                    Root::View {
+                        srv: true,
+                        data: super::host::view_strides(&views),
+                    },
+                ));
+            }
             let out = host
                 .dispatch(
                     &root,
                     &pso,
                     &Dispatch {
-                        roots: vec![(
-                            0,
-                            Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]),
-                        )],
-                        views: &[
-                            View::Mipped(64, 64, 7, &texels),
-                            View::Buffer {
-                                data: &input,
-                                stride: Stride::Raw,
-                            },
-                            View::RawUav(2 * n),
-                        ],
+                        roots,
+                        views: &views,
                         samplers: &[],
                         groups: [1, 1, 1],
                     },
@@ -1344,42 +1367,118 @@ fn multirow_samples_and_console_wave_reads_keep_each_guest_thread() {
     }
 }
 
+/// A console wave64 program with an implicit-level sample and a read of
+/// another lane on a host of 32-lane waves: the console flow in halves.
+/// Each half holds whole quads of the console wave in the console's order,
+/// so the quad gradients read within the host wave give every thread the
+/// level its console quad gives, and the lane read gives the console
+/// wave's first thread.
+#[test]
+fn implicit_samples_in_halves_take_the_console_quads() {
+    let nvidia = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let tag = |level: u32, x, y| (10000 * level + 64 * y + x) as f32;
+    let mut texels = Vec::new();
+    for level in 0..7 {
+        let edge = 64u32 >> level;
+        for y in 0..edge {
+            texels.extend((0..edge).map(|x| [tag(level, x, y), 0., 0., 1.]));
+        }
+    }
+    for (width, height) in [(8u32, 8u32), (16, 4)] {
+        let n = width * height;
+        let native = group_native(
+            &quad_program_as(Sample::Plain, width, true),
+            true,
+            [width, height, 1],
+            1 << 1 | 1 << 11,
+        );
+        let c = crate::Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: Vec::new(),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+        let io = io::raise(&p, &native).expect("io::raise");
+        let shader = super::emit(&c, &native, &p, &st, &io, &res, nvidia)
+            .expect("translates for a host of 32-lane waves");
+        let input: Vec<u32> = (0..n)
+            .flat_map(|f| {
+                [
+                    ((9.0 + 2.0 * ((f % 16) / 2) as f32) / 64.0).to_bits(),
+                    ((9.0 + 4.0 * (f / 16) as f32) / 64.0).to_bits(),
+                ]
+            })
+            .collect();
+        let host = match Host::new(false) {
+            Ok(h) if h.target() == nvidia => h,
+            _ => {
+                eprintln!("no hardware adapter of 32-lane waves; skipped");
+                continue;
+            }
+        };
+        let (root, pso) = host.compute_pipeline(&shader).unwrap();
+        let views = [
+            View::Mipped(64, 64, 7, &texels),
+            View::Buffer {
+                data: &input,
+                stride: Stride::Raw,
+            },
+            View::RawUav(2 * n),
+        ];
+        let mut roots = vec![(
+            0,
+            Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]),
+        )];
+        if shader.root_srvs.contains(&super::VIEW_STRIDES) {
+            roots.push((
+                1,
+                Root::View {
+                    srv: true,
+                    data: super::host::view_strides(&views),
+                },
+            ));
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots,
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap();
+        for f in 0..n {
+            // The coordinates reach mip 1 at the center of this texel.
+            let expected = tag(1, 4 + (f % 16) / 2, 4 + 2 * (f / 16)).to_bits();
+            let i = 2 * f as usize;
+            assert_eq!(
+                &out[0][i..i + 2],
+                &[expected, 0],
+                "halves, {width}x{height}, thread {f}"
+            );
+        }
+        eprintln!("halves {width}x{height}: {n} sample and wave-base pairs matched");
+    }
+}
+
 fn build_group(
     words: &[u32],
     wave64: bool,
     threads: [u32; 3],
     rsrc2: u32,
 ) -> Result<HostShader, crate::ShaderError> {
-    let range = |kind, table_offset_dwords, dwords, stride| UsedResource {
-        kind,
-        root: RootType::Table,
-        table_offset_dwords,
-        lower_bound: 0,
-        stride,
-        dwords,
-        user_data: 0,
-        slot: 0,
-    };
-    let native = NativeProgram {
-        stage: HwStage::Cs,
-        wave64,
-        vgprs: 32,
-        layout: vec![RootParam {
-            root: RootType::Table,
-            table_offset_dwords: 0,
-            sgprs: 1,
-            base_register: 0,
-            user_data: 0,
-            slot: 0,
-        }],
-        used: vec![
-            range(ResourceType::Srv, 0, 8, 0),
-            range(ResourceType::Srv, 8, 4, 8),
-            range(ResourceType::Uav, 16, 4, 0),
-        ],
-        io: StageIo::Cs(ComputeIo { rsrc2, threads }),
-        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-    };
+    let native = group_native(words, wave64, threads, rsrc2);
     let lowered = lowered(&native)?;
     Ok(HostShader {
         stage: HwStage::Cs,
@@ -1401,4 +1500,39 @@ fn build_group(
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
     })
+}
+
+/// The program of [`build_group`]: a texture, a buffer and a UAV in one
+/// table.
+fn group_native(words: &[u32], wave64: bool, threads: [u32; 3], rsrc2: u32) -> NativeProgram {
+    let range = |kind, table_offset_dwords, dwords, stride| UsedResource {
+        kind,
+        root: RootType::Table,
+        table_offset_dwords,
+        lower_bound: 0,
+        stride,
+        dwords,
+        user_data: 0,
+        slot: 0,
+    };
+    NativeProgram {
+        stage: HwStage::Cs,
+        wave64,
+        vgprs: 32,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![
+            range(ResourceType::Srv, 0, 8, 0),
+            range(ResourceType::Srv, 8, 4, 8),
+            range(ResourceType::Uav, 16, 4, 0),
+        ],
+        io: StageIo::Cs(ComputeIo { rsrc2, threads }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    }
 }

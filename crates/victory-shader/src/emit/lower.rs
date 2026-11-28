@@ -9209,16 +9209,6 @@ impl<'a> Lower<'a> {
             "image_get_resinfo" => (72, false),
             _ => return Err(name),
         };
-        // A compute program's sample with implicit derivatives has no valid
-        // DXIL form yet: the module fails validation ("an operation that is
-        // incompatible with the shader stage", #201). Drivers take such a
-        // module in the per-lane form; in the console flow in halves, with
-        // group barriers in its loops and branches, a title run lost its
-        // device in two of them. Such a program stops here until the sample
-        // has a valid form.
-        if matches!(op, 60 | 61) && !self.s.pixel && self.console_cf && self.split {
-            return Err(IMPLICIT_SAMPLE_IN_HALVES);
-        }
         if op == 72 {
             // Width, height, depth or layers, levels (per dmask) of the level
             // in the first address: DXIL's dimensions; a channel DXIL leaves
@@ -9397,6 +9387,24 @@ impl<'a> Lower<'a> {
                     .is_some_and(|t| t.iter().product::<u32>() % 4 != 0)
             {
                 return Err("an implicit-level sample in a group of partial quads");
+            }
+            // A compute program's sample left with implicit derivatives (no
+            // quad gradients: a cube) has no valid DXIL form: the module
+            // fails validation ("an operation that is incompatible with the
+            // shader stage", #201). Drivers take such a module in the
+            // per-lane form; in the console flow in halves, with group
+            // barriers in its loops and branches, a title run lost its
+            // device in two of them. With quad gradients the sample is a
+            // `sampleGrad`, valid in compute: each half holds whole quads
+            // of the console wave in the console's order, so the quad's
+            // lanes are read within the host wave.
+            if matches!(op, 60 | 61)
+                && !quad_grads
+                && !self.s.pixel
+                && self.console_cf
+                && self.split
+            {
+                return Err(IMPLICIT_SAMPLE_IN_HALVES);
             }
             match op {
                 60 | 61 if quad_grads => {
