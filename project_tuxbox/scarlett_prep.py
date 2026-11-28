@@ -17,7 +17,7 @@ from .runtime_shaders import REQUEST_PATTERNS, ShaderRefused, compile_request, s
 from .shader_prep import SOURCE_CACHE
 from .shader_diagnostics import normalize_refusal
 from .shader_pack import seed_requests
-from .scarlett_report import aggregate, refusal_bucket, failure_bucket
+from .scarlett_report import aggregate, refusal_bucket, failure_bucket, expected_at_preparation
 
 
 def scarlett_requests(executable, cache):
@@ -166,8 +166,19 @@ def prepare_scarlett(executable, host):
                         json.dumps(receipt, sort_keys=True, separators=(",", ":")))
     if unsupported:
         unknown = refusal_counts['cached_reason_unavailable']
-        report_progress(None, f"ProjectScarlett shader refusals: {totals['unsupported'] - unknown} with a reason, "
-                        f"{unknown} cached before reasons were kept.")
-        for reason, count in sorted(reasons.items(), key=lambda item: (-item[1], item[0]))[:10]:
+        expected = {bucket: count for bucket, count in refusal_counts.items()
+                    if expected_at_preparation(bucket)}
+        actionable_total = totals['unsupported'] - unknown - sum(expected.values())
+        actionable_reasons = {reason: count for reason, count in reasons.items()
+                              if not expected_at_preparation(refusal_bucket(ShaderRefused(reason, cached=False)))}
+        expected_total = sum(expected.values())
+        header = f"ProjectScarlett shader refusals: {actionable_total} actionable"
+        if expected_total:
+            header += (f", {expected_total} expected at pipeline creation ("
+                       + ", ".join(f"{bucket}={count}" for bucket, count in sorted(expected.items()))
+                       + ")")
+        header += ", "
+        report_progress(None, header + f"{unknown} cached before reasons were kept.")
+        for reason, count in sorted(actionable_reasons.items(), key=lambda item: (-item[1], item[0]))[:10]:
             report_progress(None, f"  {count} x {reason}")
     return True
