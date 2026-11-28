@@ -35,7 +35,7 @@
 //! and allocated again while a tracker holds it is not seen.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// The unit tracked and copied: 64 KiB, the console's page. Finer units
@@ -55,11 +55,6 @@ const HOT_THRESHOLD: u8 = 3;
 /// down and returns to a `PAGE_READONLY` guard (so cold trackers go back to
 /// zero-syscall [`Tracked::clean`]).
 const COOL_TAKES: u8 = 2;
-
-/// Number of pages currently tracked through hardware `MEM_WRITE_WATCH`
-/// (`Guards::watched.len()`), so [`Tracked::arm`] skips the guard lock when
-/// no page is watched.
-static WATCHED_PAGES: AtomicUsize = AtomicUsize::new(0);
 
 /// The pages a tracker has not taken since they changed, what it saves of
 /// pages it armed, its bit in [`DIRTY`] (none: always taken as dirty),
@@ -489,9 +484,7 @@ impl Drop for Tracked {
                     g.holders.remove(&page);
                     g.hot_streak.remove(&page);
                     g.quiet_takes.remove(&page);
-                    if g.watched.remove(&page) {
-                        WATCHED_PAGES.fetch_sub(1, Ordering::AcqRel);
-                    }
+                    g.watched.remove(&page);
                     free.push(page);
                 }
             }
@@ -622,13 +615,12 @@ fn promote_watched(g: &mut Guards, page: usize) -> bool {
         g.hot_streak.remove(&page);
         return false;
     }
-    if g.watched.insert(page) {
-        WATCHED_PAGES.fetch_add(1, Ordering::AcqRel);
-        if let Some(holders) = g.holders.get(&page) {
-            for c in holders {
-                c.4.fetch_add(1, Ordering::AcqRel);
-                set_dirty(c.2, true);
-            }
+    if g.watched.insert(page)
+        && let Some(holders) = g.holders.get(&page)
+    {
+        for c in holders {
+            c.4.fetch_add(1, Ordering::AcqRel);
+            set_dirty(c.2, true);
         }
     }
     g.quiet_takes.remove(&page);
@@ -641,7 +633,6 @@ fn remove_watched(g: &mut Guards, page: usize, skip_dirty_update: Option<&Arc<Ch
     if !g.watched.remove(&page) {
         return;
     }
-    WATCHED_PAGES.fetch_sub(1, Ordering::AcqRel);
     g.quiet_takes.remove(&page);
     g.hot_streak.remove(&page);
     if let Some(holders) = g.holders.get(&page) {
@@ -974,19 +965,17 @@ impl Tracked {
             return;
         }
         let (first, last) = (from / PAGE, to.div_ceil(PAGE));
-        if WATCHED_PAGES.load(Ordering::Acquire) == 0 {
-            self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).arm(first, last);
-            return;
-        }
-        // Acquire `GUARDS` before `Saved` (global lock order) so any hot
-        // write-watched page in `[first, last)` is demoted to a `PAGE_READONLY`
-        // guard atomically with arming, guaranteeing `on_write` saves pre-write
-        // bytes before a concurrent CPU write lands.
+        // Always serialize with `protect_noting` / `can_watch` under `GUARDS`
+        // (preserving global `GUARDS` -> `Saved` lock order) so a concurrent
+        // first-time promotion cannot leave an armed page read-write without
+        // demoting it.
         let mut g = guards();
         self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).arm(first, last);
-        let to_demote: Vec<usize> = g.watched.range(first..last).copied().collect();
-        for page in to_demote {
-            demote_watched(&mut g, page, true);
+        if !g.watched.is_empty() {
+            let to_demote: Vec<usize> = g.watched.range(first..last).copied().collect();
+            for page in to_demote {
+                demote_watched(&mut g, page, true);
+            }
         }
     }
 
@@ -2319,5 +2308,49 @@ pub(crate) mod tests {
         }
         drop((a, b));
         free(p);
+    }
+
+    /// Concurrent `arm()` racing the `HOT_THRESHOLD` promotion `take()` must
+    /// serialize under `GUARDS` so the armed page is never left read-write
+    /// without a guard and always captures its pre-write snapshot.
+    #[test]
+    fn arming_during_hot_promotion_keeps_before_image() {
+        use std::sync::Barrier;
+        use windows_sys::Win32::System::Memory::PAGE_READONLY;
+        for _ in 0..32 {
+            let p = pool(1);
+            let t = track_copy(p, PAGE, true).expect("tracked write-watched pool");
+            assert_eq!(t.take(p, p + PAGE), [(p, p + PAGE)]);
+            for k in 1..u32::from(HOT_THRESHOLD) {
+                // SAFETY: owned pool page, with the normal write-fault handler.
+                unsafe { (p as *mut u32).write_volatile(k) };
+                assert_eq!(t.take(p, p + PAGE), [(p, p + PAGE)]);
+            }
+            // Write the pre-submission value; the next `take()` would promote
+            // the page if `arm()` had not serialized against it.
+            // SAFETY: owned pool page.
+            unsafe { (p as *mut u32).write_volatile(0xAAAA_5555) };
+            let barrier = Barrier::new(2);
+            std::thread::scope(|scope| {
+                let arm = scope.spawn(|| {
+                    barrier.wait();
+                    t.arm(p, p + PAGE);
+                });
+                barrier.wait();
+                assert_eq!(t.take(p, p + PAGE), [(p, p + PAGE)]);
+                arm.join().unwrap();
+            });
+            assert!(!guards().watched.contains(&(p / PAGE)));
+            assert_eq!(page_protection(p), PAGE_READONLY);
+            // SAFETY: guarded page of our pool; handler opens it and saves old bytes.
+            unsafe { (p as *mut u32).write_volatile(0xDEAD_BEEF) };
+            let before = t
+                .saved(p / PAGE)
+                .map(|bytes| u32::from_le_bytes(bytes[..4].try_into().unwrap()));
+            t.disarm();
+            drop(t);
+            free(p);
+            assert_eq!(before, Some(0xAAAA_5555), "arming lost its pre-write snapshot");
+        }
     }
 }
