@@ -3016,15 +3016,16 @@ struct Presenter {
 
 impl Presenter {
     /// Writes the frame rate and frame time in the top left corner of
-    /// the back buffer.
+    /// the back buffer, which `list` holds in the `from` state.
     ///
     /// # Safety
-    /// The back buffer is in the copy destination state on this list.
+    /// The back buffer is in the `from` state on this list.
     unsafe fn readout(
         &self,
         device: &ID3D12Device,
         list: &ID3D12GraphicsCommandList,
         back: &ID3D12Resource,
+        from: D3D12_RESOURCE_STATES,
     ) {
         let (Some(heap), Some((fps, ms))) = (&self.readout_rtv, self.meter.shown) else {
             return;
@@ -3044,23 +3045,28 @@ impl Presenter {
             return;
         }
         let marks = crate::readout::rects(&text, at, dot);
-        // SAFETY: this list owns the back buffer in the caller's copy
-        // destination state and all rectangles fit within its RTV.
+        let moved = from != D3D12_RESOURCE_STATE_RENDER_TARGET;
+        // SAFETY: this list owns the back buffer in the caller's state and all
+        // rectangles fit within its RTV.
         unsafe {
             let view = heap.GetCPUDescriptorHandleForHeapStart();
             device.CreateRenderTargetView(back, None, view);
-            list.ResourceBarrier(&[transition(
-                back,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                D3D12_RESOURCE_STATE_RENDER_TARGET,
-            )]);
+            if moved {
+                list.ResourceBarrier(&[transition(
+                    back,
+                    from,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                )]);
+            }
             list.ClearRenderTargetView(view, &[0.0, 0.0, 0.0, 1.0], Some(&[behind]));
             list.ClearRenderTargetView(view, &[1.0, 0.9, 0.1, 1.0], Some(&marks));
-            list.ResourceBarrier(&[transition(
-                back,
-                D3D12_RESOURCE_STATE_RENDER_TARGET,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-            )]);
+            if moved {
+                list.ResourceBarrier(&[transition(
+                    back,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    from,
+                )]);
+            }
         }
     }
 }
@@ -3383,7 +3389,12 @@ impl Host {
                     let _ = frame;
                     (None::<()>, None::<()>)
                 };
-                p.readout(&self.device, list, &back);
+                p.readout(
+                    &self.device,
+                    list,
+                    &back,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                );
                 let mut after = Vec::with_capacity(2);
                 if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
                     after.push(transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state));
@@ -3492,6 +3503,15 @@ impl Host {
                     );
                     list.DrawInstanced(3, 1, 0, 0);
                 }
+                // Over the composed planes, which the back buffer already
+                // holds: the series-s profile presents a scene plane and a
+                // 4K interface plane through this path.
+                p.readout(
+                    &self.device,
+                    list,
+                    &back,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                );
                 #[cfg(feature = "diagnostics")]
                 let (capture, probe) = {
                     list.ResourceBarrier(&[transition(
