@@ -860,9 +860,12 @@ def lanes_raster_tables(host, check, gpu_args, pci, memory_symbols):
     `raster-heap-stride`: the vertex program reads a heap buffer by index under
     a root with no parameters, so the provider must translate it against a root
     with its stride table and bind that table, with a paged resource heap.
+    `raster-sampler-waterfall`: a vertex program that reads a sampler from the
+    sampler heap back through a waterfall loop, after an if/else copied it into
+    vector registers; the sampled value is its position's w.
     """
     from examples.lanes.raster_fixture import (heap_stride_pixel, heap_stride_vertex, mesh, mesh_sampler_pixel, pixel,
-                                               rootless_sampler_pixel, sampler_pixel, vertex)
+                                               rootless_sampler_pixel, sampler_pixel, sampler_waterfall_vertex, vertex)
     from examples.lanes.spill_fixture import pixel as spill_pixel
     from .runtime_shaders import shader_session
     from .shader_prep import SOURCE_CACHE
@@ -870,7 +873,7 @@ def lanes_raster_tables(host, check, gpu_args, pci, memory_symbols):
     sources = Path(host.env["WINEPREFIX"]) / SOURCE_CACHE
     rootless = {hashlib.sha256(data).hexdigest()
                 for data in (vertex(), pixel(), sampler_pixel(), mesh_sampler_pixel(), rootless_sampler_pixel(),
-                             spill_pixel(), heap_stride_vertex(), heap_stride_pixel())}
+                             spill_pixel(), heap_stride_vertex(), heap_stride_pixel(), sampler_waterfall_vertex())}
     mesh_key = hashlib.sha256(mesh()).hexdigest()
     messages = []
 
@@ -940,7 +943,8 @@ def lanes_raster_tables(host, check, gpu_args, pci, memory_symbols):
     try:
         for scenario, slots in (("raster-tables", 3), ("lane-spill-interp", None), ("raster-samplers", RASTER_SAMPLER_SLOTS),
                                 ("mesh-samplers", MESH_SAMPLER_SLOTS), ("mesh-sampler-single", MESH_SAMPLER_SLOTS),
-                                ("mesh-sampler-rootless", MESH_SAMPLER_SLOTS), ("raster-heap-stride", None)):
+                                ("mesh-sampler-rootless", MESH_SAMPLER_SLOTS), ("raster-heap-stride", None),
+                                ("raster-sampler-waterfall", None)):
             if scenario == "raster-heap-stride":
                 # The stride table exists only for a paged heap.
                 host.env["TUXBOX_DESCRIPTOR_HEAP_LIMIT"] = "64"
@@ -1148,8 +1152,9 @@ def verify(host, output, adapter, selected=None, samples=1):
                   providers={"xapu/xapu.dll": ("XApuConnect", "XApuEnqueueCommand", "XApuDequeueResult")})
         if "xcrdapi" in selected:
             check("xcrdapi", "xcrdapi/xcrdapi-read.exe", [],
-                  r"raw=16 zlib=16 guards=2 errors=2 cancellation=1 bc1=4 bc7=2 autosubmit=64 PASS",
-                  providers={"xcrdapi/xcrdapi.dll": ("DStorageGetFactory",)})
+                  r"raw=16 zlib=16 guards=2 errors=2 cancellation=2 bc1=4 bc7=2 pages=2 autosubmit=64 PASS",
+                  providers={"xcrdapi/xcrdapi.dll": ("DStorageGetFactory",)},
+                  dependencies=("xmem-smoke/xmem.dll",))
         if "xmem" in selected:
             check("xmem-heaps", "xmem-smoke/xmem-smoke.exe", ["--heaps", "--report"],
                   r"xmem-heaps PASS title=1 private=4 invalid=2 pool-commits=2 pool-decommits=2 heap-callbacks=2 stats=1 dump=1 history=2 page-classes=3",
@@ -1282,6 +1287,8 @@ def verify(host, output, adapter, selected=None, samples=1):
                             frame_match + r" displayed=2/2", providers=frame_provider, device_factory="xbox")
                     present("guest-present-rgb10", "d3d12-smoke/xbox-frame-rgb10.exe", [*gpu_args, "--present", "--report"],
                             frame_match + r" format=rgb10a2 displayed=2/2", providers=frame_provider, device_factory="xbox")
+                    present("guest-present-planes", "d3d12-smoke/xbox-frame-planes.exe", [*gpu_args, "--present", "--report"],
+                            frame_match + r" displayed=2/2 planes=2", providers=frame_provider, device_factory="xbox")
                     for mode in ("owned", "oversized", "fit", "splash"):
                         if mode == "splash" and splash_skip:
                             skipped.append({"gate": f"guest-present-4k-{mode}", "reason": splash_skip})
@@ -1456,6 +1463,7 @@ GATE_LABELS = {
     "guest-present-4k-fit": "4K RGB10 display scaled inside a smaller title window",
     "guest-present-4k-splash": "Package splash over a fitted 4K title window until frames come steadily",
     "guest-present-rgb10": "Two RGB10A2 frames sampled from the desktop window",
+    "guest-present-planes": "Two frames presented as two planes, the second blended over the first",
     "d3d12-frame-events": "Frame origins, timeout tokens, completed presentation events and display statistics",
     "d3d12-heaps": "Placed resources and allocation offsets in a shared memory heap",
     "d3d12-placement": "Virtual-address BC1 cubes and R8 textures across page changes",
@@ -1512,6 +1520,7 @@ GATE_LABELS = {
     "lanes-lane-spill-interp": "A console pixel program with a lane-spill area and an f16 interpolator selector of the same number",
     "lanes-raster-samplers": "A console pixel program's literal linear sampler, which the title's root names in another state",
     "lanes-raster-heap-stride": "A console vertex program's indexed read of a heap buffer, through the paged stride table",
+    "lanes-raster-sampler-waterfall": "A console vertex program's heap sampler, read back through a waterfall loop after an if/else",
     "lanes-compute-root": "Root-less console compute programs translated only against a three-table root",
     "lanes-mesh-samplers": "The same literal sampler in a mesh pipeline, added to the mesh root the provider builds",
     "lanes-mesh-sampler-rootless": "Literal samplers in mesh pipelines whose root has no static samplers",

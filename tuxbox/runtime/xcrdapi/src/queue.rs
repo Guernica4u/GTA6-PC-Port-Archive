@@ -1,12 +1,15 @@
 use super::*;
+use std::sync::atomic::AtomicBool;
 use crate::{decode, diag};
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
 use std::os::windows::io::{FromRawHandle, IntoRawHandle, OwnedHandle};
 use std::sync::Condvar;
 use std::thread::{self, JoinHandle};
 use windows::Win32::Graphics::Direct3D12::ID3D12Fence;
-use windows::Win32::System::Threading::{CreateEventW, ResetEvent, SetEvent};
+use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+use windows::Win32::System::Threading::{CreateEventW, GetCurrentProcess, ResetEvent, SetEvent};
 
 #[implement(IQueue2)]
 struct Queue {
@@ -33,6 +36,9 @@ struct State {
     closed: bool,
     error_count: u32,
     first_error: Option<Box<ErrorRecord>>,
+    /// Tags and cancel flags of the reads taken off the queue and not yet
+    /// finished, so a cancellation still reaches them.
+    in_flight: Vec<(u64, Arc<AtomicBool>)>,
 }
 
 enum Entry {
@@ -59,7 +65,7 @@ struct Read {
     intermediate: usize,
     options: u64,
     tag: u64,
-    cancelled: bool,
+    cancelled: Arc<AtomicBool>,
 }
 
 /// Options that need the source staged and decoded before it is written.
@@ -79,6 +85,7 @@ unsafe fn capture(queue_type: u64, req: *const Request) -> Result<Read, HRESULT>
         return Err(E_NOTIMPL);
     }
     // Snapshot the page array now: the title may reuse it after enqueueing.
+    // Entries still zero are read again when the request runs (`page_tokens`).
     let pages = if req.options & TO_PAGES != 0 {
         if req.destination.is_null() {
             return Err(E_INVALIDARG);
@@ -119,7 +126,7 @@ unsafe fn capture(queue_type: u64, req: *const Request) -> Result<Read, HRESULT>
         intermediate: req.intermediate_size as usize,
         options: req.options,
         tag: req.tag,
-        cancelled: false,
+        cancelled: Arc::new(AtomicBool::new(false)),
     })
 }
 
@@ -143,8 +150,59 @@ struct Overlapped {
 }
 
 impl Read {
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Logs why this read failed and returns `hr`.
+    fn failure(&self, stage: &str, hr: HRESULT, detail: &str) -> HRESULT {
+        let pages = self.pages.as_ref().map(|(tokens, offset)| (tokens.as_slice(), *offset));
+        let source = match self.source {
+            Source::File(_, offset) => format!("file offset {offset:#x}"),
+            Source::Memory(p) => format!("memory {p:#x}"),
+        };
+        let detail = if self.is_cancelled() { format!("{detail}; cancelled, not reported") } else { detail.to_owned() };
+        diag::failure(self.options, stage, hr, &source, self.size, self.capacity, self.intermediate, pages, &detail);
+        hr
+    }
+
+    /// The page tokens to write. ProjectScarlett enqueues some requests before
+    /// it fills their page arrays, and fills them before it submits, so an
+    /// entry that was zero at enqueue is read again from the array now. Zero
+    /// never names a page; entries seen at enqueue are kept, as the title may
+    /// have reused the array since.
+    fn page_tokens<'a>(&self, tokens: &'a [u64]) -> Cow<'a, [u64]> {
+        if !tokens.contains(&0) {
+            return Cow::Borrowed(tokens);
+        }
+        let mut live = vec![0u64; tokens.len()];
+        let mut got = 0;
+        // ReadProcessMemory fails instead of faulting if the array is gone.
+        let read = unsafe {
+            ReadProcessMemory(
+                GetCurrentProcess(),
+                self.dest as *const c_void,
+                live.as_mut_ptr().cast(),
+                live.len() * size_of::<u64>(),
+                Some(&mut got),
+            )
+        };
+        if read.is_err() || got != live.len() * size_of::<u64>() {
+            return Cow::Borrowed(tokens);
+        }
+        for (now, seen) in live.iter_mut().zip(tokens) {
+            if *seen != 0 {
+                *now = *seen;
+            }
+        }
+        if live.as_slice() != tokens {
+            diag::late_pages(self.dest, tokens, &live);
+        }
+        Cow::Owned(live)
+    }
+
     fn execute(&self) -> Result<(), HRESULT> {
-        if self.cancelled {
+        if self.is_cancelled() {
             return Ok(());
         }
         // The title's staging size bounds one compressed read. Keep the limit,
@@ -154,7 +212,7 @@ impl Read {
             && let Some((limit, _)) = lock(&STAGING).as_ref()
             && self.size > *limit
         {
-            return Err(E_OUTOFMEMORY);
+            return Err(self.failure("staging", E_OUTOFMEMORY, "source larger than the staging buffer"));
         }
         let mut local = Vec::new();
         let compressed = &mut local;
@@ -162,10 +220,10 @@ impl Read {
         let target = if self.options & DECODED != 0 {
             compressed
                 .try_reserve_exact(self.size)
-                .map_err(|_| E_OUTOFMEMORY)?;
+                .map_err(|_| self.failure("buffer", E_OUTOFMEMORY, ""))?;
             compressed.spare_capacity_mut().as_mut_ptr().cast::<u8>()
         } else if self.pages.is_some() {
-            plain.try_reserve_exact(self.size).map_err(|_| E_OUTOFMEMORY)?;
+            plain.try_reserve_exact(self.size).map_err(|_| self.failure("buffer", E_OUTOFMEMORY, ""))?;
             plain.resize(self.size, 0);
             plain.as_mut_ptr()
         } else {
@@ -204,7 +262,8 @@ impl Read {
                 let mut stats = storage_stats();
                 stats.pending_reads -= 1;
                 stats.read_errors = stats.read_errors.saturating_add(u32::from(result.is_err()));
-                result?;
+                drop(stats);
+                result.map_err(|hr| self.failure("read", hr, &format!("got {got} bytes")))?;
             }
             Source::Memory(p) => unsafe { core::ptr::copy(*p as *const u8, target, self.size) },
         }
@@ -224,15 +283,29 @@ impl Read {
                     .decode_errors
                     .saturating_add(u32::from(output.is_err()));
             }
-            let output = output.map_err(|_| HRESULT::from_win32(ERROR_INVALID_DATA.0))?;
+            let output = output
+                .map_err(|why| self.failure("decode", HRESULT::from_win32(ERROR_INVALID_DATA.0), &why))?;
+            // A request cancelled while it ran may have lost its destination.
+            if self.is_cancelled() {
+                return Ok(());
+            }
             if let Some((tokens, offset)) = &self.pages {
-                return write_pages(tokens, *offset, &output);
+                let tokens = self.page_tokens(tokens);
+                return write_pages(&tokens, *offset, &output).map_err(|hr| {
+                    self.failure("pages", hr, &format!("{} bytes, array {:#x}, tokens at run {}", output.len(), self.dest, diag::tokens(&tokens)))
+                });
             }
             unsafe {
                 core::ptr::copy_nonoverlapping(output.as_ptr(), self.dest as *mut u8, output.len())
             };
         } else if let Some((tokens, offset)) = &self.pages {
-            return write_pages(tokens, *offset, &plain);
+            if self.is_cancelled() {
+                return Ok(());
+            }
+            let tokens = self.page_tokens(tokens);
+            return write_pages(&tokens, *offset, &plain).map_err(|hr| {
+                self.failure("pages", hr, &format!("{} bytes, array {:#x}, tokens at run {}", plain.len(), self.dest, diag::tokens(&tokens)))
+            });
         }
         Ok(())
     }
@@ -296,6 +369,11 @@ fn consume(shared: &Shared) {
                 batch.extend(state.entries.pop_front());
                 state.ready -= 1;
             }
+            for entry in &batch {
+                if let Entry::Read(r) = entry {
+                    state.in_flight.push((r.tag, Arc::clone(&r.cancelled)));
+                }
+            }
             drop(state);
             let results = if batch.len() > 1 {
                 execute_reads(shared, &batch)
@@ -305,7 +383,10 @@ fn consume(shared: &Shared) {
             for (entry, result) in batch.iter().zip(results) {
                 finish(shared, entry, result, &mut last_error);
             }
-            lock(&shared.state).processing = false;
+            let mut state = lock(&shared.state);
+            state.in_flight.clear();
+            state.processing = false;
+            drop(state);
             shared.changed.notify_all();
             continue;
         }
@@ -352,6 +433,14 @@ fn execute_reads(shared: &Shared, batch: &[Entry]) -> Vec<Result<(), HRESULT>> {
 }
 
 fn finish(shared: &Shared, entry: &Entry, result: Result<(), HRESULT>, last_error: &mut HRESULT) {
+    // A cancelled request does not count as a failure, even when it was
+    // already running when the title cancelled it.
+    if let Entry::Read(read) = entry
+        && read.is_cancelled()
+    {
+        diag::cancelled(read.options, result.is_err());
+        return;
+    }
     if let Err(hr) = result {
         if let Entry::Read(read) = entry {
             diag::failed(read.options);
@@ -413,6 +502,7 @@ pub(super) unsafe fn create(desc: &QueueDesc, manual: bool) -> Result<IQueue2, H
             closed: false,
             error_count: 0,
             first_error: None,
+            in_flight: Vec::new(),
         }),
         changed: Condvar::new(),
         capacity: desc.capacity as usize,
@@ -526,11 +616,15 @@ impl IQueue_Impl for Queue_Impl {
         self.shared.changed.notify_all();
     }
     unsafe fn CancelRequestsWithTag(&self, mask: u64, value: u64) {
-        for entry in &mut lock(&self.shared.state).entries {
-            if let Entry::Read(r) = entry
-                && (r.tag & mask) == value
-            {
-                r.cancelled = true;
+        let state = lock(&self.shared.state);
+        let queued = state.entries.iter().filter_map(|e| match e {
+            Entry::Read(r) => Some((r.tag, &r.cancelled)),
+            _ => None,
+        });
+        let running = state.in_flight.iter().map(|(tag, flag)| (*tag, flag));
+        for (tag, flag) in queued.chain(running) {
+            if tag & mask == value {
+                flag.store(true, Ordering::Release);
             }
         }
     }

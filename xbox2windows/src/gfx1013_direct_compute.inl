@@ -2446,12 +2446,14 @@ struct DirectCompute {
                 // result and do not consume the incoming SCC. An explicit
                 // SRC_SCC operand still takes precedence below.
                 const bool mask_scc = n == "s_andn2_b64" || n == "s_and_b64" || n == "s_or_b64" ||
-                    n == "s_xor_b64" || n == "s_not_b64" || n == "s_wqm_b32" || n == "s_wqm_b64" ||
+                    n == "s_xor_b64" || n == "s_orn2_b64" || n == "s_nand_b64" || n == "s_nor_b64" ||
+                    n == "s_xnor_b64" || n == "s_not_b64" || n == "s_wqm_b32" || n == "s_wqm_b64" ||
                     n == "s_quadmask_b32" || n == "s_quadmask_b64" ||
                     n == "s_and_saveexec_b64" || n == "s_or_saveexec_b64" || n == "s_xor_saveexec_b64" ||
                     n == "s_andn2_saveexec_b64" || n == "s_orn2_saveexec_b64" ||
                     n == "s_nand_saveexec_b64" || n == "s_nor_saveexec_b64" || n == "s_xnor_saveexec_b64" ||
-                    n == "s_andn2_wrexec_b64";
+                    n == "s_andn1_saveexec_b64" || n == "s_orn1_saveexec_b64" ||
+                    n == "s_andn1_wrexec_b64" || n == "s_andn2_wrexec_b64";
                 const bool overwrites = mask_scc || n == "s_abs_i32" ||
                     n == "s_bcnt0_i32_b32" || n == "s_bcnt1_i32_b32" ||
                     n == "s_bcnt0_i32_b64" || n == "s_bcnt1_i32_b64" ||
@@ -2459,8 +2461,12 @@ struct DirectCompute {
                     n == "s_or_b32" || n == "s_max_u32" || n == "s_min_u32" || n == "s_min_i32" ||
                     n == "s_max_i32" || n == "s_absdiff_i32" || n == "s_add_u32" || n == "s_sub_u32" ||
                     n == "s_add_i32" || n == "s_sub_i32" || n == "s_and_saveexec_b32" ||
-                    n == "s_or_saveexec_b32" || n == "s_andn2_wrexec_b32" || n == "s_andn2_b32" || n == "s_orn2_b32" ||
-                    n == "s_nor_b32" || n == "s_nand_b32" || n == "s_xnor_b32" || n == "s_not_b32" ||
+                    n == "s_or_saveexec_b32" || n == "s_xor_saveexec_b32" || n == "s_andn2_saveexec_b32" ||
+                    n == "s_orn2_saveexec_b32" || n == "s_nand_saveexec_b32" || n == "s_nor_saveexec_b32" ||
+                    n == "s_xnor_saveexec_b32" || n == "s_andn1_saveexec_b32" || n == "s_orn1_saveexec_b32" ||
+                    n == "s_andn1_wrexec_b32" || n == "s_andn2_wrexec_b32" || n == "s_andn2_b32" ||
+                    n == "s_orn2_b32" || n == "s_nor_b32" || n == "s_nand_b32" || n == "s_xnor_b32" ||
+                    n == "s_not_b32" ||
                     n == "s_lshr_b32" || n == "s_lshl_b32" || n == "s_ashr_i32" ||
                     n == "s_lshl_b64" || n == "s_lshr_b64" || n == "s_ashr_i64" || n == "s_xor_b32" ||
                     n == "s_bfe_u64" || n == "s_bfe_i64" ||
@@ -3484,9 +3490,21 @@ struct DirectCompute {
             write(128, ir.value("zext i1 " + carry + " to i32"));
             return;
         }
+        auto combine_scalar_mask = [&](Name op, const string &left, const string &right) -> string {
+            if (op == "and" || op == "or" || op == "xor")
+                return ir.binary(string(op), left, right);
+            if (op == "andn2" || op == "orn2")
+                return ir.binary(op == "andn2" ? "and" : "or", left, ir.binary("xor", right, "4294967295"));
+            if (op == "andn1" || op == "orn1")
+                return ir.binary(op == "andn1" ? "and" : "or", ir.binary("xor", left, "4294967295"), right);
+            if (op == "nand" || op == "nor" || op == "xnor")
+                return ir.binary("xor", ir.binary(op == "nand" ? "and" : op == "nor" ? "or" : "xor", left, right),
+                                 "4294967295");
+            return {};
+        };
         if ((i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2) && n.size() > 6 && n.substr(n.size() - 4) == "_b64") {
             bool save = n.find("_saveexec_") != Name::npos;
-            const bool wrexec = compute && wave64 && n == "s_andn2_wrexec_b64";
+            const bool wrexec = compute && wave64 && (n == "s_andn2_wrexec_b64" || n == "s_andn1_wrexec_b64");
             auto op = n.substr(2, n.find('_', 2) - 2);
             if (wrexec ? ((i.dst | i.src[0]) & 1) || i.dst > 104 || i.src[0] > 104
                        : (i.dst & 1) || (i.dst > 104 && i.dst != 106 && i.dst != 126) ||
@@ -3496,31 +3514,31 @@ struct DirectCompute {
             const bool updates_exec = save || wrexec;
             auto bl = updates_exec ? read(126) : b;
             auto bh = updates_exec ? read(127) : pair_high(i, i.src[1]);
-            auto combine = [&](const string &left, const string &right) -> string {
-                if (op == "and" || op == "or" || op == "xor") return ir.binary(string(op), left, right);
-                if (op == "andn2" || op == "orn2")
-                    return ir.binary(op == "andn2" ? "and" : "or", left, ir.binary("xor", right, "4294967295"));
-                if (op == "nand" || op == "nor" || op == "xnor")
-                    return ir.binary("xor", ir.binary(op == "nand" ? "and" : op == "nor" ? "or" : "xor", left, right), "4294967295");
-                refuse(i.pc, "unsupported wave64 scalar mask operation");
-            };
             // SAVEEXEC and WREXEC combine the source with old EXEC in ISA operand order.
             // WREXEC stores the new mask in the destination pair.
-            auto lo = combine(a, bl), hi = combine(ah, bh);
+            auto lo = combine_scalar_mask(op, a, bl), hi = combine_scalar_mask(op, ah, bh);
+            if (lo.empty())
+                refuse(i.pc, "unsupported wave64 scalar mask operation");
             write(i.dst, save ? bl : lo);
             write(i.dst + 1, save ? bh : hi);
             if (updates_exec) { write(126, lo); write(127, hi); }
             write(128, ir.value("zext i1 " + cmp("ne", ir.binary("or", lo, hi), "0") + " to i32"));
             return;
         }
-        const bool or_saveexec = n == "s_or_saveexec_b32" && compute && !wave64;
-        if (or_saveexec || n == "s_and_saveexec_b32" || n == "s_andn2_wrexec_b32") {
-            const bool save = n != "s_andn2_wrexec_b32";
-            if (or_saveexec && i.dst > 107)
+        const bool saveexec32 = i.enc == Encoding::Sop1 && n.size() > 13 && n.substr(n.size() - 13) == "_saveexec_b32";
+        const bool wrexec32 = n == "s_andn2_wrexec_b32" || (compute && !wave64 && n == "s_andn1_wrexec_b32");
+        if (n == "s_and_saveexec_b32" || n == "s_andn2_wrexec_b32" ||
+            (compute && !wave64 && (saveexec32 || wrexec32))) {
+            const bool save = saveexec32;
+            const bool strict_dst = n != "s_and_saveexec_b32" && n != "s_andn2_wrexec_b32";
+            if (strict_dst && i.dst > 107)
                 refuse(i.pc, "unsupported wave32 SAVEEXEC destination");
+            auto op = n.substr(2, n.find('_', 2) - 2);
             auto old = read(126);
             // Like s_mov_b32 exec_lo, EXEC keeps every bit; a lane runs only if its own bit is set.
-            auto mask = ir.binary(or_saveexec ? "or" : "and", a, save ? old : ir.binary("xor", old, "4294967295"));
+            auto mask = combine_scalar_mask(op, a, old);
+            if (mask.empty())
+                refuse(i.pc, "unsupported wave32 scalar mask operation");
             write(i.dst, save ? old : mask);
             write(126, mask);
             write(128, ir.value("zext i1 " + cmp("ne", mask, "0") + " to i32"));
