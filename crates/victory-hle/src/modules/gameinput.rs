@@ -342,6 +342,7 @@ impl Drop for Ref {
 }
 
 type DeviceCallback = extern "system" fn(u64, *mut c_void, *const Device, u64, u32, u32);
+type ReadingCallback = extern "system" fn(u64, *mut c_void, *const Device, u64, *const Reading, u32);
 
 #[derive(Clone, Copy)]
 struct Registration {
@@ -371,6 +372,22 @@ impl Registration {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ReadingRegistration {
+    token: u64,
+    device: usize,
+    kind: u32,
+    context: usize,
+    callback: ReadingCallback,
+}
+
+struct ReadingEvent {
+    registration: ReadingRegistration,
+    device: usize,
+    timestamp: u64,
+    reading: *const Reading,
+}
+
 struct Event {
     registration: Registration,
     device: usize,
@@ -389,8 +406,10 @@ struct Slot {
 struct State {
     slots: [Slot; DEVICES],
     callbacks: Vec<Registration>,
+    reading_callbacks: Vec<ReadingRegistration>,
     /// Asynchronous enumerations, delivered by the next poll.
     pending: Vec<Event>,
+    pending_readings: Vec<ReadingEvent>,
     /// Device callbacks running now: token and thread.
     running: Vec<(u64, ThreadId)>,
 }
@@ -438,7 +457,9 @@ impl Hub {
             state: Mutex::new(State {
                 slots: Default::default(),
                 callbacks: Vec::new(),
+                reading_callbacks: Vec::new(),
                 pending: Vec::new(),
+                pending_readings: Vec::new(),
                 running: Vec::new(),
             }),
             returned: Condvar::new(),
@@ -477,8 +498,9 @@ impl Hub {
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
             (pads, source.keys(), source.mouse())
         };
-        let events = self.state().poll(&self.devices, self.one_pad, pads, keys, mouse);
+        let (events, reading_events) = self.state().poll(&self.devices, self.one_pad, pads, keys, mouse);
         self.deliver(events);
+        self.deliver_readings(reading_events);
     }
 
     /// Runs callbacks, never under our lock: they call back into us. One
@@ -511,6 +533,33 @@ impl Hub {
         }
     }
 
+    fn deliver_readings(&self, events: Vec<ReadingEvent>) {
+        let me = std::thread::current().id();
+        for e in events {
+            let r = e.registration;
+            {
+                let mut state = self.state();
+                if !state.reading_callbacks.iter().any(|c| c.token == r.token) {
+                    continue;
+                }
+                state.running.push((r.token, me));
+            }
+            (r.callback)(
+                r.token,
+                r.context as *mut c_void,
+                &self.devices[e.device],
+                e.timestamp,
+                e.reading,
+                r.kind,
+            );
+            let mut state = self.state();
+            if let Some(i) = state.running.iter().position(|&x| x == (r.token, me)) {
+                state.running.swap_remove(i);
+            }
+            self.returned.notify_all();
+        }
+    }
+
     fn index(&self, device: *const Device) -> Option<usize> {
         self.devices.iter().position(|d| std::ptr::eq(d, device))
     }
@@ -524,24 +573,25 @@ impl State {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
         mouse: Option<MouseState>,
-    ) -> Vec<Event> {
+    ) -> (Vec<Event>, Vec<ReadingEvent>) {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
-        self.update(devices, MOUSE, mouse.map(Value::Mouse), now, &mut events);
+        let mut reading_events = std::mem::take(&mut self.pending_readings);
+        self.update(devices, MOUSE, mouse.map(Value::Mouse), now, &mut events, &mut reading_events);
         if one_pad {
             let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
-            self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
-            self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
-            return events;
+            self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events, &mut reading_events);
+            self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events, &mut reading_events);
+            return (events, reading_events);
         }
         let any_pad = pads.iter().any(Option::is_some);
         for (slot, pad) in pads.into_iter().enumerate() {
-            self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
+            self.update(devices, slot, pad.map(Value::Pad), now, &mut events, &mut reading_events);
         }
         let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
-        self.update(devices, FALLBACK, fallback, now, &mut events);
-        self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
-        events
+        self.update(devices, FALLBACK, fallback, now, &mut events, &mut reading_events);
+        self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events, &mut reading_events);
+        (events, reading_events)
     }
 
     /// Records a device's state: a reading when it changed, callbacks when
@@ -553,6 +603,7 @@ impl State {
         value: Option<Value>,
         now: u64,
         events: &mut Vec<Event>,
+        reading_events: &mut Vec<ReadingEvent>,
     ) {
         let slot = &mut self.slots[index];
         let was = slot.connected;
@@ -572,6 +623,21 @@ impl State {
                 timestamp: now,
                 value,
             }));
+            let reading = slot.history.back().unwrap();
+            let reading_ptr = std::ops::Deref::deref(reading) as *const Reading;
+            let reading_kind = reading.kind();
+            for reg in &self.reading_callbacks {
+                if reg.kind & reading_kind != 0
+                    && (reg.device == 0 || reg.device == &devices[index] as *const Device as usize)
+                {
+                    reading_events.push(ReadingEvent {
+                        registration: *reg,
+                        device: index,
+                        timestamp: now,
+                        reading: reading_ptr,
+                    });
+                }
+            }
         }
         if was != slot.connected {
             tracing::info!(device = index, connected = !was, "input device");
@@ -795,16 +861,35 @@ fn token(out: *mut u64) -> HRESULT {
 // shortcut: reading callbacks never run; the title registers none
 // (it polls).
 extern "system" fn register_reading(
-    _: This,
-    _device: *const c_void,
-    _kind: u32,
+    this: This,
+    device: *const c_void,
+    kind: u32,
     _threshold: f32,
-    _context: *mut c_void,
-    _callback: *const c_void,
+    context: *mut c_void,
+    callback: Option<ReadingCallback>,
     out: *mut u64,
 ) -> HRESULT {
-    tracing::warn!("input reading callbacks are never called");
-    token(out)
+    let Some(callback) = callback else {
+        return E_INVALIDARG;
+    };
+    let hub = hub(this);
+    let registration = ReadingRegistration {
+        token: NEXT_TOKEN.fetch_add(1, Ordering::Relaxed),
+        device: device as usize,
+        kind,
+        context: context as usize,
+        callback,
+    };
+    {
+        let mut state = hub.state();
+        state.reading_callbacks.push(registration);
+    }
+    if !out.is_null() {
+        // SAFETY: checked non-null; room for a token.
+        unsafe { out.write(registration.token) };
+    }
+    tracing::info!(kind = format_args!("{kind:#x}"), "input reading callback registered");
+    S_OK
 }
 
 /// Device callbacks run on our poll thread when a device comes or goes.
@@ -875,7 +960,9 @@ extern "system" fn register_other(
 fn forget(this: This, token: u64) {
     let mut state = hub(this).state();
     state.callbacks.retain(|r| r.token != token);
+    state.reading_callbacks.retain(|r| r.token != token);
     state.pending.retain(|e| e.registration.token != token);
+    state.pending_readings.retain(|e| e.registration.token != token);
 }
 extern "system" fn stop_callback(this: This, token: u64) {
     forget(this, token);
@@ -1937,4 +2024,58 @@ mod tests {
         rumble(device, std::ptr::null());
         assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
     }
+
+    #[test]
+    fn reading_callbacks_fire_when_a_reading_changes() {
+        // A reading callback runs when a new reading is recorded, carrying
+        // the new reading pointer and its kind.
+        static CALLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        extern "system" fn cb(
+            _token: u64,
+            _context: *mut c_void,
+            _device: *const Device,
+            _timestamp: u64,
+            reading: *const Reading,
+            kind: u32,
+        ) {
+            assert!(!reading.is_null());
+            assert_eq!(kind, GAMEPAD_KIND);
+            CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let (hub, host) = fake();
+        // Register a reading callback for gamepad readings on any device.
+        type RegisterReading = extern "system" fn(
+            This,
+            *const c_void,
+            u32,
+            f32,
+            *mut c_void,
+            Option<ReadingCallback>,
+            *mut u64,
+        ) -> HRESULT;
+        let register = slot::<RegisterReading, _>(&hub.object, 0x40);
+        let mut token = 0u64;
+        assert_eq!(
+            register(&hub.object, std::ptr::null(), GAMEPAD_KIND, 0.0, std::ptr::null_mut(), Some(cb), &mut token),
+            S_OK
+        );
+        assert_ne!(token, 0);
+        // No reading yet: nothing fired.
+        assert_eq!(CALLS.load(std::sync::atomic::Ordering::Relaxed), 0);
+        // Push a pad reading: the callback fires.
+        host.lock().unwrap().pads[0] = Some(PadState { buttons: A, ..Default::default() });
+        hub.poll();
+        assert_eq!(CALLS.load(std::sync::atomic::Ordering::Relaxed), 1);
+        // An identical reading does not fire again.
+        hub.poll();
+        assert_eq!(CALLS.load(std::sync::atomic::Ordering::Relaxed), 1);
+        // Unregister stops further callbacks.
+        type Unregister = extern "system" fn(This, u64, u64) -> bool;
+        let unregister = slot::<Unregister, _>(&hub.object, 0x68);
+        assert!(unregister(&hub.object, token, 0));
+        host.lock().unwrap().pads[0] = Some(PadState { buttons: B, ..Default::default() });
+        hub.poll();
+        assert_eq!(CALLS.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
 }
