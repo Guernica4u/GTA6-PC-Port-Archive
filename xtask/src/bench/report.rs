@@ -18,6 +18,7 @@ const METRICS: [&str; 6] = [
 
 #[derive(Default)]
 pub(super) struct Report {
+    started: bool,
     translation: u64,
     textures: u64,
     reasons: BTreeMap<String, u64>,
@@ -29,6 +30,13 @@ pub(super) struct Report {
 }
 
 impl Report {
+    pub fn started() -> Self {
+        Self {
+            started: true,
+            ..Self::default()
+        }
+    }
+
     pub fn event(&mut self, line: &str) {
         // tracing may color the level, target and fields, even when redirected.
         if let Some((before, rest)) = line.split_once("\x1b[") {
@@ -83,25 +91,29 @@ impl Report {
             self.rss = Some(self.rss.unwrap_or_default().max(bytes));
         }
         let rss = rss.map_or_else(|| "-".to_owned(), |v| format!("{:.1}", v as f64 / MIB));
+        let counts = if self.started {
+            format!("{} | {}", self.translation, self.textures)
+        } else {
+            "- | -".to_owned()
+        };
         writeln!(
             self.timeline,
-            "| {:.1} | {rss} | {:.1} | {} | {} |",
+            "| {:.1} | {rss} | {:.1} | {counts} |",
             elapsed.as_secs_f64(),
             free as f64 / MIB,
-            self.translation,
-            self.textures
         )
         .unwrap();
     }
 
     pub fn markdown(&self, args: &Args, stop: &str, previous: Option<&[String]>) -> String {
         let values = [
-            Some(self.translation.to_string()),
-            Some(self.textures.to_string()),
+            self.started.then(|| self.translation.to_string()),
+            self.started.then(|| self.textures.to_string()),
             self.draws.map(|v| v.to_string()),
             self.fps.map(|v| format!("{v:.1}")),
             self.rss.map(|v| format!("{:.2}", v as f64 / MIB)),
-            Some(self.crash.as_deref().unwrap_or("none").into()),
+            self.started
+                .then(|| self.crash.as_deref().unwrap_or("none").into()),
         ]
         .map(|v| v.unwrap_or_else(|| "unobserved".into()));
         let mut out = format!(
@@ -172,14 +184,12 @@ pub(super) fn baseline(text: &str) -> Result<Vec<String>> {
                 .filter_map(|line| line.strip_prefix(&prefix)?.strip_suffix(" |"))
                 .filter(|s| !s.contains('|')); // Ignore the three-column comparison table.
             let s = rows.next().unwrap_or("");
-            let valid = match i {
-                0 | 1 => s.parse::<u64>().is_ok(),
-                2 => s == "unobserved" || s.parse::<u64>().is_ok(),
-                3 | 4 => {
-                    s == "unobserved" || s.parse::<f64>().is_ok_and(|x| x.is_finite() && x >= 0.)
-                }
-                _ => matches!(s, "unknown" | "none") || valid_rva(s),
-            };
+            let valid = s == "unobserved"
+                || match i {
+                    0..=2 => s.parse::<u64>().is_ok(),
+                    3 | 4 => s.parse::<f64>().is_ok_and(|x| x.is_finite() && x >= 0.),
+                    _ => matches!(s, "unknown" | "none") || valid_rva(s),
+                };
             ensure!(
                 valid && rows.next().is_none(),
                 "invalid benchmark baseline for {metric}"
@@ -204,6 +214,11 @@ mod tests {
             unreachable!()
         };
         let mut report = Report::default();
+        report.sample(Duration::ZERO, None, 2 << 30);
+        let refused = report.markdown(&args, "minimum free system memory", None);
+        assert_eq!(baseline(&refused).unwrap(), ["unobserved"; 6]);
+        assert!(refused.contains("| 0.0 | - | 2048.0 | - | - |"));
+        let mut report = Report::started();
         let old = baseline(&report.markdown(&args, "time limit", None)).unwrap();
         assert_eq!(
             old,

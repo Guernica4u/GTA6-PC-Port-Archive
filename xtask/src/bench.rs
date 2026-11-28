@@ -40,6 +40,27 @@ pub fn run(_: Args) -> anyhow::Result<()> {
     anyhow::bail!("the title benchmark requires Windows")
 }
 
+#[cfg(any(windows, test))]
+fn default_exe(xtask: &std::path::Path) -> anyhow::Result<PathBuf> {
+    use anyhow::Context;
+    // cargo xtask runs <target directory>/<profile>/xtask.exe.
+    let target = xtask
+        .parent()
+        .and_then(std::path::Path::parent)
+        .context("locating Cargo's target directory from xtask")?;
+    Ok(target.join("release/victory.exe"))
+}
+
+#[cfg(test)]
+#[test]
+fn finds_the_release_build_in_cargos_target_directory() {
+    let target = PathBuf::from("custom-target");
+    assert_eq!(
+        default_exe(&target.join("debug/xtask.exe")).unwrap(),
+        target.join("release/victory.exe")
+    );
+}
+
 #[cfg(windows)]
 pub fn run(args: Args) -> anyhow::Result<()> {
     use anyhow::{Context, ensure};
@@ -70,10 +91,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         .as_ref()
         .map(|p| report::baseline(&fs::read_to_string(p).context("reading baseline")?))
         .transpose()?;
-    let exe = args
-        .exe
-        .clone()
-        .unwrap_or_else(|| super::workspace_root().join("target/release/victory.exe"));
+    let exe = match &args.exe {
+        Some(path) => path.clone(),
+        None => default_exe(&std::env::current_exe()?)?,
+    };
     ensure!(
         exe.is_file(),
         "VIctory executable missing: {}",

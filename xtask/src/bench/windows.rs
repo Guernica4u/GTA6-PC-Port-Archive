@@ -76,7 +76,7 @@ pub(super) fn monitor(
     if free < bytes(min_gb) {
         let mut report = Report::default();
         report.sample(Duration::ZERO, None, free);
-        return Ok((report, "minimum free system memory".into()));
+        return Ok((report, "minimum free system memory before launch".into()));
     }
 
     let job = job().context("creating benchmark job")?;
@@ -96,7 +96,7 @@ pub(super) fn monitor(
         }
     }
     let stderr = child.stderr.take().expect("stderr piped");
-    let report = Mutex::new(Report::default());
+    let report = Mutex::new(Report::started());
     let stop = std::thread::scope(|scope| -> Result<String> {
         let reader = scope.spawn(|| -> io::Result<()> {
             let mut input = BufReader::new(stderr);
@@ -229,9 +229,9 @@ mod tests {
             monitor(&mut fixture("wait"), 1, 8., 0.).unwrap().1,
             "time limit"
         );
-        assert_eq!(
-            monitor(&mut fixture("wait"), 30, 8., 1048576.).unwrap().1,
-            "minimum free system memory"
-        );
+        let (report, reason) = monitor(&mut fixture("wait"), 30, 8., 1048576.).unwrap();
+        assert_eq!(reason, "minimum free system memory before launch");
+        let markdown = report.markdown(&args, &reason, None);
+        assert!(markdown.contains("| translation failures | unobserved |"));
     }
 }
