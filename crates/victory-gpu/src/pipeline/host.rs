@@ -827,12 +827,13 @@ impl<T> Sub<T> {
 /// of the description, padding included, and what lay between the fields
 /// of a description is not ours to hand it.
 fn zero_padding<T>(value: &mut T, padding: &[Range<usize>]) {
-    // SAFETY: `value` is a whole `T`; only bytes no field reads are written.
+    // SAFETY: `value` is a whole `T`; the ranges name bytes no field reads,
+    // and `write_bytes` initializes those bytes without reading them first.
     unsafe {
-        let bytes =
-            std::slice::from_raw_parts_mut(std::ptr::from_mut(value).cast::<u8>(), size_of::<T>());
+        let base = std::ptr::from_mut(value).cast::<u8>();
         for range in padding {
-            bytes[range.clone()].fill(0);
+            debug_assert!(range.end <= size_of::<T>());
+            base.add(range.start).write_bytes(0, range.len());
         }
     }
 }
@@ -1245,17 +1246,25 @@ mod tests {
         let _ = offsets(&inputs);
     }
 
-    fn raw<T>(value: &T) -> &[u8] {
-        // SAFETY: `value` is a whole `T`.
+    fn raw<T>(value: &T) -> &[std::mem::MaybeUninit<u8>] {
+        // SAFETY: `value` is a whole `T`; padding may be uninitialized, so
+        // expose it as `MaybeUninit` rather than as `u8`.
         unsafe {
-            std::slice::from_raw_parts(std::ptr::from_ref(value).cast::<u8>(), size_of::<T>())
+            std::slice::from_raw_parts(
+                std::ptr::from_ref(value).cast::<std::mem::MaybeUninit<u8>>(),
+                size_of::<T>(),
+            )
         }
     }
 
-    fn raw_mut<T>(value: &mut T) -> &mut [u8] {
-        // SAFETY: `value` is a whole `T`, uniquely borrowed.
+    fn raw_mut<T>(value: &mut T) -> &mut [std::mem::MaybeUninit<u8>] {
+        // SAFETY: `value` is a whole `T`, uniquely borrowed; padding may be
+        // uninitialized, so expose it as `MaybeUninit` rather than as `u8`.
         unsafe {
-            std::slice::from_raw_parts_mut(std::ptr::from_mut(value).cast::<u8>(), size_of::<T>())
+            std::slice::from_raw_parts_mut(
+                std::ptr::from_mut(value).cast::<std::mem::MaybeUninit<u8>>(),
+                size_of::<T>(),
+            )
         }
     }
 
@@ -1315,14 +1324,23 @@ mod tests {
     /// Poisons the expected padding, zeroes the computed padding, then
     /// checks that every field kept its bytes and every gap was cleared.
     fn assert_padding<T>(value: &mut T, expected: Vec<Range<usize>>, computed: &[Range<usize>]) {
-        let expected = normalize(expected);
-        let before = raw(value).to_vec();
-        {
-            let bytes = raw_mut(value);
-            for range in &expected {
-                bytes[range.clone()].fill(0xaa);
+        fn write(bytes: &mut [std::mem::MaybeUninit<u8>], ranges: &[Range<usize>], byte: u8) {
+            for range in ranges {
+                for slot in &mut bytes[range.clone()] {
+                    slot.write(byte);
+                }
             }
         }
+
+        let expected = normalize(expected);
+        // Fields are initialized; initialize padding before reading bytes.
+        write(raw_mut(value), &expected, 0);
+        // SAFETY: every byte of `value` is now initialized.
+        let before: Vec<u8> = raw(value)
+            .iter()
+            .map(|byte| unsafe { byte.assume_init() })
+            .collect();
+        write(raw_mut(value), &expected, 0xaa);
         zero_padding(value, computed);
         let after = raw(value);
         let mut padding = vec![false; after.len()];
@@ -1332,10 +1350,13 @@ mod tests {
             }
         }
         for (i, (before, after)) in before.iter().zip(after).enumerate() {
+            // SAFETY: padding was zeroed by `zero_padding` and fields were
+            // initialized before the first byte read.
+            let after = unsafe { after.assume_init() };
             if padding[i] {
-                assert_eq!(*after, 0, "padding byte {i} was not zeroed");
+                assert_eq!(after, 0, "padding byte {i} was not zeroed");
             } else {
-                assert_eq!(*after, *before, "field byte {i} was changed");
+                assert_eq!(after, *before, "field byte {i} was changed");
             }
         }
     }
